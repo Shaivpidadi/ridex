@@ -99,29 +99,6 @@ fn publishCodeCopyFrameForAttempt(
     runtime.commitCodeCopyFrame(alloc, candidate);
 }
 
-test "code copy targets publish only for a committed frame" {
-    const alloc = std.testing.allocator;
-    var runtime = transcript_runtime.TranscriptRuntime{};
-    defer runtime.deinit(alloc);
-
-    var candidate = full_transcript_screen.CodeCopyInteractionFrame{};
-    defer candidate.deinit(alloc);
-    try candidate.targets.append(alloc, .{
-        .entry_id = 41,
-        .row = 3,
-        .first_col = 72,
-        .last_col = 75,
-    });
-
-    publishCodeCopyFrameForAttempt(alloc, &runtime, &candidate, false);
-    try std.testing.expectEqual(@as(?u32, null), runtime.codeCopyHit(3, 72));
-    try std.testing.expectEqual(@as(usize, 1), candidate.targets.items.len);
-
-    publishCodeCopyFrameForAttempt(alloc, &runtime, &candidate, true);
-    try std.testing.expectEqual(@as(?u32, 41), runtime.codeCopyHit(3, 72));
-    try std.testing.expectEqual(@as(usize, 0), candidate.targets.items.len);
-}
-
 const InlineRenderReconciliation = struct {
     alternate_screen_owns_rendering: bool = false,
     terminal_transition: render_engine.terminal_diff.FrameTerminalTransition = .none,
@@ -3672,6 +3649,29 @@ fn solveFixedPointForTest(
         FixedPointTestContext.prepareCandidate,
         FixedPointTestContext.resolveCandidate,
     );
+}
+
+test "code copy targets publish only for a committed frame" {
+    const alloc = std.testing.allocator;
+    var runtime = transcript_runtime.TranscriptRuntime{};
+    defer runtime.deinit(alloc);
+
+    var candidate = full_transcript_screen.CodeCopyInteractionFrame{};
+    defer candidate.deinit(alloc);
+    try candidate.targets.append(alloc, .{
+        .entry_id = 41,
+        .row = 3,
+        .first_col = 72,
+        .last_col = 75,
+    });
+
+    publishCodeCopyFrameForAttempt(alloc, &runtime, &candidate, false);
+    try std.testing.expectEqual(@as(?u32, null), runtime.codeCopyHit(3, 72));
+    try std.testing.expectEqual(@as(usize, 1), candidate.targets.items.len);
+
+    publishCodeCopyFrameForAttempt(alloc, &runtime, &candidate, true);
+    try std.testing.expectEqual(@as(?u32, 41), runtime.codeCopyHit(3, 72));
+    try std.testing.expectEqual(@as(usize, 0), candidate.targets.items.len);
 }
 
 test "assistant tail writability changes remain traceable" {
