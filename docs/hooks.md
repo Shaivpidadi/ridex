@@ -22,13 +22,13 @@ workspace root is the child process working directory.
   "hooks": {
     "PreToolUse": [
       {
-        "command": ["/Users/alice/.fx/hooks/tool-policy"],
+        "command": ["/Users/example/.fx/hooks/tool-policy"],
         "timeout_ms": 2000
       }
     ],
     "PostTurnEnd": [
       {
-        "command": ["/Users/alice/.fx/hooks/telemetry"],
+        "command": ["/Users/example/.fx/hooks/telemetry"],
         "timeout_ms": 5000,
         "environment": ["OTEL_EXPORTER_OTLP_ENDPOINT"]
       }
@@ -44,14 +44,14 @@ user-owned profile:
 {
   "hooks": {
     "PostTurnEnd": [
-      { "command": ["/Users/alice/.fx/hooks/default-telemetry"] }
+      { "command": ["/Users/example/.fx/hooks/default-telemetry"] }
     ]
   },
   "workspaces": {
-    "/Users/alice/src/payments": {
+    "/Users/example/src/payments": {
       "hooks": {
         "PreToolUse": [
-          { "command": ["/Users/alice/.fx/hooks/payments-policy"] }
+          { "command": ["/Users/example/.fx/hooks/payments-policy"] }
         ],
         "PostTurnEnd": []
       }
@@ -84,7 +84,7 @@ used for every event:
   "event": "PreToolUse",
   "invocation": {
     "scope": "interactive",
-    "workspace_root": "/Users/alice/src/project",
+    "workspace_root": "/Users/example/src/project",
     "session_id": "01J...",
     "subagent_id": null,
     "turn_id": 42
@@ -224,7 +224,7 @@ Point the command at a user-owned adapter for the installed service version:
   "hooks": {
     "PostTurnEnd": [
       {
-        "command": ["/Users/alice/.fx/hooks/lat-adapter"],
+        "command": ["/Users/example/.fx/hooks/lat-adapter"],
         "environment": ["LAT_API_KEY"]
       }
     ]
