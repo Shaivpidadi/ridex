@@ -348,7 +348,21 @@ pub fn Runtime(comptime App: type) type {
             app.auth.pulseSignIn(app.alloc);
             switch (app.auth.pollSignInTransition(app.alloc)) {
                 .none => {},
-                .cancelled => app.shell.render_requests.request(.footer),
+                .cancelled => {
+                    // Cancelling closes the loopback callback listener, so an
+                    // authorization page still open in the browser can no longer
+                    // complete. Say so rather than leaving the surface silent.
+                    try writeAuthNotice(app, .{
+                        .topic = "auth",
+                        .tone = .warning,
+                        .body = switch (sign_in_source) {
+                            .chatgpt_subscription => "Codex sign-in cancelled. A browser page left open from it can no longer complete.",
+                            .grok_subscription => "Grok sign-in cancelled. A browser page left open from it can no longer complete.",
+                            else => "Sign-in cancelled. A browser page left open from it can no longer complete.",
+                        },
+                    });
+                    app.shell.render_requests.request(.footer);
+                },
                 .failed => |err| {
                     debug_trace.logf("auth", "login failed source={t} err={s}", .{ sign_in_source, @errorName(err) });
                     _ = app.auth.popPickerStage(app.alloc);
@@ -625,7 +639,7 @@ pub fn Runtime(comptime App: type) type {
                 return;
             }) {
                 app.shell.render_requests.request(.footer);
-                if (io_mod.getenv("FX_NO_OPEN_BROWSER") == null) try openSignInBrowser(app);
+                if (!io_mod.envFlagEnabled("FX_NO_OPEN_BROWSER")) try openSignInBrowser(app);
             }
         }
 
@@ -656,7 +670,7 @@ pub fn Runtime(comptime App: type) type {
                 return;
             }) {
                 app.shell.render_requests.request(.footer);
-                if (io_mod.getenv("FX_NO_OPEN_BROWSER") == null) try openSignInBrowser(app);
+                if (!io_mod.envFlagEnabled("FX_NO_OPEN_BROWSER")) try openSignInBrowser(app);
             }
         }
 
@@ -669,7 +683,7 @@ pub fn Runtime(comptime App: type) type {
                 return;
             }) {
                 app.shell.render_requests.request(.footer);
-                if (io_mod.getenv("FX_NO_OPEN_BROWSER") == null) try openSignInBrowser(app);
+                if (!io_mod.envFlagEnabled("FX_NO_OPEN_BROWSER")) try openSignInBrowser(app);
             }
         }
 
@@ -682,7 +696,7 @@ pub fn Runtime(comptime App: type) type {
                 return;
             }) {
                 app.shell.render_requests.request(.footer);
-                if (io_mod.getenv("FX_NO_OPEN_BROWSER") == null) try openSignInBrowser(app);
+                if (!io_mod.envFlagEnabled("FX_NO_OPEN_BROWSER")) try openSignInBrowser(app);
             }
         }
 
@@ -1040,7 +1054,7 @@ pub fn Runtime(comptime App: type) type {
                 // Open the browser as soon as the device code is ready instead of
                 // waiting for Enter; Enter stays as a manual re-open, and
                 // FX_NO_OPEN_BROWSER opts out for headless/SSH sessions.
-                if (io_mod.getenv("FX_NO_OPEN_BROWSER") == null) try openSignInBrowser(app);
+                if (!io_mod.envFlagEnabled("FX_NO_OPEN_BROWSER")) try openSignInBrowser(app);
             }
         }
 
