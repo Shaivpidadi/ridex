@@ -1849,7 +1849,7 @@ test "expired review budget fails closed before transport" {
     try std.testing.expectEqual(@as(usize, 0), fake.calls);
 }
 
-test "command evidence names the shell that will interpret the command" {
+test "command evidence names the exact shell invocation that will interpret the command" {
     const Capture = struct {
         payload: [8192]u8 = undefined,
         len: usize = 0,
@@ -1892,41 +1892,57 @@ test "command evidence names the shell that will interpret the command" {
         }},
     };
 
-    // A user shell re-reads this command through the operator's aliases, so the
-    // reviewer must be told which interpreter runs it.
-    var outcome = try reviewer.review(std.testing.allocator, .{
-        .workspace_root = "/tmp/workspace",
-        .review_turn = .{
-            .model = "openai/gpt-5",
-            .pending_assistant = pending_assistant,
-            .target_call_id = "call_git",
-            .origin = .root,
-            .current_root_request = "Check the repo status.",
+    // Both supported user shells load operator definitions, but through
+    // different startup flags. The evidence has to preserve each exact shape:
+    // Bash needs explicit alias expansion, while zsh gets it from interactive
+    // startup. The zsh case protects the default macOS path without requiring a
+    // zsh process on the test runner.
+    for ([_]struct {
+        shell: []const u8,
+        expected_invocation: []const u8,
+    }{
+        .{
+            .shell = "/bin/bash",
+            .expected_invocation = "'/bin/bash' '--login' '-O' 'expand_aliases' '-c'",
         },
-        .targets = &.{},
-        .action = .{ .command = .{
-            .command = "git status",
-            .resolved_cwd = "/tmp/workspace",
-            .background = false,
-            .target_os = .linux,
-            .environment = .{ .user = "/bin/bash" },
-        } },
-        .escalation_reason = "command_requires_approval",
-    });
-    defer outcome.deinit(std.testing.allocator);
+        .{
+            .shell = "/bin/zsh",
+            .expected_invocation = "'/bin/zsh' '-l' '-i' '-c'",
+        },
+    }) |case| {
+        capture.len = 0;
+        var outcome = try reviewer.review(std.testing.allocator, .{
+            .workspace_root = "/tmp/workspace",
+            .review_turn = .{
+                .model = "openai/gpt-5",
+                .pending_assistant = pending_assistant,
+                .target_call_id = "call_git",
+                .origin = .root,
+                .current_root_request = "Check the repo status.",
+            },
+            .targets = &.{},
+            .action = .{ .command = .{
+                .command = "git status",
+                .resolved_cwd = "/tmp/workspace",
+                .background = false,
+                .target_os = .linux,
+                .environment = .{ .user = case.shell },
+            } },
+            .escalation_reason = "command_requires_approval",
+        });
+        defer outcome.deinit(std.testing.allocator);
 
-    const payload = capture.payload[0..capture.len];
-    try std.testing.expect(std.mem.find(u8, payload, "environment: user") != null);
-    try std.testing.expect(std.mem.find(u8, payload, "/bin/bash") != null);
+        const payload = capture.payload[0..capture.len];
+        try std.testing.expect(std.mem.find(u8, payload, "environment: user") != null);
+        try std.testing.expect(std.mem.find(u8, payload, case.shell) != null);
 
-    // The startup words are what separate this from an ordinary `bash -c`, where
-    // the operator's aliases would not apply at all.
-    const invocation_line = std.mem.find(u8, payload, "environment_invocation:") orelse
-        return error.TestExpectedInvocation;
-    const rest = payload[invocation_line..];
-    const line_end = std.mem.findScalar(u8, rest, '\n') orelse rest.len;
-    const invocation = rest[0..line_end];
-    try std.testing.expect(std.mem.find(u8, invocation, "expand_aliases") != null);
+        const invocation_line = std.mem.find(u8, payload, "environment_invocation:") orelse
+            return error.TestExpectedInvocation;
+        const rest = payload[invocation_line..];
+        const line_end = std.mem.findScalar(u8, rest, '\n') orelse rest.len;
+        const invocation = rest[0..line_end];
+        try std.testing.expect(std.mem.find(u8, invocation, case.expected_invocation) != null);
+    }
 }
 
 test "a shell-routed command whose shell is unnamed cannot be auto-approved" {
