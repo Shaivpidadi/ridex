@@ -368,7 +368,14 @@ class PgsoCorpusTests(unittest.TestCase):
         self.assertEqual(36, len(corpus.scenarios))
         self.assertEqual(54, len(corpus.candidate_scenarios))
         self.assertEqual(
-            {"direct-version": 100, "direct-sessions": 100},
+            {
+                "direct-help": 100,
+                "direct-version": 100,
+                "direct-status": 100,
+                "direct-background": 100,
+                "direct-doctor": 100,
+                "direct-sessions": 100,
+            },
             {
                 scenario.name: scenario.profile_runs
                 for scenario in corpus.scenarios

@@ -34,6 +34,7 @@
       "argv": ["{binary}", "help"],
       "cwd": ".",
       "env_set": {"FX_SKIP_ONBOARDING": "1"},
+      "profile_runs": 100,
       "timeout_seconds": 60,
       "requires_tmux": false
     },
@@ -51,6 +52,7 @@
       "argv": ["{binary}", "status", "--json"],
       "cwd": ".",
       "env_set": {"FX_SKIP_ONBOARDING": "1"},
+      "profile_runs": 100,
       "timeout_seconds": 60,
       "requires_tmux": false
     },
@@ -59,6 +61,7 @@
       "argv": ["{binary}", "background", "--json"],
       "cwd": ".",
       "env_set": {"FX_SKIP_ONBOARDING": "1"},
+      "profile_runs": 100,
       "timeout_seconds": 60,
       "requires_tmux": false
     },
@@ -67,6 +70,7 @@
       "argv": ["{binary}", "doctor", "--json"],
       "cwd": ".",
       "env_set": {"FX_SKIP_ONBOARDING": "1"},
+      "profile_runs": 100,
       "timeout_seconds": 60,
       "requires_tmux": false
     },
