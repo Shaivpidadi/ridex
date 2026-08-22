@@ -1,5 +1,6 @@
 const std = @import("std");
 const types = @import("../../shared/types.zig");
+const file_mutation_contract = @import("../../tooling/file_mutation_contract.zig");
 const vision_contracts = @import("vision_contracts.zig");
 
 const Allocator = std.mem.Allocator;
@@ -28,22 +29,50 @@ pub const Disposition = enum {
     block,
 };
 
+pub const CanonicalPathTarget = struct {
+    path: []const u8,
+    identity: file_mutation_contract.FileIdentity,
+};
+
+const StoredPathTarget = struct {
+    path: []u8,
+    identity: ?file_mutation_contract.FileIdentity,
+};
+
 const Target = union(enum) {
     image_ids: []usize,
-    paths: [][]u8,
+    paths: []StoredPathTarget,
 
-    fn clone(alloc: Allocator, request: vision_contracts.VisionRequest) Allocator.Error!Target {
+    fn clone(
+        alloc: Allocator,
+        request: vision_contracts.VisionRequest,
+        canonical_targets: ?[]const CanonicalPathTarget,
+    ) Allocator.Error!Target {
         if (request.image_ids()) |image_ids| {
             return .{ .image_ids = try alloc.dupe(usize, image_ids) };
         }
 
-        const paths = request.paths().?;
-        const owned = try alloc.alloc([]u8, paths.len);
+        const requested_paths = request.paths().?;
+        const target_count = if (canonical_targets) |targets|
+            targets.len
+        else
+            requested_paths.len;
+        const owned = try alloc.alloc(StoredPathTarget, target_count);
         errdefer alloc.free(owned);
         var copied: usize = 0;
-        errdefer for (owned[0..copied]) |path| alloc.free(path);
-        for (paths, owned) |path, *destination| {
-            destination.* = try alloc.dupe(u8, path);
+        errdefer for (owned[0..copied]) |target| alloc.free(target.path);
+        for (owned, 0..) |*destination, index| {
+            const path = if (canonical_targets) |targets|
+                targets[index].path
+            else
+                requested_paths[index];
+            destination.* = .{
+                .path = try alloc.dupe(u8, path),
+                .identity = if (canonical_targets) |targets|
+                    targets[index].identity
+                else
+                    null,
+            };
             copied += 1;
         }
         return .{ .paths = owned };
@@ -53,13 +82,17 @@ const Target = union(enum) {
         switch (self) {
             .image_ids => |image_ids| alloc.free(image_ids),
             .paths => |paths| {
-                for (paths) |path| alloc.free(path);
+                for (paths) |target| alloc.free(target.path);
                 alloc.free(paths);
             },
         }
     }
 
-    fn matches(self: Target, request: vision_contracts.VisionRequest) bool {
+    fn matches(
+        self: Target,
+        request: vision_contracts.VisionRequest,
+        canonical_targets: ?[]const CanonicalPathTarget,
+    ) bool {
         return switch (self) {
             .image_ids => |stored| blk: {
                 const requested = request.image_ids() orelse break :blk false;
@@ -70,10 +103,17 @@ const Target = union(enum) {
                 break :blk true;
             },
             .paths => |stored| blk: {
-                const requested = request.paths() orelse break :blk false;
-                if (stored.len != requested.len) break :blk false;
-                for (stored) |candidate| {
-                    if (!containsPath(requested, candidate)) break :blk false;
+                const requested_paths = request.paths() orelse break :blk false;
+                if (canonical_targets) |targets| {
+                    if (stored.len != targets.len) break :blk false;
+                    for (stored) |candidate| {
+                        if (!containsCanonicalTarget(targets, candidate)) break :blk false;
+                    }
+                } else {
+                    if (stored.len != requested_paths.len) break :blk false;
+                    for (stored) |candidate| {
+                        if (!containsPath(requested_paths, candidate.path)) break :blk false;
+                    }
                 }
                 break :blk true;
             },
@@ -102,6 +142,7 @@ pub const State = struct {
         alloc: Allocator,
         call: ToolCall,
         silent_step: bool,
+        canonical_targets: ?[]const CanonicalPathTarget,
     ) Allocator.Error!Disposition {
         if (!silent_step or
             call.provenance != .fx_local or
@@ -127,8 +168,19 @@ pub const State = struct {
         };
         defer request.deinit(alloc);
 
-        if (self.target == null or !self.target.?.matches(request)) {
-            const replacement = try Target.clone(alloc, request);
+        if (canonical_targets) |targets| {
+            const paths = request.paths() orelse {
+                self.clear(alloc);
+                return .untracked;
+            };
+            if (targets.len != paths.len) {
+                self.clear(alloc);
+                return .untracked;
+            }
+        }
+
+        if (self.target == null or !self.target.?.matches(request, canonical_targets)) {
+            const replacement = try Target.clone(alloc, request, canonical_targets);
             self.clear(alloc);
             self.target = replacement;
         }
@@ -173,6 +225,18 @@ fn containsPath(paths: []const []const u8, candidate: []const u8) bool {
     return false;
 }
 
+fn containsCanonicalTarget(
+    targets: []const CanonicalPathTarget,
+    candidate: StoredPathTarget,
+) bool {
+    const identity = candidate.identity orelse return false;
+    for (targets) |target| {
+        if (std.mem.eql(u8, target.path, candidate.path) and
+            std.meta.eql(target.identity, identity)) return true;
+    }
+    return false;
+}
+
 fn visionCall(id: []const u8, arguments_json: []const u8) ToolCall {
     return .{
         .id = id,
@@ -196,13 +260,13 @@ test "Vision repetition allows five silent successes then blocks the sixth" {
     };
 
     for (calls[0..5], 0..) |call, index| {
-        const disposition = try state.beginCall(alloc, call, true);
+        const disposition = try state.beginCall(alloc, call, true, null);
         try std.testing.expectEqual(Disposition.allow, disposition);
         try std.testing.expectEqual(index == 2, state.finishCall(disposition, true));
     }
     try std.testing.expectEqual(
         Disposition.block,
-        try state.beginCall(alloc, calls[5], true),
+        try state.beginCall(alloc, calls[5], true, null),
     );
 }
 
@@ -229,27 +293,61 @@ test "Vision repetition resets for progress and failed inspections" {
         .arguments_json = "{\"path\":\"notes.txt\"}",
     };
 
-    var disposition = try state.beginCall(alloc, first, true);
+    var disposition = try state.beginCall(alloc, first, true, null);
     try std.testing.expect(!state.finishCall(disposition, true));
-    disposition = try state.beginCall(alloc, reordered, true);
+    disposition = try state.beginCall(alloc, reordered, true, null);
     try std.testing.expect(!state.finishCall(disposition, true));
     try std.testing.expectEqual(@as(usize, 2), state.successful_calls);
 
-    disposition = try state.beginCall(alloc, changed, true);
+    disposition = try state.beginCall(alloc, changed, true, null);
     try std.testing.expect(!state.finishCall(disposition, true));
     try std.testing.expectEqual(@as(usize, 1), state.successful_calls);
 
-    disposition = try state.beginCall(alloc, changed, true);
+    disposition = try state.beginCall(alloc, changed, true, null);
     try std.testing.expect(!state.finishCall(disposition, false));
     try std.testing.expectEqual(@as(usize, 0), state.successful_calls);
 
-    disposition = try state.beginCall(alloc, changed, true);
+    disposition = try state.beginCall(alloc, changed, true, null);
     try std.testing.expect(!state.finishCall(disposition, true));
-    try std.testing.expectEqual(Disposition.untracked, try state.beginCall(alloc, read, true));
+    try std.testing.expectEqual(Disposition.untracked, try state.beginCall(alloc, read, true, null));
     try std.testing.expect(state.target == null);
 
-    disposition = try state.beginCall(alloc, changed, true);
+    disposition = try state.beginCall(alloc, changed, true, null);
     try std.testing.expect(!state.finishCall(disposition, true));
-    try std.testing.expectEqual(Disposition.untracked, try state.beginCall(alloc, changed, false));
+    try std.testing.expectEqual(Disposition.untracked, try state.beginCall(alloc, changed, false, null));
     try std.testing.expect(state.target == null);
+}
+
+test "Vision repetition matches canonical paths across equivalent spellings" {
+    const alloc = std.testing.allocator;
+    var state: State = .{};
+    defer state.deinit(alloc);
+
+    const calls = [_]ToolCall{
+        visionCall("one", "{\"paths\":[\"image.png\"],\"focus\":\"inspect\"}"),
+        visionCall("two", "{\"paths\":[\"./image.png\"],\"focus\":\"compare\"}"),
+        visionCall("three", "{\"paths\":[\"/workspace/image.png\"],\"focus\":\"read\"}"),
+        visionCall("four", "{\"paths\":[\"image.png\"],\"focus\":\"check\"}"),
+        visionCall("five", "{\"paths\":[\"./image.png\"],\"focus\":\"verify\"}"),
+        visionCall("six", "{\"paths\":[\"/workspace/image.png\"],\"focus\":\"again\"}"),
+    };
+    const canonical_targets: []const CanonicalPathTarget = &.{.{
+        .path = "/workspace/image.png",
+        .identity = .{ .device = 1, .inode = 2, .kind = .file },
+    }};
+
+    for (calls[0..5]) |call| {
+        const disposition = try state.beginCall(
+            alloc,
+            call,
+            true,
+            canonical_targets,
+        );
+        try std.testing.expectEqual(Disposition.allow, disposition);
+        _ = state.finishCall(disposition, true);
+    }
+    try std.testing.expectEqual(
+        Disposition.block,
+        try state.beginCall(alloc, calls[5], true, canonical_targets),
+    );
 }

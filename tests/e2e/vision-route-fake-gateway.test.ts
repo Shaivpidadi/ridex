@@ -716,26 +716,46 @@ describe("Vision route fake Gateway", () => {
   );
 
   test(
-    "fx ask stops a sixth silent Vision inspection of the same image",
+    "fx ask stops a sixth silent Vision inspection across equivalent path spellings",
     async () => {
       const root = createIsolatedRoot();
       const fixture = createScopedImageFixture(root);
       const gateway = startImageGateway([
-        sseToolCall("vision", { image_ids: [1], focus: "inspect the cost" }, "vision_1"),
+        sseToolCall(
+          "vision",
+          { paths: ["assets/nested/fixture.png"], focus: "inspect the cost" },
+          "vision_1",
+        ),
         sseText(visionResult(1, "first evidence")),
-        sseToolCall("vision", { image_ids: [1], focus: "find the price" }, "vision_2"),
+        sseToolCall(
+          "vision",
+          { paths: ["./assets/nested/fixture.png"], focus: "find the price" },
+          "vision_2",
+        ),
         sseText(visionResult(1, "second evidence")),
         sseToolCall(
           "vision",
-          { image_ids: [1], focus: "read the dollar amount" },
+          { paths: [fixture.imagePath], focus: "read the dollar amount" },
           "vision_3",
         ),
         sseText(visionResult(1, "third evidence")),
-        sseToolCall("vision", { image_ids: [1], focus: "check the footer" }, "vision_4"),
+        sseToolCall(
+          "vision",
+          { paths: ["assets/nested/fixture.png"], focus: "check the footer" },
+          "vision_4",
+        ),
         sseText(visionResult(1, "fourth evidence")),
-        sseToolCall("vision", { image_ids: [1], focus: "inspect the total" }, "vision_5"),
+        sseToolCall(
+          "vision",
+          { paths: ["./assets/nested/fixture.png"], focus: "inspect the total" },
+          "vision_5",
+        ),
         sseText(visionResult(1, "fifth evidence")),
-        sseToolCall("vision", { image_ids: [1], focus: "look once more" }, "vision_6"),
+        sseToolCall(
+          "vision",
+          { paths: [fixture.imagePath], focus: "look once more" },
+          "vision_6",
+        ),
       ]);
       try {
         const result = await runFx(

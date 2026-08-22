@@ -6585,10 +6585,27 @@ fn processQueuedPromptLoop(
                 );
             }
 
+            const canonical_vision_targets: ?[]const runtime_vision_repetition.CanonicalPathTarget = switch (execution_authority) {
+                .vision_paths => |authority| blk: {
+                    const targets = try arena.alloc(
+                        runtime_vision_repetition.CanonicalPathTarget,
+                        authority.targets.len,
+                    );
+                    for (authority.targets, targets) |authority_target, *target| {
+                        target.* = .{
+                            .path = authority_target.canonical_path,
+                            .identity = authority_target.identity,
+                        };
+                    }
+                    break :blk targets;
+                },
+                .ordinary, .run_command, .file_mutation => null,
+            };
             const vision_repetition_disposition = try vision_repetition.beginCall(
                 arena,
                 tool_call,
                 !step_has_content,
+                canonical_vision_targets,
             );
             if (vision_repetition_disposition == .block) {
                 const blocked_output = try tool_result_errors.toolExecutionFailureJson(

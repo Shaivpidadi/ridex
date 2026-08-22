@@ -1832,6 +1832,69 @@ test "vision stops a sixth silent inspection of the same image set" {
     ) != null);
 }
 
+test "vision repetition guard treats equivalent path spellings as one image set" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io_mod.getIo(), .{
+        .sub_path = "image.png",
+        .data = "\x89PNG\r\n\x1a\nimage bytes",
+    });
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+    const image_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "image.png");
+    defer alloc.free(image_path);
+    const absolute_arguments = try std.fmt.allocPrint(
+        alloc,
+        "{{\"paths\":[\"{s}\"],\"focus\":\"inspect absolute\"}}",
+        .{image_path},
+    );
+    defer alloc.free(absolute_arguments);
+
+    var calls: [6][1]ToolCall = .{
+        .{toolCall("vision_path_1", "vision", "{\"paths\":[\"image.png\"],\"focus\":\"inspect\"}")},
+        .{toolCall("vision_path_2", "vision", "{\"paths\":[\"./image.png\"],\"focus\":\"compare\"}")},
+        .{toolCall("vision_path_3", "vision", absolute_arguments)},
+        .{toolCall("vision_path_4", "vision", "{\"paths\":[\"image.png\"],\"focus\":\"check\"}")},
+        .{toolCall("vision_path_5", "vision", "{\"paths\":[\"./image.png\"],\"focus\":\"verify\"}")},
+        .{toolCall("vision_path_6", "vision", absolute_arguments)},
+    };
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls[0] },
+        .{ .tool_calls = &calls[1] },
+        .{ .tool_calls = &calls[2] },
+        .{ .tool_calls = &calls[3] },
+        .{ .tool_calls = &calls[4] },
+        .{ .tool_calls = &calls[5] },
+    };
+    const plans = [_]test_support.FakeExecPlan{
+        .{ .result = .{ .model_output = "vision result" } },
+        .{ .result = .{ .model_output = "vision result" } },
+        .{ .result = .{ .model_output = "vision result" } },
+        .{ .result = .{ .model_output = "vision result" } },
+        .{ .result = .{ .model_output = "vision result" } },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.workspace_root = workspace;
+    hooks.tool_registry = .{ .tools = vision_agent_test_tools[0..] };
+    hooks.exec_plans = &plans;
+    var fixture = PromptFixture{ .workspace_root = workspace };
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 5), hooks.executed_names.items.len);
+    try std.testing.expectEqual(@as(usize, 6), gateway.request_bodies.items.len);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.failed, hooks.finalized_outcome.?);
+    try std.testing.expect(std.mem.find(
+        u8,
+        hooks.history_assistant_text.?,
+        "Stopped a repeated Vision loop",
+    ) != null);
+}
+
 test "vision OOM propagates through assembled orchestrator without a tool result" {
     const alloc = std.testing.allocator;
     const calls = [_]ToolCall{toolCall(
