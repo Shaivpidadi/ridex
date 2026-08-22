@@ -932,7 +932,7 @@ const BrowserOpenPrompt = struct {
         const stdin_is_tty = try std.Io.File.stdin().isTty(io_mod.getIo());
         return .{
             .url = url,
-            .enabled = browserOpenEnabled(io_mod.getenv("FX_NO_OPEN_BROWSER") != null, stdin_is_tty, host.current()),
+            .enabled = browserOpenEnabled(io_mod.envFlagEnabled("FX_NO_OPEN_BROWSER"), stdin_is_tty, host.current()),
         };
     }
 
