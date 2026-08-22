@@ -1854,6 +1854,7 @@ pub fn Runtime(comptime App: type) type {
                 skill.name,
                 skill.path,
                 skill_runtime.skillDisplaySource(app.skills.items, skill),
+                skill_runtime.skillPathDiscriminatorSpan(app.skills.items, skill),
             );
             app.skills.closeMenu();
             app.shell.render_requests.request(.footer);
@@ -2209,6 +2210,7 @@ pub fn Runtime(comptime App: type) type {
                 skill.name,
                 skill.path,
                 skill_runtime.skillDisplaySource(app.skills.items, skill),
+                skill_runtime.skillPathDiscriminatorSpan(app.skills.items, skill),
             );
             app.input_runtime.picker.resetInlinePickerEpisode();
             app.shell.render_requests.request(.footer);
@@ -6017,6 +6019,7 @@ test "app_input_runtime file completion preserves a selected skill binding" {
         "review".len,
         "review",
         "/tmp/review/SKILL.md",
+        null,
         null,
     );
     app.input_runtime.edit_state.cursor = app.input_runtime.edit_state.input.items.len;
