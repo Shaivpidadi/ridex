@@ -412,8 +412,12 @@ pub fn executeCommandInEnvironmentResolving(
     const invocation = try shell_resolver.capturedInvocationResolving(environment, command, words);
     debug_trace.logf(
         "core",
-        "command runner explicit environment={s} shell={s}",
-        .{ @tagName(std.meta.activeTag(environment)), invocation.path },
+        "command runner explicit environment={s} shell={s} word_resolution={s}",
+        .{
+            @tagName(std.meta.activeTag(environment)),
+            invocation.path,
+            @tagName(words),
+        },
     );
     return executeRawInvocation(
         arena,
