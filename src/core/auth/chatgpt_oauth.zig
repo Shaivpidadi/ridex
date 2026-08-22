@@ -8,6 +8,7 @@ const login_flow = @import("login_flow.zig");
 const oauth = @import("oauth.zig");
 const oauth_transport = @import("oauth_transport.zig");
 const secret = @import("secret.zig");
+const url_opener_mod = @import("../hosts/url_opener.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -224,34 +225,33 @@ fn pollBrowserToken(
     if (comptime host_target.is_wasm) return error.ChatGptOAuthUnavailable;
     if (cancel_flag.load(.seq_cst)) return error.Cancelled;
     const context: *BrowserLoginContext = @ptrCast(@alignCast(raw.?));
-    if (!try browserCallbackReady(&context.listener, cancel_flag)) return .pending;
-
-    var stream = try context.listener.accept(io_mod.getIo());
-    defer stream.close(io_mod.getIo());
-    setBrowserSocketTimeouts(stream.socket.handle);
-    const target = try readBrowserCallbackTarget(alloc, stream);
-    defer alloc.free(target);
-    var callback = parseBrowserCallbackTarget(alloc, target, context.state) catch |err| {
-        writeBrowserCallbackResponse(stream, false) catch {};
-        return err;
-    };
-    defer callback.deinit(alloc);
+    var accepted = (try awaitBrowserCallback(
+        alloc,
+        &context.listener,
+        context.state,
+        cancel_flag,
+    )) orelse return .pending;
+    defer accepted.deinit(alloc);
 
     var token = exchangeAuthorizationCodeForRedirectWithBounds(
         alloc,
         transport,
         metadata.token_endpoint,
-        callback.code,
+        accepted.callback.code,
         context.code_verifier,
         context.redirect_uri,
         cancel_flag,
         deadline,
     ) catch |err| {
-        writeBrowserCallbackResponse(stream, false) catch {};
+        writeBrowserCallbackResponse(accepted.stream, .failed) catch {};
         return err;
     };
     errdefer token.deinit(alloc);
-    try writeBrowserCallbackResponse(stream, true);
+    try writeBrowserCallbackResponse(accepted.stream, .ok);
+    // The page is already flushed, so the browser can paint the hand-off notice
+    // while the terminal comes forward. A web page cannot focus another
+    // application, so the return trip has to start here.
+    url_opener_mod.focusOwningTerminal(alloc);
 
     const scope = try alloc.dupe(u8, "");
     errdefer if (scope.len > 0) alloc.free(scope);
@@ -268,6 +268,71 @@ fn pollBrowserToken(
         .scope = scope,
         .token_type = token_type,
     } };
+}
+
+/// A callback connection that has been read and validated. The stream stays
+/// open so the caller can answer it after the token exchange settles.
+const AcceptedCallback = struct {
+    stream: std.Io.net.Stream,
+    callback: BrowserCallback,
+
+    fn deinit(self: *AcceptedCallback, alloc: Allocator) void {
+        self.callback.deinit(alloc);
+        self.stream.close(io_mod.getIo());
+        self.* = undefined;
+    }
+};
+
+/// Guards against a client that keeps reconnecting inside a single poll tick.
+const max_browser_callback_accepts_per_poll: usize = 16;
+
+/// Drains the connections the listener already has queued and returns the first
+/// one carrying a well-formed authorization callback, or null if none arrived.
+///
+/// Browsers speculatively open connections to the redirect origin and fetch
+/// `/favicon.ico` from it, so a connection that is not the callback is a routine
+/// event rather than a failure. Treating one as fatal would close the listening
+/// socket while the authorization page is still open, and the redirect that
+/// follows would land on a port nothing is bound to.
+fn awaitBrowserCallback(
+    alloc: Allocator,
+    listener: *std.Io.net.Server,
+    expected_state: []const u8,
+    cancel_flag: *std.atomic.Value(bool),
+) !?AcceptedCallback {
+    var accepts: usize = 0;
+    while (accepts < max_browser_callback_accepts_per_poll) : (accepts += 1) {
+        if (!try browserCallbackReady(listener, cancel_flag)) return null;
+        var stream = listener.accept(io_mod.getIo()) catch |err| switch (err) {
+            error.ConnectionAborted, error.WouldBlock => continue,
+            else => return err,
+        };
+        var handed_off = false;
+        defer if (!handed_off) stream.close(io_mod.getIo());
+        setBrowserSocketTimeouts(stream.socket.handle);
+
+        const target = readBrowserCallbackTarget(alloc, stream) catch {
+            // A bare connection carrying no request, or one too large to be a
+            // redirect, is never the callback. Ignore it and keep listening.
+            writeBrowserCallbackResponse(stream, .unrelated) catch {};
+            continue;
+        };
+        defer alloc.free(target);
+
+        const callback = parseBrowserCallbackTarget(alloc, target, expected_state) catch |err| switch (err) {
+            error.InvalidChatGptOAuthCallback => {
+                writeBrowserCallbackResponse(stream, .unrelated) catch {};
+                continue;
+            },
+            else => {
+                writeBrowserCallbackResponse(stream, .failed) catch {};
+                return err;
+            },
+        };
+        handed_off = true;
+        return .{ .stream = stream, .callback = callback };
+    }
+    return null;
 }
 
 fn browserCallbackReady(
@@ -314,16 +379,58 @@ fn readBrowserCallbackTarget(alloc: Allocator, stream: std.Io.net.Stream) ![]u8 
     return alloc.dupe(u8, request_line[4..target_end]);
 }
 
-fn writeBrowserCallbackResponse(stream: std.Io.net.Stream, success: bool) !void {
-    const body = if (success)
-        "Authorization complete. You can return to fx."
-    else
-        "Authorization failed. Return to fx for details.";
-    var buffer: [1024]u8 = undefined;
+const BrowserCallbackResponse = enum {
+    /// The callback was accepted and the sign-in finished.
+    ok,
+    /// The callback belonged to this attempt but could not be completed.
+    failed,
+    /// The request was not the callback at all; the login keeps waiting.
+    unrelated,
+};
+
+fn browserCallbackPage(comptime title: []const u8, comptime detail: []const u8) []const u8 {
+    return "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">" ++
+        "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">" ++
+        "<title>fx</title><style>" ++
+        ":root{color-scheme:light dark}" ++
+        "body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;" ++
+        "background:#fff;color:#111;" ++
+        "font:15px/1.6 ui-sans-serif,-apple-system,BlinkMacSystemFont,\"Segoe UI\",sans-serif}" ++
+        "@media(prefers-color-scheme:dark){body{background:#0b0b0c;color:#f4f4f5}}" ++
+        "main{text-align:center;padding:2rem;max-width:26rem}" ++
+        "h1{margin:0 0 .5rem;font-size:1.125rem;font-weight:600;letter-spacing:-.01em}" ++
+        "p{margin:0;font-size:.875rem;opacity:.62}" ++
+        "</style></head><body><main><h1>" ++ title ++ "</h1><p>" ++ detail ++ "</p></main></body></html>";
+}
+
+fn writeBrowserCallbackResponse(stream: std.Io.net.Stream, outcome: BrowserCallbackResponse) !void {
+    const reply: struct { status: []const u8, body: []const u8 } = switch (outcome) {
+        .ok => .{
+            .status = "200 OK",
+            .body = comptime browserCallbackPage(
+                "Authorization complete",
+                "Returning you to fx. You can close this tab.",
+            ),
+        },
+        .failed => .{
+            .status = "400 Bad Request",
+            .body = comptime browserCallbackPage(
+                "Authorization failed",
+                "Return to fx for details.",
+            ),
+        },
+        // Not the callback at all, so keep it terse: browsers request this
+        // origin for favicons and speculative connections.
+        .unrelated => .{
+            .status = "404 Not Found",
+            .body = "<!doctype html><title>Not found</title>Not found.",
+        },
+    };
+    var buffer: [4096]u8 = undefined;
     var writer = stream.writer(io_mod.getIo(), &buffer);
     try writer.interface.print(
-        "HTTP/1.1 {s}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
-        .{ if (success) "200 OK" else "400 Bad Request", body.len, body },
+        "HTTP/1.1 {s}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
+        .{ reply.status, reply.body.len, reply.body },
     );
     try writer.interface.flush();
 }
@@ -387,7 +494,7 @@ pub fn runLogin(
     try writeStdout("Open this URL to sign in with Codex:\n");
     try writeStdout(authorization_url);
     try writeStdout("\n\nWaiting for browser authorization...\n");
-    if (io_mod.getenv("FX_NO_OPEN_BROWSER") == null) {
+    if (!io_mod.envFlagEnabled("FX_NO_OPEN_BROWSER")) {
         _ = url_opener.open(alloc, authorization_url) catch false;
     }
 
@@ -792,6 +899,17 @@ fn parseBrowserCallbackTarget(
         return error.InvalidChatGptOAuthCallback;
     }
     const query = target[prefix.len..];
+    // A denial arrives on the same path with `error=` in place of `code=`.
+    // Only trust it once the state proves it belongs to this attempt, so a
+    // stale tab from an earlier attempt cannot abort this one.
+    if (queryValueAlloc(alloc, query, "error")) |denial| {
+        alloc.free(denial);
+        const denial_state = queryValueAlloc(alloc, query, "state") catch
+            return error.InvalidChatGptOAuthCallback;
+        defer secret.zeroAndFree(alloc, denial_state);
+        if (!std.mem.eql(u8, denial_state, expected_state)) return error.InvalidChatGptOAuthCallback;
+        return error.ChatGptAuthorizationFailed;
+    } else |_| {}
     const code = try queryValueAlloc(alloc, query, "code");
     errdefer secret.zeroAndFree(alloc, code);
     const state = try queryValueAlloc(alloc, query, "state");
@@ -941,6 +1059,74 @@ test "ChatGPT browser authorization URL uses PKCE without device authentication"
     try std.testing.expect(std.mem.find(u8, url, "state=state-value") != null);
     try std.testing.expect(std.mem.find(u8, url, "originator=fx") != null);
     try std.testing.expect(std.mem.find(u8, url, "device") == null);
+}
+
+const CallbackProbe = struct {
+    port: u16,
+    requests: []const []const u8,
+
+    /// Drives the client half of the loopback exchange from a second thread so
+    /// the listener under test can accept on this one.
+    fn run(self: CallbackProbe) void {
+        const io = io_mod.getIo();
+        for (self.requests) |request| {
+            var address = std.Io.net.IpAddress.parse("127.0.0.1", self.port) catch return;
+            var stream = address.connect(io, .{ .mode = .stream }) catch return;
+            defer stream.close(io);
+            if (request.len == 0) continue; // bare connect, no bytes
+            var buffer: [512]u8 = undefined;
+            var writer = stream.writer(io, &buffer);
+            writer.interface.writeAll(request) catch return;
+            writer.interface.flush() catch return;
+            var read_buffer: [512]u8 = undefined;
+            var reader = stream.reader(io, &read_buffer);
+            _ = reader.interface.discardRemaining() catch {};
+        }
+    }
+};
+
+test "ChatGPT browser callback survives strays and still accepts the real redirect" {
+    const alloc = std.testing.allocator;
+    var listener = try bindBrowserCallback(true);
+    defer listener.deinit(io_mod.getIo());
+    const port = listener.socket.address.getPort();
+
+    const requests = [_][]const u8{
+        // A browser speculative preconnect: a TCP open carrying no request.
+        "",
+        // The favicon the browser fetches from the redirect origin.
+        "GET /favicon.ico HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+        // The genuine redirect.
+        "GET /auth/callback?code=granted%20code&state=expected HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+    };
+    const probe = CallbackProbe{ .port = port, .requests = &requests };
+    const thread = try std.Thread.spawn(.{}, CallbackProbe.run, .{probe});
+    defer thread.join();
+
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var accepted = (try awaitBrowserCallback(alloc, &listener, "expected", &cancel_flag)) orelse
+        return error.CallbackNeverArrived;
+    defer accepted.deinit(alloc);
+    try std.testing.expectEqualStrings("granted code", accepted.callback.code);
+}
+
+test "ChatGPT browser callback reports a denial only for this attempt" {
+    try std.testing.expectError(
+        error.InvalidChatGptOAuthCallback,
+        parseBrowserCallbackTarget(
+            std.testing.allocator,
+            "/auth/callback?error=access_denied&state=stale",
+            "expected",
+        ),
+    );
+    try std.testing.expectError(
+        error.ChatGptAuthorizationFailed,
+        parseBrowserCallbackTarget(
+            std.testing.allocator,
+            "/auth/callback?error=access_denied&state=expected",
+            "expected",
+        ),
+    );
 }
 
 test "ChatGPT browser callback requires the exact path and state" {
