@@ -162,7 +162,10 @@ fn readTarget(
                 null
             else
                 error.InvalidOAuthCallbackRequest,
-            else => return err,
+            error.ReadFailed => switch (reader.err orelse return error.ReadFailed) {
+                error.ConnectionResetByPeer => return null,
+                else => |read_err| return read_err,
+            },
         };
         request_len += 1;
         if (std.mem.endsWith(u8, request_bytes[0..request_len], "\r\n\r\n")) {
@@ -229,13 +232,28 @@ fn writeResponse(stream: std.Io.net.Stream, outcome: Response) !void {
 
 fn setSocketTimeouts(socket: std.posix.socket_t) void {
     const timeout = std.posix.timeval{ .sec = socket_timeout_seconds, .usec = 0 };
-    const bytes = std.mem.asBytes(&timeout);
-    std.posix.setsockopt(socket, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, bytes) catch |err| {
-        debug_trace.logf("auth", "OAuth callback receive timeout setup failed err={s}", .{@errorName(err)});
-    };
-    std.posix.setsockopt(socket, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, bytes) catch |err| {
-        debug_trace.logf("auth", "OAuth callback send timeout setup failed err={s}", .{@errorName(err)});
-    };
+    const receive_rc = std.c.setsockopt(
+        socket,
+        std.c.SOL.SOCKET,
+        std.c.SO.RCVTIMEO,
+        &timeout,
+        @sizeOf(std.posix.timeval),
+    );
+    if (receive_rc != 0) {
+        const err = std.posix.errno(receive_rc);
+        debug_trace.logf("auth", "OAuth callback receive timeout setup failed errno={s}", .{@tagName(err)});
+    }
+    const send_rc = std.c.setsockopt(
+        socket,
+        std.c.SOL.SOCKET,
+        std.c.SO.SNDTIMEO,
+        &timeout,
+        @sizeOf(std.posix.timeval),
+    );
+    if (send_rc != 0) {
+        const err = std.posix.errno(send_rc);
+        debug_trace.logf("auth", "OAuth callback send timeout setup failed errno={s}", .{@tagName(err)});
+    }
 }
 
 fn bindTestListener() !std.Io.net.Server {
@@ -277,6 +295,54 @@ const CallbackProbe = struct {
             var reader = stream.reader(io, &read_buffer);
             _ = reader.interface.discardRemaining() catch {};
         }
+    }
+};
+
+const ResetPreconnectProbe = struct {
+    port: u16,
+    request: []const u8,
+    hold_ms: u64,
+    connected: std.atomic.Value(bool) = .init(false),
+    failed: std.atomic.Value(bool) = .init(false),
+
+    fn run(self: *ResetPreconnectProbe) void {
+        const io = io_mod.getIo();
+        var address = std.Io.net.IpAddress.parse("127.0.0.1", self.port) catch
+            return self.finish(true);
+        {
+            var reset_stream = address.connect(io, .{ .mode = .stream }) catch
+                return self.finish(true);
+            defer reset_stream.close(io);
+            const reset_on_close: std.posix.linger = .{
+                .onoff = 1,
+                .linger = 0,
+            };
+            std.posix.setsockopt(
+                reset_stream.socket.handle,
+                std.posix.SOL.SOCKET,
+                std.posix.SO.LINGER,
+                std.mem.asBytes(&reset_on_close),
+            ) catch return self.finish(true);
+            self.finish(false);
+            io_mod.sleep(self.hold_ms * std.time.ns_per_ms);
+        }
+
+        var stream = address.connect(io, .{ .mode = .stream }) catch return;
+        defer stream.close(io);
+        var buffer: [512]u8 = undefined;
+        var writer = stream.writer(io, &buffer);
+        writer.interface.writeAll(self.request) catch return;
+        writer.interface.flush() catch return;
+    }
+
+    fn finish(self: *ResetPreconnectProbe, failed: bool) void {
+        self.failed.store(failed, .release);
+        self.connected.store(true, .release);
+    }
+
+    fn waitUntilConnected(self: *ResetPreconnectProbe) !void {
+        while (!self.connected.load(.acquire)) io_mod.sleep(std.time.ns_per_ms);
+        try std.testing.expect(!self.failed.load(.acquire));
     }
 };
 
@@ -414,4 +480,38 @@ test "browser callback survives unrelated requests before the redirect" {
     defer accepted.deinit();
     try accepted.respond(.ok);
     try std.testing.expectEqualStrings("granted", accepted.callback.code);
+}
+
+fn expectResetPreconnectSurvives(hold_ms: u64) !void {
+    var listener = try bindTestListener();
+    defer listener.deinit(io_mod.getIo());
+
+    var probe = ResetPreconnectProbe{
+        .port = listener.socket.address.getPort(),
+        .request = "GET /callback?code=granted HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+        .hold_ms = hold_ms,
+    };
+    const thread = try std.Thread.spawn(.{}, ResetPreconnectProbe.run, .{&probe});
+    defer thread.join();
+    try probe.waitUntilConnected();
+
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var accepted = (try await(
+        TestCallback,
+        parseTestCallback,
+        std.testing.allocator,
+        &listener,
+        null,
+        &cancel_flag,
+    )) orelse return error.CallbackNeverArrived;
+    defer accepted.deinit();
+    try std.testing.expectEqualStrings("granted", accepted.callback.code);
+}
+
+test "browser callback survives a reset preconnect before the redirect" {
+    try expectResetPreconnectSurvives(100);
+}
+
+test "browser callback survives a reset queued before accept" {
+    try expectResetPreconnectSurvives(0);
 }
