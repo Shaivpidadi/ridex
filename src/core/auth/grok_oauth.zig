@@ -26,6 +26,12 @@ const browser_callback_ports = [_]u16{ 8976, 8977 };
 const browser_login_timeout_seconds: i64 = 5 * 60;
 const browser_callback_poll_ms: i32 = 100;
 const browser_callback_io_timeout_seconds: i64 = 30;
+/// How long a freshly accepted connection may say nothing before it is treated
+/// as a browser preconnect rather than the redirect. A browser opens
+/// speculative connections to the redirect origin and holds them idle for
+/// reuse, so waiting one out would park the real callback in the accept queue
+/// behind it.
+const browser_callback_silence_ms: i64 = 250;
 
 pub const RefreshMode = enum {
     if_needed,
@@ -107,7 +113,7 @@ fn prepareBrowserSignIn(alloc: Allocator, transport: oauth_transport.Provider) !
     const configured_token_endpoint = try configuredEndpoint(alloc, e2e_token_url_env, token_url);
     errdefer alloc.free(configured_token_endpoint);
 
-    var listener = try bindBrowserCallback();
+    var listener = try bindBrowserCallback(io_mod.getenv(e2e_issuer_url_env) != null);
     var listener_owned = true;
     errdefer if (listener_owned) listener.deinit(io_mod.getIo());
     const callback_port = listener.socket.address.getPort();
@@ -184,7 +190,14 @@ fn deinitBrowserLoginContext(raw: ?*anyopaque, alloc: Allocator) void {
     alloc.destroy(context);
 }
 
-fn bindBrowserCallback() !std.Io.net.Server {
+fn bindBrowserCallback(e2e: bool) !std.Io.net.Server {
+    // Tests and the E2E harness discover the port from the authorization URL,
+    // so they take an ephemeral one rather than contending with a real login
+    // running on the same machine.
+    if (e2e) {
+        var address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+        return address.listen(io_mod.getIo(), .{ .reuse_address = true });
+    }
     // A stable port lets a retry reuse an authorization page the browser still
     // has open. An ephemeral port changes on every attempt, so the stale page
     // would always redirect to a socket nothing is listening on.
@@ -299,6 +312,11 @@ const max_browser_callback_accepts_per_poll: usize = 16;
 /// event rather than a failure. Treating one as fatal would close the listening
 /// socket while the authorization page is still open, and the redirect that
 /// follows would land on a port nothing is bound to.
+///
+/// A connection that stays silent past its budget is dropped rather than waited
+/// out, so the redirect queued behind a speculative preconnect is still served
+/// promptly, and a callback carrying another attempt's state is answered and
+/// ignored rather than ending this one.
 fn awaitBrowserCallback(
     alloc: Allocator,
     listener: *std.Io.net.Server,
@@ -316,16 +334,39 @@ fn awaitBrowserCallback(
         defer if (!handed_off) stream.close(io_mod.getIo());
         setBrowserSocketTimeouts(stream.socket.handle);
 
-        const target = readBrowserCallbackTarget(alloc, stream) catch {
-            // A bare connection carrying no request, or one too large to be a
-            // redirect, is never the callback. Ignore it and keep listening.
-            writeBrowserCallbackResponse(stream, .unrelated) catch {};
-            continue;
+        const maybe_target = readBrowserCallbackTarget(alloc, stream, cancel_flag) catch |err| switch (err) {
+            // Cancellation has to keep travelling. A blanket catch here would
+            // demote it to "stray connection" and keep the loop running.
+            error.Cancelled => return err,
+            error.InvalidGrokOAuthCallback, error.GrokOAuthCallbackTooLarge => {
+                // A malformed request, or one too large to be a redirect, is
+                // never the callback. Ignore it and keep listening.
+                writeBrowserCallbackResponse(stream, .unrelated) catch {};
+                continue;
+            },
+            else => return err,
         };
+        // A connection that never spoke is a speculative preconnect. Close it
+        // without a reply: a bare FIN is the ordinary idle keep-alive signal a
+        // browser already reconnects through, and writing to a socket that has
+        // sent nothing only risks blocking against the same silence.
+        const target = maybe_target orelse continue;
         defer alloc.free(target);
 
         const callback = parseBrowserCallbackTarget(alloc, target, expected_state) catch |err| switch (err) {
-            error.InvalidGrokOAuthCallback => {
+            // A callback that cannot be proven to belong to this attempt is a
+            // stray, not a failure. The ports are stable so a retry reuses the
+            // one an earlier attempt bound, which means finishing a tab left
+            // over from that attempt lands here; ending the live login over it
+            // would let any stale page kill a retry.
+            error.InvalidGrokOAuthCallback, error.GrokOAuthStateMismatch => {
+                if (err == error.GrokOAuthStateMismatch) {
+                    debug_trace.logf(
+                        "auth",
+                        "Grok callback ignored: state belongs to another attempt",
+                        .{},
+                    );
+                }
                 writeBrowserCallbackResponse(stream, .unrelated) catch {};
                 continue;
             },
@@ -354,25 +395,83 @@ fn browserCallbackReady(
     if (cancel_flag.load(.seq_cst)) return error.Cancelled;
     if (ready == 0) return false;
     if ((fds[0].revents & std.posix.POLL.IN) == 0) {
-        return error.InvalidGrokOAuthCallback;
+        // The listening socket itself is broken. That is not a stray request,
+        // and reporting it as one would hide the real cause from the user.
+        return error.GrokOAuthCallbackListenerFailed;
     }
     return true;
 }
 
-fn readBrowserCallbackTarget(alloc: Allocator, stream: std.Io.net.Stream) ![]u8 {
+/// Waits for an accepted connection to have something to read, in slices small
+/// enough that cancellation is still noticed promptly, and reports false once
+/// the connection has spent its budget in silence.
+///
+/// Unlike `browserCallbackReady` this does not insist on `POLL.IN`: on a
+/// connection a hangup is a legitimate ready event, and reading it simply ends
+/// the request with `EndOfStream`.
+fn browserRequestReadable(
+    socket: std.posix.socket_t,
+    cancel_flag: *std.atomic.Value(bool),
+    deadline_ms: i64,
+) !bool {
+    while (true) {
+        if (cancel_flag.load(.seq_cst)) return error.Cancelled;
+        const remaining_ms = deadline_ms - io_mod.milliTimestamp();
+        const wait_ms: i32 = if (remaining_ms <= 0)
+            0
+        else
+            @intCast(@min(remaining_ms, browser_callback_poll_ms));
+        var fds = [_]std.posix.pollfd{.{
+            .fd = socket,
+            .events = std.posix.POLL.IN,
+            .revents = 0,
+        }};
+        const ready = try std.posix.poll(&fds, wait_ms);
+        if (cancel_flag.load(.seq_cst)) return error.Cancelled;
+        if (ready != 0) return true;
+        if (remaining_ms <= 0) return false;
+    }
+}
+
+/// Reads the request target off an accepted connection, or returns null when
+/// the connection never sent anything within its budget.
+fn readBrowserCallbackTarget(
+    alloc: Allocator,
+    stream: std.Io.net.Stream,
+    cancel_flag: *std.atomic.Value(bool),
+) !?[]u8 {
+    const deadline_ms = io_mod.milliTimestamp() + browser_callback_silence_ms;
     var socket_buffer: [4096]u8 = undefined;
     var reader = stream.reader(io_mod.getIo(), &socket_buffer);
     var request_bytes: [16 * 1024]u8 = undefined;
     var request_len: usize = 0;
+    var found_terminator = false;
     while (request_len < request_bytes.len) {
+        // `takeByte` only reaches the socket once the buffer runs dry, so the
+        // poll belongs just before that read rather than on every byte.
+        if (reader.interface.bufferedLen() == 0 and
+            !try browserRequestReadable(stream.socket.handle, cancel_flag, deadline_ms))
+        {
+            return null;
+        }
         request_bytes[request_len] = reader.interface.takeByte() catch |err| switch (err) {
-            error.EndOfStream => return error.InvalidGrokOAuthCallback,
+            // A peer that opened a connection and closed it without speaking is
+            // the same speculative preconnect, just already gone.
+            error.EndOfStream => return if (request_len == 0)
+                null
+            else
+                error.InvalidGrokOAuthCallback,
             else => return err,
         };
         request_len += 1;
-        if (std.mem.endsWith(u8, request_bytes[0..request_len], "\r\n\r\n")) break;
+        if (std.mem.endsWith(u8, request_bytes[0..request_len], "\r\n\r\n")) {
+            found_terminator = true;
+            break;
+        }
     }
-    if (request_len == request_bytes.len) return error.GrokOAuthCallbackTooLarge;
+    // Length alone cannot tell the two apart: a request whose terminator lands
+    // exactly on the last byte fills the buffer and is still well-formed.
+    if (!found_terminator) return error.GrokOAuthCallbackTooLarge;
     const line_end = std.mem.find(u8, request_bytes[0..request_len], "\r\n") orelse
         return error.InvalidGrokOAuthCallback;
     const request_line = request_bytes[0..line_end];
@@ -381,7 +480,7 @@ fn readBrowserCallbackTarget(alloc: Allocator, stream: std.Io.net.Stream) ![]u8 
     }
     const target_end = std.mem.findScalarPos(u8, request_line, 4, ' ') orelse
         return error.InvalidGrokOAuthCallback;
-    return alloc.dupe(u8, request_line[4..target_end]);
+    return try alloc.dupe(u8, request_line[4..target_end]);
 }
 
 const BrowserCallbackResponse = enum {
@@ -1095,9 +1194,141 @@ const CallbackProbe = struct {
     }
 };
 
+/// Opens a browser-style preconnect -- a TCP open that never sends anything --
+/// and holds it open, then optionally delivers `request` on a second
+/// connection. The listener under test has to step over the idle socket rather
+/// than wait it out, which is what a real browser preconnect forces and what
+/// `CallbackProbe` cannot express: its empty request closes immediately.
+const HeldPreconnectProbe = struct {
+    port: u16,
+    request: []const u8 = "",
+    delivered: std.atomic.Value(bool) = .init(false),
+    release: std.atomic.Value(bool) = .init(false),
+    failed: std.atomic.Value(bool) = .init(false),
+
+    fn run(self: *HeldPreconnectProbe) void {
+        const io = io_mod.getIo();
+        var address = std.Io.net.IpAddress.parse("127.0.0.1", self.port) catch
+            return self.finish(true);
+        var idle = address.connect(io, .{ .mode = .stream }) catch
+            return self.finish(true);
+        defer idle.close(io);
+        if (self.request.len == 0) {
+            self.finish(false);
+            return self.wait();
+        }
+        var stream = address.connect(io, .{ .mode = .stream }) catch
+            return self.finish(true);
+        defer stream.close(io);
+        var buffer: [512]u8 = undefined;
+        var writer = stream.writer(io, &buffer);
+        writer.interface.writeAll(self.request) catch return self.finish(true);
+        writer.interface.flush() catch return self.finish(true);
+        self.finish(false);
+        self.wait();
+    }
+
+    /// `failed` is stored before `delivered` is released and read after it is
+    /// acquired, so the main thread never sees a stale verdict.
+    fn finish(self: *HeldPreconnectProbe, failed: bool) void {
+        self.failed.store(failed, .release);
+        self.delivered.store(true, .release);
+    }
+
+    fn wait(self: *HeldPreconnectProbe) void {
+        while (!self.release.load(.acquire)) io_mod.sleep(std.time.ns_per_ms);
+    }
+
+    /// Starts the listener only once the bytes are already in the kernel
+    /// buffer, so the assertions measure the listener rather than the probe.
+    fn waitUntilDelivered(self: *HeldPreconnectProbe) !void {
+        while (!self.delivered.load(.acquire)) io_mod.sleep(std.time.ns_per_ms);
+        try std.testing.expect(!self.failed.load(.acquire));
+    }
+};
+
+test "Grok browser callback outruns an idle preconnect held open" {
+    const alloc = std.testing.allocator;
+    var listener = try bindBrowserCallback(true);
+    defer listener.deinit(io_mod.getIo());
+
+    var probe = HeldPreconnectProbe{
+        .port = listener.socket.address.getPort(),
+        .request = "GET /callback?code=granted%20code&state=expected HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+    };
+    const thread = try std.Thread.spawn(.{}, HeldPreconnectProbe.run, .{&probe});
+    // Registered after the join so LIFO releases the probe first. Reversing
+    // these two lines deadlocks the test.
+    defer thread.join();
+    defer probe.release.store(true, .release);
+    try probe.waitUntilDelivered();
+
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    const started_ms = io_mod.milliTimestamp();
+    var accepted = (try awaitBrowserCallback(alloc, &listener, "expected", &cancel_flag)) orelse
+        return error.CallbackNeverArrived;
+    defer accepted.deinit(alloc);
+    try std.testing.expectEqualStrings("granted code", accepted.callback.code);
+    // Before the silence budget the idle socket held the read until
+    // SO_RCVTIMEO, so this is the assertion that encodes the regression.
+    try std.testing.expect(io_mod.milliTimestamp() - started_ms < 1_000);
+}
+
+test "Grok browser callback cancels while an idle preconnect is open" {
+    const alloc = std.testing.allocator;
+    var listener = try bindBrowserCallback(true);
+    defer listener.deinit(io_mod.getIo());
+
+    var probe = HeldPreconnectProbe{ .port = listener.socket.address.getPort() };
+    const thread = try std.Thread.spawn(.{}, HeldPreconnectProbe.run, .{&probe});
+    defer thread.join();
+    defer probe.release.store(true, .release);
+    try probe.waitUntilDelivered();
+
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    const Flip = struct {
+        fn run(flag: *std.atomic.Value(bool)) void {
+            io_mod.sleep(20 * std.time.ns_per_ms);
+            flag.store(true, .seq_cst);
+        }
+    };
+    const flip = try std.Thread.spawn(.{}, Flip.run, .{&cancel_flag});
+    defer flip.join();
+
+    const started_ms = io_mod.milliTimestamp();
+    try std.testing.expectError(
+        error.Cancelled,
+        awaitBrowserCallback(alloc, &listener, "expected", &cancel_flag),
+    );
+    try std.testing.expect(io_mod.milliTimestamp() - started_ms < 1_000);
+}
+
+test "Grok browser callback ignores a stale success and waits for this attempt" {
+    const alloc = std.testing.allocator;
+    var listener = try bindBrowserCallback(true);
+    defer listener.deinit(io_mod.getIo());
+    const port = listener.socket.address.getPort();
+
+    const requests = [_][]const u8{
+        // A tab left over from an earlier attempt completing on the port this
+        // attempt now owns. It must not end the live login.
+        "GET /callback?code=stale%20code&state=stale HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+        "GET /callback?code=granted%20code&state=expected HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+    };
+    const probe = CallbackProbe{ .port = port, .requests = &requests };
+    const thread = try std.Thread.spawn(.{}, CallbackProbe.run, .{probe});
+    defer thread.join();
+
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var accepted = (try awaitBrowserCallback(alloc, &listener, "expected", &cancel_flag)) orelse
+        return error.CallbackNeverArrived;
+    defer accepted.deinit(alloc);
+    try std.testing.expectEqualStrings("granted code", accepted.callback.code);
+}
+
 test "Grok browser callback survives strays and still accepts the real redirect" {
     const alloc = std.testing.allocator;
-    var listener = try bindBrowserCallback();
+    var listener = try bindBrowserCallback(true);
     defer listener.deinit(io_mod.getIo());
     const port = listener.socket.address.getPort();
 
@@ -1124,7 +1355,7 @@ test "Grok browser callback survives strays and still accepts the real redirect"
 
 test "Grok browser callback reports an authorization denial for this attempt" {
     const alloc = std.testing.allocator;
-    var listener = try bindBrowserCallback();
+    var listener = try bindBrowserCallback(true);
     defer listener.deinit(io_mod.getIo());
     const port = listener.socket.address.getPort();
 
