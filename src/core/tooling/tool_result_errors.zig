@@ -237,12 +237,20 @@ pub fn toolPermissionDenialReason(output: []const u8) ?types.ToolPermissionDenia
         .string => |value| value,
         else => return null,
     };
-    if (!std.mem.eql(u8, type_value, "tool_permission_denied")) return null;
     const reason_value = switch (error_value.get("reason") orelse return null) {
         .string => |value| value,
         else => return null,
     };
-    return std.meta.stringToEnum(types.ToolPermissionDenialReason, reason_value);
+    const reason = std.meta.stringToEnum(types.ToolPermissionDenialReason, reason_value) orelse return null;
+    if (std.mem.eql(u8, type_value, "tool_permission_denied")) return switch (reason) {
+        .review_caution, .review_unavailable => null,
+        else => reason,
+    };
+    if (std.mem.eql(u8, type_value, "tool_review_held")) return switch (reason) {
+        .review_caution, .review_unavailable => reason,
+        else => null,
+    };
+    return null;
 }
 
 pub fn toolExecutionFailureJson(alloc: Allocator, failure: ExecutionFailure) Allocator.Error![]u8 {
@@ -468,9 +476,19 @@ test "review hold JSON distinguishes caution and unavailable from permission den
     try std.testing.expect(std.mem.find(u8, caution, "approval_request_id") == null);
     try std.testing.expect(isToolReviewHeldOutput(caution));
     try std.testing.expect(!isToolPermissionDeniedOutput(caution));
+    try std.testing.expectEqual(
+        @as(?types.ToolPermissionDenialReason, .review_caution),
+        toolPermissionDenialReason(caution),
+    );
     try std.testing.expect(std.mem.find(u8, unavailable, "\"reason\":\"review_unavailable\"") != null);
     try std.testing.expect(std.mem.find(u8, unavailable, "\"advice\"") == null);
     try std.testing.expect(isToolReviewHeldOutput(unavailable));
+    try std.testing.expectEqual(
+        @as(?types.ToolPermissionDenialReason, .review_unavailable),
+        toolPermissionDenialReason(unavailable),
+    );
+    try std.testing.expect(toolPermissionDenialReason("{\"error\":{\"type\":\"tool_review_held\",\"reason\":\"auto_denied\"}}") == null);
+    try std.testing.expect(toolPermissionDenialReason("{\"error\":{\"type\":\"tool_permission_denied\",\"reason\":\"review_caution\"}}") == null);
 }
 
 test "tool permission denied JSON explains policy and headless blockers" {
