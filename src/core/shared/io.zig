@@ -387,26 +387,6 @@ pub fn getenv(key: []const u8) ?[]const u8 {
     return null;
 }
 
-/// Reads an environment variable as a boolean switch.
-///
-/// A variable exported with an empty value (`FX_NO_OPEN_BROWSER=`) is present as
-/// far as `getenv` is concerned, so a bare presence test treats the shell's
-/// idiom for "leave this off" as "turn this on". Callers get the least
-/// surprising reading instead: only an affirmative value counts.
-pub fn envFlagEnabled(key: []const u8) bool {
-    return envValueEnabled(getenv(key));
-}
-
-fn envValueEnabled(raw: ?[]const u8) bool {
-    const value = std.mem.trim(u8, raw orelse return false, " \t\r\n");
-    if (value.len == 0) return false;
-    const affirmative = [_][]const u8{ "1", "true", "yes", "on" };
-    for (affirmative) |word| {
-        if (std.ascii.eqlIgnoreCase(value, word)) return true;
-    }
-    return false;
-}
-
 pub fn e2eFailIfDurableMutationAttempted() void {
     const enabled = getenv("FX_E2E_FAIL_ON_DURABLE_MUTATION") orelse return;
     if (!std.mem.eql(u8, enabled, "1")) return;
@@ -1435,23 +1415,4 @@ test "timed advisory lock reports unsupported without unlocked fallback" {
         error.LockUnsupported,
         acquireTimedAdvisoryLockWithOps(&dir, "settings.lock", 25, ops),
     );
-}
-
-test "env flag reads only affirmative values as enabled" {
-    // Present but empty is the shell idiom for "leave this off"; a bare
-    // presence test used to read it as "on".
-    try std.testing.expect(!envValueEnabled(null));
-    try std.testing.expect(!envValueEnabled(""));
-    try std.testing.expect(!envValueEnabled("   "));
-    try std.testing.expect(!envValueEnabled("0"));
-    try std.testing.expect(!envValueEnabled("false"));
-    try std.testing.expect(!envValueEnabled("no"));
-    try std.testing.expect(!envValueEnabled("off"));
-
-    try std.testing.expect(envValueEnabled("1"));
-    try std.testing.expect(envValueEnabled("true"));
-    try std.testing.expect(envValueEnabled("TRUE"));
-    try std.testing.expect(envValueEnabled("Yes"));
-    try std.testing.expect(envValueEnabled("on"));
-    try std.testing.expect(envValueEnabled(" 1 "));
 }

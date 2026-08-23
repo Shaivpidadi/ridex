@@ -1,4 +1,5 @@
 const std = @import("std");
+const browser_callback = @import("browser_callback.zig");
 const chatgpt_session = @import("chatgpt_session.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const host = @import("../hosts/host.zig");
@@ -8,7 +9,6 @@ const login_flow = @import("login_flow.zig");
 const oauth = @import("oauth.zig");
 const oauth_transport = @import("oauth_transport.zig");
 const secret = @import("secret.zig");
-const url_opener_mod = @import("../hosts/url_opener.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -21,14 +21,6 @@ const jwt_auth_claim = "https://api.openai.com/auth";
 const browser_scope = "openid profile email offline_access api.connectors.read api.connectors.invoke";
 const browser_callback_ports = [_]u16{ 1455, 1457 };
 const browser_login_timeout_seconds: i64 = 5 * 60;
-const browser_callback_poll_ms: i32 = 100;
-const browser_callback_io_timeout_seconds: i64 = 30;
-/// How long a freshly accepted connection may say nothing before it is treated
-/// as a browser preconnect rather than the redirect. A browser opens
-/// speculative connections to the redirect origin and holds them idle for
-/// reuse, so waiting one out would park the real callback in the accept queue
-/// behind it.
-const browser_callback_silence_ms: i64 = 250;
 
 pub const RefreshMode = enum {
     if_needed,
@@ -237,7 +229,10 @@ fn pollBrowserToken(
         context.state,
         cancel_flag,
     )) orelse return .pending;
-    defer accepted.deinit(alloc);
+    defer {
+        accepted.callback.deinit(alloc);
+        accepted.deinit();
+    }
 
     var token = exchangeAuthorizationCodeForRedirectWithBounds(
         alloc,
@@ -249,15 +244,11 @@ fn pollBrowserToken(
         cancel_flag,
         deadline,
     ) catch |err| {
-        writeBrowserCallbackResponse(accepted.stream, .failed) catch {};
+        accepted.respond(.failed) catch {};
         return err;
     };
     errdefer token.deinit(alloc);
-    try writeBrowserCallbackResponse(accepted.stream, .ok);
-    // The page is already flushed, so the browser can paint the hand-off notice
-    // while the terminal comes forward. A web page cannot focus another
-    // application, so the return trip has to start here.
-    url_opener_mod.focusOwningTerminal(alloc);
+    try accepted.respond(.ok);
 
     const scope = try alloc.dupe(u8, "");
     errdefer if (scope.len > 0) alloc.free(scope);
@@ -276,266 +267,46 @@ fn pollBrowserToken(
     } };
 }
 
-/// A callback connection that has been read and validated. The stream stays
-/// open so the caller can answer it after the token exchange settles.
-const AcceptedCallback = struct {
-    stream: std.Io.net.Stream,
-    callback: BrowserCallback,
-
-    fn deinit(self: *AcceptedCallback, alloc: Allocator) void {
-        self.callback.deinit(alloc);
-        self.stream.close(io_mod.getIo());
-        self.* = undefined;
-    }
+const BrowserCallbackParserContext = struct {
+    expected_state: []const u8,
 };
 
-/// Guards against a client that keeps reconnecting inside a single poll tick.
-const max_browser_callback_accepts_per_poll: usize = 16;
-
-/// Drains the connections the listener already has queued and returns the first
-/// one carrying a well-formed authorization callback, or null if none arrived.
-///
-/// Browsers speculatively open connections to the redirect origin and fetch
-/// `/favicon.ico` from it, so a connection that is not the callback is a routine
-/// event rather than a failure. Treating one as fatal would close the listening
-/// socket while the authorization page is still open, and the redirect that
-/// follows would land on a port nothing is bound to.
-///
-/// A connection that stays silent past its budget is dropped rather than waited
-/// out, so the redirect queued behind a speculative preconnect is still served
-/// promptly, and a callback carrying another attempt's state is answered and
-/// ignored rather than ending this one.
 fn awaitBrowserCallback(
     alloc: Allocator,
     listener: *std.Io.net.Server,
     expected_state: []const u8,
     cancel_flag: *std.atomic.Value(bool),
-) !?AcceptedCallback {
-    var accepts: usize = 0;
-    while (accepts < max_browser_callback_accepts_per_poll) : (accepts += 1) {
-        if (!try browserCallbackReady(listener, cancel_flag)) return null;
-        var stream = listener.accept(io_mod.getIo()) catch |err| switch (err) {
-            error.ConnectionAborted, error.WouldBlock => continue,
-            else => return err,
-        };
-        var handed_off = false;
-        defer if (!handed_off) stream.close(io_mod.getIo());
-        setBrowserSocketTimeouts(stream.socket.handle);
-
-        const maybe_target = readBrowserCallbackTarget(alloc, stream, cancel_flag) catch |err| switch (err) {
-            // Cancellation has to keep travelling. A blanket catch here would
-            // demote it to "stray connection" and keep the loop running.
-            error.Cancelled => return err,
-            error.InvalidChatGptOAuthCallback, error.ChatGptOAuthCallbackTooLarge => {
-                // A malformed request, or one too large to be a redirect, is
-                // never the callback. Ignore it and keep listening.
-                writeBrowserCallbackResponse(stream, .unrelated) catch {};
-                continue;
-            },
-            else => return err,
-        };
-        // A connection that never spoke is a speculative preconnect. Close it
-        // without a reply: a bare FIN is the ordinary idle keep-alive signal a
-        // browser already reconnects through, and writing to a socket that has
-        // sent nothing only risks blocking against the same silence.
-        const target = maybe_target orelse continue;
-        defer alloc.free(target);
-
-        const callback = parseBrowserCallbackTarget(alloc, target, expected_state) catch |err| switch (err) {
-            // A callback that cannot be proven to belong to this attempt is a
-            // stray, not a failure. The ports are stable so a retry reuses the
-            // one an earlier attempt bound, which means finishing a tab left
-            // over from that attempt lands here; ending the live login over it
-            // would let any stale page kill a retry.
-            error.InvalidChatGptOAuthCallback, error.ChatGptOAuthStateMismatch => {
-                if (err == error.ChatGptOAuthStateMismatch) {
-                    debug_trace.logf(
-                        "auth",
-                        "ChatGPT callback ignored: state belongs to another attempt",
-                        .{},
-                    );
-                }
-                writeBrowserCallbackResponse(stream, .unrelated) catch {};
-                continue;
-            },
-            else => {
-                writeBrowserCallbackResponse(stream, .failed) catch {};
-                return err;
-            },
-        };
-        handed_off = true;
-        return .{ .stream = stream, .callback = callback };
-    }
-    return null;
+) !?browser_callback.Accepted(BrowserCallback) {
+    var parser_context = BrowserCallbackParserContext{ .expected_state = expected_state };
+    return browser_callback.await(
+        BrowserCallback,
+        classifyBrowserCallback,
+        alloc,
+        listener,
+        &parser_context,
+        cancel_flag,
+    ) catch |err| switch (err) {
+        error.OAuthCallbackListenerFailed => error.ChatGptOAuthCallbackListenerFailed,
+        else => err,
+    };
 }
 
-fn browserCallbackReady(
-    listener: *std.Io.net.Server,
-    cancel_flag: *std.atomic.Value(bool),
-) !bool {
-    if (cancel_flag.load(.seq_cst)) return error.Cancelled;
-    var fds = [_]std.posix.pollfd{.{
-        .fd = listener.socket.handle,
-        .events = std.posix.POLL.IN,
-        .revents = 0,
-    }};
-    const ready = try std.posix.poll(&fds, browser_callback_poll_ms);
-    if (cancel_flag.load(.seq_cst)) return error.Cancelled;
-    if (ready == 0) return false;
-    if ((fds[0].revents & std.posix.POLL.IN) == 0) {
-        // The listening socket itself is broken. That is not a stray request,
-        // and reporting it as one would hide the real cause from the user.
-        return error.ChatGptOAuthCallbackListenerFailed;
-    }
-    return true;
-}
-
-/// Waits for an accepted connection to have something to read, in slices small
-/// enough that cancellation is still noticed promptly, and reports false once
-/// the connection has spent its budget in silence.
-///
-/// Unlike `browserCallbackReady` this does not insist on `POLL.IN`: on a
-/// connection a hangup is a legitimate ready event, and reading it simply ends
-/// the request with `EndOfStream`.
-fn browserRequestReadable(
-    socket: std.posix.socket_t,
-    cancel_flag: *std.atomic.Value(bool),
-    deadline_ms: i64,
-) !bool {
-    while (true) {
-        if (cancel_flag.load(.seq_cst)) return error.Cancelled;
-        const remaining_ms = deadline_ms - io_mod.milliTimestamp();
-        const wait_ms: i32 = if (remaining_ms <= 0)
-            0
-        else
-            @intCast(@min(remaining_ms, browser_callback_poll_ms));
-        var fds = [_]std.posix.pollfd{.{
-            .fd = socket,
-            .events = std.posix.POLL.IN,
-            .revents = 0,
-        }};
-        const ready = try std.posix.poll(&fds, wait_ms);
-        if (cancel_flag.load(.seq_cst)) return error.Cancelled;
-        if (ready != 0) return true;
-        if (remaining_ms <= 0) return false;
-    }
-}
-
-/// Reads the request target off an accepted connection, or returns null when
-/// the connection never sent anything within its budget.
-fn readBrowserCallbackTarget(
+fn classifyBrowserCallback(
+    raw: ?*anyopaque,
     alloc: Allocator,
-    stream: std.Io.net.Stream,
-    cancel_flag: *std.atomic.Value(bool),
-) !?[]u8 {
-    const deadline_ms = io_mod.milliTimestamp() + browser_callback_silence_ms;
-    var socket_buffer: [4096]u8 = undefined;
-    var reader = stream.reader(io_mod.getIo(), &socket_buffer);
-    var request_bytes: [16 * 1024]u8 = undefined;
-    var request_len: usize = 0;
-    var found_terminator = false;
-    while (request_len < request_bytes.len) {
-        // `takeByte` only reaches the socket once the buffer runs dry, so the
-        // poll belongs just before that read rather than on every byte.
-        if (reader.interface.bufferedLen() == 0 and
-            !try browserRequestReadable(stream.socket.handle, cancel_flag, deadline_ms))
-        {
-            return null;
-        }
-        request_bytes[request_len] = reader.interface.takeByte() catch |err| switch (err) {
-            // A peer that opened a connection and closed it without speaking is
-            // the same speculative preconnect, just already gone.
-            error.EndOfStream => return if (request_len == 0)
-                null
-            else
-                error.InvalidChatGptOAuthCallback,
-            else => return err,
-        };
-        request_len += 1;
-        if (std.mem.endsWith(u8, request_bytes[0..request_len], "\r\n\r\n")) {
-            found_terminator = true;
-            break;
-        }
-    }
-    // Length alone cannot tell the two apart: a request whose terminator lands
-    // exactly on the last byte fills the buffer and is still well-formed.
-    if (!found_terminator) return error.ChatGptOAuthCallbackTooLarge;
-    const line_end = std.mem.find(u8, request_bytes[0..request_len], "\r\n") orelse
-        return error.InvalidChatGptOAuthCallback;
-    const request_line = request_bytes[0..line_end];
-    if (!std.mem.startsWith(u8, request_line, "GET ")) {
-        return error.InvalidChatGptOAuthCallback;
-    }
-    const target_end = std.mem.findScalarPos(u8, request_line, 4, ' ') orelse
-        return error.InvalidChatGptOAuthCallback;
-    return try alloc.dupe(u8, request_line[4..target_end]);
-}
-
-const BrowserCallbackResponse = enum {
-    /// The callback was accepted and the sign-in finished.
-    ok,
-    /// The callback belonged to this attempt but could not be completed.
-    failed,
-    /// The request was not the callback at all; the login keeps waiting.
-    unrelated,
-};
-
-fn browserCallbackPage(comptime title: []const u8, comptime detail: []const u8) []const u8 {
-    return "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">" ++
-        "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">" ++
-        "<title>fx</title><style>" ++
-        ":root{color-scheme:light dark}" ++
-        "body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;" ++
-        "background:#fff;color:#111;" ++
-        "font:15px/1.6 ui-sans-serif,-apple-system,BlinkMacSystemFont,\"Segoe UI\",sans-serif}" ++
-        "@media(prefers-color-scheme:dark){body{background:#0b0b0c;color:#f4f4f5}}" ++
-        "main{text-align:center;padding:2rem;max-width:26rem}" ++
-        "h1{margin:0 0 .5rem;font-size:1.125rem;font-weight:600;letter-spacing:-.01em}" ++
-        "p{margin:0;font-size:.875rem;opacity:.62}" ++
-        "</style></head><body><main><h1>" ++ title ++ "</h1><p>" ++ detail ++ "</p></main></body></html>";
-}
-
-fn writeBrowserCallbackResponse(stream: std.Io.net.Stream, outcome: BrowserCallbackResponse) !void {
-    const reply: struct { status: []const u8, body: []const u8 } = switch (outcome) {
-        .ok => .{
-            .status = "200 OK",
-            .body = comptime browserCallbackPage(
-                "Authorization complete",
-                "Returning you to fx. You can close this tab.",
-            ),
+    target: []const u8,
+) browser_callback.ParseResult(BrowserCallback) {
+    const context: *BrowserCallbackParserContext = @ptrCast(@alignCast(raw.?));
+    const callback = parseBrowserCallbackTarget(alloc, target, context.expected_state) catch |err| switch (err) {
+        error.InvalidChatGptOAuthCallback, error.ChatGptOAuthStateMismatch => {
+            if (err == error.ChatGptOAuthStateMismatch) {
+                debug_trace.logf("auth", "ChatGPT callback ignored: state belongs to another attempt", .{});
+            }
+            return .unrelated;
         },
-        .failed => .{
-            .status = "400 Bad Request",
-            .body = comptime browserCallbackPage(
-                "Authorization failed",
-                "Return to fx for details.",
-            ),
-        },
-        // Not the callback at all, so keep it terse: browsers request this
-        // origin for favicons and speculative connections.
-        .unrelated => .{
-            .status = "404 Not Found",
-            .body = "<!doctype html><title>Not found</title>Not found.",
-        },
+        else => return .{ .failed = err },
     };
-    var buffer: [4096]u8 = undefined;
-    var writer = stream.writer(io_mod.getIo(), &buffer);
-    try writer.interface.print(
-        "HTTP/1.1 {s}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
-        .{ reply.status, reply.body.len, reply.body },
-    );
-    try writer.interface.flush();
-}
-
-fn setBrowserSocketTimeouts(socket: std.posix.socket_t) void {
-    const timeout = std.posix.timeval{ .sec = browser_callback_io_timeout_seconds, .usec = 0 };
-    const bytes = std.mem.asBytes(&timeout);
-    std.posix.setsockopt(socket, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, bytes) catch |err| {
-        debug_trace.logf("auth", "ChatGPT callback receive timeout setup failed err={s}", .{@errorName(err)});
-    };
-    std.posix.setsockopt(socket, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, bytes) catch |err| {
-        debug_trace.logf("auth", "ChatGPT callback send timeout setup failed err={s}", .{@errorName(err)});
-    };
+    return .{ .accepted = callback };
 }
 
 fn completeSignIn(
@@ -586,7 +357,7 @@ pub fn runLogin(
     try writeStdout("Open this URL to sign in with Codex:\n");
     try writeStdout(authorization_url);
     try writeStdout("\n\nWaiting for browser authorization...\n");
-    if (!io_mod.envFlagEnabled("FX_NO_OPEN_BROWSER")) {
+    if (io_mod.getenv("FX_NO_OPEN_BROWSER") == null) {
         _ = url_opener.open(alloc, authorization_url) catch false;
     }
 
@@ -991,9 +762,6 @@ fn parseBrowserCallbackTarget(
         return error.InvalidChatGptOAuthCallback;
     }
     const query = target[prefix.len..];
-    // A denial arrives on the same path with `error=` in place of `code=`.
-    // Only trust it once the state proves it belongs to this attempt, so a
-    // stale tab from an earlier attempt cannot abort this one.
     if (queryValueAlloc(alloc, query, "error")) |denial| {
         alloc.free(denial);
         const denial_state = queryValueAlloc(alloc, query, "state") catch
@@ -1153,204 +921,41 @@ test "ChatGPT browser authorization URL uses PKCE without device authentication"
     try std.testing.expect(std.mem.find(u8, url, "device") == null);
 }
 
-const CallbackProbe = struct {
-    port: u16,
-    requests: []const []const u8,
+test "ChatGPT browser callback classifier keeps stale callbacks unrelated" {
+    var context = BrowserCallbackParserContext{ .expected_state = "expected" };
 
-    /// Drives the client half of the loopback exchange from a second thread so
-    /// the listener under test can accept on this one.
-    fn run(self: CallbackProbe) void {
-        const io = io_mod.getIo();
-        for (self.requests) |request| {
-            var address = std.Io.net.IpAddress.parse("127.0.0.1", self.port) catch return;
-            var stream = address.connect(io, .{ .mode = .stream }) catch return;
-            defer stream.close(io);
-            if (request.len == 0) continue; // bare connect, no bytes
-            var buffer: [512]u8 = undefined;
-            var writer = stream.writer(io, &buffer);
-            writer.interface.writeAll(request) catch return;
-            writer.interface.flush() catch return;
-            var read_buffer: [512]u8 = undefined;
-            var reader = stream.reader(io, &read_buffer);
-            _ = reader.interface.discardRemaining() catch {};
-        }
-    }
-};
-
-/// Opens a browser-style preconnect -- a TCP open that never sends anything --
-/// and holds it open, then optionally delivers `request` on a second
-/// connection. The listener under test has to step over the idle socket rather
-/// than wait it out, which is what a real browser preconnect forces and what
-/// `CallbackProbe` cannot express: its empty request closes immediately.
-const HeldPreconnectProbe = struct {
-    port: u16,
-    request: []const u8 = "",
-    delivered: std.atomic.Value(bool) = .init(false),
-    release: std.atomic.Value(bool) = .init(false),
-    failed: std.atomic.Value(bool) = .init(false),
-
-    fn run(self: *HeldPreconnectProbe) void {
-        const io = io_mod.getIo();
-        var address = std.Io.net.IpAddress.parse("127.0.0.1", self.port) catch
-            return self.finish(true);
-        var idle = address.connect(io, .{ .mode = .stream }) catch
-            return self.finish(true);
-        defer idle.close(io);
-        if (self.request.len == 0) {
-            self.finish(false);
-            return self.wait();
-        }
-        var stream = address.connect(io, .{ .mode = .stream }) catch
-            return self.finish(true);
-        defer stream.close(io);
-        var buffer: [512]u8 = undefined;
-        var writer = stream.writer(io, &buffer);
-        writer.interface.writeAll(self.request) catch return self.finish(true);
-        writer.interface.flush() catch return self.finish(true);
-        self.finish(false);
-        self.wait();
-    }
-
-    /// `failed` is stored before `delivered` is released and read after it is
-    /// acquired, so the main thread never sees a stale verdict.
-    fn finish(self: *HeldPreconnectProbe, failed: bool) void {
-        self.failed.store(failed, .release);
-        self.delivered.store(true, .release);
-    }
-
-    fn wait(self: *HeldPreconnectProbe) void {
-        while (!self.release.load(.acquire)) io_mod.sleep(std.time.ns_per_ms);
-    }
-
-    /// Starts the listener only once the bytes are already in the kernel
-    /// buffer, so the assertions measure the listener rather than the probe.
-    fn waitUntilDelivered(self: *HeldPreconnectProbe) !void {
-        while (!self.delivered.load(.acquire)) io_mod.sleep(std.time.ns_per_ms);
-        try std.testing.expect(!self.failed.load(.acquire));
-    }
-};
-
-test "ChatGPT browser callback outruns an idle preconnect held open" {
-    const alloc = std.testing.allocator;
-    var listener = try bindBrowserCallback(true);
-    defer listener.deinit(io_mod.getIo());
-
-    var probe = HeldPreconnectProbe{
-        .port = listener.socket.address.getPort(),
-        .request = "GET /auth/callback?code=granted%20code&state=expected HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
-    };
-    const thread = try std.Thread.spawn(.{}, HeldPreconnectProbe.run, .{&probe});
-    // Registered after the join so LIFO releases the probe first. Reversing
-    // these two lines deadlocks the test.
-    defer thread.join();
-    defer probe.release.store(true, .release);
-    try probe.waitUntilDelivered();
-
-    var cancel_flag = std.atomic.Value(bool).init(false);
-    const started_ms = io_mod.milliTimestamp();
-    var accepted = (try awaitBrowserCallback(alloc, &listener, "expected", &cancel_flag)) orelse
-        return error.CallbackNeverArrived;
-    defer accepted.deinit(alloc);
-    try std.testing.expectEqualStrings("granted code", accepted.callback.code);
-    // Before the silence budget the idle socket held the read until
-    // SO_RCVTIMEO, so this is the assertion that encodes the regression.
-    try std.testing.expect(io_mod.milliTimestamp() - started_ms < 1_000);
-}
-
-test "ChatGPT browser callback cancels while an idle preconnect is open" {
-    const alloc = std.testing.allocator;
-    var listener = try bindBrowserCallback(true);
-    defer listener.deinit(io_mod.getIo());
-
-    var probe = HeldPreconnectProbe{ .port = listener.socket.address.getPort() };
-    const thread = try std.Thread.spawn(.{}, HeldPreconnectProbe.run, .{&probe});
-    defer thread.join();
-    defer probe.release.store(true, .release);
-    try probe.waitUntilDelivered();
-
-    var cancel_flag = std.atomic.Value(bool).init(false);
-    const Flip = struct {
-        fn run(flag: *std.atomic.Value(bool)) void {
-            io_mod.sleep(20 * std.time.ns_per_ms);
-            flag.store(true, .seq_cst);
-        }
-    };
-    const flip = try std.Thread.spawn(.{}, Flip.run, .{&cancel_flag});
-    defer flip.join();
-
-    const started_ms = io_mod.milliTimestamp();
-    try std.testing.expectError(
-        error.Cancelled,
-        awaitBrowserCallback(alloc, &listener, "expected", &cancel_flag),
+    const stale_success = classifyBrowserCallback(
+        &context,
+        std.testing.allocator,
+        "/auth/callback?code=stale&state=other",
     );
-    try std.testing.expect(io_mod.milliTimestamp() - started_ms < 1_000);
-}
+    switch (stale_success) {
+        .unrelated => {},
+        else => return error.ExpectedUnrelatedCallback,
+    }
 
-test "ChatGPT browser callback ignores a stale success and waits for this attempt" {
-    const alloc = std.testing.allocator;
-    var listener = try bindBrowserCallback(true);
-    defer listener.deinit(io_mod.getIo());
-    const port = listener.socket.address.getPort();
-
-    const requests = [_][]const u8{
-        // A tab left over from an earlier attempt completing on the port this
-        // attempt now owns. It must not end the live login.
-        "GET /auth/callback?code=stale%20code&state=stale HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
-        "GET /auth/callback?code=granted%20code&state=expected HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
-    };
-    const probe = CallbackProbe{ .port = port, .requests = &requests };
-    const thread = try std.Thread.spawn(.{}, CallbackProbe.run, .{probe});
-    defer thread.join();
-
-    var cancel_flag = std.atomic.Value(bool).init(false);
-    var accepted = (try awaitBrowserCallback(alloc, &listener, "expected", &cancel_flag)) orelse
-        return error.CallbackNeverArrived;
-    defer accepted.deinit(alloc);
-    try std.testing.expectEqualStrings("granted code", accepted.callback.code);
-}
-
-test "ChatGPT browser callback survives strays and still accepts the real redirect" {
-    const alloc = std.testing.allocator;
-    var listener = try bindBrowserCallback(true);
-    defer listener.deinit(io_mod.getIo());
-    const port = listener.socket.address.getPort();
-
-    const requests = [_][]const u8{
-        // A browser speculative preconnect: a TCP open carrying no request.
-        "",
-        // The favicon the browser fetches from the redirect origin.
-        "GET /favicon.ico HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
-        // The genuine redirect.
-        "GET /auth/callback?code=granted%20code&state=expected HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
-    };
-    const probe = CallbackProbe{ .port = port, .requests = &requests };
-    const thread = try std.Thread.spawn(.{}, CallbackProbe.run, .{probe});
-    defer thread.join();
-
-    var cancel_flag = std.atomic.Value(bool).init(false);
-    var accepted = (try awaitBrowserCallback(alloc, &listener, "expected", &cancel_flag)) orelse
-        return error.CallbackNeverArrived;
-    defer accepted.deinit(alloc);
-    try std.testing.expectEqualStrings("granted code", accepted.callback.code);
-}
-
-test "ChatGPT browser callback reports a denial only for this attempt" {
-    try std.testing.expectError(
-        error.InvalidChatGptOAuthCallback,
-        parseBrowserCallbackTarget(
-            std.testing.allocator,
-            "/auth/callback?error=access_denied&state=stale",
-            "expected",
-        ),
+    const stale_denial = classifyBrowserCallback(
+        &context,
+        std.testing.allocator,
+        "/auth/callback?error=access_denied&state=other",
     );
-    try std.testing.expectError(
-        error.ChatGptAuthorizationFailed,
-        parseBrowserCallbackTarget(
-            std.testing.allocator,
-            "/auth/callback?error=access_denied&state=expected",
-            "expected",
-        ),
+    switch (stale_denial) {
+        .unrelated => {},
+        else => return error.ExpectedUnrelatedCallback,
+    }
+}
+
+test "ChatGPT browser callback classifier reports a current denial" {
+    var context = BrowserCallbackParserContext{ .expected_state = "expected" };
+    const denied = classifyBrowserCallback(
+        &context,
+        std.testing.allocator,
+        "/auth/callback?error=access_denied&state=expected",
     );
+    switch (denied) {
+        .failed => |err| try std.testing.expectEqual(error.ChatGptAuthorizationFailed, err),
+        else => return error.ExpectedFailedCallback,
+    }
 }
 
 test "ChatGPT browser callback requires the exact path and state" {
