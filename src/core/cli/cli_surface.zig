@@ -32,6 +32,7 @@ const secret = @import("../auth/secret.zig");
 const output_contracts = @import("../output/output_contracts.zig");
 const prompt_policy = @import("../config/prompt_policy.zig");
 const session_store = @import("../session/session_store.zig");
+const subagent_profiles = @import("../subagent/profile_registry.zig");
 const usage_report = @import("../session/usage_report.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
 const types = @import("../shared/types.zig");
@@ -66,6 +67,7 @@ pub const Command = union(enum) {
     status: []const [:0]const u8,
     permissions: []const [:0]const u8,
     models: []const [:0]const u8,
+    agents: []const [:0]const u8,
     provider: []const [:0]const u8,
     doctor: []const [:0]const u8,
     background: []const [:0]const u8,
@@ -453,6 +455,7 @@ pub fn parse(command_catalog: CommandCatalog, args: []const [:0]const u8) Comman
         'a' => {
             if (command_specs.matchesTopLevel(command_catalog, command, .ask)) return .{ .ask = args[1..] };
             if (command_specs.matchesTopLevel(command_catalog, command, .acp)) return .{ .acp = args[1..] };
+            if (command_specs.matchesTopLevel(command_catalog, command, .agents)) return .{ .agents = args[1..] };
         },
         'b' => {
             if (command_specs.matchesTopLevel(command_catalog, command, .background)) return .{ .background = args[1..] };
@@ -1128,6 +1131,59 @@ fn runNonInteractiveWithDeps(
             defer alloc.free(text);
             try writeFormattedOutput(deps, text, opts.format);
             return .handled_success;
+        },
+        .agents => |rest| {
+            var format: output_contracts.OutputFormat = .text;
+            var positional: std.ArrayList([]const u8) = .empty;
+            defer positional.deinit(alloc);
+            for (rest) |arg| {
+                if (std.mem.eql(u8, arg, "--json")) {
+                    if (format == .json) {
+                        try writeTopLevelUsage(cfg.command_catalog, deps, .agents);
+                        return .handled_failure;
+                    }
+                    format = .json;
+                } else try positional.append(alloc, arg);
+            }
+            if (positional.items.len == 0 or
+                (positional.items.len == 1 and std.mem.eql(u8, positional.items[0], "list")))
+            {
+                const profiles = subagent_profiles.list(alloc) catch |err| {
+                    try writeLookupFailure(alloc, deps, "agents", err, format);
+                    return .handled_failure;
+                };
+                defer subagent_profiles.freeSummaries(alloc, profiles);
+                const summaries = try alloc.alloc(output_contracts.AgentProfileSummary, profiles.len);
+                defer alloc.free(summaries);
+                for (profiles, 0..) |profile, index| summaries[index] = .{
+                    .name = profile.name,
+                    .description = profile.description,
+                };
+                const text = try (output_contracts.AgentProfileListSnapshot{ .profiles = summaries }).render(alloc, format);
+                defer alloc.free(text);
+                try writeFormattedOutput(deps, text, format);
+                return .handled_success;
+            }
+            if (positional.items.len == 2 and std.mem.eql(u8, positional.items[0], "show")) {
+                var profile = subagent_profiles.load(alloc, positional.items[1]) catch |err| {
+                    try writeLookupFailure(alloc, deps, "agents", err, format);
+                    return .handled_failure;
+                };
+                defer profile.deinit(alloc);
+                const text = try (output_contracts.AgentProfileDetailSnapshot{
+                    .name = profile.name,
+                    .description = profile.description,
+                    .model = profile.model,
+                    .effort = profile.effort,
+                    .permission_mode = profile.permission_mode,
+                    .instructions = profile.instructions,
+                }).render(alloc, format);
+                defer alloc.free(text);
+                try writeFormattedOutput(deps, text, format);
+                return .handled_success;
+            }
+            try writeTopLevelUsage(cfg.command_catalog, deps, .agents);
+            return .handled_failure;
         },
         .models => |rest| {
             const opts = parseLocalSurfaceArgs(rest) catch |err| {

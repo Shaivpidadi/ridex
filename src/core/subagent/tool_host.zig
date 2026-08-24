@@ -12,6 +12,7 @@ const control_store = @import("control_store.zig");
 const domain = @import("domain.zig");
 const execution = @import("execution.zig");
 const manager_mod = @import("manager.zig");
+const profile_registry = @import("profile_registry.zig");
 const tool_result = @import("tool_result.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
@@ -383,6 +384,7 @@ pub const Runtime = struct {
         if (command.* == .inspect) {
             return self.executeModelInspection(alloc, command.*, options);
         }
+        if (command.* == .create) try applyCreateProfile(alloc, &command.create);
         if (command.* == .create and
             !try self.callerMayCreate(alloc, options.caller_id))
         {
@@ -651,7 +653,10 @@ pub const Runtime = struct {
             } };
         }
 
-        if (command.* == .create) try applyCreateDefaults(alloc, &command.create, options.defaults);
+        if (command.* == .create) {
+            try applyCreateProfile(alloc, &command.create);
+            try applyCreateDefaults(alloc, &command.create, options.defaults);
+        }
         var context = manager_mod.Context{
             .actor_id = options.caller_id,
             .root_user_intent_context = options.root_user_intent_context,
@@ -883,7 +888,10 @@ pub const Runtime = struct {
             runAfterTargetAuthorizationTestHook();
         }
 
-        if (command.* == .create) try applyCreateDefaults(alloc, &command.create, options.defaults);
+        if (command.* == .create) {
+            try applyCreateProfile(alloc, &command.create);
+            try applyCreateDefaults(alloc, &command.create, options.defaults);
+        }
         return self.executeAuthorizedCommand(
             alloc,
             command.*,
@@ -2194,6 +2202,25 @@ fn boundedFailureAlloc(
     );
 }
 
+fn applyCreateProfile(
+    alloc: Allocator,
+    create: *domain.CreateCommand,
+) !void {
+    const name = create.configuration.profile orelse return;
+    if (create.configuration.profile_instructions != null) return;
+    var profile = try profile_registry.load(alloc, name);
+    defer profile.deinit(alloc);
+    create.configuration.profile_instructions = try alloc.dupe(u8, profile.instructions);
+    if (create.configuration.model == null and profile.model != null) {
+        create.configuration.model = try alloc.dupe(u8, profile.model.?);
+    }
+    if (create.configuration.effort == null) create.configuration.effort = profile.effort;
+    if (!create.permission_mode_explicit and profile.permission_mode != null) {
+        create.configuration.permission_mode = profile.permission_mode.?;
+        create.permission_mode_explicit = true;
+    }
+}
+
 fn applyCreateDefaults(
     alloc: Allocator,
     create: *domain.CreateCommand,
@@ -2400,6 +2427,7 @@ fn captureAdmission(
         .parent_id = request.parent_id,
         .source_id = request.source_id,
         .model = request.preferences.model,
+        .profile_instructions = request.configuration.profile_instructions,
         .provider = request.preferences.provider,
         .effort = request.preferences.effort,
         .permission_mode = snapshot.permission_mode,

@@ -645,6 +645,74 @@ pub const PermissionsSnapshot = struct {
     }
 };
 
+pub const AgentProfileSummary = struct {
+    name: []const u8,
+    description: []const u8,
+};
+
+pub const AgentProfileListSnapshot = struct {
+    profiles: []const AgentProfileSummary,
+
+    pub fn render(self: AgentProfileListSnapshot, alloc: Allocator, format: OutputFormat) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        if (format == .json) {
+            try out.writer.print("{{\"kind\":\"agents\",\"count\":{d},\"profiles\":[", .{self.profiles.len});
+            for (self.profiles, 0..) |profile, index| {
+                if (index != 0) try out.writer.writeByte(',');
+                try out.writer.writeAll("{\"name\":");
+                try std.json.Stringify.value(profile.name, .{}, &out.writer);
+                try out.writer.writeAll(",\"description\":");
+                try std.json.Stringify.value(profile.description, .{}, &out.writer);
+                try out.writer.writeByte('}');
+            }
+            try out.writer.writeAll("]}");
+        } else if (self.profiles.len == 0) {
+            try out.writer.writeAll("[agents] no profiles found in ~/.fx/agents\n");
+        } else {
+            try out.writer.print("[agents] {d} available\n", .{self.profiles.len});
+            for (self.profiles) |profile| try out.writer.print(" - {s}: {s}\n", .{ profile.name, profile.description });
+        }
+        return out.toOwnedSlice();
+    }
+};
+
+pub const AgentProfileDetailSnapshot = struct {
+    name: []const u8,
+    description: []const u8,
+    model: ?[]const u8,
+    effort: ?types.ReasoningEffort,
+    permission_mode: ?types.PermissionMode,
+    instructions: []const u8,
+
+    pub fn render(self: AgentProfileDetailSnapshot, alloc: Allocator, format: OutputFormat) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        if (format == .json) {
+            try out.writer.writeAll("{\"kind\":\"agent\",\"name\":");
+            try std.json.Stringify.value(self.name, .{}, &out.writer);
+            try out.writer.writeAll(",\"description\":");
+            try std.json.Stringify.value(self.description, .{}, &out.writer);
+            try out.writer.writeAll(",\"model\":");
+            try std.json.Stringify.value(self.model, .{}, &out.writer);
+            try out.writer.writeAll(",\"effort\":");
+            try std.json.Stringify.value(if (self.effort) |value| value.label() else null, .{}, &out.writer);
+            try out.writer.writeAll(",\"permission_mode\":");
+            try std.json.Stringify.value(if (self.permission_mode) |value| @tagName(value) else null, .{}, &out.writer);
+            try out.writer.writeAll(",\"instructions\":");
+            try std.json.Stringify.value(self.instructions, .{}, &out.writer);
+            try out.writer.writeByte('}');
+        } else {
+            try out.writer.print("[agent] {s}\n{s}\n", .{ self.name, self.description });
+            if (self.model) |model| try out.writer.print("model: {s}\n", .{model});
+            if (self.effort) |effort| try out.writer.print("effort: {s}\n", .{effort.label()});
+            if (self.permission_mode) |mode| try out.writer.print("permission mode: {s}\n", .{@tagName(mode)});
+            try out.writer.print("\n{s}\n", .{self.instructions});
+        }
+        return out.toOwnedSlice();
+    }
+};
+
 pub const ModelListSnapshot = struct {
     ids: []const []const u8,
     provider: model_provider.ProviderId = .gateway,

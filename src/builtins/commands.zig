@@ -135,6 +135,13 @@ pub const top_level_specs = [_]TopLevelSpec{
         .options = &.{json_option},
     },
     .{
+        .kind = .agents,
+        .token = "agents",
+        .usage = "agents [list|show <name>] [--json]",
+        .summary = "List or inspect global subagent profiles",
+        .options = &.{json_option},
+    },
+    .{
         .kind = .provider,
         .token = "provider",
         .usage = "provider <gateway|codex|grok>",
@@ -304,6 +311,7 @@ pub const top_level_help_groups = [_]TopLevelHelpGroup{
         .{ .kind = .status, .usage = "status" },
         .{ .kind = .doctor, .usage = "doctor" },
         .{ .kind = .models, .usage = "models" },
+        .{ .kind = .agents, .usage = "agents" },
         .{ .kind = .permissions, .usage = "permissions" },
         .{ .kind = .workspace, .usage = "workspace" },
         .{ .kind = .upgrade, .usage = "upgrade" },

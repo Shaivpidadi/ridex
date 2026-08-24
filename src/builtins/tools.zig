@@ -406,6 +406,7 @@ const subagent_notifications_schema = model_tool_schema.ObjectSchema{
 const subagent_create_schema = model_tool_schema.ObjectSchema{
     .properties = &.{
         .{ .name = "name", .json_type = .string, .min_length = 1, .max_length = subagent_domain.max_name_bytes },
+        .{ .name = "profile", .json_type = .string, .min_length = 1, .max_length = subagent_domain.max_profile_bytes, .description = "Optional global profile from ~/.fx/agents/<name>.md. Explicit create fields override profile defaults." },
         .{ .name = "mode", .json_type = .string, .shape = &.{ .enum_values = &.{ "one_off", "persistent" } } },
         .{ .name = "prompt", .json_type = .string, .min_length = 1, .max_length = subagent_domain.max_prompt_bytes },
         .{ .name = "model", .json_type = .string, .min_length = 1, .max_length = subagent_domain.max_model_bytes },
