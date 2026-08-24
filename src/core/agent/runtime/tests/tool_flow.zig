@@ -975,6 +975,53 @@ test "denied web_fetch is presented without dns http or cache work" {
     try expectBodyContains(&gateway, 1, "permission_required");
 }
 
+test "missing serial permission authority fails the tool without aborting the turn" {
+    const alloc = std.testing.allocator;
+    const calls = [_]ToolCall{toolCall("call_1", "read_file", "{\"path\":\"README.md\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls },
+        .{ .content = "Recovered after the tool failure" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    hooks.permission_omit_execution_authority = true;
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 2), gateway.index);
+    try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
+    try std.testing.expectEqual(@as(usize, 1), hooks.rejected_names.items.len);
+    try expectBodyContains(&gateway, 1, "tool_execution_failed");
+}
+
+test "missing parallel permission authority fails one tool without aborting the batch" {
+    const alloc = std.testing.allocator;
+    const calls = [_]ToolCall{
+        toolCall("call_1", "read_file", "{\"path\":\"README.md\"}"),
+        toolCall("call_2", "glob_files", "{\"pattern\":\"*.md\",\"path\":\".\",\"mode\":\"matches\"}"),
+    };
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls },
+        .{ .content = "Recovered after parallel failures" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    hooks.permission_omit_execution_authority = true;
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 2), gateway.index);
+    try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
+    try std.testing.expectEqual(@as(usize, 2), hooks.rejected_names.items.len);
+    try expectBodyContains(&gateway, 1, "tool_execution_failed");
+}
+
 test "accepted automatic review remains internal before ordinary tool execution" {
     const alloc = std.testing.allocator;
     const calls = [_]ToolCall{toolCall("call_1", "terminal", "{\"action\":\"exec\",\"command\":\"printf done\"}")};

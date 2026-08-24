@@ -5165,11 +5165,22 @@ fn processQueuedPromptLoop(
                         try runtime_tool_admission.applyInitialSessionGrants(deps, arena, &local_grants, config.workspace_root, parallel_call, target_path);
                     }
 
+                    const parallel_authority = permission_outcome.execution_authority orelse {
+                        const failure_output = try tool_result_errors.formatToolExecutionErrorJson(
+                            arena,
+                            parallel_call.name,
+                            error.MissingToolExecutionAuthority,
+                        );
+                        precomputed_results[group_index] = .{
+                            .status = .failure,
+                            .model_output = failure_output,
+                            .status_detail = "permission preflight failed",
+                        };
+                        continue;
+                    };
                     if (!parallel_status_started[group_index]) {
                         parallel_status_started[group_index] = try runtime_tool_presentation.startToolVisibleLifecycle(deps, arena, turn_id, stream_ctx.provisional_statuses.presentation_group_id, parallel_call, null, advertised_dynamic_tool_names);
                     }
-                    const parallel_authority = permission_outcome.execution_authority orelse
-                        return error.MissingToolExecutionAuthority;
                     if (parallel_authority != .ordinary) {
                         return error.UnexpectedCommandExecutionAuthority;
                     }
@@ -6462,7 +6473,54 @@ fn processQueuedPromptLoop(
                     "call_id={s} tool_name={s}",
                     .{ tool_call.id, tool_call.name },
                 );
-                return error.MissingToolExecutionAuthority;
+                const failure_output = try tool_result_errors.formatToolExecutionErrorJson(
+                    arena,
+                    tool_call.name,
+                    error.MissingToolExecutionAuthority,
+                );
+                const failure: ToolExecutionResult = .{
+                    .status = .failure,
+                    .model_output = failure_output,
+                    .status_detail = "permission preflight failed",
+                };
+                const prepared_failure = try runtime_execution_memory.prepareToolModelOutput(
+                    arena,
+                    config,
+                    tool_call,
+                    failure_output,
+                );
+                _ = try stream_ctx.provisional_statuses.finishExecutedCall(
+                    deps,
+                    stream_ctx.alloc,
+                    call_allocator,
+                    turn_id,
+                    execution_call,
+                    status_started,
+                    tool_display_target,
+                    failure,
+                    prepared_failure.model_output,
+                    prepared_failure.memory,
+                    null,
+                    advertised_dynamic_tool_names,
+                );
+                try runtime_tool_batch.appendToolResultContent(
+                    arena,
+                    &within_turn_suffix,
+                    &completed_tool_names,
+                    &step_batch,
+                    tool_call,
+                    prepared_failure.model_output,
+                    prepared_failure.memory,
+                    .{ .increment_error = true },
+                );
+                try runtime_tool_admission.recordRejectedToolCall(
+                    deps,
+                    arena,
+                    tool_call,
+                    prepared_failure.model_output,
+                    null,
+                );
+                continue;
             };
             if (try tooling_tool_admission.callUsesCommandAuthority(
                 deps.tool_registry,

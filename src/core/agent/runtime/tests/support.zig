@@ -517,6 +517,7 @@ pub const FakeAgentRuntimeDeps = struct {
     permission_feedback: []const []const u8 = &.{},
     permission_errors: []const ?anyerror = &.{},
     permission_human_approvals: []const command_admission.HumanApprovalProvenance = &.{},
+    permission_omit_execution_authority: bool = false,
     permission_request_override: ?PermissionRequestOverride = null,
     permission_wait_index: ?usize = null,
     permission_waiting: ?*std.atomic.Value(bool) = null,
@@ -1054,7 +1055,7 @@ pub const FakeAgentRuntimeDeps = struct {
                 std.Thread.yield() catch std.atomic.spinLoopHint();
             }
         }
-        const execution_authority = if (decision.isDenied()) null else if (revalidation) |request| switch (request) {
+        const execution_authority = if (decision.isDenied() or self.permission_omit_execution_authority) null else if (revalidation) |request| switch (request) {
             .action => |action| action.authority,
         } else if (file_mutation_contract.isToolName(call.name))
             command_admission.ToolExecutionAuthority{
