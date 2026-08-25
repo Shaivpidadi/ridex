@@ -388,6 +388,20 @@ pub const Runtime = struct {
             applyCreateProfile(alloc, &command.create) catch |err| {
                 if (err == error.OutOfMemory) return error.OutOfMemory;
                 const error_code = createProfileErrorCode(err) orelse return err;
+                self.abortOperationIdentity(
+                    options.invocation_id,
+                    .model,
+                    options.identity_epoch,
+                ) catch {
+                    return boundedFailureAlloc(
+                        alloc,
+                        options.invocation_id,
+                        null,
+                        "control_commit_indeterminate",
+                        true,
+                        options.max_result_bytes,
+                    );
+                };
                 return boundedFailureAlloc(
                     alloc,
                     options.invocation_id,
@@ -3849,16 +3863,28 @@ test "tool host returns stable non-retryable profile lookup failures" {
         .mode = .persistent,
     } });
     defer missing.deinit(alloc);
-    const missing_result = try host.execute(
+    var options = testOptions(root_id, "create-missing-profile");
+    options.identity_epoch = try host.issueOperationIdentity(
         alloc,
-        &missing,
-        testOptions(root_id, "create-missing-profile"),
+        options.invocation_id,
+        .model,
     );
+    const operation_id = try tool_result.boundOperationIdAlloc(
+        alloc,
+        options.invocation_id,
+        .model,
+        options.identity_epoch,
+    );
+    defer alloc.free(operation_id);
+    try std.testing.expect(try host.operationIdentityOutstanding(alloc, operation_id));
+
+    const missing_result = try host.execute(alloc, &missing, options);
     defer alloc.free(missing_result);
     const missing_code = try resultStringAlloc(alloc, missing_result, "error_code");
     defer alloc.free(missing_code);
     try std.testing.expectEqualStrings("profile_home_unavailable", missing_code);
     try std.testing.expect(std.mem.find(u8, missing_result, "\"retryable\":false") != null);
+    try std.testing.expect(!try host.operationIdentityOutstanding(alloc, operation_id));
 }
 
 test "tool host materializes defaults and executes canonical persistent branches" {
