@@ -420,6 +420,25 @@ function createLinkedMetadataSkillsMenuFixture() {
   return { home, workspace, stderrPath };
 }
 
+function createUnavailableLinkedSkillFixture() {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-unavailable-linked-skill-")));
+  workDirs.push(root);
+  const home = join(root, "home");
+  const workspace = join(root, "workspace");
+  const skillsRoot = join(workspace, ".codex", "skills");
+  const stderrPath = join(root, "stderr.log");
+  mkdirSync(join(home, ".fx"), { recursive: true });
+  mkdirSync(skillsRoot, { recursive: true });
+  writeFileSync(join(home, ".fx", "settings.json"), "{}\n");
+  symlinkSync(
+    "../../skill-source/missing-skill",
+    join(skillsRoot, "missing-skill"),
+    "dir",
+  );
+  writeFileSync(stderrPath, "");
+  return { home, workspace, stderrPath };
+}
+
 function createModelsMenuFixture() {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-models-menu-")));
   workDirs.push(root);
@@ -678,6 +697,49 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       );
       expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
 
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "unavailable linked skill reports the failing directory boundary",
+    async () => {
+      const fixture = createUnavailableLinkedSkillFixture();
+      session = await TmuxSession.create({
+        cwd: fixture.workspace,
+        env: {
+          HOME: fixture.home,
+          AI_GATEWAY_API_KEY: undefined,
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_AUTO_UPGRADE: "0",
+        },
+        width: 120,
+        height: 32,
+        stderrPath: fixture.stderrPath,
+      });
+
+      await session.waitForText(
+        "Skills: 1 discovery issue; some skills may be missing (ctrl o to view)",
+        10_000,
+      );
+      await session.waitForComposer(10_000);
+      await session.sendKeys("C-o");
+      await session.waitForPane(
+        (pane) => pane.replace(/\s+/g, " ").includes(
+          "linked skill directory could not be resolved to an authorized readable directory",
+        ),
+        5_000,
+      );
+      const detail = (await session.capturePane()).replace(/\s+/g, " ");
+      expect(detail).toContain("repair or remove the link");
+      expect(detail).not.toContain("SKILL.md is unreadable or not a regular file");
+      expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+
+      await session.sendKeys("C-o");
+      await session.waitForComposer(5_000);
       await session.sendText("/quit");
       expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
       session = null;
@@ -1132,10 +1194,14 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
 
       await session.sendKeys("Down");
       await session.sendKeys("Down");
-      await session.waitForText("manage MCP servers, resources, and prompts", 5_000);
+      await session.waitForText(
+        "manage local and remote MCP servers, resources, and prompts",
+        5_000,
+      );
       const scrolledGrid = await session.capturePaneGrid();
       const mcpRow = scrolledGrid.find((line) =>
-        line.includes("/mcp") && line.includes("manage MCP servers, resources, and prompts")
+        line.includes("/mcp") &&
+        line.includes("manage local and remote MCP servers, resources, and prompts")
       );
       expect(mcpRow).toBeDefined();
       expect(mcpRow!.indexOf("Extensions")).toBe(metadataColumn);
@@ -1200,7 +1266,9 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       const mcpRow = grid.find((line) => line.includes("/mcp"));
       expect(modelRow).toContain("choose what model and reasoning effort to use");
       expect(modelRow).not.toContain("Model");
-      expect(mcpRow).toContain("manage MCP servers, resources, and prompts");
+      expect(mcpRow).toContain(
+        "manage local and remote MCP servers, resources, and prompts",
+      );
       expect(mcpRow).not.toContain("Extensions");
 
       await session.sendKeys("C-u");
@@ -2651,7 +2719,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
         (current) => composerContains(current, `/model ${currentModel}`) && current.includes("default"),
         5_000,
       );
-      expect((JSON.parse(readFileSync(fixture.settingsPath, "utf8")) as { model?: string }).model).toBeUndefined();
+      expect((JSON.parse(readFileSync(fixture.settingsPath, "utf8")) as { models?: { gateway?: string } }).models?.gateway).toBeUndefined();
       await session.sendKeys("C-u");
       await session.waitForPane(hasEmptyComposer, 5_000);
 
@@ -2663,8 +2731,8 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.sendKeys("Enter");
       await session.waitForText(`● Switched to ${selectedModel}`, 5_000);
 
-      const settings = JSON.parse(readFileSync(fixture.settingsPath, "utf8")) as { model?: string };
-      expect(settings.model).toBe(selectedModel);
+      const settings = JSON.parse(readFileSync(fixture.settingsPath, "utf8")) as { models?: { gateway?: string } };
+      expect(settings.models?.gateway).toBe(selectedModel);
       expect(await session.paneTitle()).toBe(`fx · workspace · ${selectedModel}`);
       expect(session.isAlive()).toBe(true);
 
@@ -2778,7 +2846,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(hasEmptyComposer(pane)).toBe(true);
       expect(pane).not.toContain("Reasoning effort");
       expect(pane).not.toContain("default");
-      expect(JSON.parse(readFileSync(fixture.settingsPath, "utf8")).model).toBe(selectedModel);
+      expect(JSON.parse(readFileSync(fixture.settingsPath, "utf8")).models.gateway).toBe(selectedModel);
       expect(await session.paneTitle()).toBe(`fx · workspace · ${selectedModel}`);
       expect(session.isAlive()).toBe(true);
       expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
