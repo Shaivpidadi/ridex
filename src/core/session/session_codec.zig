@@ -574,7 +574,7 @@ fn validateStateWithPermissionMigration(
             return error.InvalidDurableField;
     }
     if (state.recovery_checkpoint) |checkpoint| {
-        if (checkpoint.version != 3 or
+        if (checkpoint.version < 1 or checkpoint.version > 3 or
             checkpoint.turn_id == 0 or
             checkpoint.max_provider_attempts == 0 or
             checkpoint.consumed_provider_attempts > checkpoint.max_provider_attempts or
