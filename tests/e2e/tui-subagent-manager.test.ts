@@ -551,7 +551,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
           },
         });
       }, {
-        classifierDecision: "allow",
+        classifierDecision: "clear",
         models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] }],
       });
       try {
@@ -733,7 +733,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         }
         return fakeGatewayFinalText("unexpected terminal-safe child request");
       }, {
-        classifierDecision: "allow",
+        classifierDecision: "clear",
         models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] }],
       });
       const env = {
@@ -908,12 +908,13 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         if (body.includes(childPrompt)) {
           return fakeGatewayToolCall(callId, "terminal", {
             action: "exec",
+            timeout_ms: 600_000,
             command: `printf yolo > ${JSON.stringify(marker)}`,
           });
         }
         return fakeGatewayFinalText("unexpected default-yolo request");
       }, {
-        classifierDecision: "ask",
+        classifierDecision: "caution",
         models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] }],
       });
       try {
@@ -1029,7 +1030,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         }
         return fakeGatewayFinalText("unexpected child file request");
       }, {
-        classifierDecision: "allow",
+        classifierDecision: "clear",
         models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] }],
       });
       try {
@@ -1139,7 +1140,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         }
         return fakeGatewayFinalText("unexpected Ctrl-C request");
       }, {
-        classifierDecision: "allow",
+        classifierDecision: "clear",
         models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] }],
       });
       const env = {
@@ -1326,7 +1327,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
           },
         });
       }, {
-        classifierDecision: "ask",
+        classifierDecision: "caution",
         models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] }],
       });
       try {
@@ -1407,7 +1408,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
           },
         });
       }, {
-        classifierDecision: "allow",
+        classifierDecision: "clear",
         models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] }],
       });
       try {
@@ -1451,7 +1452,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
   );
 
   test(
-    "persistent auto child replans a direct delete before review",
+    "persistent auto child keeps an injected delete held after review caution",
     async () => {
       const fixture = createFixture();
       writeFileSync(
@@ -1484,7 +1485,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
           },
         });
       }, {
-        classifierDecision: "allow",
+        classifierDecision: "caution",
         models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] }],
       });
       try {
@@ -1514,16 +1515,16 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         await active.waitForText("AUTO_DELETE_PARENT_READY", TIMEOUT);
         const denialDeadline = Date.now() + TIMEOUT;
         while (
-          !gateway.requests.some((request) => request.body.includes("auto_denied")) &&
+          !gateway.requests.some((request) => request.body.includes("review_caution")) &&
           Date.now() < denialDeadline
         ) {
           await Bun.sleep(25);
         }
         expect(gateway.requests.some((request) =>
-          request.body.includes("auto_denied")
+          request.body.includes("review_caution")
         )).toBe(true);
         expect(readFileSync(marker, "utf8")).toBe("keep\n");
-        expect(gateway.classifierRequests).toHaveLength(0);
+        expect(gateway.classifierRequests).toHaveLength(1);
         expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
       } finally {
         gateway.stop();
@@ -1592,7 +1593,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
           },
         });
       }, {
-        classifierDecision: "allow",
+        classifierDecision: "clear",
         models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] }],
       });
       try {
@@ -1734,6 +1735,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
           }
           return fakeGatewayToolCall(`command_stream_${next}`, "terminal", {
             action: "exec",
+            timeout_ms: 600_000,
             command:
               `printf COMMAND_${next}_START; sleep 0.35; printf COMMAND_${next}_END`,
           });
@@ -1741,6 +1743,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         if (body.includes(childPrompt)) {
           return fakeGatewayToolCall("command_stream_1", "terminal", {
             action: "exec",
+            timeout_ms: 600_000,
             command:
               "printf COMMAND_1_START; sleep 0.35; printf COMMAND_1_END",
           });
@@ -1755,7 +1758,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
           },
         });
       }, {
-        classifierDecision: "allow",
+        classifierDecision: "clear",
         models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] }],
       });
 
@@ -1854,7 +1857,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         }
         return fakeGatewayFinalText("unexpected fast route request");
       }, {
-        classifierDecision: "allow",
+        classifierDecision: "clear",
         models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] }],
       });
 
@@ -1998,7 +2001,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         if (!response) return new Response("unexpected request", { status: 500 });
         return response;
       }, {
-        classifierDecision: "allow",
+        classifierDecision: "clear",
         models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] }],
       });
       try {
@@ -2239,7 +2242,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
       const gateway = startDynamicFakeGateway(
         () => fakeGatewayFinalText("CHECKPOINT2_CHILD_COMPLETE"),
         {
-          classifierDecision: "allow",
+          classifierDecision: "clear",
           models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] }],
         },
       );
@@ -2376,7 +2379,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
       const gateway = startDynamicFakeGateway(
         () => fakeGatewayFinalText("RELATIONSHIP_DISCLOSURE_READY"),
         {
-          classifierDecision: "allow",
+          classifierDecision: "clear",
           models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] }],
         },
       );
@@ -2463,7 +2466,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
       const gateway = startDynamicFakeGateway(
         () => fakeGatewayFinalText("RELATIONSHIP_DISCLOSURE_READY"),
         {
-          classifierDecision: "allow",
+          classifierDecision: "clear",
           models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] }],
         },
       );
@@ -2634,7 +2637,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         const response = responses[step++];
         return response?.() ?? new Response("unexpected gateway step", { status: 500 });
       }, {
-        classifierDecision: "allow",
+        classifierDecision: "clear",
         models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] }],
       });
       try {
@@ -2775,7 +2778,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
           },
         });
       }, {
-        classifierDecision: "allow",
+        classifierDecision: "clear",
         models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] }],
       });
       try {
@@ -3101,7 +3104,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
           },
         });
       }, {
-        classifierDecision: "allow",
+        classifierDecision: "clear",
         models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] }],
       });
       try {
@@ -3322,7 +3325,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         if (body.includes(queuedMessage)) return fakeGatewayFinalText(completedText);
         return fakeGatewayFinalText("unexpected checkpoint three request");
       }, {
-        classifierDecision: "allow",
+        classifierDecision: "clear",
         models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] }],
       });
       let direct: TmuxSession | null = null;
@@ -3527,7 +3530,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         if (latest.includes(directMessage)) return directStream.response;
         return fakeGatewayFinalText("unexpected external-owner request");
       }, {
-        classifierDecision: "allow",
+        classifierDecision: "clear",
         models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] }],
       });
       let direct: TmuxSession | null = null;
@@ -3884,7 +3887,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         if (body.includes(initialPrompt)) return initialStream.response;
         return fakeGatewayFinalText("unexpected checkpoint two request");
       }, {
-        classifierDecision: "ask",
+        classifierDecision: "caution",
         models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] }],
       });
       try {
@@ -3970,6 +3973,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         await active.waitForText("Full detail · ←/→ switch · ctrl o close", TIMEOUT);
         releaseChildApproval(fakeGatewayToolCall(callId, "terminal", {
           action: "exec",
+          timeout_ms: 600_000,
           command: "printf approved > child-approval-effect.txt",
         }));
         const childApproval = await active.waitForPane(
@@ -4381,7 +4385,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
             ? "CHILD_QUIT_REACHED_MODEL"
             : "CHILD_LOCAL_QUIT_READY",
         ), {
-        classifierDecision: "allow",
+        classifierDecision: "clear",
         models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] }],
       });
 
@@ -4452,7 +4456,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
             ? "CHILD_MODELS_REACHED_MODEL"
             : "CHILD_LOCAL_MODELS_READY",
         ), {
-        classifierDecision: "allow",
+        classifierDecision: "clear",
         models: async () => {
           await modelsReady;
           return [
@@ -4592,7 +4596,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
             : "CHILD_POINTER_EDITED",
         ),
         {
-          classifierDecision: "allow",
+          classifierDecision: "clear",
           models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] }],
         },
       );
@@ -4684,7 +4688,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
             ? "CHILD_SKILLS_REACHED_MODEL"
             : "CHILD_LOCAL_SKILLS_READY",
         ), {
-        classifierDecision: "allow",
+        classifierDecision: "clear",
         models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] }],
       });
 
@@ -4815,7 +4819,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
       const gateway = startDynamicFakeGateway(
         () => fakeGatewayFinalText("CHILD_NARROW_CONFIG_READY"),
         {
-          classifierDecision: "allow",
+          classifierDecision: "clear",
           models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] }],
         },
       );
@@ -4922,7 +4926,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
       const gateway = startDynamicFakeGateway(
         () => fakeGatewayFinalText("DURATION_CHILD_READY"),
         {
-          classifierDecision: "allow",
+          classifierDecision: "clear",
           models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] }],
         },
       );
@@ -5104,7 +5108,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         if (body.includes("BACKGROUND_CONFIGURE")) return externalResponse;
         return fakeGatewayFinalText("STALE_CHILD_READY");
       }, {
-        classifierDecision: "allow",
+        classifierDecision: "clear",
         models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] }],
       });
       const env = {
@@ -5314,7 +5318,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
       );
       const gateway = startDynamicFakeGateway(() =>
         fakeGatewayFinalText(historyLines.join("\n")), {
-        classifierDecision: "allow",
+        classifierDecision: "clear",
         models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] }],
       });
       const visibleRange = (pane: string) => {
@@ -5443,7 +5447,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         body.includes("CHILD_RESIZE_INITIAL")
           ? fakeGatewayFinalText("CHILD_RESIZE_READY")
           : fakeGatewayFinalText(mainLines.join("\n")), {
-        classifierDecision: "allow",
+        classifierDecision: "clear",
         models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] }],
       });
 
@@ -5547,7 +5551,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
             ? "CHILD_DRAFT_A_READY"
             : "CHILD_DRAFT_B_READY",
         ), {
-        classifierDecision: "allow",
+        classifierDecision: "clear",
         models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] }],
       });
 
@@ -5696,7 +5700,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
             : "VISIBLE_CHILD_INITIAL_DONE",
         );
       }, {
-        classifierDecision: "allow",
+        classifierDecision: "clear",
         models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] }],
       });
       const childLine = (pane: string) =>
@@ -5860,18 +5864,20 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         if (body.includes(firstPrompt)) {
           return fakeGatewayToolCall(firstCallId, "terminal", {
             action: "exec",
+            timeout_ms: 600_000,
             command: `printf first > ${JSON.stringify(firstMarker)}`,
           });
         }
         if (body.includes(secondPrompt)) {
           return fakeGatewayToolCall(secondCallId, "terminal", {
             action: "exec",
+            timeout_ms: 600_000,
             command: `printf second > ${JSON.stringify(secondMarker)}`,
           });
         }
         return fakeGatewayFinalText("unexpected simultaneous approval request");
       }, {
-        classifierDecision: "ask",
+        classifierDecision: "caution",
         models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] }],
       });
       try {
@@ -6106,7 +6112,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
           },
         });
       }, {
-        classifierDecision: "allow",
+        classifierDecision: "clear",
         models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] }],
       });
       try {
@@ -6220,7 +6226,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
           },
         });
       }, {
-        classifierDecision: "allow",
+        classifierDecision: "clear",
         models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] }],
       });
       try {
@@ -6364,6 +6370,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         if (body.includes(childPrompt)) {
           return fakeGatewayToolCall(childCallId, "terminal", {
             action: "exec",
+            timeout_ms: 600_000,
             command: "printf denied > cancelled-approval-effect.txt",
           });
         }
@@ -6378,7 +6385,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
           },
         });
       }, {
-        classifierDecision: "ask",
+        classifierDecision: "caution",
         models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] }],
       });
       try {
@@ -6582,7 +6589,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
           },
         });
       }, {
-        classifierDecision: "allow",
+        classifierDecision: "clear",
         models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] }],
       });
       try {
@@ -6692,7 +6699,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
           },
         });
       }, {
-        classifierDecision: "allow",
+        classifierDecision: "clear",
         models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] }],
       });
       try {
@@ -7048,7 +7055,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
           },
         );
       }, {
-        classifierDecision: "allow",
+        classifierDecision: "clear",
         models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] }],
       });
       try {
@@ -7111,7 +7118,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
       const gateway = startDynamicFakeGateway(
         () => fakeGatewayFinalText("ZERO_TURN_CHILD_READY"),
         {
-          classifierDecision: "allow",
+          classifierDecision: "clear",
           models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] }],
         },
       );
@@ -7238,7 +7245,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
           },
         });
       }, {
-        classifierDecision: "allow",
+        classifierDecision: "clear",
         models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] }],
       });
       try {
