@@ -384,7 +384,20 @@ pub const Runtime = struct {
         if (command.* == .inspect) {
             return self.executeModelInspection(alloc, command.*, options);
         }
-        if (command.* == .create) try applyCreateProfile(alloc, &command.create);
+        if (command.* == .create) {
+            applyCreateProfile(alloc, &command.create) catch |err| {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
+                const error_code = createProfileErrorCode(err) orelse return err;
+                return boundedFailureAlloc(
+                    alloc,
+                    options.invocation_id,
+                    null,
+                    error_code,
+                    false,
+                    options.max_result_bytes,
+                );
+            };
+        }
         if (command.* == .create and
             !try self.callerMayCreate(alloc, options.caller_id))
         {
@@ -2202,6 +2215,17 @@ fn boundedFailureAlloc(
     );
 }
 
+fn createProfileErrorCode(err: anyerror) ?[]const u8 {
+    return switch (err) {
+        error.InvalidProfileName => "invalid_profile_name",
+        error.ProfileNotFound => "profile_not_found",
+        error.ProfileUnreadable => "profile_unreadable",
+        error.ProfileTooLarge, error.InvalidProfile => "invalid_profile",
+        error.HomeUnavailable => "profile_home_unavailable",
+        else => null,
+    };
+}
+
 fn applyCreateProfile(
     alloc: Allocator,
     create: *domain.CreateCommand,
@@ -3773,6 +3797,68 @@ fn resultStringAlloc(
     const raw = parsed.value.object.get(key) orelse return error.TestUnexpectedResult;
     if (raw != .string) return error.TestUnexpectedResult;
     return alloc.dupe(u8, raw.string);
+}
+
+test "profile registry errors map to stable non-retryable result codes" {
+    try std.testing.expectEqualStrings(
+        "invalid_profile_name",
+        createProfileErrorCode(error.InvalidProfileName).?,
+    );
+    try std.testing.expectEqualStrings(
+        "profile_not_found",
+        createProfileErrorCode(error.ProfileNotFound).?,
+    );
+    try std.testing.expectEqualStrings(
+        "profile_unreadable",
+        createProfileErrorCode(error.ProfileUnreadable).?,
+    );
+    try std.testing.expectEqualStrings(
+        "invalid_profile",
+        createProfileErrorCode(error.ProfileTooLarge).?,
+    );
+    try std.testing.expectEqualStrings(
+        "invalid_profile",
+        createProfileErrorCode(error.InvalidProfile).?,
+    );
+    try std.testing.expectEqualStrings(
+        "profile_home_unavailable",
+        createProfileErrorCode(error.HomeUnavailable).?,
+    );
+    try std.testing.expect(createProfileErrorCode(error.OutOfMemory) == null);
+}
+
+test "tool host returns stable non-retryable profile lookup failures" {
+    const alloc = std.testing.allocator;
+    const root_id = "01J00000000000000000000000";
+    var env = try TestEnvironment.init(alloc);
+    defer env.deinit(alloc);
+    try env.createSession(alloc, root_id);
+    var test_authority = TestAuthority{ .root_id = root_id };
+    const host = try Runtime.create(
+        alloc,
+        &env.store,
+        root_id,
+        test_authority.resolver(),
+        .{},
+    );
+    defer host.deinit();
+
+    var missing = try domain.validateCommand(alloc, .{ .create = .{
+        .name = "worker",
+        .profile = "missing-profile",
+        .mode = .persistent,
+    } });
+    defer missing.deinit(alloc);
+    const missing_result = try host.execute(
+        alloc,
+        &missing,
+        testOptions(root_id, "create-missing-profile"),
+    );
+    defer alloc.free(missing_result);
+    const missing_code = try resultStringAlloc(alloc, missing_result, "error_code");
+    defer alloc.free(missing_code);
+    try std.testing.expectEqualStrings("profile_home_unavailable", missing_code);
+    try std.testing.expect(std.mem.find(u8, missing_result, "\"retryable\":false") != null);
 }
 
 test "tool host materializes defaults and executes canonical persistent branches" {
