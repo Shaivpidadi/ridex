@@ -680,10 +680,7 @@ pub const Runtime = struct {
             } };
         }
 
-        if (command.* == .create) {
-            try applyCreateProfile(alloc, &command.create);
-            try applyCreateDefaults(alloc, &command.create, options.defaults);
-        }
+        if (command.* == .create) try applyCreateDefaults(alloc, &command.create, options.defaults);
         var context = manager_mod.Context{
             .actor_id = options.caller_id,
             .root_user_intent_context = options.root_user_intent_context,
@@ -2244,7 +2241,7 @@ fn applyCreateProfile(
     alloc: Allocator,
     create: *domain.CreateCommand,
 ) !void {
-    const name = create.configuration.profile orelse return;
+    const name = create.profile orelse return;
     if (create.configuration.profile_instructions != null) return;
     var profile = try profile_registry.load(alloc, name);
     defer profile.deinit(alloc);

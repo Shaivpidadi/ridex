@@ -90,7 +90,6 @@ pub const NotificationPolicy = struct {
 
 pub const Configuration = struct {
     name: []u8,
-    profile: ?[]u8 = null,
     profile_instructions: ?[]u8 = null,
     model: ?[]u8 = null,
     effort: ?types.ReasoningEffort = null,
@@ -99,7 +98,6 @@ pub const Configuration = struct {
 
     pub fn deinit(self: *Configuration, alloc: Allocator) void {
         alloc.free(self.name);
-        if (self.profile) |profile| alloc.free(profile);
         if (self.profile_instructions) |instructions| alloc.free(instructions);
         if (self.model) |model| alloc.free(model);
         self.notifications.deinit(alloc);
@@ -110,15 +108,12 @@ pub const Configuration = struct {
     pub fn clone(self: Configuration, alloc: Allocator) !Configuration {
         const name = try alloc.dupe(u8, self.name);
         errdefer alloc.free(name);
-        const profile = if (self.profile) |value| try alloc.dupe(u8, value) else null;
-        errdefer if (profile) |value| alloc.free(value);
         const profile_instructions = if (self.profile_instructions) |value| try alloc.dupe(u8, value) else null;
         errdefer if (profile_instructions) |value| alloc.free(value);
         const model = if (self.model) |value| try alloc.dupe(u8, value) else null;
         errdefer if (model) |value| alloc.free(value);
         return .{
             .name = name,
-            .profile = profile,
             .profile_instructions = profile_instructions,
             .model = model,
             .effort = self.effort,
@@ -230,12 +225,14 @@ pub const CommandInput = struct {
 
 pub const CreateCommand = struct {
     configuration: Configuration,
+    profile: ?[]u8,
     mode: Mode,
     prompt: ?[]u8,
     permission_mode_explicit: bool,
 
     fn deinit(self: *CreateCommand, alloc: Allocator) void {
         self.configuration.deinit(alloc);
+        if (self.profile) |profile| alloc.free(profile);
         if (self.prompt) |prompt| alloc.free(prompt);
         self.* = undefined;
     }
@@ -808,12 +805,12 @@ fn validateCreate(alloc: Allocator, input: CreateInput) ValidationError!CreateCo
     return .{
         .configuration = .{
             .name = name,
-            .profile = profile,
             .model = model,
             .effort = input.effort,
             .permission_mode = input.permission_mode orelse .yolo,
             .notifications = notifications,
         },
+        .profile = profile,
         .mode = mode,
         .prompt = prompt,
         .permission_mode_explicit = input.permission_mode != null,
@@ -1323,7 +1320,6 @@ fn hashConfiguration(
     configuration: Configuration,
 ) void {
     hashString(hash, configuration.name);
-    hashOptionalString(hash, configuration.profile);
     hashOptionalString(hash, configuration.profile_instructions);
     hashOptionalString(hash, configuration.model);
     hashOptionalEffort(hash, configuration.effort);

@@ -462,8 +462,6 @@ fn renderConfiguration(
 ) !void {
     try writer.writeAll("{\"name\":");
     try writeJsonString(writer, configuration.name);
-    try writer.writeAll(",\"profile\":");
-    try writeOptionalString(writer, configuration.profile);
     try writer.writeAll(",\"profile_instructions\":");
     try writeOptionalString(writer, configuration.profile_instructions);
     try writer.writeAll(",\"model\":");
@@ -1118,7 +1116,7 @@ fn parseConfiguration(
     const object = exactObject(
         value,
         if (version >= profile_schema_version)
-            &.{ "name", "profile", "profile_instructions", "model", "effort", "permission_mode", "notifications" }
+            &.{ "name", "profile_instructions", "model", "effort", "permission_mode", "notifications" }
         else if (version >= permission_mode_schema_version)
             &.{ "name", "model", "effort", "permission_mode", "notifications" }
         else
@@ -1127,12 +1125,6 @@ fn parseConfiguration(
         return error.InvalidControlRecord;
     const name_raw = requireString(object, "name") catch return error.InvalidControlRecord;
     validateText(name_raw, domain.max_name_bytes) catch return error.InvalidControlRecord;
-    const profile_raw = if (version >= profile_schema_version)
-        optionalString(object, "profile") catch return error.InvalidControlRecord
-    else
-        null;
-    if (profile_raw) |profile| validateText(profile, domain.max_profile_bytes) catch
-        return error.InvalidControlRecord;
     const profile_instructions_raw = if (version >= profile_schema_version)
         optionalString(object, "profile_instructions") catch return error.InvalidControlRecord
     else
@@ -1147,15 +1139,12 @@ fn parseConfiguration(
     ) catch return error.InvalidControlRecord;
     const name = try alloc.dupe(u8, name_raw);
     errdefer alloc.free(name);
-    const profile = if (profile_raw) |raw| try alloc.dupe(u8, raw) else null;
-    errdefer if (profile) |owned| alloc.free(owned);
     const profile_instructions = if (profile_instructions_raw) |raw| try alloc.dupe(u8, raw) else null;
     errdefer if (profile_instructions) |owned| alloc.free(owned);
     const model = if (model_raw) |raw| try alloc.dupe(u8, raw) else null;
     errdefer if (model) |owned| alloc.free(owned);
     return .{
         .name = name,
-        .profile = profile,
         .profile_instructions = profile_instructions,
         .model = model,
         .effort = effort,
@@ -2064,7 +2053,7 @@ test "schema v2 migration closes absent legacy replay identities" {
         u8,
         alloc,
         versioned_with_mode,
-        ",\"profile\":null,\"profile_instructions\":null",
+        ",\"profile_instructions\":null",
         "",
     );
     defer alloc.free(versioned_without_profile);
@@ -2114,7 +2103,7 @@ test "schema v3 process epochs cannot seed manager replay authority" {
         u8,
         alloc,
         legacy_with_mode,
-        ",\"profile\":null,\"profile_instructions\":null",
+        ",\"profile_instructions\":null",
         "",
     );
     defer alloc.free(legacy_without_profile);
@@ -2157,7 +2146,7 @@ test "schema v4 manager epochs retain replay authority and migrate child permiss
         u8,
         alloc,
         legacy_with_mode,
-        ",\"profile\":null,\"profile_instructions\":null",
+        ",\"profile_instructions\":null",
         "",
     );
     defer alloc.free(legacy_without_profile);
