@@ -361,6 +361,16 @@ fn writeTerminalSafe(writer: *std.Io.Writer, alloc: Allocator, raw: []const u8) 
     try writer.writeAll(encoded.bytes);
 }
 
+fn writeTerminalSafeMultiline(writer: *std.Io.Writer, alloc: Allocator, raw: []const u8) !void {
+    var lines = std.mem.splitScalar(u8, raw, '\n');
+    var first = true;
+    while (lines.next()) |line| {
+        if (!first) try writer.writeByte('\n');
+        first = false;
+        try writeTerminalSafe(writer, alloc, line);
+    }
+}
+
 fn gatewayProviderConnected(auth: auth_runtime.StatusSnapshot) bool {
     const source = auth.active_source orelse return auth.gateway_connected;
     return auth.gateway_connected or (source != .chatgpt_subscription and source != .grok_subscription);
@@ -718,7 +728,7 @@ pub const AgentProfileDetailSnapshot = struct {
             if (self.effort) |effort| try out.writer.print("effort: {s}\n", .{effort.label()});
             if (self.permission_mode) |mode| try out.writer.print("permission mode: {s}\n", .{@tagName(mode)});
             try out.writer.writeByte('\n');
-            try writeTerminalSafe(&out.writer, alloc, self.instructions);
+            try writeTerminalSafeMultiline(&out.writer, alloc, self.instructions);
             try out.writer.writeByte('\n');
         }
         return out.toOwnedSlice();
@@ -747,7 +757,7 @@ test "agent profile text visibly escapes terminal controls" {
     }).render(std.testing.allocator, .text);
     defer std.testing.allocator.free(detail_text);
     try std.testing.expectEqualStrings(
-        "[agent] reviewer\nReview\\x1b[2J\nmodel: test/model\\x1b[31m\n\nInspect\\x0acarefully\\x1b]52;c;clipboard\\x07\n",
+        "[agent] reviewer\nReview\\x1b[2J\nmodel: test/model\\x1b[31m\n\nInspect\ncarefully\\x1b]52;c;clipboard\\x07\n",
         detail_text,
     );
     try std.testing.expect(std.mem.findScalar(u8, detail_text, 0x1b) == null);
