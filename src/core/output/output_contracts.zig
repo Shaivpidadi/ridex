@@ -671,7 +671,11 @@ pub const AgentProfileListSnapshot = struct {
             try out.writer.writeAll("[agents] no profiles found in ~/.fx/agents\n");
         } else {
             try out.writer.print("[agents] {d} available\n", .{self.profiles.len});
-            for (self.profiles) |profile| try out.writer.print(" - {s}: {s}\n", .{ profile.name, profile.description });
+            for (self.profiles) |profile| {
+                try out.writer.print(" - {s}: ", .{profile.name});
+                try writeTerminalSafe(&out.writer, alloc, profile.description);
+                try out.writer.writeByte('\n');
+            }
         }
         return out.toOwnedSlice();
     }
@@ -703,15 +707,52 @@ pub const AgentProfileDetailSnapshot = struct {
             try std.json.Stringify.value(self.instructions, .{}, &out.writer);
             try out.writer.writeByte('}');
         } else {
-            try out.writer.print("[agent] {s}\n{s}\n", .{ self.name, self.description });
-            if (self.model) |model| try out.writer.print("model: {s}\n", .{model});
+            try out.writer.print("[agent] {s}\n", .{self.name});
+            try writeTerminalSafe(&out.writer, alloc, self.description);
+            try out.writer.writeByte('\n');
+            if (self.model) |model| {
+                try out.writer.writeAll("model: ");
+                try writeTerminalSafe(&out.writer, alloc, model);
+                try out.writer.writeByte('\n');
+            }
             if (self.effort) |effort| try out.writer.print("effort: {s}\n", .{effort.label()});
             if (self.permission_mode) |mode| try out.writer.print("permission mode: {s}\n", .{@tagName(mode)});
-            try out.writer.print("\n{s}\n", .{self.instructions});
+            try out.writer.writeByte('\n');
+            try writeTerminalSafe(&out.writer, alloc, self.instructions);
+            try out.writer.writeByte('\n');
         }
         return out.toOwnedSlice();
     }
 };
+
+test "agent profile text visibly escapes terminal controls" {
+    const profiles = [_]AgentProfileSummary{.{
+        .name = "reviewer",
+        .description = "Review\x1b]52;c;clipboard\x07\nnext",
+    }};
+    const list_text = try (AgentProfileListSnapshot{ .profiles = &profiles }).render(std.testing.allocator, .text);
+    defer std.testing.allocator.free(list_text);
+    try std.testing.expectEqualStrings(
+        "[agents] 1 available\n - reviewer: Review\\x1b]52;c;clipboard\\x07\\x0anext\n",
+        list_text,
+    );
+
+    const detail_text = try (AgentProfileDetailSnapshot{
+        .name = "reviewer",
+        .description = "Review\x1b[2J",
+        .model = "test/model\x1b[31m",
+        .effort = null,
+        .permission_mode = null,
+        .instructions = "Inspect\ncarefully\x1b]52;c;clipboard\x07",
+    }).render(std.testing.allocator, .text);
+    defer std.testing.allocator.free(detail_text);
+    try std.testing.expectEqualStrings(
+        "[agent] reviewer\nReview\\x1b[2J\nmodel: test/model\\x1b[31m\n\nInspect\\x0acarefully\\x1b]52;c;clipboard\\x07\n",
+        detail_text,
+    );
+    try std.testing.expect(std.mem.findScalar(u8, detail_text, 0x1b) == null);
+    try std.testing.expect(std.mem.findScalar(u8, detail_text, 0x07) == null);
+}
 
 pub const ModelListSnapshot = struct {
     ids: []const []const u8,

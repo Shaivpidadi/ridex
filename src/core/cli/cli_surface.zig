@@ -2812,10 +2812,28 @@ fn writeLookupFailure(
         error.DurableLayoutFailed, error.SessionStoreUnavailable => {
             try writeStderr(deps, "fx session: durable session store is unavailable\n");
         },
-        error.HomeNotSet => {
+        error.HomeNotSet, error.HomeUnavailable => {
             try writeStderr(deps, "fx ");
             try writeStderr(deps, kind);
             try writeStderr(deps, ": HOME is not set\n");
+        },
+        error.InvalidProfileName => {
+            try writeStderr(deps, "fx agents: invalid profile name\n");
+        },
+        error.ProfileNotFound => {
+            try writeStderr(deps, "fx agents: profile not found\n");
+        },
+        error.ProfileUnreadable => {
+            try writeStderr(deps, "fx agents: profile is unreadable\n");
+        },
+        error.ProfileTooLarge => {
+            try writeStderr(deps, "fx agents: profile is too large\n");
+        },
+        error.InvalidProfile => {
+            try writeStderr(deps, "fx agents: profile is invalid\n");
+        },
+        error.TooManyProfiles => {
+            try writeStderr(deps, "fx agents: too many profiles\n");
         },
         else => return err,
     }
@@ -2908,9 +2926,62 @@ fn lookupFailureMessage(err: anyerror) ?[]const u8 {
         error.PrivateStatePermissionsUnsupported,
         => "durable session storage is unsafe or does not support required private permissions",
         error.DurableLayoutFailed, error.SessionStoreUnavailable => "durable session store is unavailable",
-        error.HomeNotSet => "HOME is not set",
+        error.HomeNotSet, error.HomeUnavailable => "HOME is not set",
+        error.InvalidProfileName => "invalid profile name",
+        error.ProfileNotFound => "profile not found",
+        error.ProfileUnreadable => "profile is unreadable",
+        error.ProfileTooLarge => "profile is too large",
+        error.InvalidProfile => "profile is invalid",
+        error.TooManyProfiles => "too many profiles",
         else => null,
     };
+}
+
+test "agent profile lookup failures keep stable text and json messages" {
+    const cases = [_]struct {
+        err: anyerror,
+        message: []const u8,
+    }{
+        .{ .err = error.HomeUnavailable, .message = "HOME is not set" },
+        .{ .err = error.InvalidProfileName, .message = "invalid profile name" },
+        .{ .err = error.ProfileNotFound, .message = "profile not found" },
+        .{ .err = error.ProfileUnreadable, .message = "profile is unreadable" },
+        .{ .err = error.ProfileTooLarge, .message = "profile is too large" },
+        .{ .err = error.InvalidProfile, .message = "profile is invalid" },
+        .{ .err = error.TooManyProfiles, .message = "too many profiles" },
+    };
+    for (cases) |case| {
+        var text_output = CaptureOutput.init(std.testing.allocator);
+        defer text_output.deinit();
+        try writeLookupFailure(
+            std.testing.allocator,
+            text_output.deps(),
+            "agents",
+            case.err,
+            .text,
+        );
+        const expected_text = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "fx agents: {s}\n",
+            .{case.message},
+        );
+        defer std.testing.allocator.free(expected_text);
+        try std.testing.expectEqualStrings(expected_text, text_output.stderr.written());
+        try std.testing.expectEqualStrings("", text_output.stdout.written());
+
+        var json_output = CaptureOutput.init(std.testing.allocator);
+        defer json_output.deinit();
+        try writeLookupFailure(
+            std.testing.allocator,
+            json_output.deps(),
+            "agents",
+            case.err,
+            .json,
+        );
+        try std.testing.expectEqualStrings("", json_output.stderr.written());
+        try std.testing.expect(std.mem.find(u8, json_output.stdout.written(), case.message) != null);
+        try std.testing.expect(std.mem.find(u8, json_output.stdout.written(), @errorName(case.err)) != null);
+    }
 }
 
 test "session detail failures separate corruption from unsupported schema" {
