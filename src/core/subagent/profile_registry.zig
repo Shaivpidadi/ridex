@@ -90,6 +90,15 @@ pub fn loadFromHome(alloc: Allocator, home: []const u8, name: []const u8) Error!
     return profile;
 }
 
+fn initSummary(alloc: Allocator, name: []const u8, description: []const u8) !Summary {
+    const owned_name = try alloc.dupe(u8, name);
+    errdefer alloc.free(owned_name);
+    return .{
+        .name = owned_name,
+        .description = try alloc.dupe(u8, description),
+    };
+}
+
 pub fn list(alloc: Allocator) Error![]Summary {
     const home = io_mod.getenv("HOME") orelse return error.HomeUnavailable;
     return listFromHome(alloc, home);
@@ -136,10 +145,7 @@ pub fn listFromHome(alloc: Allocator, home: []const u8) Error![]Summary {
     for (names.items) |name| {
         var profile = try loadFromHome(alloc, home, name);
         defer profile.deinit(alloc);
-        summaries[built] = .{
-            .name = try alloc.dupe(u8, profile.name),
-            .description = try alloc.dupe(u8, profile.description),
-        };
+        summaries[built] = try initSummary(alloc, profile.name, profile.description);
         built += 1;
     }
     return summaries;
@@ -191,10 +197,16 @@ pub fn parse(alloc: Allocator, bytes: []const u8) Error!Profile {
     const profile_name = name orelse return error.InvalidProfile;
     try validateProfileName(profile_name);
     const profile_description = description orelse return error.InvalidProfile;
+    const owned_name = try alloc.dupe(u8, profile_name);
+    errdefer alloc.free(owned_name);
+    const owned_description = try alloc.dupe(u8, profile_description);
+    errdefer alloc.free(owned_description);
+    const owned_model = if (model) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (owned_model) |value| alloc.free(value);
     return .{
-        .name = try alloc.dupe(u8, profile_name),
-        .description = try alloc.dupe(u8, profile_description),
-        .model = if (model) |value| try alloc.dupe(u8, value) else null,
+        .name = owned_name,
+        .description = owned_description,
+        .model = owned_model,
         .effort = effort,
         .permission_mode = permission_mode,
         .instructions = try alloc.dupe(u8, body),
@@ -238,4 +250,34 @@ test "profile parser rejects unknown fields" {
         \\---
         \\Review.
     ));
+}
+
+fn checkParseAllocationFailures(alloc: Allocator) !void {
+    var profile = try parse(alloc,
+        \\---
+        \\name: reviewer
+        \\description: Reviews code
+        \\model: test/model
+        \\---
+        \\Review independently.
+    );
+    profile.deinit(alloc);
+}
+
+fn checkSummaryAllocationFailures(alloc: Allocator) !void {
+    var summary = try initSummary(alloc, "reviewer", "Reviews code");
+    summary.deinit(alloc);
+}
+
+test "profile owned values clean every failing allocation path" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkParseAllocationFailures,
+        .{},
+    );
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkSummaryAllocationFailures,
+        .{},
+    );
 }

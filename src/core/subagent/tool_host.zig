@@ -384,6 +384,18 @@ pub const Runtime = struct {
         if (command.* == .inspect) {
             return self.executeModelInspection(alloc, command.*, options);
         }
+        if (command.* == .create and
+            !try self.callerMayCreate(alloc, options.caller_id))
+        {
+            return boundedFailureAlloc(
+                alloc,
+                options.invocation_id,
+                null,
+                "invalid_state",
+                false,
+                options.max_result_bytes,
+            );
+        }
         if (command.* == .create) {
             applyCreateProfile(alloc, &command.create) catch |err| {
                 if (err == error.OutOfMemory) return error.OutOfMemory;
@@ -411,18 +423,6 @@ pub const Runtime = struct {
                     options.max_result_bytes,
                 );
             };
-        }
-        if (command.* == .create and
-            !try self.callerMayCreate(alloc, options.caller_id))
-        {
-            return boundedFailureAlloc(
-                alloc,
-                options.invocation_id,
-                null,
-                "invalid_state",
-                false,
-                options.max_result_bytes,
-            );
         }
         if (!try self.admitModelCommand(
             alloc,
@@ -3114,6 +3114,7 @@ test "one off caller cannot create before identity or child allocation" {
 
     var nested_create = try domain.validateCommand(alloc, .{ .create = .{
         .name = "must not exist",
+        .profile = "../must-not-be-read",
         .mode = .persistent,
     } });
     defer nested_create.deinit(alloc);
