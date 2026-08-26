@@ -13,6 +13,7 @@ const tool_set_contract = @import("../core/tooling/tool_set.zig");
 const tool_specs = @import("../core/tooling/tool_specs.zig");
 const tracked_file_mutations = @import("../core/tooling/tracked_file_mutations.zig");
 const types = @import("../core/shared/types.zig");
+const lexical_relevance = @import("../core/shared/lexical_relevance.zig");
 const permission_gate = @import("../core/permissions/permission_gate.zig");
 const ask_user_question_impl = @import("../tools/agent/ask_user_question.zig");
 const subagent_impl = @import("../tools/agent/subagent.zig");
@@ -35,6 +36,8 @@ const read_tool_result_impl = @import("../tools/session/read_tool_result.zig");
 const terminal_impl = @import("../tools/terminal/terminal.zig");
 const install_skill_impl = @import("../tools/skills/install_skill.zig");
 const skill_impl = @import("../tools/skills/skill.zig");
+const skill_search_impl = @import("../tools/skills/skill_search.zig");
+const capability_search_impl = @import("../tools/capabilities/capability_search.zig");
 const web_fetch_impl = @import("../tools/web/fetch.zig");
 const web_search_impl = @import("../tools/web/search.zig");
 const test_io_mod = if (std_builtin.is_test)
@@ -356,6 +359,10 @@ const terminal_exec_only_gateway_required = blk: {
 };
 const skill_description =
     "Read an installed skill or one of its relative text resources in bounded chunks. Pass the exact advertised location when one is listed, then use next_offset to continue. When to use: the user explicitly invokes a listed skill or the task clearly matches one. When NOT to use: generic exploration, ordinary file edits, guessing from vague words, or installing a missing skill.";
+const skill_search_description =
+    "Search bounded metadata for installed skills by natural-language use case without loading skill instructions. When to use: a task may match an installed skill but its exact name is unknown. When NOT to use: an exact skill is already known, ordinary local inspection is sufficient, or the user asks to install a missing skill. After discovery, call skill with the returned exact name and location.";
+const capability_search_description =
+    "Search installed skill metadata and configured MCP tool metadata together from one natural-language task. When to use: the task may need a specialized capability but its exact skill or MCP tool name is unknown. When NOT to use: the exact capability is already advertised, or ordinary local inspection, execution, web, or user interaction is sufficient. After discovery, call skill with an exact returned name and location, or mcp_select_tool with an exact returned MCP tool name.";
 const install_skill_description =
     "Install a reusable skill from a supported source into fx managed skill storage. When to use: the user asks to install a skill or pastes a skills install command. When NOT to use: no installation is required, install packages, fetch unrelated repos, or modify project code.";
 const mcp_search_tools_description =
@@ -1061,6 +1068,65 @@ pub fn terminalExecOnlySpec() ToolSpec {
     return terminal_exec_only;
 }
 
+pub const skill_search = ToolSpec{
+    .name = "skill_search",
+    .description = skill_search_description,
+    .model_schema = .{
+        .name = "skill_search",
+        .description = skill_search_description,
+        .input_schema = .{
+            .properties = &.{
+                .{ .name = "query", .json_type = .string, .bounds = &.{ .max_length = lexical_relevance.max_query_bytes }, .description = "Natural-language use case over installed skill names and descriptions." },
+            },
+            .required = &.{"query"},
+            .additional_properties = false,
+        },
+    },
+    .model_visible = false,
+    .executor_kind = .skill,
+    .activity_kind = .read,
+    .requires_approval = false,
+    .action_label = "Searching skills",
+    .completed_action_label = "Searched skills",
+    .label_arg_kind = .query,
+    .label_arg_default = "skills",
+    .permission_target_kind = .none,
+    .decode = skill_search_impl.decode,
+    .validate = skill_search_impl.validate,
+    .call = skill_search_impl.call,
+    .reads_only_fn = skill_search_impl.readsOnly,
+    .irreversible_fn = skill_search_impl.isIrreversible,
+};
+
+pub const capability_search = ToolSpec{
+    .name = "capability_search",
+    .description = capability_search_description,
+    .model_schema = .{
+        .name = "capability_search",
+        .description = capability_search_description,
+        .input_schema = .{
+            .properties = &.{
+                .{ .name = "query", .json_type = .string, .bounds = &.{ .max_length = lexical_relevance.max_query_bytes }, .description = "Natural-language task over installed skills and configured MCP tools." },
+            },
+            .required = &.{"query"},
+            .additional_properties = false,
+        },
+    },
+    .executor_kind = .skill,
+    .activity_kind = .read,
+    .requires_approval = false,
+    .action_label = "Searching capabilities",
+    .completed_action_label = "Searched capabilities",
+    .label_arg_kind = .query,
+    .label_arg_default = "capabilities",
+    .permission_target_kind = .none,
+    .decode = capability_search_impl.decode,
+    .validate = capability_search_impl.validate,
+    .call = capability_search_impl.call,
+    .reads_only_fn = capability_search_impl.readsOnly,
+    .irreversible_fn = capability_search_impl.isIrreversible,
+};
+
 pub const skill = ToolSpec{
     .name = "skill",
     .description = skill_description,
@@ -1161,12 +1227,13 @@ pub const mcp_search_tools = ToolSpec{
         .description = mcp_search_tools_description,
         .input_schema = .{
             .properties = &.{
-                .{ .name = "query", .json_type = .string, .description = "Keyword query over dynamic tool name, description, server, input schema, and tags." },
+                .{ .name = "query", .json_type = .string, .bounds = &.{ .max_length = lexical_relevance.max_query_bytes }, .description = "Keyword query over dynamic tool name, description, server, input schema, and tags." },
                 .{ .name = "limit", .json_type = .integer, .description = "Optional maximum results to return. Defaults to 8 and is capped." },
             },
             .required = &.{"query"},
         },
     },
+    .model_visible = false,
     .executor_kind = .mcp_search_tools,
     .activity_kind = .read,
     .requires_approval = false,
@@ -1376,6 +1443,8 @@ pub const all = [_]tool_dispatch.Tool{
     web_fetch,
     web_search,
     terminal,
+    capability_search,
+    skill_search,
     skill,
     install_skill,
     subagent,
@@ -1417,7 +1486,7 @@ test "built-in model-facing tool contract stays byte exact" {
 
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
-        "e431263d93dfb3fe4fc744c34ff7f4e6572c6020db1f3953e03fdfa358d09f9d",
+        "61c2e9be3a3b512eaf2d56f64bbe635f92c75b2605885d5c65167ce1e8f2466c",
         &actual_hex,
     );
 }
@@ -1928,9 +1997,9 @@ pub const advertisement_order = [_][]const u8{
     "create_folder",
     "terminal",
     "subagent",
+    "capability_search",
     "skill",
     "install_skill",
-    "mcp_search_tools",
     "mcp_select_tool",
     "mcp_features",
     "memory",
@@ -2000,6 +2069,8 @@ test "built-in tools register exact active local order" {
         "web_fetch",
         "web_search",
         "terminal",
+        "capability_search",
+        "skill_search",
         "skill",
         "install_skill",
         "subagent",
@@ -2012,8 +2083,9 @@ test "built-in tools register exact active local order" {
     };
 
     try std.testing.expectEqual(expected_names.len, all.len);
-    for (expected_names, all) |expected, tool| {
-        try std.testing.expectEqualStrings(expected, tool.name);
+    for (expected_names, 0..) |expected, index| {
+        if (index >= all.len) return error.TestExpectedEqual;
+        try std.testing.expectEqualStrings(expected, all[index].name);
     }
 }
 
@@ -2023,6 +2095,10 @@ test "built-in tool lookup and metadata use registered defaults" {
     try std.testing.expectEqual(types.ToolActivityKind.command, toolActivityKind("terminal"));
     try std.testing.expect(toolRequiresApproval("terminal"));
     try std.testing.expect(toolHasPermissionContract("terminal"));
+    try std.testing.expect(lookup("capability_search") != null);
+    try std.testing.expect(lookup("skill_search") != null);
+    try std.testing.expect(!skill_search.model_visible);
+    try std.testing.expect(!mcp_search_tools.model_visible);
     try std.testing.expect(lookup("run_command") == null);
     try std.testing.expect(lookup("missing_tool") == null);
 }
@@ -2647,6 +2723,41 @@ test "built-in install_skill owns product metadata and schema" {
     try std.testing.expectEqualStrings("Installed skill", install_skill.completed_action_label);
 }
 
+test "built-in skill_search owns bounded metadata schema and callbacks" {
+    const schema_json = try tool_specs.toolGatewaySchemaJson(std.testing.allocator, skill_search);
+    defer std.testing.allocator.free(schema_json);
+
+    try std.testing.expectEqualStrings("skill_search", skill_search.name);
+    try std.testing.expect(std.mem.find(u8, skill_search.description, "without loading skill instructions") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "\"query\":{\"type\":\"string\",\"maxLength\":4096") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "\"required\":[\"query\"]") != null);
+    try std.testing.expectEqual(tool_dispatch.ExecutorKind.skill, skill_search.executor_kind);
+    try std.testing.expectEqual(types.ToolActivityKind.read, skill_search.activity_kind);
+    try std.testing.expect(!skill_search.requires_approval);
+    try std.testing.expectEqual(tool_dispatch.LabelArgKind.query, skill_search.label_arg_kind);
+    try std.testing.expect(skill_search.decode == skill_search_impl.decode);
+    try std.testing.expect(skill_search.call == skill_search_impl.call);
+    try std.testing.expect(skill_search.reads_only_fn == skill_search_impl.readsOnly);
+}
+
+test "built-in capability_search owns unified bounded metadata schema and callbacks" {
+    const schema_json = try tool_specs.toolGatewaySchemaJson(std.testing.allocator, capability_search);
+    defer std.testing.allocator.free(schema_json);
+
+    try std.testing.expectEqualStrings("capability_search", capability_search.name);
+    try std.testing.expect(std.mem.find(u8, capability_search.description, "skill metadata and configured MCP tool metadata together") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "\"query\":{\"type\":\"string\",\"maxLength\":4096") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "\"required\":[\"query\"]") != null);
+    try std.testing.expect(capability_search.model_visible);
+    try std.testing.expectEqual(tool_dispatch.ExecutorKind.skill, capability_search.executor_kind);
+    try std.testing.expectEqual(types.ToolActivityKind.read, capability_search.activity_kind);
+    try std.testing.expect(!capability_search.requires_approval);
+    try std.testing.expectEqual(tool_dispatch.LabelArgKind.query, capability_search.label_arg_kind);
+    try std.testing.expect(capability_search.decode == capability_search_impl.decode);
+    try std.testing.expect(capability_search.call == capability_search_impl.call);
+    try std.testing.expect(capability_search.reads_only_fn == capability_search_impl.readsOnly);
+}
+
 test "built-in mcp_search_tools owns product metadata schema and callbacks" {
     const schema_json = try tool_specs.toolGatewaySchemaJson(std.testing.allocator, mcp_search_tools);
     defer std.testing.allocator.free(schema_json);
@@ -2656,6 +2767,7 @@ test "built-in mcp_search_tools owns product metadata schema and callbacks" {
     try std.testing.expect(std.mem.find(u8, mcp_search_tools.description, "metadata for configured MCP/dynamic tools") != null);
     try std.testing.expect(std.mem.find(u8, mcp_search_tools.description, "memory, skill, or ask-user work") == null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"query\":{\"type\":\"string\"") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "\"maxLength\":4096") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"limit\":{\"type\":\"integer\"") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"required\":[\"query\"]") != null);
     try std.testing.expectEqual(tool_dispatch.ExecutorKind.mcp_search_tools, mcp_search_tools.executor_kind);
