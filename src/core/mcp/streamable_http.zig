@@ -727,7 +727,7 @@ fn readJsonResponse(
     reader: *std.Io.Reader,
     request_id: i64,
     max_response_bytes: usize,
-    allow_null_error_id: bool,
+    allow_discovery_error_id_mismatch: bool,
 ) ![]u8 {
     var body_list: std.ArrayList(u8) = .empty;
     defer body_list.deinit(alloc);
@@ -742,7 +742,12 @@ fn readJsonResponse(
     }
     const body = try body_list.toOwnedSlice(alloc);
     errdefer alloc.free(body);
-    try validateFinalResponse(alloc, body, request_id, allow_null_error_id);
+    try validateFinalResponse(
+        alloc,
+        body,
+        request_id,
+        allow_discovery_error_id_mismatch,
+    );
     return body;
 }
 
@@ -985,7 +990,7 @@ fn validateFinalResponse(
     alloc: Allocator,
     body: []const u8,
     request_id: i64,
-    allow_null_error_id: bool,
+    allow_discovery_error_id_mismatch: bool,
 ) !void {
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch {
         return error.InvalidJsonResponse;
@@ -998,8 +1003,7 @@ fn validateFinalResponse(
     }
     const id_value = parsed.value.object.get("id") orelse return error.InvalidJsonResponse;
     const matching_id = id_value == .integer and id_value.integer == request_id;
-    const classifiable_discovery_error = allow_null_error_id and
-        id_value == .null and
+    const classifiable_discovery_error = allow_discovery_error_id_mismatch and
         parsed.value.object.contains("error") and
         !parsed.value.object.contains("result");
     if (!matching_id and !classifiable_discovery_error) {
@@ -1398,6 +1402,36 @@ test "modern MCP JSON responses are bounded and retain request ownership" {
     try std.testing.expectError(
         error.MismatchedResponseId,
         readJsonResponse(alloc, &strict_sdk_error_reader, 7, sdk_error.len, false),
+    );
+
+    const string_id_discovery_error =
+        "{\"jsonrpc\":\"2.0\",\"id\":\"server-error\",\"error\":{\"code\":-32600,\"message\":\"Unsupported protocol version\"}}";
+    var string_id_discovery_error_reader = std.Io.Reader.fixed(string_id_discovery_error);
+    const string_id_discovery_error_body = try readJsonResponse(
+        alloc,
+        &string_id_discovery_error_reader,
+        7,
+        string_id_discovery_error.len,
+        true,
+    );
+    defer alloc.free(string_id_discovery_error_body);
+    try std.testing.expectEqualStrings(
+        string_id_discovery_error,
+        string_id_discovery_error_body,
+    );
+
+    const string_id_success =
+        "{\"jsonrpc\":\"2.0\",\"id\":\"server-error\",\"result\":{}}";
+    var string_id_success_reader = std.Io.Reader.fixed(string_id_success);
+    try std.testing.expectError(
+        error.MismatchedResponseId,
+        readJsonResponse(
+            alloc,
+            &string_id_success_reader,
+            7,
+            string_id_success.len,
+            true,
+        ),
     );
 }
 
