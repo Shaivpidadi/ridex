@@ -44,6 +44,7 @@ const context_contract = @import("../workspace/context_contract.zig");
 const mode_registry = @import("../modes/mode_registry.zig");
 const mcp_contract = @import("../mcp/mcp_contract.zig");
 const mcp_command_provider = @import("../mcp/command_provider.zig");
+const mcp_health = @import("../mcp/health.zig");
 const mcp_runtime = @import("../mcp/mcp_runtime.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
@@ -1110,11 +1111,19 @@ fn runNonInteractiveWithDeps(
             try writeConfigDiagnostics(alloc, deps, startup.config_diagnostics);
             const mcp_config_diagnostic = try cfg.inspect_mcp_profile_config(alloc);
 
-            const snapshot = statusSnapshotFromStartupWithBuild(startup, .{
+            var mcp_inspection = try inspectLocalMcp(
+                alloc,
+                cfg,
+                startup.workspace_root,
+            );
+            defer mcp_inspection.deinit(alloc);
+
+            var snapshot = statusSnapshotFromStartupWithBuild(startup, .{
                 .channel = cfg.build_channel,
                 .version = cfg.version,
                 .revision = cfg.revision,
             }, mcp_config_diagnostic);
+            snapshot.mcp = mcp_inspection.view();
             if (opts.format == .json) {
                 try writeStatusJsonLine(alloc, deps, snapshot);
                 return .handled_success;
@@ -1232,7 +1241,15 @@ fn runNonInteractiveWithDeps(
             );
             defer snapshot.deinit(alloc);
 
-            const output_snapshot = doctorSnapshotFromRuntime(snapshot);
+            var mcp_inspection = try inspectLocalMcp(
+                alloc,
+                cfg,
+                snapshot.workspace_root,
+            );
+            defer mcp_inspection.deinit(alloc);
+
+            var output_snapshot = doctorSnapshotFromRuntime(snapshot);
+            output_snapshot.mcp = mcp_inspection.view();
             if (opts.format == .json) {
                 try writeDoctorJsonLine(alloc, deps, output_snapshot);
                 return .handled_success;
@@ -2117,6 +2134,58 @@ const McpCommandRuntime = struct {
     }
 };
 
+const LocalMcpInspection = struct {
+    runtime: ?*mcp_runtime.McpRuntime = null,
+    snapshot: ?mcp_health.Snapshot = null,
+    inspection_error: ?[]const u8 = null,
+
+    fn deinit(self: *LocalMcpInspection, alloc: Allocator) void {
+        if (self.snapshot) |*snapshot| snapshot.deinit(alloc);
+        if (self.runtime) |runtime| {
+            runtime.deinit();
+            alloc.destroy(runtime);
+        }
+        self.* = .{};
+    }
+
+    fn view(self: *const LocalMcpInspection) output_contracts.McpLocalSnapshot {
+        const snapshot = self.snapshot orelse return .{
+            .inspection_error = self.inspection_error,
+        };
+        return .{
+            .servers = snapshot.servers,
+            .configuration_issues = snapshot.configuration_issues,
+            .inspection_error = self.inspection_error,
+        };
+    }
+};
+
+fn inspectLocalMcp(
+    alloc: Allocator,
+    cfg: Config,
+    workspace_root: []const u8,
+) !LocalMcpInspection {
+    const runtime = cfg.load_mcp_runtime(
+        alloc,
+        workspace_root,
+        .{ .form = true, .url = true },
+    ) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        return .{ .inspection_error = @errorName(err) };
+    } orelse return .{};
+    var result = LocalMcpInspection{ .runtime = runtime };
+    errdefer result.deinit(alloc);
+    result.snapshot = runtime.snapshotHealth(
+        alloc,
+        @intCast(@max(io_mod.milliTimestamp(), 0)),
+    ) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        result.inspection_error = @errorName(err);
+        return result;
+    };
+    return result;
+}
+
 fn loadMcpCommandRuntime(
     alloc: Allocator,
     cfg: Config,
@@ -2231,7 +2300,8 @@ fn runTopLevelMcp(
         return .handled_success;
     }
     if (std.mem.eql(u8, operation, "list")) {
-        if (rest.len != 1) {
+        const connect = rest.len == 2 and std.mem.eql(u8, rest[1], "--connect");
+        if (rest.len != 1 and !connect) {
             try writeTopLevelUsage(cfg.command_catalog, deps, .mcp);
             return .handled_failure;
         }
@@ -2242,7 +2312,11 @@ fn runTopLevelMcp(
         defer loaded.deinit(alloc);
         try writeConfigDiagnostics(alloc, deps, loaded.startup.config_diagnostics);
         const listing = if (loaded.runtime) |runtime| listing: {
-            try runtime.loadStoredCredentialsForHealthSnapshot();
+            if (connect) {
+                runtime.connectAll(cfg.tool_set.registry);
+            } else {
+                try runtime.loadStoredCredentialsForHealthSnapshot();
+            }
             break :listing try runtime.listServersAndTools(alloc);
         } else try alloc.dupe(u8, "No MCP servers configured.\n");
         defer alloc.free(listing);
@@ -5385,13 +5459,13 @@ test "runIfRequested local json success appends exactly one newline" {
     const result = try runIfRequestedWithDeps(std.testing.allocator, &.{ @constCast("status"), @constCast("--json") }, testConfig(), deps);
     try std.testing.expectEqual(RunResult.handled_success, result);
     try std.testing.expectEqualStrings(
-        "{\"kind\":\"status\",\"model\":\"test-model\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"missing\",\"auth_refreshable\":false,\"auth_help\":\"Fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.\",\"permission_mode\":\"auto\",\"workspace\":\"/tmp/fx\",\"history_turns\":0,\"session_permission_grants\":0,\"agent_step_limit\":42}\n",
+        "{\"kind\":\"status\",\"model\":\"test-model\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"missing\",\"auth_refreshable\":false,\"auth_help\":\"Fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.\",\"permission_mode\":\"auto\",\"workspace\":\"/tmp/fx\",\"history_turns\":0,\"session_permission_grants\":0,\"agent_step_limit\":42,\"mcp\":{\"connection_check\":\"not_checked\",\"servers\":[],\"configuration_issues\":[],\"inspection_error\":null}}\n",
         capture.stdout.written(),
     );
     try std.testing.expect(!std.mem.endsWith(u8, capture.stdout.written(), "\n\n"));
 }
 
-test "status and doctor inspect the supplied MCP profile diagnostic once" {
+test "status and doctor inspect MCP configuration once per command" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -5424,7 +5498,7 @@ test "status and doctor inspect the supplied MCP profile diagnostic once" {
     );
     try std.testing.expectEqual(RunResult.handled_success, status_result);
     try std.testing.expectEqual(@as(usize, 1), mcp_config_inspection_calls_for_test);
-    try std.testing.expectEqual(@as(usize, 0), mcp_runtime_load_calls_for_test);
+    try std.testing.expectEqual(@as(usize, 1), mcp_runtime_load_calls_for_test);
     try std.testing.expect(std.mem.find(
         u8,
         status_capture.stdout.written(),
@@ -5432,6 +5506,7 @@ test "status and doctor inspect the supplied MCP profile diagnostic once" {
     ) != null);
 
     mcp_config_inspection_calls_for_test = 0;
+    mcp_runtime_load_calls_for_test = 0;
     var doctor_capture = CaptureOutput.init(alloc);
     defer doctor_capture.deinit();
     const doctor_result = try runIfRequestedWithDeps(
@@ -5442,7 +5517,7 @@ test "status and doctor inspect the supplied MCP profile diagnostic once" {
     );
     try std.testing.expectEqual(RunResult.handled_success, doctor_result);
     try std.testing.expectEqual(@as(usize, 1), mcp_config_inspection_calls_for_test);
-    try std.testing.expectEqual(@as(usize, 0), mcp_runtime_load_calls_for_test);
+    try std.testing.expectEqual(@as(usize, 1), mcp_runtime_load_calls_for_test);
     try std.testing.expectEqual(
         @as(usize, 1),
         std.mem.count(

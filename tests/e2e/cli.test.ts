@@ -38,6 +38,11 @@ const NO_GATEWAY_AUTH = {
 };
 const MISSING_AUTH_MESSAGE =
   "Fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.";
+const MODERN_MCP_FIXTURE = join(
+  import.meta.dirname,
+  "fixtures",
+  "mcp-modern-stdio.mjs",
+);
 
 const KEYCHAIN_SERVICE = "FX_AI_GATEWAY_API_KEY";
 
@@ -4965,6 +4970,68 @@ describe("cli: workspace access", () => {
 });
 
 describe("cli: MCP profile add", () => {
+  test("status and doctor inspect MCP without transport while list --connect discovers it", async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-cli-mcp-inspect-")));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    const pidPath = join(root, "mcp.pid");
+    mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
+    mkdirSync(workspace);
+    writeFileSync(join(home, ".fx", "settings.json"), "{}\n", { mode: 0o600 });
+    writeFileSync(
+      join(home, ".fx", "mcp.json"),
+      JSON.stringify({
+        mcp: {
+          fixture: {
+            type: "local",
+            command: [process.execPath, MODERN_MCP_FIXTURE],
+            environment: { FX_MCP_PID_PATH: pidPath },
+          },
+        },
+      }),
+      { mode: 0o600 },
+    );
+    const env = { HOME: home, ...NO_GATEWAY_AUTH };
+    try {
+      const status = await runFx(["status", "--json"], { cwd: workspace, env });
+      expect(status.code).toBe(0);
+      expect(JSON.parse(status.stdout.trim()).mcp).toMatchObject({
+        connection_check: "not_checked",
+        servers: [{
+          name: "fixture",
+          source: "profile",
+          connection: "not_checked",
+          authentication: "not_checked",
+        }],
+      });
+      expect(existsSync(pidPath)).toBe(false);
+
+      const doctor = await runFx(["doctor", "--json"], { cwd: workspace, env });
+      expect(doctor.code).toBe(0);
+      expect(JSON.parse(doctor.stdout.trim()).mcp.connection_check).toBe(
+        "not_checked",
+      );
+      expect(existsSync(pidPath)).toBe(false);
+
+      const passive = await runFx(["mcp", "list"], { cwd: workspace, env });
+      expect(passive.code).toBe(0);
+      expect(passive.stdout).toContain("state=disconnected");
+      expect(existsSync(pidPath)).toBe(false);
+
+      const connected = await runFx(
+        ["mcp", "list", "--connect"],
+        { cwd: workspace, env, timeoutMs: TIMEOUT },
+      );
+      expect(connected.code).toBe(0);
+      expect(connected.stderr).toBe("");
+      expect(connected.stdout).toContain("state=ready");
+      expect(connected.stdout).toContain("tools=1");
+      expect(existsSync(pidPath)).toBe(true);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   test("lists paths and removes profile servers without launching MCP transport", async () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-cli-mcp-manage-")));
     const home = join(root, "home");
