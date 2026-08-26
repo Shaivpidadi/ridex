@@ -204,6 +204,7 @@ fn collectFinalityNominations(
 
 pub const TranscriptPreparationSource = struct {
     bytes: []u8,
+    entry_spans: []transcript_blocks.EntryByteSpan = &.{},
     folded_summary_indices: []usize,
     line_provenance: []const transcript_blocks.LineProvenance = &.{},
     preview: render_engine.frame_layout.TranscriptFlowPreview,
@@ -227,6 +228,7 @@ pub const TranscriptPreparationSource = struct {
 
     pub fn deinit(self: *TranscriptPreparationSource, alloc: Allocator) void {
         if (self.bytes.len > 0) alloc.free(self.bytes);
+        if (self.entry_spans.len > 0) alloc.free(self.entry_spans);
         if (self.folded_summary_indices.len > 0) alloc.free(self.folded_summary_indices);
         if (self.line_provenance.len > 0) alloc.free(self.line_provenance);
         if (self.hard_line_starts.len > 0) alloc.free(self.hard_line_starts);
@@ -279,6 +281,11 @@ pub const TranscriptPreparationSource = struct {
     pub fn clone(self: *const TranscriptPreparationSource, alloc: Allocator) !TranscriptPreparationSource {
         const bytes = try alloc.dupe(u8, self.bytes);
         errdefer alloc.free(bytes);
+        const entry_spans = try alloc.dupe(
+            transcript_blocks.EntryByteSpan,
+            self.entry_spans,
+        );
+        errdefer if (entry_spans.len > 0) alloc.free(entry_spans);
         const folded_summary_indices = try alloc.dupe(usize, self.folded_summary_indices);
         errdefer alloc.free(folded_summary_indices);
         const line_provenance = try alloc.dupe(
@@ -301,6 +308,7 @@ pub const TranscriptPreparationSource = struct {
         errdefer finality.deinit(alloc);
         return .{
             .bytes = bytes,
+            .entry_spans = entry_spans,
             .folded_summary_indices = folded_summary_indices,
             .line_provenance = line_provenance,
             .preview = self.preview,
@@ -467,7 +475,9 @@ fn prepareTranscriptSourceInternal(
     var folded_summary_indices: []usize = &.{};
     errdefer if (folded_summary_indices.len > 0) alloc.free(folded_summary_indices);
     var line_provenance: []const transcript_blocks.LineProvenance = &.{};
+    var entry_spans: []transcript_blocks.EntryByteSpan = &.{};
     errdefer if (line_provenance.len > 0) alloc.free(line_provenance);
+    errdefer if (entry_spans.len > 0) alloc.free(entry_spans);
     var trailing_boundary_blank_rows: u16 = 0;
     var tracked_entry_start_line: ?usize = null;
     var replaceable_entry_start_byte: ?usize = null;
@@ -554,6 +564,7 @@ fn prepareTranscriptSourceInternal(
         bytes = rendered.bytes;
         folded_summary_indices = rendered.folded_summary_indices;
         line_provenance = rendered.line_provenance;
+        entry_spans = rendered.entry_spans;
         trailing_boundary_blank_rows = rendered.trailing_boundary_blank_rows;
         tracked_entry_start_line = rendered.target_entry_start_line;
         replaceable_entry_start_byte = rendered.target_entry_start_byte;
@@ -710,6 +721,7 @@ fn prepareTranscriptSourceInternal(
 
     return .{
         .bytes = bytes,
+        .entry_spans = entry_spans,
         .folded_summary_indices = folded_summary_indices,
         .line_provenance = line_provenance,
         .preview = preview,

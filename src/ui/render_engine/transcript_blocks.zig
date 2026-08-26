@@ -205,7 +205,7 @@ pub fn blockGapRowsBetween(prev: TranscriptBlockKind, next: TranscriptBlockKind)
     return default_block_gap_policy.gapBetween(prev, next);
 }
 
-fn blockKindForEntry(entry: TranscriptEntry) TranscriptBlockKind {
+pub fn blockKindForEntry(entry: TranscriptEntry) TranscriptBlockKind {
     return switch (entry) {
         .raw_bytes => |e| blockKindForRawClass(e.class),
         .semantic_notice => |e| blockKindForNoticeTone(e.tone),
@@ -1872,6 +1872,16 @@ const RenderedEntries = struct {
     bytes: []u8,
     target_entry_start_line: ?usize,
     target_entry_start_byte: ?usize,
+    entry_spans: []EntryByteSpan = &.{},
+};
+
+pub const EntryByteSpan = struct {
+    entry_id: u32,
+    kind: TranscriptBlockKind,
+    start: usize,
+    content_start: usize,
+    end: usize,
+    ends_with_newline: bool = false,
 };
 
 const BlockSequenceState = struct {
@@ -1919,6 +1929,7 @@ const RenderEntriesOptions = struct {
     summary_transcript_indices: []usize = &.{},
     line_provenance: ?*std.ArrayList(LineProvenance) = null,
     entry_overrides: []const EntryRenderOverride = &.{},
+    capture_entry_spans: bool = false,
 
     fn resetSummaryIndices(self: RenderEntriesOptions) void {
         std.debug.assert(self.summary_entry_ids.len == self.summary_transcript_indices.len);
@@ -1961,6 +1972,7 @@ const RenderEntriesOptions = struct {
 
 const RenderEntriesBuilder = struct {
     out: std.ArrayList(u8) = .empty,
+    entry_spans: std.ArrayList(EntryByteSpan) = .empty,
     sequence: BlockSequenceState = .{},
     line_index: usize = 0,
     target_entry_start_line: ?usize = null,
@@ -1968,6 +1980,7 @@ const RenderEntriesBuilder = struct {
 
     fn deinit(self: *RenderEntriesBuilder, alloc: Allocator) void {
         self.out.deinit(alloc);
+        self.entry_spans.deinit(alloc);
     }
 
     fn appendSeparatorBefore(
@@ -2021,7 +2034,9 @@ const RenderEntriesBuilder = struct {
         options: RenderEntriesOptions,
         checkpoint: ?*build_checkpoint.BuildCheckpoint,
     ) !void {
+        const span_start = self.out.items.len;
         try self.appendSeparatorBefore(alloc, block.kind, options.line_provenance);
+        const content_start = self.out.items.len;
 
         const entry_id = entry.id();
         if (options.target_entry_id == entry_id) self.target_entry_start_line = self.line_index;
@@ -2039,6 +2054,17 @@ const RenderEntriesBuilder = struct {
         }
 
         try self.out.appendSlice(alloc, block.bytes);
+        if (options.capture_entry_spans) {
+            try self.entry_spans.append(alloc, .{
+                .entry_id = entry_id,
+                .kind = block.kind,
+                .start = span_start,
+                .content_start = content_start,
+                .end = self.out.items.len,
+                .ends_with_newline = self.out.items.len > span_start and
+                    self.out.items[self.out.items.len - 1] == '\n',
+            });
+        }
         try appendBlockProvenance(alloc, options.line_provenance, entry, block);
         for (block.bytes) |byte| {
             try build_checkpoint.tick(checkpoint);
@@ -2049,10 +2075,18 @@ const RenderEntriesBuilder = struct {
 
     fn finish(self: *RenderEntriesBuilder, alloc: Allocator) !RenderedEntries {
         try self.out.appendNTimes(alloc, '\n', self.sequence.finalNewlineCount());
+        if (self.entry_spans.items.len > 0) {
+            self.entry_spans.items[self.entry_spans.items.len - 1].end = self.out.items.len;
+            self.entry_spans.items[self.entry_spans.items.len - 1].ends_with_newline =
+                self.out.items.len > 0 and self.out.items[self.out.items.len - 1] == '\n';
+        }
+        const entry_spans = try self.entry_spans.toOwnedSlice(alloc);
+        errdefer if (entry_spans.len > 0) alloc.free(entry_spans);
         return .{
             .bytes = try self.out.toOwnedSlice(alloc),
             .target_entry_start_line = self.target_entry_start_line,
             .target_entry_start_byte = self.target_entry_start_byte,
+            .entry_spans = entry_spans,
         };
     }
 };
@@ -2242,11 +2276,13 @@ pub const TranscriptPreparationBytes = struct {
     target_entry_start_byte: ?usize = null,
     folded_summary_indices: []usize,
     line_provenance: []const LineProvenance = &.{},
+    entry_spans: []EntryByteSpan = &.{},
 
     pub fn deinit(self: *TranscriptPreparationBytes, alloc: Allocator) void {
         alloc.free(self.bytes);
         alloc.free(self.folded_summary_indices);
         if (self.line_provenance.len > 0) alloc.free(self.line_provenance);
+        if (self.entry_spans.len > 0) alloc.free(self.entry_spans);
         self.* = undefined;
     }
 };
@@ -2297,7 +2333,7 @@ pub fn renderEntriesForPreparationInterruptible(
     errdefer alloc.free(summary_indices);
     var line_provenance: std.ArrayList(LineProvenance) = .empty;
     errdefer line_provenance.deinit(alloc);
-    const rendered = try renderEntriesInterruptible(
+    var rendered = try renderEntriesInterruptible(
         alloc,
         entries,
         cols,
@@ -2313,10 +2349,12 @@ pub fn renderEntriesForPreparationInterruptible(
             .summary_transcript_indices = summary_indices,
             .line_provenance = if (options.capture_provenance) &line_provenance else null,
             .entry_overrides = options.entry_overrides,
+            .capture_entry_spans = true,
         },
         checkpoint,
     );
     errdefer alloc.free(rendered.bytes);
+    errdefer if (rendered.entry_spans.len > 0) alloc.free(rendered.entry_spans);
 
     const boundary = splitTrailingBoundaryRows(rendered.bytes);
     const kept_line_count = renderedHardLineCount(rendered.bytes[0..boundary.content_len]);
@@ -2337,11 +2375,20 @@ pub fn renderEntriesForPreparationInterruptible(
             .target_entry_start_byte = rendered.target_entry_start_byte,
             .folded_summary_indices = summary_indices,
             .line_provenance = owned_provenance,
+            .entry_spans = rendered.entry_spans,
         };
     }
 
     const trimmed = try alloc.dupe(u8, rendered.bytes[0..boundary.content_len]);
     alloc.free(rendered.bytes);
+    if (rendered.entry_spans.len > 0) {
+        rendered.entry_spans[rendered.entry_spans.len - 1].end = @min(
+            rendered.entry_spans[rendered.entry_spans.len - 1].end,
+            boundary.content_len,
+        );
+        const last = &rendered.entry_spans[rendered.entry_spans.len - 1];
+        last.ends_with_newline = last.end > last.start and trimmed[last.end - 1] == '\n';
+    }
     return .{
         .bytes = trimmed,
         .trailing_boundary_blank_rows = boundary.blank_rows,
@@ -2349,6 +2396,7 @@ pub fn renderEntriesForPreparationInterruptible(
         .target_entry_start_byte = rendered.target_entry_start_byte,
         .folded_summary_indices = summary_indices,
         .line_provenance = owned_provenance,
+        .entry_spans = rendered.entry_spans,
     };
 }
 
@@ -3517,6 +3565,26 @@ test "renderEntriesToBytes normalizes raw byte entry tails and inserts block gap
     const out = try renderEntriesToBytes(alloc, entries.items, 80, .{});
     defer alloc.free(out);
     try std.testing.expectEqualStrings("first\n\nsecond\n", out);
+}
+
+test "preparation records entry byte spans including their leading separators" {
+    const alloc = std.testing.allocator;
+    var entries: std.ArrayList(TranscriptEntry) = .empty;
+    defer deinitTestEntries(&entries, alloc);
+    try appendRawTestEntry(&entries, alloc, 1, "one", .unknown_raw);
+    try appendRawTestEntry(&entries, alloc, 2, "two", .unknown_raw);
+
+    var prepared = try renderEntriesForPreparation(
+        alloc,
+        entries.items,
+        80,
+        .{},
+        .{},
+    );
+    defer prepared.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), prepared.entry_spans.len);
+    try std.testing.expectEqual(EntryByteSpan{ .entry_id = 1, .kind = .unknown_raw, .start = 0, .content_start = 0, .end = 3, .ends_with_newline = false }, prepared.entry_spans[0]);
+    try std.testing.expectEqual(EntryByteSpan{ .entry_id = 2, .kind = .unknown_raw, .start = 3, .content_start = 5, .end = 8, .ends_with_newline = false }, prepared.entry_spans[1]);
 }
 
 test "compact presentation hides context notices while full presentation retains them" {

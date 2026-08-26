@@ -50,8 +50,7 @@ fn BootstrapDeps(comptime App: type) type {
             bool,
         ) anyerror!void;
         const InitializePersistenceFn = *const fn (*App, bool) anyerror!void;
-        const StageRequestedResumeViewFn = *const fn (*App) app_session_runtime.ResumeViewStage;
-        const PublishStagedResumeViewFn = *const fn (*App, u32) anyerror!void;
+        const StageRequestedSessionTranscriptFn = *const fn (*App) anyerror!void;
         const LoadSkillsFn = *const fn (
             Allocator,
             []const u8,
@@ -63,8 +62,7 @@ fn BootstrapDeps(comptime App: type) type {
         bootstrap_interactive_app: BootstrapInteractiveAppFn,
         configure_session_preferences: ConfigureSessionPreferencesFn,
         initialize_persistence: InitializePersistenceFn,
-        stage_requested_resume_view: StageRequestedResumeViewFn,
-        publish_staged_resume_view: PublishStagedResumeViewFn,
+        stage_requested_session_transcript: StageRequestedSessionTranscriptFn,
         load_mcp_runtime: mcp_runtime.LoadRuntimeFn,
         load_skills: LoadSkillsFn,
         skill_root_policy: skill_contract.RootPolicy,
@@ -102,8 +100,7 @@ pub fn Runtime(comptime App: type) type {
                 .bootstrap_interactive_app = bootstrapInteractiveAppDefault,
                 .configure_session_preferences = configureSessionPreferencesDefault,
                 .initialize_persistence = initializePersistenceDefault,
-                .stage_requested_resume_view = stageRequestedResumeViewDefault,
-                .publish_staged_resume_view = publishStagedResumeViewDefault,
+                .stage_requested_session_transcript = stageRequestedSessionTranscriptDefault,
                 .load_mcp_runtime = capability_providers.load_mcp_runtime,
                 .load_skills = app_runtime_setup.loadSkills,
                 .skill_root_policy = capability_providers.skill_root_policy,
@@ -128,12 +125,8 @@ pub fn Runtime(comptime App: type) type {
             );
         }
 
-        fn stageRequestedResumeViewDefault(app: *App) app_session_runtime.ResumeViewStage {
-            return app_session_runtime.Runtime(App).stageRequestedResumeView(app);
-        }
-
-        fn publishStagedResumeViewDefault(app: *App, entry_id: u32) !void {
-            try app_session_runtime.Runtime(App).publishStagedResumeView(app, entry_id);
+        fn stageRequestedSessionTranscriptDefault(app: *App) !void {
+            try app_session_runtime.Runtime(App).stageRequestedSessionTranscript(app);
         }
 
         fn configureSessionPreferencesDefault(
@@ -317,10 +310,9 @@ pub fn Runtime(comptime App: type) type {
                 app,
                 app.requested_resume != null,
             );
-            const staged_resume_view = if (app.requested_resume != null)
-                deps.stage_requested_resume_view(app)
-            else
-                app_session_runtime.ResumeViewStage.none;
+            if (app.requested_resume != null) {
+                try deps.stage_requested_session_transcript(app);
+            }
             const profile_mcp = try deps.load_mcp_runtime(
                 app.alloc,
                 app.workspace_root,
@@ -466,10 +458,6 @@ pub fn Runtime(comptime App: type) type {
                 app_session_runtime.Runtime(App).syncTerminalTitleWith(app, deps.terminal_title);
             }
 
-            switch (staged_resume_view) {
-                .none => {},
-                .ready => |entry_id| try deps.publish_staged_resume_view(app, entry_id),
-            }
             app.shell.render_requests.request(.first_frame);
         }
     };
@@ -643,8 +631,7 @@ fn testDeps() BootstrapDeps(TestApp) {
         .bootstrap_interactive_app = bootstrapInteractiveAppForTest,
         .configure_session_preferences = configureSessionPreferencesForTest,
         .initialize_persistence = initializePersistenceForTest,
-        .stage_requested_resume_view = stageRequestedResumeViewForTest,
-        .publish_staged_resume_view = publishStagedResumeViewForTest,
+        .stage_requested_session_transcript = stageRequestedSessionTranscriptForTest,
         .load_mcp_runtime = loadMcpRuntimeForTest,
         .load_skills = loadSkillsForTest,
         .skill_root_policy = .{
@@ -739,14 +726,8 @@ fn initializePersistenceForTest(
     active_capture.?.initialize_required = required;
 }
 
-fn stageRequestedResumeViewForTest(_: *TestApp) app_session_runtime.ResumeViewStage {
-    active_capture.?.recordEvent("resume_view_stage");
-    return .{ .ready = 1 };
-}
-
-fn publishStagedResumeViewForTest(_: *TestApp, entry_id: u32) !void {
-    try std.testing.expectEqual(@as(u32, 1), entry_id);
-    active_capture.?.recordEvent("resume_view_publish");
+fn stageRequestedSessionTranscriptForTest(_: *TestApp) !void {
+    active_capture.?.recordEvent("session_transcript_stage");
 }
 
 fn loadMcpRuntimeForTest(_: Allocator, _: []const u8, _: @import("../mcp/elicitation.zig").Capabilities) !?*mcp_runtime.McpRuntime {
@@ -987,13 +968,12 @@ test "app_bootstrap_runtime stages requested sessions with the first frame pendi
     try std.testing.expectEqualStrings("", app.transcript.items);
     try std.testing.expect(!app.transcript_recorded);
     const events = capture.eventSlice();
-    try std.testing.expectEqualStrings("resume_view_stage", events[0]);
+    try std.testing.expectEqualStrings("session_transcript_stage", events[0]);
     try std.testing.expectEqualStrings("load_mcp", events[1]);
     try std.testing.expectEqualStrings("load_skills", events[2]);
-    try std.testing.expectEqualStrings("resume_view_publish", events[3]);
 }
 
-test "app_bootstrap_runtime publishes a staged resume view after startup notices" {
+test "app_bootstrap_runtime streams the session transcript before startup notices" {
     const alloc = std.testing.allocator;
     var capture = TestCapture.init(alloc);
     capture.emit_skill_diagnostic = true;
@@ -1006,12 +986,11 @@ test "app_bootstrap_runtime publishes a staged resume view after startup notices
     try std.testing.expectEqualSlices(
         []const u8,
         &.{
-            "resume_view_stage",
+            "session_transcript_stage",
             "load_mcp",
             "load_skills",
             "welcome",
             "welcome",
-            "resume_view_publish",
         },
         capture.eventSlice(),
     );

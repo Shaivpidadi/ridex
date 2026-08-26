@@ -2558,7 +2558,7 @@ describe("effect-aware command permissions", () => {
       activeSession = null;
 
       rmSync(
-        join(root.home, ".fx", "sessions", sessionId, "resume-view.bin"),
+        join(root.home, ".fx", "sessions", sessionId, "transcript.meta"),
         { force: true },
       );
       activeSession = await TmuxSession.create({

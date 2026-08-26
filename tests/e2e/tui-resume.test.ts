@@ -4476,6 +4476,68 @@ test.skipIf(!tmuxAvailable())(
 );
 
 test.skipIf(!tmuxAvailable())(
+  "corrupt committed transcript fails closed before the composer",
+  async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-corrupt-transcript-")));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    const stderrPath = join(root, "stderr.log");
+    mkdirSync(home);
+    mkdirSync(workspace);
+    const marker = "CORRUPT_TRANSCRIPT_SEED_MARKER";
+    const seedGateway = startFakeGateway([fakeGatewayFinalText(marker)]);
+    let active: TmuxSession | null = null;
+
+    try {
+      writeFileSync(stderrPath, "");
+      active = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: workspace,
+        env: gatewayEnv(home, seedGateway),
+        stderrPath,
+      });
+      await active.waitForComposer(TIMEOUT);
+      await active.sendText("Create a session whose transcript metadata will be corrupted.");
+      await active.waitForText(marker, TIMEOUT);
+      await active.sendText("/quit");
+      expect(await active.waitForSessionEnd()).toBe(true);
+      await active.kill();
+      active = null;
+
+      const sessionId = sessionIdFromHome(home);
+      writeFileSync(
+        join(home, ".fx", "sessions", sessionId, "transcript.meta"),
+        "malformed",
+      );
+      const resumeGateway = startFakeGateway([]);
+      try {
+        writeFileSync(stderrPath, "");
+        active = await TmuxSession.create({
+          cmd: `${FX_BIN} --resume-${sessionId}`,
+          cwd: workspace,
+          env: gatewayEnv(home, resumeGateway),
+          stderrPath,
+          remainOnExit: true,
+        });
+        await active.waitForPane(() => active!.paneStatus().dead, TIMEOUT);
+        expect(active.paneStatus()).toEqual({ dead: true, status: 1 });
+        expect(await active.capturePane()).not.toContain("auto ·");
+        expect(readFileSync(stderrPath, "utf8")).toContain("CorruptSessionTranscript");
+        await active.kill();
+        active = null;
+      } finally {
+        resumeGateway.stop();
+      }
+    } finally {
+      if (active) await active.kill();
+      seedGateway.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT * 2,
+);
+
+test.skipIf(!tmuxAvailable())(
   "interactive resume aliases restore history and return to a live composer",
   async () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-resume-")));
@@ -4513,15 +4575,22 @@ test.skipIf(!tmuxAvailable())(
       expect(readFileSync(stderrPath, "utf8")).not.toContain("AnsiBandOverflow");
 
       const sessionId = sessionIdFromHome(home);
-      const resumeViewPath = join(
+      const transcriptPath = join(
         home,
         ".fx",
         "sessions",
         sessionId,
-        "resume-view.bin",
+        "transcript.ansi",
       );
-      expect(existsSync(resumeViewPath)).toBe(true);
-      const initialResumeView = readFileSync(resumeViewPath);
+      const transcriptMetadataPath = join(
+        home,
+        ".fx",
+        "sessions",
+        sessionId,
+        "transcript.meta",
+      );
+      expect(existsSync(transcriptPath)).toBe(true);
+      expect(existsSync(transcriptMetadataPath)).toBe(true);
 
       const pickerGateway = startFakeGateway([]);
       gateways.push(pickerGateway);
@@ -4549,7 +4618,6 @@ test.skipIf(!tmuxAvailable())(
       await active.kill();
       active = null;
       expect(readFileSync(stderrPath, "utf8")).toBe("");
-      writeFileSync(resumeViewPath, initialResumeView);
 
       const invocations = [
         ["-c"],
@@ -4584,6 +4652,7 @@ test.skipIf(!tmuxAvailable())(
         await active.waitForComposer(TIMEOUT);
         const scrollback = await waitForScrollback(active, restoredMarker);
         expect(scrollback).toContain(restoredMarker);
+        expect(countOccurrences(scrollback, restoredMarker)).toBe(1);
         await active.sendText(`Continue session ${index}.`);
         await active.waitForText(followUp, TIMEOUT);
         expect(sessionIdFromHome(home)).toBe(sessionId);
@@ -4594,25 +4663,28 @@ test.skipIf(!tmuxAvailable())(
         active = null;
         expect(readFileSync(stderrPath, "utf8")).toBe("");
         const resumeTrace = readFileSync(tracePath, "utf8");
-        expect(resumeTrace).toMatch(
-          /event=resume_view_cache (?:outcome=painted freshness=exact|outcome=skipped freshness=(?:exact|older))/,
-        );
+        expect(resumeTrace).toMatch(/event=session_transcript_stream outcome=exact bytes=\d+/);
+        if (resumeTrace.includes("event=session_transcript outcome=degraded")) {
+          console.error(
+            resumeTrace
+              .split("\n")
+              .filter((line) => line.includes("event=session_transcript outcome=degraded"))
+              .join("\n"),
+          );
+        }
+        expect(resumeTrace).not.toContain("event=session_transcript outcome=degraded");
         const replay = await runFx(["replay", tapePath, "--frames"], {
           cwd: workspaceRoot,
           env: { HOME: home },
         });
         expect(replay.code).toBe(0);
         expect(replay.stderr).toBe("");
-        expect(replay.stdout).not.toMatch(/Run \/help for commands/i);
         const firstApplicationFrame = replay.stdout
           .split(/(?=--- frame \d+)/)
           .find((frame) =>
             /Recording:|Session:|Run \/help for commands|auto ·/.test(frame),
           );
         expect(firstApplicationFrame).toContain(restoredMarker);
-        if (index === 0) {
-          writeFileSync(resumeViewPath, initialResumeView);
-        }
       }
 
       const markdownHome = join(root, "markdown-home");

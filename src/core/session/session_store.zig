@@ -141,7 +141,7 @@ pub fn imageSnapshotStorageDir(
 pub const ReadOnlyDetail = store_types.ReadOnlyDetail;
 pub const ResumeOptions = store_types.ResumeOptions;
 pub const ResumeTarget = store_types.ResumeTarget;
-pub const ResumeViewAdmission = session_log.ResumeViewAdmission;
+pub const TranscriptAdmission = session_log.TranscriptAdmission;
 pub const SessionMigrationResult = store_types.SessionMigrationResult;
 pub const SessionMigrationStatus = store_types.SessionMigrationStatus;
 pub const SessionRecoveryResult = store_types.SessionRecoveryResult;
@@ -1002,30 +1002,24 @@ pub const Store = struct {
         );
     }
 
-    pub fn admitResumeView(
+    pub fn admitTranscript(
         self: Store,
         alloc: Allocator,
         target: ResumeTarget,
-    ) !?ResumeViewAdmission {
+    ) !?TranscriptAdmission {
         var root = self.canonical_root;
         return switch (target) {
-            .id => |id| try root.admitResumeView(alloc, id),
+            .id => |id| try root.admitTranscript(alloc, id),
             .last => blk: {
                 if (self.deferredCacheInvalidatesReads()) {
                     var latest = try self.latestReadOnlyWorkspaceSummary(alloc);
                     defer latest.deinit(alloc);
-                    break :blk try root.admitResumeView(
-                        alloc,
-                        latest.id,
-                    );
+                    break :blk try root.admitTranscript(alloc, latest.id);
                 }
                 var latest = (try readLatestPointer(self, alloc, self.workspace_root)) orelse
                     return null;
                 defer latest.deinit(alloc);
-                break :blk try root.admitResumeView(
-                    alloc,
-                    latest.session_id,
-                );
+                break :blk try root.admitTranscript(alloc, latest.session_id);
             },
         };
     }
@@ -1054,10 +1048,10 @@ pub const Store = struct {
         return self.finishResumedForWrite(alloc, loaded, options);
     }
 
-    pub fn resumeAdmittedForWrite(
+    pub fn resumeTranscriptAdmittedForWrite(
         self: Store,
         alloc: Allocator,
-        admission: *ResumeViewAdmission,
+        admission: *TranscriptAdmission,
         expected_session_id: []const u8,
         workspace_root: []const u8,
         options: ResumeOptions,
@@ -8247,7 +8241,7 @@ test "writable resume last selects canonically while deferred repair is busy" {
     );
     writer.deinit(alloc);
 
-    var admission = (try ctx.store.admitResumeView(alloc, .last)) orelse
+    var admission = (try ctx.store.admitTranscript(alloc, .last)) orelse
         return error.TestExpectedEqual;
     try std.testing.expectEqualStrings("dirty-resume-a", admission.sessionId());
     admission.deinit(alloc);

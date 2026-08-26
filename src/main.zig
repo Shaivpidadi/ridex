@@ -1266,7 +1266,7 @@ const App = struct {
         );
     }
 
-    pub fn installResumeProjection(
+    pub fn installResumeProjectionRetained(
         self: *App,
         projection: *ResumeProjection,
     ) !void {
@@ -1280,7 +1280,7 @@ const App = struct {
         }
         projection.pending_diffs.clearRetainingCapacity();
         self.next_diff_id = projection.next_diff_id;
-        projection.install(&self.shell);
+        projection.installRetained(&self.shell);
     }
 
     pub fn historicalToolActivityKind(
@@ -1294,8 +1294,8 @@ const App = struct {
         try self.flushRequestedFrame();
     }
 
-    pub fn persistResumeViewAfterFrame(self: *App) void {
-        SessionAppRuntime.persistResumeViewAfterFrame(self);
+    pub fn persistSessionTranscriptAfterFrame(self: *App) void {
+        SessionAppRuntime.persistSessionTranscriptAfterFrame(self);
     }
 
     pub fn flushDirectTerminalShutdownOutcome(self: *App) !void {
@@ -4168,6 +4168,7 @@ test {
     _ = @import("ui/footer/surface_invalidation.zig");
     _ = @import("ui/full_transcript_screen.zig");
     _ = @import("ui/render_engine/frame_fixed_point.zig");
+    _ = @import("ui/transcript/resume_projection.zig");
     _ = @import("ui/transcript/runtime.zig");
     _ = @import("ui/transcript/runtime_tests.zig");
     _ = @import("core/agent/worker_runtime.zig");

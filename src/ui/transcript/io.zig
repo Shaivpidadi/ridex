@@ -53,6 +53,26 @@ pub fn writeFrameBytes(shell: anytype, metrics: *Metrics, bytes: []const u8) ter
     return recordCompleteFrame(metrics, bytes);
 }
 
+/// Resume-only terminal edge. `writeFrameBytes` remains the sole physical
+/// writer; this helper mirrors exactly the accepted prefix into the shadow VT.
+pub fn writeResumeStreamBytes(
+    shell: anytype,
+    metrics: *Metrics,
+    bytes: []const u8,
+) !void {
+    const result = writeFrameBytes(shell, metrics, bytes);
+    const accepted_len = switch (result) {
+        .complete => bytes.len,
+        .partial => |partial| partial.accepted_bytes,
+    };
+    const shadow = shell.shadow_vt orelse return error.ShadowTerminalUnavailable;
+    if (accepted_len > 0) try shadow.feed(bytes[0..accepted_len]);
+    switch (result) {
+        .complete => {},
+        .partial => |partial| return partial.err,
+    }
+}
+
 fn recordPartialFrame(metrics: *Metrics, accepted: []const u8, err: anyerror) terminal_diff.FrameSinkWriteResult {
     record_tape.recordStdout(accepted);
     metrics.ansi_bytes += accepted.len;
@@ -95,6 +115,27 @@ test "writeFrameBytes writes the frame without feeding shadow" {
     try std.testing.expect(writeFrameBytes(&shell, &metrics, "abc") == .complete);
     try std.testing.expectEqual(@as(u21, ' '), shadow.cellAt(1, 1).?.codepoint);
     try std.testing.expectEqual(@as(usize, 3), metrics.ansi_bytes);
+}
+
+test "resume stream writer feeds every accepted byte to the shadow" {
+    const FakeShell = struct {
+        stdout_file: std.Io.File,
+        shadow_vt: ?*vt_emulator.Grid = null,
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var file = try tmp.dir.createFile(std.testing.io, "resume-stream.log", .{ .read = true });
+    defer file.close(io_mod.getIo());
+    var shadow = try vt_emulator.Grid.init(std.testing.allocator, 8, 4);
+    defer shadow.deinit();
+    shadow.autowrap = false;
+    var shell = FakeShell{ .stdout_file = file, .shadow_vt = &shadow };
+    var metrics: Metrics = .{};
+
+    try writeResumeStreamBytes(&shell, &metrics, "\x1b[?7h123456789\x1b[?7l");
+    try std.testing.expect(!shadow.autowrap);
+    try std.testing.expectEqual(@as(u21, '9'), shadow.cellAt(2, 1).?.codepoint);
+    try std.testing.expectEqual(@as(usize, 19), metrics.ansi_bytes);
 }
 
 test "standalone presentation bell is written without changing the shadow grid" {

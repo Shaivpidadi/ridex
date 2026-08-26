@@ -394,7 +394,15 @@ pub const ResumeProjection = struct {
         self.finalized = true;
     }
 
-    pub fn install(self: *ResumeProjection, target: *TranscriptRuntime) void {
+    pub fn publicationBytes(self: *const ResumeProjection) []const u8 {
+        std.debug.assert(self.finalized);
+        std.debug.assert(!self.consumed);
+        return self.publication_source.?.bytes;
+    }
+
+    /// Installs structured continuation state after historical bytes were
+    /// already written directly to the terminal. No pending source is armed.
+    pub fn installRetained(self: *ResumeProjection, target: *TranscriptRuntime) void {
         std.debug.assert(self.finalized);
         std.debug.assert(!self.consumed);
         std.debug.assert(target.pending_resume_source == null);
@@ -421,12 +429,13 @@ pub const ResumeProjection = struct {
         target.replaceable_last_line = self.runtime.replaceable_last_line;
         target.replaceable_row = self.runtime.replaceable_row;
         target.replaceable_start = self.runtime.replaceable_start;
-        target.pending_resume_source = self.publication_source;
-        self.publication_source = null;
         target.recomputeCursorFromTranscript();
-        target.reconcileDetachedInstallSource(target.pendingResumeFlow());
+        target.reconcileDetachedInstallSource(self.publication_source.?.bytes);
         target.markTranscriptDirty();
 
+        var publication = self.publication_source.?;
+        self.publication_source = null;
+        publication.deinit(self.alloc);
         self.consumed = true;
         self.runtime.deinit(self.alloc);
     }
@@ -526,42 +535,32 @@ test "empty resume projection keeps layout without source conversation" {
     try std.testing.expectEqual(@as(usize, 1), source.entries.items.len);
 }
 
-test "resume projection installs complete publication and retained continuation together" {
+test "resume projection can install retained continuation without publication" {
     const alloc = std.testing.allocator;
     var source: TranscriptRuntime = .{};
     source.layout = .{
-        .rows = 40,
-        .cols = 80,
-        .content_bottom = 36,
-        .divider_top_row = 37,
-        .input_row = 38,
-        .divider_bottom_row = 39,
-        .hint_row = 40,
+        .rows = 24,
+        .cols = 72,
+        .content_bottom = 20,
+        .divider_top_row = 21,
+        .input_row = 22,
+        .divider_bottom_row = 23,
+        .hint_row = 24,
     };
-    source.max_retained_transcript_bytes = 96;
     defer source.deinit(alloc);
-
     var target: TranscriptRuntime = .{};
     target.layout = source.layout;
-    target.max_retained_transcript_bytes = source.max_retained_transcript_bytes;
     defer target.deinit(alloc);
 
-    var projection = try ResumeProjection.init(alloc, &source, 42, 1);
+    var projection = try ResumeProjection.initEmpty(alloc, &source, 42, 1);
     defer projection.deinit();
-    for (0..12) |index| {
-        var text: [64]u8 = undefined;
-        const line = try std.fmt.bufPrint(&text, "publication marker {d}\n", .{index});
-        _ = try projection.appendRawClassified(line, .unknown_raw);
-    }
+    _ = try projection.appendRawClassified("retained marker\n", .unknown_raw);
     try projection.finalize();
-    projection.install(&target);
+    projection.installRetained(&target);
 
-    try std.testing.expect(std.mem.find(u8, target.pendingResumeFlow(), "publication marker 0") != null);
-    try std.testing.expect(std.mem.find(u8, target.pendingResumeFlow(), "publication marker 11") != null);
-    try std.testing.expect(target.entries.items.len < 12);
-    var prepared = try target.prepareTranscriptSource(alloc, null);
-    defer prepared.deinit(alloc);
-    try std.testing.expectEqualStrings(target.pendingResumeFlow(), prepared.bytes);
+    try std.testing.expectEqual(@as(usize, 0), target.pendingResumeFlow().len);
+    try std.testing.expectEqual(@as(usize, 1), target.entries.items.len);
+    try std.testing.expect(std.mem.find(u8, target.transcript.items, "retained marker") != null);
 }
 
 test "resume projection transfers a complete standalone runtime" {

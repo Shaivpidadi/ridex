@@ -36,7 +36,7 @@ const captured_command = @import("../tooling/captured_command.zig");
 const tool_result_errors = @import("../tooling/tool_result_errors.zig");
 const session_display_metadata = @import("../session/session_display_metadata.zig");
 const session_log = @import("../session/session_log.zig");
-const session_resume_view = @import("../session/session_resume_view.zig");
+const session_transcript = @import("../session/session_transcript.zig");
 const session_store = @import("../session/session_store.zig");
 const session_summary_codec = @import("../session/session_summary_codec.zig");
 const subagent_tool_host = @import("../subagent/tool_host.zig");
@@ -54,6 +54,104 @@ const ui_input = @import("../../ui/input/runtime.zig");
 const ui_render = @import("../../ui/render.zig");
 
 const Allocator = std.mem.Allocator;
+
+const resume_stream_autowrap_enable = "\x1b[?7h";
+const resume_stream_autowrap_disable = "\x1b[?7l";
+const resume_stream_read_bytes: usize = 64 * 1024;
+const resume_stream_first_read_bytes: usize = 1024;
+
+fn streamSessionTranscript(app: anytype, reader: anytype) !u64 {
+    try app.shell.writeResumeStreamBytes(
+        &app.metrics,
+        resume_stream_autowrap_enable,
+    );
+    const payload_result = streamSessionTranscriptPayload(app, reader);
+    if (payload_result) |payload_bytes| {
+        try app.shell.writeResumeStreamBytes(
+            &app.metrics,
+            resume_stream_autowrap_disable,
+        );
+        app.shell.adoptStreamedSessionHistory();
+        return payload_bytes;
+    } else |payload_err| {
+        app.shell.writeResumeStreamBytes(
+            &app.metrics,
+            resume_stream_autowrap_disable,
+        ) catch |restore_err| {
+            debug_trace.logf(
+                "session",
+                "event=session_transcript_stream outcome=failed stage=restore payload_err={s} restore_err={s}",
+                .{ @errorName(payload_err), @errorName(restore_err) },
+            );
+            return error.TerminalModeRestoreFailed;
+        };
+        return payload_err;
+    }
+}
+
+fn streamSessionTranscriptPayload(app: anytype, reader: anytype) !u64 {
+    var storage: [resume_stream_read_bytes + session_transcript.max_control_sequence_bytes]u8 = undefined;
+    var carry_len: usize = 0;
+    var read_offset: u64 = 0;
+    var emitted_bytes: u64 = 0;
+    var last_emitted: ?u8 = null;
+    while (true) {
+        const read_capacity = if (read_offset == 0 and carry_len == 0)
+            resume_stream_first_read_bytes
+        else
+            resume_stream_read_bytes;
+        const read = try reader.readAt(
+            storage[carry_len .. carry_len + read_capacity],
+            read_offset,
+        );
+        read_offset = std.math.add(u64, read_offset, @intCast(read)) catch
+            return error.TranscriptTooLarge;
+        const total = carry_len + read;
+        const eof = read == 0;
+        const safe_len = try session_transcript.validatedPrefix(storage[0..total], eof);
+        if (safe_len > 0) {
+            try app.shell.writeResumeStreamBytes(
+                &app.metrics,
+                storage[0..safe_len],
+            );
+            if (emitted_bytes == 0) {
+                debug_trace.logf(
+                    "session",
+                    "event=session_transcript_stream outcome=first_payload bytes={d}",
+                    .{safe_len},
+                );
+            }
+            emitted_bytes = std.math.add(u64, emitted_bytes, @intCast(safe_len)) catch
+                return error.TranscriptTooLarge;
+            last_emitted = storage[safe_len - 1];
+        }
+        const remainder = total - safe_len;
+        if (remainder > session_transcript.max_control_sequence_bytes) {
+            return error.InvalidTranscriptGrammar;
+        }
+        if (remainder > 0) {
+            std.mem.copyForwards(u8, storage[0..remainder], storage[safe_len..total]);
+        }
+        carry_len = remainder;
+        if (eof) break;
+    }
+    if (last_emitted != '\n' and last_emitted != '\r') {
+        try app.shell.writeResumeStreamBytes(&app.metrics, "\r\n");
+    }
+    return emitted_bytes;
+}
+
+const MemoryTranscriptReader = struct {
+    bytes: []const u8,
+
+    fn readAt(self: MemoryTranscriptReader, buffer: []u8, offset: u64) !usize {
+        const start = std.math.cast(usize, offset) orelse return error.TranscriptTooLarge;
+        if (start >= self.bytes.len) return 0;
+        const len = @min(buffer.len, self.bytes.len - start);
+        @memcpy(buffer[0..len], self.bytes[start..][0..len]);
+        return len;
+    }
+};
 
 const BackgroundSessionPolicy = enum {
     carry_forward,
@@ -241,11 +339,6 @@ pub const ResumeHandoffIntent = enum {
 const ResumeNotice = union(enum) {
     session,
     upgrade: []const u8,
-};
-
-pub const ResumeViewStage = union(enum) {
-    none,
-    ready: u32,
 };
 
 pub const ResumeHandoffState = struct {
@@ -1087,7 +1180,9 @@ pub const Persistence = struct {
     degraded_warning_emitted: bool = false,
     pending_cancelled_command: ?PendingCancelledCommand = null,
     image_snapshot_temp_dir: ?[]u8 = null,
-    resume_view_admission: ?session_store.ResumeViewAdmission = null,
+    transcript_admission: ?session_store.TranscriptAdmission = null,
+    resume_transcript_committed_len: ?u64 = null,
+    resume_transcript_streamed: bool = false,
     resume_handoff_intent: ResumeHandoffIntent = .none,
     pending_live_session_policy: ?BackgroundSessionPolicy = null,
 
@@ -1100,7 +1195,7 @@ pub const Persistence = struct {
             );
         }
         if (self.pending_cancelled_command) |*pending| pending.discard(alloc);
-        if (self.resume_view_admission) |*admission| admission.deinit(alloc);
+        if (self.transcript_admission) |*admission| admission.deinit(alloc);
         if (self.image_snapshot_temp_dir) |path| {
             image_attachments.cleanupSnapshotDir(path);
             alloc.free(path);
@@ -1122,136 +1217,142 @@ pub const Persistence = struct {
 
 pub fn Runtime(comptime App: type) type {
     return struct {
-        pub fn stageRequestedResumeView(app: *App) ResumeViewStage {
-            const requested = app.requested_resume orelse return .none;
-            const store = app.session_persistence.store orelse return .none;
+        pub fn stageRequestedSessionTranscript(app: *App) !void {
+            const requested = app.requested_resume orelse return;
+            const store = app.session_persistence.store orelse return;
             const target: session_store.ResumeTarget = switch (requested) {
-                .pick => return .none,
+                .pick => return,
                 .last => .last,
                 .id => |session_id| .{ .id = session_id },
             };
-            var admission = (subagent_resume_admission.admitResumeViewForExternalPrompt(
+            debug_trace.logf(
+                "session",
+                "event=session_transcript_resume stage=selection target={s}",
+                .{switch (target) {
+                    .last => "last",
+                    .id => "id",
+                }},
+            );
+            var admission = (try subagent_resume_admission.admitTranscriptForExternalPrompt(
                 store,
                 app.alloc,
                 target,
-            ) catch |err| {
-                traceResumeViewUnavailable(err);
-                return .none;
-            }) orelse {
-                debug_trace.logf("session", "event=resume_view_cache outcome=missing", .{});
-                return .none;
-            };
+            )) orelse return;
             var admission_owned = true;
             defer if (admission_owned) admission.deinit(app.alloc);
-            var stage: ResumeViewStage = .none;
-            switch (admission.view) {
-                .missing, .invalid, .stale => debug_trace.logf(
-                    "session",
-                    "event=resume_view_cache outcome={s}",
-                    .{@tagName(admission.view)},
-                ),
-                .exact, .older => |view| {
-                    switch (requested) {
-                        .last => app.requested_resume = .{ .id = app.alloc.dupe(u8, view.session_id) catch |err| {
-                            traceResumeViewUnavailable(err);
-                            return .none;
-                        } },
-                        .pick, .id => {},
-                    }
-                    const freshness = std.meta.activeTag(admission.view);
-                    const paint_safe = freshness == .exact and view.capture.canPaintAt(
-                        app.shell.layout.rows,
-                        app.shell.layout.cols,
-                    );
-                    if (paint_safe) {
-                        const entry_id = app.shell.appendRawTranscriptEntryClassified(
-                            app.alloc,
-                            view.text,
-                            .unknown_raw,
-                        ) catch |err| {
-                            traceResumeViewUnavailable(err);
-                            return .none;
-                        };
-                        stage = .{ .ready = entry_id };
-                    }
-                    app.session_persistence.resume_view_admission = admission;
-                    admission_owned = false;
+
+            if (requested == .last) {
+                const selected_id = try app.alloc.dupe(u8, admission.sessionId());
+                app.requested_resume = .{ .id = selected_id };
+            }
+            try streamAdmittedTranscript(app, admission.transcript);
+            app.session_persistence.transcript_admission = admission;
+            admission_owned = false;
+        }
+
+        fn streamAdmittedTranscript(
+            app: *App,
+            transcript: session_transcript.Admission,
+        ) !void {
+            app.session_persistence.resume_transcript_committed_len = null;
+            app.session_persistence.resume_transcript_streamed = false;
+            switch (transcript) {
+                .exact => |reader| {
                     debug_trace.logf(
                         "session",
-                        "event=resume_view_cache outcome={s} freshness={s} complete={} cached={d}x{d} terminal={d}x{d} bytes={d}",
-                        .{
-                            if (paint_safe) "painted" else "skipped",
-                            @tagName(freshness),
-                            view.capture.complete,
-                            view.capture.terminal_cols,
-                            view.capture.terminal_rows,
-                            app.shell.layout.cols,
-                            app.shell.layout.rows,
-                            view.text.len,
-                        },
+                        "event=session_transcript_stream outcome=admitted bytes={d}",
+                        .{reader.committed_len},
+                    );
+                    const streamed = try streamSessionTranscript(app, &reader);
+                    if (streamed != reader.committed_len) {
+                        return error.TruncatedSessionTranscript;
+                    }
+                    app.session_persistence.resume_transcript_committed_len =
+                        reader.committed_len;
+                    app.session_persistence.resume_transcript_streamed = true;
+                    debug_trace.logf(
+                        "session",
+                        "event=session_transcript_stream outcome=exact bytes={d}",
+                        .{streamed},
                     );
                 },
+                .missing, .incomplete => {
+                    debug_trace.logf(
+                        "session",
+                        "event=session_transcript_stream outcome={s}",
+                        .{@tagName(transcript)},
+                    );
+                },
+                .corrupt => return error.CorruptSessionTranscript,
             }
-            return stage;
         }
 
-        pub fn publishStagedResumeView(app: *App, entry_id: u32) !void {
-            app.commitStartupResumeReplayAnchor() catch |err| {
-                traceResumeViewUnavailable(err);
-            };
-            _ = try app.shell.releaseStartupResumeViewEntry(
-                app.alloc,
-                entry_id,
-            );
-        }
+        pub fn persistSessionTranscriptAfterFrame(app: *App) void {
+            var pending = app.shell.takePendingPresentationRecord();
+            defer if (pending) |*value| value.deinit(app.alloc);
+            const restamp_ready = app.shell.takePresentationRecordRestamp();
+            if (pending == null and !restamp_ready) return;
 
-        fn traceResumeViewUnavailable(err: anyerror) void {
-            debug_trace.logf(
-                "session",
-                "event=resume_view_cache outcome=unavailable err={s}",
-                .{@errorName(err)},
-            );
-        }
-
-        pub fn persistResumeViewAfterFrame(app: *App) void {
-            if (app.stream.active) return;
-            if (comptime @hasField(App, "terminal")) {
-                if (app.terminal.alternate_screen_owner != .none) return;
-            }
             app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
             defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
-            const loaded = if (app.session_persistence.writable) |*value| value else return;
-            if (!loaded.resume_view_stale) return;
-            var snapshot = app.shell.snapshotVisibleTranscriptText(
-                app.alloc,
-                session_resume_view.max_text_bytes,
-            ) catch |err| {
-                debug_trace.logf(
-                    "session",
-                    "event=resume_view_cache outcome=capture_failed err={s}",
-                    .{@errorName(err)},
-                );
-                return;
-            } orelse return;
-            defer snapshot.deinit(app.alloc);
-            loaded.writeResumeView(app.alloc, .{
-                .terminal_rows = snapshot.terminal_rows,
-                .terminal_cols = snapshot.terminal_cols,
-                .complete = snapshot.complete,
-            }, snapshot.text) catch |err| {
-                debug_trace.logf(
-                    "session",
-                    "event=resume_view_cache outcome=write_failed err={s}",
-                    .{@errorName(err)},
-                );
+            const loaded = if (app.session_persistence.writable) |*value| value else {
+                app.shell.degradePresentationRecord();
                 return;
             };
-            loaded.resume_view_stale = false;
-            debug_trace.logf(
-                "session",
-                "event=resume_view_cache outcome=stored complete={} terminal={d}x{d} bytes={d}",
-                .{ snapshot.complete, snapshot.terminal_cols, snapshot.terminal_rows, snapshot.text.len },
-            );
+            const prior_committed_len = app.shell.presentationRecordCommittedLen() orelse return;
+            if (pending) |*delta| {
+                const next_committed_len: u64 = if (prior_committed_len == 0) blk: {
+                    loaded.publishTranscript(app.alloc, delta.bytes) catch |err| {
+                        debug_trace.logf(
+                            "session",
+                            "event=session_transcript outcome=degraded stage=publish err={s}",
+                            .{@errorName(err)},
+                        );
+                        app.shell.degradePresentationRecord();
+                        return;
+                    };
+                    break :blk @intCast(delta.bytes.len);
+                } else loaded.appendTranscript(
+                    app.alloc,
+                    prior_committed_len,
+                    delta.bytes,
+                ) catch |err| {
+                    debug_trace.logf(
+                        "session",
+                        "event=session_transcript outcome=degraded stage=append err={s}",
+                        .{@errorName(err)},
+                    );
+                    app.shell.degradePresentationRecord();
+                    return;
+                };
+                app.shell.commitPresentationRecord(
+                    delta.next_cursor,
+                    next_committed_len,
+                );
+                debug_trace.logf(
+                    "session",
+                    "event=session_transcript outcome=committed delta_bytes={d} committed_bytes={d}",
+                    .{ delta.bytes.len, next_committed_len },
+                );
+            } else if (restamp_ready and
+                prior_committed_len > 0 and
+                loaded.transcriptNeedsRestamp())
+            {
+                loaded.restampTranscript(app.alloc, prior_committed_len) catch |err| {
+                    debug_trace.logf(
+                        "session",
+                        "event=session_transcript outcome=degraded stage=caught_up_restamp err={s}",
+                        .{@errorName(err)},
+                    );
+                    app.shell.degradePresentationRecord();
+                    return;
+                };
+                debug_trace.logf(
+                    "session",
+                    "event=session_transcript outcome=restamped committed_bytes={d}",
+                    .{prior_committed_len},
+                );
+            }
         }
 
         pub fn captureImageAttachment(
@@ -1400,6 +1501,7 @@ pub fn Runtime(comptime App: type) type {
                 try warnNonDurable(app, "session creation failed", err);
                 return;
             };
+            app.shell.beginPresentationRecord();
             app.session_persistence.degraded_warning_emitted = false;
             app.total_input_tokens = 0;
             app.total_output_tokens = 0;
@@ -1508,10 +1610,11 @@ pub fn Runtime(comptime App: type) type {
             log_options: session_log.Options,
         ) !void {
             try prepareLiveSessionTransition(app, .stop_forget, log_options);
+            try app.shell.requestTerminalReset(&app.metrics);
+            try app.commitStartupResumeReplayAnchor();
         }
 
         pub fn finishLiveSessionResume(app: *App) !void {
-            try app.shell.requestTerminalReset(&app.metrics);
             app.shell.render_requests.request(.footer);
         }
 
@@ -1623,9 +1726,9 @@ pub fn Runtime(comptime App: type) type {
                 .last => .last,
                 .id => |session_id| .{ .id = session_id },
             };
-            var loaded = if (app.session_persistence.resume_view_admission) |saved| admitted: {
+            var loaded = if (app.session_persistence.transcript_admission) |saved| admitted: {
                 var admission = saved;
-                app.session_persistence.resume_view_admission = null;
+                app.session_persistence.transcript_admission = null;
                 defer admission.deinit(app.alloc);
                 const session_id = switch (resume_target) {
                     .id => |id| id,
@@ -1633,7 +1736,7 @@ pub fn Runtime(comptime App: type) type {
                 };
                 const store = app.session_persistence.store orelse
                     return error.SessionStoreUnavailable;
-                break :admitted try subagent_resume_admission.resumeAdmittedForExternalPrompt(
+                break :admitted try subagent_resume_admission.resumeTranscriptAdmittedForExternalPrompt(
                     store,
                     app.alloc,
                     &admission,
@@ -1807,19 +1910,44 @@ pub fn Runtime(comptime App: type) type {
 
         pub fn resumeSelectedSession(app: *App) !bool {
             const selected_id = app.session_persistence.session_picker.selectedId() orelse return false;
+            debug_trace.logf(
+                "session",
+                "event=session_transcript_resume stage=selection target=picker",
+                .{},
+            );
             const log_options = session_log.Options{
                 .session_lock_deadline_ms = 0,
                 .commit_lock_deadline_ms = 0,
             };
-            var loaded = try loadResumeTargetForWrite(
-                app,
+            const store = app.session_persistence.store orelse
+                return error.SessionStoreUnavailable;
+            var admission = (try subagent_resume_admission.admitTranscriptForExternalPrompt(
+                store,
+                app.alloc,
                 .{ .id = selected_id },
-                log_options,
+            )) orelse return error.SessionNotFound;
+            defer admission.deinit(app.alloc);
+            const admitted_id = admission.sessionId();
+            if (admission.transcript == .corrupt) {
+                return error.CorruptSessionTranscript;
+            }
+
+            try app.prepareLiveSessionResume(log_options);
+            try streamAdmittedTranscript(app, admission.transcript);
+            var loaded = try subagent_resume_admission.resumeTranscriptAdmittedForExternalPrompt(
+                store,
+                app.alloc,
+                &admission,
+                admitted_id,
+                app.workspace_root,
+                .{
+                    .seed_preferences = app.session_persistence.workspace_preferences,
+                    .log = log_options,
+                },
             );
             var loaded_owned = true;
             errdefer if (loaded_owned) loaded.deinit(app.alloc);
 
-            try app.prepareLiveSessionResume(log_options);
             loaded_owned = false;
             try installResumedSession(app, &loaded, .session);
             requestSubagentBackgroundRecovery(app);
@@ -1868,7 +1996,6 @@ pub fn Runtime(comptime App: type) type {
             }
             const active = &app.session_persistence.writable.?;
             try hydrateResumedSession(app, active.state, display.title, notice);
-            active.resume_view_stale = true;
             enableSessionStores(app);
             refreshSubagentProjectionAfterSessionInstall(app);
         }
@@ -1920,13 +2047,55 @@ pub fn Runtime(comptime App: type) type {
                     .app = app,
                     .projection = &projection,
                 };
-                try writeResumeNotice(app, &sink, display_title, notice);
                 try replayHistoryToSink(app, &sink, state.history);
                 try writeRecoveryCheckpointToSink(app, &sink, state);
                 const projection_finished_ns = io_mod.nanoTimestamp();
                 try projection.finalize();
                 const finalization_finished_ns = io_mod.nanoTimestamp();
-                try app.installResumeProjection(&projection);
+                var committed_len = app.session_persistence.resume_transcript_committed_len;
+                if (!app.session_persistence.resume_transcript_streamed) {
+                    const transcript_bytes = projection.publicationBytes();
+                    const streamed = try streamSessionTranscript(
+                        app,
+                        MemoryTranscriptReader{ .bytes = transcript_bytes },
+                    );
+                    if (streamed != @as(u64, @intCast(transcript_bytes.len))) {
+                        return error.TruncatedSessionTranscript;
+                    }
+                    if (app.session_persistence.writable) |*loaded| {
+                        if (loaded.publishTranscript(app.alloc, transcript_bytes)) |_| {
+                            committed_len = @intCast(transcript_bytes.len);
+                        } else |err| {
+                            debug_trace.logf(
+                                "session",
+                                "event=session_transcript outcome=degraded stage=backfill_publish err={s}",
+                                .{@errorName(err)},
+                            );
+                            committed_len = null;
+                        }
+                    }
+                } else if (committed_len) |len| {
+                    if (app.session_persistence.writable) |*loaded| {
+                        loaded.restampTranscript(app.alloc, len) catch |err| {
+                            debug_trace.logf(
+                                "session",
+                                "event=session_transcript outcome=degraded stage=resume_restamp err={s}",
+                                .{@errorName(err)},
+                            );
+                            committed_len = null;
+                        };
+                    }
+                }
+                try app.installResumeProjectionRetained(&projection);
+                var live_sink = LiveHistorySink(App){ .app = app };
+                try writeResumeNotice(app, &live_sink, display_title, notice);
+                if (committed_len) |len| {
+                    app.shell.resumePresentationRecord(len);
+                } else {
+                    app.shell.degradePresentationRecord();
+                }
+                app.session_persistence.resume_transcript_committed_len = null;
+                app.session_persistence.resume_transcript_streamed = false;
                 const install_finished_ns = io_mod.nanoTimestamp();
                 debug_trace.logf(
                     "session",
@@ -4371,6 +4540,19 @@ pub fn Runtime(comptime App: type) type {
                     .{ loaded.active_id, @errorName(err) },
                 );
             };
+            if (app.shell.presentationRecordCanRestamp() and
+                loaded.transcriptNeedsRestamp())
+            {
+                if (app.shell.presentationRecordCommittedLen()) |committed_len| {
+                    loaded.restampTranscript(app.alloc, committed_len) catch |err| {
+                        debug_trace.logf(
+                            "session",
+                            "event=session_transcript outcome=degraded stage=close_restamp err={s}",
+                            .{@errorName(err)},
+                        );
+                    };
+                }
+            }
             const should_create_handoff = resume_boundary_valid and
                 shouldCreateResumeHandoff(.{
                     .intent = handoff_intent,
@@ -7249,174 +7431,6 @@ test "execution replay keeps failed and unpaired persisted results visible witho
         },
         app.replay_events.items,
     );
-}
-
-test "safe last resume view paints and pins authoritative resume to its session id" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const paths = try testPaths(alloc, &tmp);
-    defer {
-        alloc.free(paths.home);
-        alloc.free(paths.workspace);
-    }
-    const home = try TestHome.install(alloc, paths.home);
-    defer home.deinit();
-    var app = try TestApp.init(alloc, paths.workspace);
-    defer app.deinit();
-
-    try configureTestPreferences(&app);
-    try Runtime(TestApp).initializePersistence(&app, true);
-    try writeSessionFixture(
-        alloc,
-        app.session_persistence.store.?,
-        "cached-session",
-        &.{},
-        0,
-    );
-    {
-        var fixture = try app.session_persistence.store.?.resumeForWrite(
-            alloc,
-            "cached-session",
-        );
-        defer fixture.deinit(alloc);
-        try fixture.writeResumeView(alloc, .{
-            .terminal_rows = 24,
-            .terminal_cols = 80,
-            .complete = true,
-        }, "cached transcript\n");
-    }
-
-    app.shell.layout.rows = 24;
-    app.shell.layout.cols = 80;
-    app.requested_resume = .last;
-    const stage = Runtime(TestApp).stageRequestedResumeView(&app);
-    try std.testing.expectEqual(@as(u32, 1), stage.ready);
-
-    try std.testing.expectEqualStrings("cached transcript\n", app.shell.transcript.items);
-    switch (app.requested_resume.?) {
-        .id => |session_id| try std.testing.expectEqualStrings("cached-session", session_id),
-        .pick, .last => return error.TestExpectedPinnedResumeSession,
-    }
-    try std.testing.expectError(
-        error.SessionBusy,
-        app.session_persistence.store.?.resumeTargetForWrite(
-            alloc,
-            .{ .id = "cached-session" },
-            paths.workspace,
-            .{ .log = .{ .session_lock_deadline_ms = 0 } },
-        ),
-    );
-    try Runtime(TestApp).publishStagedResumeView(&app, stage.ready);
-    try std.testing.expectEqual(@as(usize, 0), app.shell.transcript.items.len);
-    try std.testing.expectEqual(@as(usize, 1), app.startup_resume_anchor_count);
-    try Runtime(TestApp).resumeRequestedSession(&app);
-    try std.testing.expect(app.session_persistence.resume_view_admission == null);
-    try std.testing.expectEqualStrings(
-        "cached-session",
-        app.session_persistence.writable.?.active_id,
-    );
-}
-
-test "resume view policy denial does not paint or retain admission" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const paths = try testPaths(alloc, &tmp);
-    defer {
-        alloc.free(paths.home);
-        alloc.free(paths.workspace);
-    }
-    const home = try TestHome.install(alloc, paths.home);
-    defer home.deinit();
-    var app = try TestApp.init(alloc, paths.workspace);
-    defer app.deinit();
-
-    try configureTestPreferences(&app);
-    try Runtime(TestApp).initializePersistence(&app, true);
-    const store = app.session_persistence.store.?;
-    try writeSessionFixture(alloc, store, "malformed-child", &.{}, 0);
-    {
-        var fixture = try store.resumeForWrite(alloc, "malformed-child");
-        defer fixture.deinit(alloc);
-        try fixture.writeResumeView(alloc, .{
-            .terminal_rows = 24,
-            .terminal_cols = 80,
-            .complete = true,
-        }, "private cached transcript\n");
-        const capability = try fixture.childCapability();
-        var entry = try capability.atomicReplace(
-            alloc,
-            .subagent_control,
-            "control.json",
-            "{",
-        );
-        entry.deinit(alloc);
-    }
-
-    app.requested_resume = .last;
-    try std.testing.expectEqual(
-        ResumeViewStage.none,
-        Runtime(TestApp).stageRequestedResumeView(&app),
-    );
-
-    try std.testing.expectEqual(@as(usize, 0), app.transcript.items.len);
-    try std.testing.expect(app.session_persistence.resume_view_admission == null);
-    var loaded = try store.resumeForWrite(alloc, "malformed-child");
-    loaded.deinit(alloc);
-}
-
-test "resume view persistence waits for main frame and retries failed writes" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const paths = try testPaths(alloc, &tmp);
-    defer {
-        alloc.free(paths.home);
-        alloc.free(paths.workspace);
-    }
-    const home = try TestHome.install(alloc, paths.home);
-    defer home.deinit();
-    var app = try TestApp.init(alloc, paths.workspace);
-    defer app.deinit();
-
-    try configureTestPreferences(&app);
-    try Runtime(TestApp).initializePersistence(&app, true);
-    try Runtime(TestApp).beginFreshPersistedSession(&app);
-    app.shell.layout.rows = 6;
-    app.shell.layout.cols = 12;
-    try app.shell.enableShadowVt(alloc);
-    try app.shell.shadow_vt.?.feed("\x1b[1;1Hcached transcript");
-    app.shell.has_painted_transcript = true;
-    app.shell.last_visible_transcript_top_row = 1;
-    app.shell.last_visible_transcript_last_row = 1;
-
-    const loaded = &app.session_persistence.writable.?;
-    loaded.resume_view_stale = true;
-    app.terminal.alternate_screen_owner = .full_transcript;
-    Runtime(TestApp).persistResumeViewAfterFrame(&app);
-    try std.testing.expect(loaded.resume_view_stale);
-    app.terminal.alternate_screen_owner = .none;
-    try loaded.log.dir.dir.createDir(
-        std.testing.io,
-        "resume-view.bin",
-        std.Io.File.Permissions.fromMode(0o700),
-    );
-    Runtime(TestApp).persistResumeViewAfterFrame(&app);
-    try std.testing.expect(loaded.resume_view_stale);
-
-    try loaded.log.dir.dir.deleteDir(std.testing.io, "resume-view.bin");
-    Runtime(TestApp).persistResumeViewAfterFrame(&app);
-    try std.testing.expect(!loaded.resume_view_stale);
-    const stat = try loaded.log.dir.dir.statFile(
-        std.testing.io,
-        "resume-view.bin",
-        .{ .follow_symlinks = false },
-    );
-    try std.testing.expectEqual(std.Io.File.Kind.file, stat.kind);
 }
 
 test "upgrade resume restores active session with the installed version notice" {

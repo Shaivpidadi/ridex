@@ -217,27 +217,27 @@ pub fn resumeForExternalPrompt(
     return loaded;
 }
 
-pub fn admitResumeViewForExternalPrompt(
+pub fn admitTranscriptForExternalPrompt(
     store: session_store.Store,
     alloc: Allocator,
     target: session_store.ResumeTarget,
-) !?session_store.ResumeViewAdmission {
-    var admission = (try store.admitResumeView(alloc, target)) orelse return null;
+) !?session_store.TranscriptAdmission {
+    var admission = (try store.admitTranscript(alloc, target)) orelse return null;
     errdefer admission.deinit(alloc);
     try ensureExternalPromptAllowed(store, alloc, admission.sessionId(), true);
     return admission;
 }
 
-pub fn resumeAdmittedForExternalPrompt(
+pub fn resumeTranscriptAdmittedForExternalPrompt(
     store: session_store.Store,
     alloc: Allocator,
-    admission: *session_store.ResumeViewAdmission,
+    admission: *session_store.TranscriptAdmission,
     session_id: []const u8,
     workspace_root: []const u8,
     options: session_store.ResumeOptions,
 ) !session_store.LoadedWritableSession {
     try ensureExternalPromptAllowed(store, alloc, session_id, true);
-    var loaded = try store.resumeAdmittedForWrite(
+    var loaded = try store.resumeTranscriptAdmittedForWrite(
         alloc,
         admission,
         session_id,
@@ -406,7 +406,7 @@ test "external prompt resume rejects a canonical one-off child" {
         error.OneOffSessionNotResumable,
         "one-off-child",
     );
-    if (admitResumeViewForExternalPrompt(
+    if (admitTranscriptForExternalPrompt(
         env.store,
         alloc,
         .{ .id = "one-off-child" },
@@ -415,7 +415,7 @@ test "external prompt resume rejects a canonical one-off child" {
             var admission = value;
             admission.deinit(alloc);
         }
-        return error.TestExpectedResumeViewAdmissionError;
+        return error.TestExpectedTranscriptAdmissionError;
     } else |err| try std.testing.expectEqual(error.OneOffSessionNotResumable, err);
 }
 
@@ -742,22 +742,18 @@ const TestEnvironment = struct {
         loaded.deinit(alloc);
     }
 
-    fn createResumeViewAdmission(
+    fn createTranscriptAdmission(
         self: *TestEnvironment,
         alloc: Allocator,
         session_id: []const u8,
-    ) !session_store.ResumeViewAdmission {
+    ) !session_store.TranscriptAdmission {
         {
             var loaded = try self.store.resumeForWrite(alloc, session_id);
             defer loaded.deinit(alloc);
-            try loaded.writeResumeView(alloc, .{
-                .terminal_rows = 24,
-                .terminal_cols = 80,
-                .complete = true,
-            }, "cached transcript\n");
+            try loaded.publishTranscript(alloc, "cached transcript\r\n");
         }
-        return (try self.store.admitResumeView(alloc, .{ .id = session_id })) orelse
-            error.TestExpectedResumeViewAdmission;
+        return (try self.store.admitTranscript(alloc, .{ .id = session_id })) orelse
+            error.TestExpectedTranscriptAdmission;
     }
 
     fn expectAdmittedResumeError(
@@ -766,9 +762,9 @@ const TestEnvironment = struct {
         expected: anyerror,
         session_id: []const u8,
     ) !void {
-        var admission = try self.createResumeViewAdmission(alloc, session_id);
+        var admission = try self.createTranscriptAdmission(alloc, session_id);
         defer admission.deinit(alloc);
-        try expectResumeError(alloc, expected, resumeAdmittedForExternalPrompt(
+        try expectResumeError(alloc, expected, resumeTranscriptAdmittedForExternalPrompt(
             self.store,
             alloc,
             &admission,

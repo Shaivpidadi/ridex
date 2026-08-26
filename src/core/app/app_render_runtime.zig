@@ -1577,8 +1577,8 @@ pub fn Runtime(comptime App: type) type {
                     render_requests.animation_next_deadline_ms,
                 },
             );
-            if (comptime @hasDecl(App, "persistResumeViewAfterFrame")) {
-                app.persistResumeViewAfterFrame();
+            if (comptime @hasDecl(App, "persistSessionTranscriptAfterFrame")) {
+                app.persistSessionTranscriptAfterFrame();
             }
         }
 

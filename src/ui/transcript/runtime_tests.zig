@@ -1166,6 +1166,55 @@ fn countExactHistoryLine(history: []const u8, expected: []const u8) usize {
     return count;
 }
 
+test "stable zero-scroll frame yields the complete finalized presentation record" {
+    const alloc = std.testing.allocator;
+    var runtime = commandOutputTestRuntime(undefined);
+    defer runtime.deinit(alloc);
+    runtime.beginPresentationRecord();
+    _ = try runtime.appendRawTranscriptEntryClassified(
+        alloc,
+        "single visible line\n",
+        .unknown_raw,
+    );
+
+    var source = try runtime.prepareTranscriptSource(alloc, null);
+    defer source.deinit(alloc);
+    var prepared = try prepareTestSourceForCurrentArea(&runtime, alloc, &source);
+    defer prepared.deinit(alloc);
+    var plan = testPaintPlan(&runtime, prepared.selection);
+    const scroll_plan = render_engine.frame_scroll_plan.FrameScrollPlan.none(
+        runtime.layout.rows,
+        runtime.owned_top_row,
+    );
+    var transition = try resolveAndSealTranscriptTransitionForTest(
+        &runtime,
+        alloc,
+        &source,
+        &prepared,
+        render_engine.frame_layout.CommittedLayoutSnapshot.fromPaintPlan(plan),
+        &plan,
+        scroll_plan,
+    );
+    defer transition.deinit(alloc);
+    try std.testing.expect(transition.document_append.isEmpty());
+
+    runtime.consumeTranscriptTransition(alloc, &transition, .{
+        .bytes_written = 0,
+        .changed_cells = 0,
+        .full_repaint = false,
+        .terminal_scroll_rows_committed = 0,
+        .document_append_committed = false,
+        .committed_cursor_row = transition.cursor_row,
+        .committed_cursor_col = transition.cursor_col,
+        .shadow_state = .committed,
+        .next_invalidation = render_engine.paint_plan.FrameInvalidationSet.empty(),
+    });
+    var pending = runtime.takePendingPresentationRecord() orelse
+        return error.MissingPresentationRecord;
+    defer pending.deinit(alloc);
+    try std.testing.expectEqualStrings("single visible line", pending.bytes);
+}
+
 fn cloneRecoveryTransitionForTest(
     alloc: Allocator,
     source: *const transcript_runtime.TranscriptTransition,

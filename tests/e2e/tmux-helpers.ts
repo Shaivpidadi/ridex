@@ -846,6 +846,21 @@ export class TmuxSession {
     }
   }
 
+  async captureFullScrollbackToFile(path: string): Promise<void> {
+    const child = Bun.spawn(
+      ["tmux", ...this.tmuxArgs(["capture-pane", "-t", this.name, "-p", "-S", "-"])],
+      {
+        stdout: Bun.file(path),
+        stderr: "pipe",
+      },
+    );
+    const stderr = await new Response(child.stderr).text();
+    const code = await child.exited;
+    if (code !== 0) {
+      throw new Error(`tmux full scrollback capture failed (${code}): ${stderr}`);
+    }
+  }
+
   /**
    * Complete pane history including the ANSI sequences emitted by fx.
    * Keep this separate from the viewport capture so transcript-order tests

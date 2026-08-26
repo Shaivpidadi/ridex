@@ -12,7 +12,7 @@ const session_layout = @import("session_layout.zig");
 const session_projection = @import("session_projection.zig");
 const session_replay = @import("session_replay.zig");
 const session_display_metadata = @import("session_display_metadata.zig");
-const session_resume_view = @import("session_resume_view.zig");
+const session_transcript = @import("session_transcript.zig");
 const session_usage = @import("session_usage.zig");
 const session_usage_sidecar = @import("session_usage_sidecar.zig");
 
@@ -302,22 +302,22 @@ pub const WritableSessionDir = struct {
     }
 };
 
-pub const ResumeViewAdmission = struct {
+pub const TranscriptAdmission = struct {
     writable: ?WritableSessionDir,
-    view: session_resume_view.LoadOutcome,
+    transcript: session_transcript.Admission,
 
-    pub fn deinit(self: *ResumeViewAdmission, alloc: Allocator) void {
+    pub fn deinit(self: *TranscriptAdmission, alloc: Allocator) void {
         if (self.writable) |*writable| writable.deinit(alloc);
-        self.view.deinit(alloc);
+        self.transcript.deinit();
         self.* = undefined;
     }
 
-    pub fn sessionId(self: *const ResumeViewAdmission) []const u8 {
+    pub fn sessionId(self: *const TranscriptAdmission) []const u8 {
         return self.writable.?.session_id;
     }
 
     pub fn resumeForWrite(
-        self: *ResumeViewAdmission,
+        self: *TranscriptAdmission,
         alloc: Allocator,
         options: Options,
     ) !LoadedWritableSession {
@@ -547,7 +547,7 @@ pub const LoadedWritableSession = struct {
     migration_source_schema_version: ?u8 = null,
     migration_source_bytes: ?u64 = null,
     usage_sidecar_reseal_pending: bool = false,
-    resume_view_stale: bool = false,
+    transcript_position: ?CommitPosition = null,
     /// Runtime-only provenance installed by subagent resume admission. These
     /// fields are never written into the session event log.
     external_prompt_origin: ExternalPromptOrigin = .root,
@@ -571,20 +571,57 @@ pub const LoadedWritableSession = struct {
         self.* = undefined;
     }
 
-    pub fn writeResumeView(
+    pub fn publishTranscript(
         self: *LoadedWritableSession,
         alloc: Allocator,
-        capture: session_resume_view.Capture,
-        text: []const u8,
+        bytes: []const u8,
     ) !void {
-        try session_resume_view.write(
+        try session_transcript.publishComplete(
             alloc,
             &self.log.dir,
             self.active_id,
-            resumeViewBoundary(self.position),
-            capture,
-            text,
+            self.position,
+            bytes,
         );
+        self.transcript_position = self.position;
+    }
+
+    pub fn appendTranscript(
+        self: *LoadedWritableSession,
+        alloc: Allocator,
+        prior_committed_len: u64,
+        bytes: []const u8,
+    ) !u64 {
+        const committed_len = try session_transcript.appendAndCommit(
+            alloc,
+            &self.log.dir,
+            self.active_id,
+            prior_committed_len,
+            self.position,
+            bytes,
+        );
+        self.transcript_position = self.position;
+        return committed_len;
+    }
+
+    pub fn restampTranscript(
+        self: *LoadedWritableSession,
+        alloc: Allocator,
+        committed_len: u64,
+    ) !void {
+        try session_transcript.restampComplete(
+            alloc,
+            &self.log.dir,
+            self.active_id,
+            committed_len,
+            self.position,
+        );
+        self.transcript_position = self.position;
+    }
+
+    pub fn transcriptNeedsRestamp(self: *const LoadedWritableSession) bool {
+        const stamped = self.transcript_position orelse return true;
+        return !positionsEqual(stamped, self.position);
     }
 
     /// Returns a borrowed address that remains stable until deinit.
@@ -1331,21 +1368,21 @@ pub const Root = struct {
         return state;
     }
 
-    pub fn admitResumeView(
+    pub fn admitTranscript(
         self: *Root,
         alloc: Allocator,
         session_id: []const u8,
-    ) !ResumeViewAdmission {
+    ) !TranscriptAdmission {
         var writable = try self.openWritableSessionDir(alloc, session_id, 0);
         errdefer writable.deinit(alloc);
         const position = try loadCurrentPositionReference(alloc, &writable.dir, session_id);
         return .{
             .writable = writable,
-            .view = try session_resume_view.loadMatching(
+            .transcript = try session_transcript.admit(
                 alloc,
                 &writable.dir,
                 session_id,
-                resumeViewBoundary(position),
+                position,
             ),
         };
     }
@@ -1399,14 +1436,6 @@ pub const Root = struct {
         return entryExists(&dir, name);
     }
 };
-
-fn resumeViewBoundary(position: CommitPosition) session_resume_view.Boundary {
-    return .{
-        .log_generation = position.log_generation,
-        .seq = position.through_seq,
-        .event_log_bytes = position.through_event_log_bytes,
-    };
-}
 
 fn validateLeaf(name: []const u8) !void {
     if (name.len == 0 or std.mem.eql(u8, name, ".") or
@@ -3375,7 +3404,6 @@ fn publishFrames(
         err,
         options,
     );
-    loaded.resume_view_stale = true;
     switch (prepared.kind) {
         .event => {
             const published = loadCurrentPositionReference(
@@ -3798,7 +3826,6 @@ fn confirmWritableNamespace(
         loaded.state.deinit(alloc);
         loaded.state = next_state;
         loaded.position = position;
-        loaded.resume_view_stale = true;
         if (generation_changed) {
             loaded.generation_base_seq = position.through_seq;
             loaded.generation_base_bytes = position.through_event_log_bytes;
@@ -4265,7 +4292,6 @@ fn compactCanonicalLog(
         events_file,
         io_mod.getIo(),
     ) catch return error.SessionLogCompactionIndeterminate;
-    loaded.resume_view_stale = true;
     options.test_controls.boundary(.after_compaction_log_rename) catch
         return error.SessionLogCompactionIndeterminate;
     io_mod.syncVerifiedDir(loaded.log.dir.dir) catch
@@ -7131,7 +7157,6 @@ test "automatic compaction leaves post-rename uncertainty fenced" {
     var next = try stateWithTurn(alloc, loaded.state, 20);
     defer next.deinit(alloc);
     var failure = BoundaryFailure{ .target = .after_compaction_log_rename };
-    loaded.resume_view_stale = false;
 
     try std.testing.expectError(
         error.SessionLogCompactionIndeterminate,
@@ -7149,7 +7174,6 @@ test "automatic compaction leaves post-rename uncertainty fenced" {
     );
 
     try std.testing.expect(loaded.namespace_confirmation_required);
-    try std.testing.expect(loaded.resume_view_stale);
     try std.testing.expectError(
         error.SessionCommitBoundaryUnavailable,
         temp.root.loadReadOnly(alloc, initial.id, .{}),
@@ -7247,7 +7271,6 @@ test "log compaction rename remains fenced until writable resolution" {
         .{},
     );
     var failure = BoundaryFailure{ .target = .after_compaction_log_rename };
-    loaded.resume_view_stale = false;
 
     try std.testing.expectError(
         error.SessionLogCompactionIndeterminate,
@@ -7257,7 +7280,6 @@ test "log compaction rename remains fenced until writable resolution" {
             .compaction_byte_threshold = 1,
         }),
     );
-    try std.testing.expect(loaded.resume_view_stale);
     loaded.deinit(alloc);
     try std.testing.expectError(
         error.SessionCommitBoundaryUnavailable,

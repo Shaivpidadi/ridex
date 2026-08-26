@@ -29,6 +29,7 @@ const TIMEOUT = 30_000;
 const REAL_TITLE = "RESUME_REAL_SESSION_FIRST_PROMPT";
 const FOREIGN_TITLE = "RESUME_FOREIGN_NEWEST";
 const FINAL_MARKER = "RESUME_REAL_SESSION_HISTORY_DONE";
+const CONTINUATION_MARKER = "RESUME_POST_RESTORE_CONTINUATION_DONE";
 
 type Config = {
   label: string;
@@ -84,6 +85,21 @@ function pad(value: number, width = 6): string {
 
 function stripAnsi(text: string): string {
   return text.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "");
+}
+
+function countScrollbackLines(path: string, marker: string): number {
+  try {
+    const output = execFileSync(
+      "grep",
+      ["-F", "-c", "--", marker, path],
+      { encoding: "utf8" },
+    ).trim();
+    return Number(output);
+  } catch (error) {
+    const status = (error as { status?: number }).status;
+    if (status === 1) return 0;
+    throw error;
+  }
 }
 
 function percentile(values: number[], fraction: number): number {
@@ -219,7 +235,11 @@ async function seedRealSession(paths: Paths, config: Config): Promise<IndexedSum
     session = await TmuxSession.create({
       cmd: FX_BIN,
       cwd: realpathSync(paths.workspace),
-      env: gatewayEnv(paths.home, gateway),
+      env: {
+        ...gatewayEnv(paths.home, gateway),
+        FX_TRACE_LOG: paths.trace,
+        FX_TRACE_SCOPES: "session",
+      },
       stderrPath: paths.stderr,
       width: 104,
       height: 30,
@@ -230,7 +250,12 @@ async function seedRealSession(paths: Paths, config: Config): Promise<IndexedSum
     });
     await session.waitForComposer(TIMEOUT);
     await session.sendText(`${REAL_TITLE}: build the prepared long chat and tool history.`);
-    await session.waitForText(FINAL_MARKER, TIMEOUT * 20);
+    const requestedChatLines = config.chatBatches * config.chatLinesPerBatch;
+    const seedTimeout = TIMEOUT * Math.max(
+      20,
+      Math.ceil(requestedChatLines / 3_000),
+    );
+    await session.waitForText(FINAL_MARKER, seedTimeout);
     await session.sendText("/quit");
     expect(await session.waitForSessionEnd(TIMEOUT * 2)).toBe(true);
   } finally {
@@ -245,7 +270,7 @@ async function seedRealSession(paths: Paths, config: Config): Promise<IndexedSum
   expect(parsed.sessions).toHaveLength(1);
   const actual = parsed.sessions[0]!;
   actual.title = REAL_TITLE;
-  actual.preview = `${REAL_TITLE}\n50K chat and large tools`;
+  actual.preview = `${REAL_TITLE}\n${config.chatBatches * config.chatLinesPerBatch} chat lines and large tools`;
   actual.display_metadata_present = true;
   return actual;
 }
@@ -414,7 +439,7 @@ async function runStress(config: Config): Promise<Paths> {
   installLargeCatalog(paths, config, real);
   writeFileSync(paths.stderr, "");
 
-  const gateway = startFakeGateway([]);
+  const gateway = startFakeGateway([fakeGatewayFinalText(CONTINUATION_MARKER)]);
   const metrics: Metrics = {
     open: [],
     scope: [],
@@ -443,7 +468,7 @@ async function runStress(config: Config): Promise<Paths> {
       height: 32,
       minimumHistoryLines: Math.max(
         50_000,
-        config.chatBatches * config.chatLinesPerBatch * 2,
+        config.chatBatches * config.chatLinesPerBatch * 20,
       ),
     });
     await session.waitForComposer(TIMEOUT * 4);
@@ -474,11 +499,34 @@ async function runStress(config: Config): Promise<Paths> {
       () => session!.sendKeys("Enter"),
       () => session!.waitForText(FINAL_MARKER, TIMEOUT * 20),
     );
-    expect(await session.captureFullScrollback()).toContain("RESUME_CHAT_000000");
-    expect(await session.captureFullScrollback()).toContain(
-      `RESUME_CHAT_${pad(config.chatBatches * config.chatLinesPerBatch - 1)}`,
+    const headMarker = "RESUME_CHAT_000000";
+    const middleMarker = `RESUME_CHAT_${pad(Math.floor(config.chatBatches * config.chatLinesPerBatch / 2))}`;
+    const tailMarker = `RESUME_CHAT_${pad(config.chatBatches * config.chatLinesPerBatch - 1)}`;
+    const restoredScrollbackPath = join(paths.root, "restored-scrollback.txt");
+    await session.captureFullScrollbackToFile(restoredScrollbackPath);
+    for (const marker of [headMarker, middleMarker, tailMarker, FINAL_MARKER]) {
+      expect(countScrollbackLines(restoredScrollbackPath, marker)).toBe(1);
+    }
+    expect(countScrollbackLines(restoredScrollbackPath, "resume-tool-payload.txt")).toBeGreaterThan(0);
+    expect(readFileSync(paths.trace, "utf8")).toMatch(
+      /event=session_transcript_stream outcome=exact bytes=\d+/,
     );
-    expect(await session.captureFullScrollback()).toContain("resume-tool-payload.txt");
+
+    await session.sendText("Continue after the complete transcript restore.");
+    await session.waitForText(CONTINUATION_MARKER, TIMEOUT * 4);
+    await session.resizeWindow(90, 28);
+    await session.captureFullScrollbackToFile(restoredScrollbackPath);
+    expect(countScrollbackLines(restoredScrollbackPath, headMarker)).toBe(1);
+    expect(countScrollbackLines(restoredScrollbackPath, tailMarker)).toBe(1);
+    expect(countScrollbackLines(restoredScrollbackPath, CONTINUATION_MARKER)).toBe(1);
+    const postResumeTrace = readFileSync(paths.trace, "utf8");
+    const exactStreamIndex = postResumeTrace.lastIndexOf(
+      "event=session_transcript_stream outcome=exact",
+    );
+    expect(exactStreamIndex).toBeGreaterThanOrEqual(0);
+    expect(postResumeTrace.slice(exactStreamIndex)).not.toContain(
+      "event=session_transcript outcome=degraded",
+    );
 
     if (profiler) await profiler.exited;
     expect(readFileSync(paths.stderr, "utf8")).toBe("");
@@ -603,8 +651,8 @@ test.skipIf(
   900_000,
 );
 
-test.skipIf(!tmuxAvailable() || process.env.FX_RESUME_50K !== "1")(
-  "/resume survives a fifty-thousand-entry catalog and real fifty-thousand-line tool-heavy session",
+test.skipIf(!tmuxAvailable() || process.env.FX_RESUME_100K !== "1")(
+  "/resume restores a real one-hundred-thousand-line tool-heavy session exactly once",
   async () => {
     const profileSeconds = process.env.FX_RESUME_PROFILE === "1" &&
         platform() === "darwin" &&
@@ -612,18 +660,18 @@ test.skipIf(!tmuxAvailable() || process.env.FX_RESUME_50K !== "1")(
       ? 30
       : undefined;
     const paths = await runStress({
-      label: "real-50k",
+      label: "real-100k",
       catalogEntries: 50_000,
-      chatBatches: 50,
-      chatLinesPerBatch: 1_000,
+      chatBatches: 10,
+      chatLinesPerBatch: 10_000,
       toolsPerBatch: 4,
       cycles: 120,
       profileSeconds,
       retainArtifacts: true,
     });
-    console.error(`RESUME_50K_METRICS=${paths.metrics}`);
+    console.error(`RESUME_100K_METRICS=${paths.metrics}`);
     if (profileSeconds !== undefined) {
-      console.error(`RESUME_50K_SAMPLE=${paths.profile}`);
+      console.error(`RESUME_100K_SAMPLE=${paths.profile}`);
     }
   },
   1_800_000,
