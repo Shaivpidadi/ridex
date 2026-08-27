@@ -2852,8 +2852,9 @@ test "processQueuedPrompt automatically compacts an older active result under pr
     };
     var gateway = FakeGateway.init(alloc, &completions);
     defer gateway.deinit();
+    const model = "provider/automatic-compaction";
     const available_overrides = [_]ModelCapabilityOverride{.{
-        .model = "anthropic/claude-opus-4.6",
+        .model = model,
         .capabilities = .{ .context_window = 45_000 },
     }};
     const runtime_contexts = [_][]const u8{
@@ -2873,8 +2874,10 @@ test "processQueuedPrompt automatically compacts an older active result under pr
     var fixture = PromptFixture{};
     var config = fixture.config();
     config.tool_result_dir = result_dir;
+    var job = fixture.job();
+    job.model = @constCast(model);
 
-    try runFakePrompt(&gateway, &hooks, config, fixture.job());
+    try runFakePrompt(&gateway, &hooks, config, job);
 
     try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
     try expectBodyNotContains(&gateway, 2, "AUTO_OLD_RESULT_SENTINEL");
@@ -2888,8 +2891,9 @@ test "processQueuedPrompt automatically compacts an older active result under pr
 
 test "processQueuedPrompt fails before provider delivery when exact context cannot fit" {
     const alloc = std.testing.allocator;
+    const model = "provider/capacity-failure";
     const available_overrides = [_]ModelCapabilityOverride{.{
-        .model = "anthropic/claude-opus-4.6",
+        .model = model,
         .capabilities = .{ .context_window = 1 },
     }};
     const completions = [_]FakeCompletion{.{ .content = "must not run" }};
@@ -2899,10 +2903,12 @@ test "processQueuedPrompt fails before provider delivery when exact context cann
     hooks.available_capability_overrides = &available_overrides;
     defer hooks.deinit();
     var fixture = PromptFixture{};
+    var job = fixture.job();
+    job.model = @constCast(model);
 
     try std.testing.expectError(
         error.ContextCapacityExceeded,
-        runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job()),
+        runFakePrompt(&gateway, &hooks, fixture.config(), job),
     );
     try std.testing.expectEqual(@as(usize, 0), gateway.request_bodies.items.len);
     try std.testing.expectEqual(@as(usize, 0), hooks.successful_effect_count.load(.seq_cst));
