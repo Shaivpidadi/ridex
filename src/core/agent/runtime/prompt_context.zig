@@ -140,9 +140,10 @@ pub fn planHybridProjection(
     return .{
         .decision = if (owned.len > 0)
             .project
-        else if (over_capacity and hasToolResultContext(
+        else if (over_capacity and hasNonEvictableResult(
             input.durable_history,
             input.request_local,
+            input.request_local_provenance,
         ))
             .capacity_failure
         else
@@ -154,17 +155,30 @@ pub fn planHybridProjection(
     };
 }
 
-fn hasToolResultContext(
+fn hasNonEvictableResult(
     durable_history: []const ChatMessage,
     request_local: []const ChatMessage,
+    request_local_provenance: RequestLocalProvenance,
 ) bool {
     for (durable_history) |message| {
-        if (message.role == .tool) return true;
+        if (isNonEvictableResult(message, .unversioned_history)) return true;
     }
     for (request_local) |message| {
-        if (message.role == .tool) return true;
+        if (isNonEvictableResult(message, request_local_provenance)) return true;
     }
     return false;
+}
+
+fn isNonEvictableResult(
+    message: ChatMessage,
+    provenance: RequestLocalProvenance,
+) bool {
+    if (message.role != .tool) return false;
+    const content = message.content orelse return false;
+    if (std.mem.startsWith(u8, content, compacted_result_prefix)) return true;
+    const memory = message.tool_result_memory orelse return false;
+    if (memory.output_handle != null) return false;
+    return memory.truncated or provenance == .unversioned_history;
 }
 
 fn usableInputTokens(
@@ -715,6 +729,35 @@ test "hybrid projection reports capacity after tool-result candidates are exhaus
     defer plan.deinit(alloc);
 
     try std.testing.expectEqual(ProjectionDecision.capacity_failure, plan.decision);
+}
+
+test "hybrid projection leaves a fresh protected complete result to the provider" {
+    const alloc = std.testing.allocator;
+    const calls = [_]types.ToolCall{.{
+        .id = "fresh-call",
+        .name = "write_file",
+        .arguments_json = "{}",
+    }};
+    const request_local = [_]ChatMessage{
+        .{ .role = .assistant, .tool_calls = &calls },
+        .{
+            .role = .tool,
+            .content = "complete fresh result",
+            .tool_call_id = "fresh-call",
+            .tool_name = "write_file",
+            .tool_result_memory = .{ .truncated = false },
+        },
+    };
+    var plan = try planHybridProjection(alloc, .{
+        .trigger = .automatic,
+        .capabilities = .{ .context_window = 100, .max_output_tokens = 20 },
+        .cost = .{ .serialized_bytes = 500, .estimated_input_tokens = 101 },
+        .durable_history = &.{},
+        .request_local = &request_local,
+    });
+    defer plan.deinit(alloc);
+
+    try std.testing.expectEqual(ProjectionDecision.no_op, plan.decision);
 }
 
 test "hybrid projection treats resumed handle-free request-local memory conservatively" {

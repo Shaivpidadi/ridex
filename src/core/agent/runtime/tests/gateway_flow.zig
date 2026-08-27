@@ -2908,7 +2908,9 @@ test "processQueuedPrompt fails after an ineligible tool result cannot fit" {
     hooks.available_capability_overrides = &available_overrides;
     defer hooks.deinit();
     hooks.permission_decisions = &.{.once};
-    hooks.exec_plans = &.{.{ .result = .{ .model_output = "ineligible result" } }};
+    hooks.exec_plans = &.{.{ .result = .{
+        .model_output = "ineligible result\n" ++ ("x" ** (70 * 1024)),
+    } }};
     var fixture = PromptFixture{};
     var job = fixture.job();
     job.model = @constCast(model);
