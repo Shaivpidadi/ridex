@@ -11,6 +11,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runFx } from "../evals/eval-helpers";
 import {
+  startContentLengthMcpHttpFixture,
+  type ContentLengthResponseType,
+} from "./fixtures/mcp-content-length-http";
+import {
   MODERN_HTTP_TOOL_RESULT,
   MODERN_MCP_VERSION,
   startModernMcpHttpFixture,
@@ -30,6 +34,9 @@ const TOOL_NAME = "mcp_fixture_echo";
 
 let cleanupRoot: string | null = null;
 let fixture: ReturnType<typeof startModernMcpHttpFixture> | null = null;
+let contentLengthFixture: Awaited<
+  ReturnType<typeof startContentLengthMcpHttpFixture>
+> | null = null;
 let gateway: ReturnType<typeof startFakeGateway> | null = null;
 let tui: TmuxSession | null = null;
 
@@ -37,15 +44,18 @@ afterEach(async () => {
   const activeTui = tui;
   const activeGateway = gateway;
   const activeFixture = fixture;
+  const activeContentLengthFixture = contentLengthFixture;
   const activeCleanupRoot = cleanupRoot;
   tui = null;
   gateway = null;
   fixture = null;
+  contentLengthFixture = null;
   cleanupRoot = null;
 
   if (activeTui) await activeTui.kill();
   activeGateway?.stop();
   activeFixture?.stop();
+  if (activeContentLengthFixture) await activeContentLengthFixture.stop();
   if (activeCleanupRoot) {
     rmSync(activeCleanupRoot, { recursive: true, force: true });
   }
@@ -53,7 +63,7 @@ afterEach(async () => {
 
 function createRoot(
   label: string,
-  activeFixture: ReturnType<typeof startModernMcpHttpFixture>,
+  activeFixture: { url: string },
   operationTimeoutMs = 5_000,
   required = false,
 ) {
@@ -197,6 +207,50 @@ function assertModernWire(
 }
 
 describe("modern MCP Streamable HTTP", () => {
+  for (
+    const responseType of ["json", "sse"] as const satisfies readonly ContentLengthResponseType[]
+  ) {
+    test(`fixed-length ${responseType} responses complete on one-shot connections`, async () => {
+      contentLengthFixture = await startContentLengthMcpHttpFixture(responseType);
+      const root = createRoot(`content-length-${responseType}`, contentLengthFixture);
+      gateway = startToolGateway(`Fixed-length ${responseType} complete.`);
+
+      const result = await runFx(
+        [
+          "ask",
+          "--json",
+          "--auto",
+          "--no-save",
+          `Call the fixed-length ${responseType} fixture.`,
+        ],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway),
+          timeoutMs: 20_000,
+        },
+      );
+
+      if (result.code !== 0) {
+        const signal = result.signal ?? "none";
+        throw new Error(
+          `fixed-length ${responseType} failed signal=${signal} ` +
+            `stderr=${JSON.stringify(result.stderr)}`,
+        );
+      }
+      expect(result.code).toBe(0);
+      expect(JSON.parse(result.stdout).output).toContain(
+        `Fixed-length ${responseType} complete.`,
+      );
+      expect(contentLengthFixture.failure).toBeUndefined();
+      expect(
+        contentLengthFixture.requests.map((entry) => entry.message.method),
+      ).toEqual(["server/discover", "tools/list", "tools/call"]);
+      for (const request of contentLengthFixture.requests) {
+        expect(request.headers.connection).toBe("close");
+      }
+    }, 30_000);
+  }
+
   test.skipIf(!tmuxAvailable())(
     "/mcp add --transport http persists and reloads a remote server",
     async () => {
