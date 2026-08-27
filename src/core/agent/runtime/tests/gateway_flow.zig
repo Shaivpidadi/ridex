@@ -2889,19 +2889,26 @@ test "processQueuedPrompt automatically compacts an older active result under pr
     );
 }
 
-test "processQueuedPrompt fails before provider delivery when exact context cannot fit" {
+test "processQueuedPrompt fails after an ineligible tool result cannot fit" {
     const alloc = std.testing.allocator;
     const model = "provider/capacity-failure";
     const available_overrides = [_]ModelCapabilityOverride{.{
         .model = model,
         .capabilities = .{ .context_window = 1 },
     }};
-    const completions = [_]FakeCompletion{.{ .content = "must not run" }};
+    const calls = [_]ToolCall{toolCall(
+        "capacity_result_1",
+        "read_file",
+        "{\"path\":\"capacity.txt\"}",
+    )};
+    const completions = [_]FakeCompletion{.{ .tool_calls = &calls }};
     var gateway = FakeGateway.init(alloc, &completions);
     defer gateway.deinit();
     var hooks = FakeAgentRuntimeDeps.init(alloc);
     hooks.available_capability_overrides = &available_overrides;
     defer hooks.deinit();
+    hooks.permission_decisions = &.{.once};
+    hooks.exec_plans = &.{.{ .result = .{ .model_output = "ineligible result" } }};
     var fixture = PromptFixture{};
     var job = fixture.job();
     job.model = @constCast(model);
@@ -2910,8 +2917,8 @@ test "processQueuedPrompt fails before provider delivery when exact context cann
         error.ContextCapacityExceeded,
         runFakePrompt(&gateway, &hooks, fixture.config(), job),
     );
-    try std.testing.expectEqual(@as(usize, 0), gateway.request_bodies.items.len);
-    try std.testing.expectEqual(@as(usize, 0), hooks.successful_effect_count.load(.seq_cst));
+    try std.testing.expectEqual(@as(usize, 1), gateway.request_bodies.items.len);
+    try std.testing.expectEqual(@as(usize, 1), hooks.successful_effect_count.load(.seq_cst));
 }
 
 test "processQueuedPrompt resolves catalog capabilities for opaque effort" {

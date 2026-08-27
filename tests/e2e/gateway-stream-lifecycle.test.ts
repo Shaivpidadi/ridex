@@ -3948,7 +3948,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
   }, 30_000);
 
   test(
-    "nine saved turns stay canonical while the next request uses bounded context",
+    "nine small saved turns stay visible until provider pressure requires compaction",
     async () => {
       const root = createFixtureRoot("canonical-history-projection");
       const tracePath = join(root.root, "trace.log");
@@ -4052,7 +4052,15 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         const userTexts = request.prompt
           .filter((message) => message.role === "user")
           .map((message) => contentText(message.content));
-        expect(userTexts).toEqual([
+        const canonicalUserTexts = userTexts.filter((text) =>
+          text.startsWith("canonical ")
+        );
+        expect(canonicalUserTexts).toEqual([
+          "canonical turn 1",
+          "canonical turn 2",
+          "canonical turn 3",
+          "canonical turn 4",
+          "canonical turn 5",
           "canonical turn 6",
           "canonical turn 7",
           "canonical turn 8",
@@ -4063,14 +4071,13 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           .filter((message) => message.role === "system")
           .map((message) => contentText(message.content))
           .join("\n");
-        expect(systemText).toContain("Conversation summary:");
-        expect(systemText).toContain("read_file success");
+        expect(systemText).not.toContain("Conversation summary:");
         const structuredParts = request.prompt.flatMap((message) =>
           Array.isArray(message.content) ? message.content : []
         ) as Array<Record<string, unknown>>;
         expect(structuredParts.some((part) =>
           part.type === "tool-call" && part.toolCallId === callId
-        )).toBe(false);
+        )).toBe(true);
 
         const finalDetailResult = await runFx(
           ["session", "--id", sessionId, "--json"],

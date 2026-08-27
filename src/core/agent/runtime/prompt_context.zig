@@ -140,7 +140,10 @@ pub fn planHybridProjection(
     return .{
         .decision = if (owned.len > 0)
             .project
-        else if (over_capacity)
+        else if (over_capacity and hasToolResultContext(
+            input.durable_history,
+            input.request_local,
+        ))
             .capacity_failure
         else
             .no_op,
@@ -149,6 +152,19 @@ pub fn planHybridProjection(
         .high_water_tokens = high_water,
         .target_tokens = target,
     };
+}
+
+fn hasToolResultContext(
+    durable_history: []const ChatMessage,
+    request_local: []const ChatMessage,
+) bool {
+    for (durable_history) |message| {
+        if (message.role == .tool) return true;
+    }
+    for (request_local) |message| {
+        if (message.role == .tool) return true;
+    }
+    return false;
 }
 
 fn usableInputTokens(
@@ -663,7 +679,7 @@ test "hybrid projection is idempotent after installing a stored marker" {
     try std.testing.expectEqual(@as(usize, 0), plan.candidates.len);
 }
 
-test "hybrid projection reports physical capacity only after candidates are exhausted" {
+test "hybrid projection leaves oversized exact user input to the provider" {
     const alloc = std.testing.allocator;
     var plan = try planHybridProjection(alloc, .{
         .trigger = .automatic,
@@ -674,10 +690,31 @@ test "hybrid projection reports physical capacity only after candidates are exha
     });
     defer plan.deinit(alloc);
 
-    try std.testing.expectEqual(ProjectionDecision.capacity_failure, plan.decision);
+    try std.testing.expectEqual(ProjectionDecision.no_op, plan.decision);
     try std.testing.expectEqual(@as(?usize, 80), plan.usable_input_tokens);
     try std.testing.expectEqual(@as(?usize, 64), plan.high_water_tokens);
     try std.testing.expectEqual(@as(?usize, 48), plan.target_tokens);
+}
+
+test "hybrid projection reports capacity after tool-result candidates are exhausted" {
+    const alloc = std.testing.allocator;
+    const request_local = [_]ChatMessage{.{
+        .role = .tool,
+        .content = "incomplete capped body",
+        .tool_call_id = "capped-call",
+        .tool_name = "read_file",
+        .tool_result_memory = .{ .truncated = true },
+    }};
+    var plan = try planHybridProjection(alloc, .{
+        .trigger = .automatic,
+        .capabilities = .{ .context_window = 100, .max_output_tokens = 20 },
+        .cost = .{ .serialized_bytes = 500, .estimated_input_tokens = 101 },
+        .durable_history = &.{},
+        .request_local = &request_local,
+    });
+    defer plan.deinit(alloc);
+
+    try std.testing.expectEqual(ProjectionDecision.capacity_failure, plan.decision);
 }
 
 test "hybrid projection treats resumed handle-free request-local memory conservatively" {
