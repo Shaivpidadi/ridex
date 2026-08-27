@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import http.client
 import ipaddress
 import json
@@ -11,6 +12,7 @@ from urllib.parse import SplitResult, urlsplit
 
 _MAX_REQUEST_HEAD_BYTES = 64 * 1024
 _STREAM_CHUNK_BYTES = 64 * 1024
+_DIAGNOSTIC_TARGET_HOST = "ai-gateway.vercel.sh"
 _HOP_BY_HOP_HEADERS = {
     "connection",
     "keep-alive",
@@ -154,9 +156,46 @@ def _probe_hosted_inference_sync(
     results: list[dict[str, object]] = []
     for method, path in probes:
         results.append(_probe_request(upstream, token, method, path))
+    results.extend(
+        [
+            _probe_request(
+                upstream,
+                token,
+                "GET",
+                base_path,
+                auth_header="Proxy-Authorization",
+                probe_type="proxy_authorization_origin_form",
+            ),
+            _probe_request(
+                upstream,
+                token,
+                "HEAD",
+                f"https://{_DIAGNOSTIC_TARGET_HOST}/v3/ai/language-model",
+                auth_header="Proxy-Authorization",
+                probe_type="proxy_authorization_absolute_form",
+            ),
+            _probe_request(
+                upstream,
+                token,
+                "CONNECT",
+                f"{_DIAGNOSTIC_TARGET_HOST}:443",
+                auth_header="Authorization",
+                probe_type="authorization_connect",
+            ),
+            _probe_request(
+                upstream,
+                token,
+                "CONNECT",
+                f"{_DIAGNOSTIC_TARGET_HOST}:443",
+                auth_header="Proxy-Authorization",
+                probe_type="proxy_authorization_connect",
+            ),
+        ]
+    )
     return {
         "host": upstream.hostname,
         "base_path": base_path,
+        "token_metadata": _token_metadata(token),
         "probes": results,
     }
 
@@ -166,6 +205,9 @@ def _probe_request(
     token: str,
     method: str,
     path: str,
+    *,
+    auth_header: str = "Authorization",
+    probe_type: str = "origin_form",
 ) -> dict[str, object]:
     host = upstream.hostname
     if host is None:
@@ -177,19 +219,26 @@ def _probe_request(
         else http.client.HTTPConnection
     )
     connection = connection_class(host, port, timeout=10)
-    result: dict[str, object] = {"method": method, "path": path}
+    result: dict[str, object] = {
+        "probe_type": probe_type,
+        "method": method,
+        "path": path,
+        "auth_header": auth_header,
+    }
     try:
         connection.request(
             method,
             path,
             headers={
                 "Accept": "application/json",
-                "Authorization": f"Bearer {token}",
-                "User-Agent": "fx-harbor-contract-probe/1",
+                auth_header: f"Bearer {token}",
+                "User-Agent": "fx-harbor-contract-probe/2",
             },
         )
         response = connection.getresponse()
-        body = response.read(4096)
+        body = b"" if method == "HEAD" or (
+            method == "CONNECT" and 200 <= response.status < 300
+        ) else response.read(4096)
         result["status"] = response.status
         selected_headers = {
             name.lower(): value
@@ -198,6 +247,8 @@ def _probe_request(
             in {
                 "allow",
                 "content-type",
+                "location",
+                "proxy-authenticate",
                 "server",
                 "via",
                 "x-powered-by",
@@ -218,6 +269,41 @@ def _probe_request(
     finally:
         connection.close()
     return result
+
+
+def _token_metadata(token: str) -> dict[str, object]:
+    """Return routing-relevant JWT metadata without persisting the credential."""
+
+    parts = token.split(".")
+    if len(parts) != 3:
+        return {"format": "opaque", "length": len(token)}
+
+    decoded: list[dict[str, object]] = []
+    for encoded in parts[:2]:
+        try:
+            padding = "=" * (-len(encoded) % 4)
+            value = json.loads(
+                base64.urlsafe_b64decode(encoded + padding).decode("utf-8")
+            )
+        except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+            return {"format": "jwt-like", "decodable": False}
+        if not isinstance(value, dict):
+            return {"format": "jwt-like", "decodable": False}
+        decoded.append(value)
+
+    header, payload = decoded
+    safe_claims = {
+        key: payload[key]
+        for key in ("aud", "iss", "provider", "model", "target")
+        if key in payload and isinstance(payload[key], (str, int, float, bool))
+    }
+    return {
+        "format": "jwt",
+        "algorithm": header.get("alg") if isinstance(header.get("alg"), str) else None,
+        "header_keys": sorted(header),
+        "claim_keys": sorted(payload),
+        "routing_claims": safe_claims,
+    }
 
 
 def _validated_upstream(value: str) -> SplitResult:

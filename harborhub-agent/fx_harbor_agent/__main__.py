@@ -91,7 +91,7 @@ class FxAskAgent(Agent):
             agent_info=Implementation(
                 name="fx-x6-ask",
                 title="FX X6 ask wrapper",
-                version="0.0.6-x6.dd87df1-hg3",
+                version="0.0.6-x6.dd87df1-hg4",
             ),
         )
 
