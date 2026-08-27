@@ -1159,13 +1159,20 @@ test "allowsExternalPath preserves the exact eligible tool set" {
         try std.testing.expect(allowsExternalPath(expected_name));
     }
     try std.testing.expect(!allowsExternalPath("semantic_search"));
+    try std.testing.expect(!allowsExternalPath("apply_patch"));
     try std.testing.expect(!allowsExternalPath("run_command"));
     try std.testing.expect(!allowsExternalPath("missing_tool"));
+}
+
+test "apply_patch uses edit permission while remaining a filesystem mutation" {
+    try std.testing.expectEqualStrings("edit", permissionNameForTool("apply_patch"));
+    try std.testing.expect(isFilesystemMutationTool("apply_patch"));
 }
 
 pub fn isFilesystemMutationTool(tool_name: []const u8) bool {
     return std.mem.eql(u8, tool_name, "write_file") or
         std.mem.eql(u8, tool_name, "edit_file") or
+        std.mem.eql(u8, tool_name, "apply_patch") or
         std.mem.eql(u8, tool_name, "delete_file") or
         std.mem.eql(u8, tool_name, "create_folder") or
         std.mem.eql(u8, tool_name, "copy_file") or
@@ -1494,7 +1501,9 @@ pub fn formatPermissionsStatus(
 
 pub fn permissionNameForTool(tool_name: []const u8) []const u8 {
     if (std.mem.eql(u8, tool_name, "read_file")) return "read";
-    if (std.mem.eql(u8, tool_name, "write_file") or std.mem.eql(u8, tool_name, "edit_file")) return "edit";
+    if (std.mem.eql(u8, tool_name, "write_file") or
+        std.mem.eql(u8, tool_name, "edit_file") or
+        std.mem.eql(u8, tool_name, "apply_patch")) return "edit";
     if (std.mem.eql(u8, tool_name, "list_files")) return "list";
     if (std.mem.eql(u8, tool_name, "glob_files")) return "glob";
     if (std.mem.eql(u8, tool_name, "grep_files")) return "grep";

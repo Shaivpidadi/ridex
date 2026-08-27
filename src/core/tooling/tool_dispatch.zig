@@ -375,6 +375,7 @@ pub const ExecutorKind = enum {
     read_tool_result,
     write_file,
     edit_file,
+    apply_patch,
     delete_file,
     rename_file,
     copy_file,
