@@ -14,18 +14,19 @@ pub const max_config_file_bytes: usize = 64 * 1024;
 pub const max_system_prompt_parts: usize = 16;
 pub const max_system_prompt_part_bytes: usize = 64 * 1024;
 pub const max_system_prompt_total_bytes: usize = 128 * 1024;
+const max_integer_json = std.fmt.comptimePrint("{d}", .{std.math.maxInt(usize)});
 
 pub const json_schema =
-    "{\"$schema\":\"https://json-schema.org/draft/2020-12/schema\",\"$id\":\"https://fx.sh/schema/launch-config-v1.json\",\"title\":\"fx launch configuration\",\"type\":\"object\",\"additionalProperties\":false,\"required\":[\"schema_version\"],\"$defs\":{\"contextLimit\":{\"oneOf\":[{\"type\":\"integer\",\"minimum\":0},{\"const\":\"off\"}]}},\"properties\":{" ++
+    "{\"$schema\":\"https://json-schema.org/draft/2020-12/schema\",\"$id\":\"https://fx.sh/schema/launch-config-v1.json\",\"title\":\"fx launch configuration\",\"type\":\"object\",\"additionalProperties\":false,\"required\":[\"schema_version\"],\"$defs\":{\"contextLimit\":{\"oneOf\":[{\"type\":\"integer\",\"minimum\":0,\"maximum\":" ++ max_integer_json ++ "},{\"const\":\"off\"}]}},\"properties\":{" ++
     "\"schema_version\":{\"const\":1}," ++
     "\"agent\":{\"type\":\"object\",\"additionalProperties\":false,\"properties\":{" ++
-    "\"provider\":{\"enum\":[\"gateway\",\"codex\",\"grok\"]},\"model\":{\"type\":\"string\",\"minLength\":1,\"maxLength\":1024},\"effort\":{\"type\":\"string\",\"minLength\":1,\"maxLength\":64,\"pattern\":\"^[A-Za-z0-9._-]+$\"},\"fast_mode\":{\"type\":\"boolean\"},\"max_steps\":{\"type\":\"integer\",\"minimum\":0},\"first_call_tool_choice\":{\"enum\":[\"auto\",\"none\",\"required\"]},\"enabled_tools\":{\"type\":\"array\",\"uniqueItems\":true,\"items\":{\"type\":\"string\"}}}}," ++
+    "\"provider\":{\"enum\":[\"gateway\",\"codex\",\"grok\"]},\"model\":{\"type\":\"string\",\"minLength\":1,\"maxLength\":1024,\"pattern\":\"^[^\\\\u0000-\\\\u0020\\\\u007F](?:[^\\\\u0000-\\\\u001F\\\\u007F]*[^\\\\u0000-\\\\u0020\\\\u007F])?$\"},\"effort\":{\"type\":\"string\",\"minLength\":1,\"maxLength\":64,\"pattern\":\"^[A-Za-z0-9._-]+$\"},\"fast_mode\":{\"type\":\"boolean\"},\"max_steps\":{\"type\":\"integer\",\"minimum\":0,\"maximum\":" ++ max_integer_json ++ "},\"first_call_tool_choice\":{\"enum\":[\"auto\",\"none\",\"required\"]},\"enabled_tools\":{\"type\":\"array\",\"uniqueItems\":true,\"items\":{\"type\":\"string\",\"minLength\":1,\"pattern\":\"^[^\\\\u0000]+$\"}}}}," ++
     "\"prompt\":{\"type\":\"object\",\"additionalProperties\":false,\"properties\":{\"system_parts\":{\"type\":\"array\",\"maxItems\":16,\"items\":{\"oneOf\":[" ++
     "{\"type\":\"object\",\"additionalProperties\":false,\"required\":[\"type\",\"id\"],\"properties\":{\"type\":{\"const\":\"builtin\"},\"id\":{\"const\":\"default\"}}}," ++
     "{\"type\":\"object\",\"additionalProperties\":false,\"required\":[\"type\",\"text\"],\"properties\":{\"type\":{\"const\":\"inline\"},\"text\":{\"type\":\"string\",\"maxLength\":65536}}}," ++
-    "{\"type\":\"object\",\"additionalProperties\":false,\"required\":[\"type\",\"path\"],\"properties\":{\"type\":{\"const\":\"file\"},\"path\":{\"type\":\"string\",\"minLength\":1}}}]}}}}," ++
-    "\"runtime\":{\"type\":\"object\",\"additionalProperties\":false,\"properties\":{\"permission_mode\":{\"enum\":[\"ask\",\"auto\",\"yolo\"]},\"max_tool_result_bytes\":{\"type\":\"integer\",\"minimum\":1024},\"context_enabled\":{\"type\":\"boolean\"},\"context_limits\":{\"type\":\"object\",\"additionalProperties\":false,\"properties\":{" ++
-    "\"skill_description_bytes\":{\"$ref\":\"#/$defs/contextLimit\"},\"skill_catalog_bytes\":{\"$ref\":\"#/$defs/contextLimit\"},\"skill_chunk_bytes\":{\"$ref\":\"#/$defs/contextLimit\"},\"skill_file_bytes\":{\"$ref\":\"#/$defs/contextLimit\"},\"mcp_description_bytes\":{\"$ref\":\"#/$defs/contextLimit\"},\"mcp_search_result_bytes\":{\"$ref\":\"#/$defs/contextLimit\"},\"mcp_server_instructions_bytes\":{\"$ref\":\"#/$defs/contextLimit\"},\"mcp_selected_schema_bytes\":{\"$ref\":\"#/$defs/contextLimit\"},\"project_instruction_file_bytes\":{\"$ref\":\"#/$defs/contextLimit\"},\"project_instructions_total_bytes\":{\"$ref\":\"#/$defs/contextLimit\"},\"image_adapter_output_bytes\":{\"$ref\":\"#/$defs/contextLimit\"}}},\"additional_directories\":{\"type\":\"array\",\"maxItems\":16,\"uniqueItems\":true,\"items\":{\"type\":\"string\"}}}}}}\n";
+    "{\"type\":\"object\",\"additionalProperties\":false,\"required\":[\"type\",\"path\"],\"properties\":{\"type\":{\"const\":\"file\"},\"path\":{\"type\":\"string\",\"minLength\":1,\"pattern\":\"^[^\\\\u0000]+$\"}}}]}}}}," ++
+    "\"runtime\":{\"type\":\"object\",\"additionalProperties\":false,\"properties\":{\"permission_mode\":{\"enum\":[\"ask\",\"auto\",\"yolo\"]},\"max_tool_result_bytes\":{\"type\":\"integer\",\"minimum\":1024,\"maximum\":" ++ max_integer_json ++ "},\"context_enabled\":{\"type\":\"boolean\"},\"context_limits\":{\"type\":\"object\",\"additionalProperties\":false,\"properties\":{" ++
+    "\"skill_description_bytes\":{\"$ref\":\"#/$defs/contextLimit\"},\"skill_catalog_bytes\":{\"$ref\":\"#/$defs/contextLimit\"},\"skill_chunk_bytes\":{\"$ref\":\"#/$defs/contextLimit\"},\"skill_file_bytes\":{\"$ref\":\"#/$defs/contextLimit\"},\"mcp_description_bytes\":{\"$ref\":\"#/$defs/contextLimit\"},\"mcp_search_result_bytes\":{\"$ref\":\"#/$defs/contextLimit\"},\"mcp_server_instructions_bytes\":{\"$ref\":\"#/$defs/contextLimit\"},\"mcp_selected_schema_bytes\":{\"$ref\":\"#/$defs/contextLimit\"},\"project_instruction_file_bytes\":{\"$ref\":\"#/$defs/contextLimit\"},\"project_instructions_total_bytes\":{\"$ref\":\"#/$defs/contextLimit\"},\"image_adapter_output_bytes\":{\"$ref\":\"#/$defs/contextLimit\"}}},\"additional_directories\":{\"type\":\"array\",\"maxItems\":16,\"uniqueItems\":true,\"items\":{\"type\":\"string\",\"minLength\":1,\"pattern\":\"^[^\\\\u0000]+$\"}}}}}}\n";
 
 pub const InputSource = union(enum) {
     regular_file: []const u8,
@@ -529,6 +530,13 @@ fn collectInteger(
             };
             if (converted < minimum) try collector.add(location, .invalid_value);
         },
+        .number_string => |text| {
+            const converted = std.fmt.parseInt(usize, text, 10) catch {
+                try collector.add(location, .invalid_value);
+                return;
+            };
+            if (converted < minimum) try collector.add(location, .invalid_value);
+        },
         else => try collector.add(location, .invalid_type),
     }
 }
@@ -626,6 +634,7 @@ pub fn collectValidationDiagnostics(
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, bytes, .{
         .duplicate_field_behavior = .@"error",
     }) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
         if (err == error.DuplicateField) {
             const location = findFirstDuplicatePointer(alloc, bytes) catch |scan_error| switch (scan_error) {
                 error.OutOfMemory => return error.OutOfMemory,
@@ -1008,6 +1017,9 @@ fn collectContextLimitDiagnostics(collector: *ValidationCollector, value: std.js
             .integer => |integer| if (std.math.cast(usize, integer) == null) {
                 try collector.add(location, .invalid_value);
             },
+            .number_string => |text| if (std.fmt.parseInt(usize, text, 10)) |_| {} else |_| {
+                try collector.add(location, .invalid_value);
+            },
             .string => |text| if (!std.mem.eql(u8, text, "off")) {
                 try collector.add(location, .invalid_value);
             },
@@ -1264,6 +1276,9 @@ fn parseContextLimitValue(value: std.json.Value) !context_limits.Value {
         .integer => |integer| .{
             .bytes = std.math.cast(usize, integer) orelse return error.InvalidContextLimit,
         },
+        .number_string => |text| .{
+            .bytes = std.fmt.parseInt(usize, text, 10) catch return error.InvalidContextLimit,
+        },
         .string => |string| if (std.mem.eql(u8, string, "off"))
             .off
         else
@@ -1340,6 +1355,22 @@ test "published schema is valid JSON and describes the strict root" {
     try std.testing.expectEqual(@as(i64, 1), effort.get("minLength").?.integer);
     try std.testing.expectEqual(@as(i64, 64), effort.get("maxLength").?.integer);
     try std.testing.expectEqualStrings("^[A-Za-z0-9._-]+$", effort.get("pattern").?.string);
+    const agent_properties = parsed.value.object.get("properties").?.object
+        .get("agent").?.object.get("properties").?.object;
+    const model = agent_properties.get("model").?.object;
+    try std.testing.expectEqualStrings(
+        "^[^\\u0000-\\u0020\\u007F](?:[^\\u0000-\\u001F\\u007F]*[^\\u0000-\\u0020\\u007F])?$",
+        model.get("pattern").?.string,
+    );
+    const enabled_tool_items = agent_properties.get("enabled_tools").?.object
+        .get("items").?.object;
+    try std.testing.expectEqual(@as(i64, 1), enabled_tool_items.get("minLength").?.integer);
+    try std.testing.expectEqualStrings("^[^\\u0000]+$", enabled_tool_items.get("pattern").?.string);
+    const max_steps = agent_properties.get("max_steps").?.object.get("maximum").?;
+    try std.testing.expectEqualStrings(
+        std.fmt.comptimePrint("{d}", .{std.math.maxInt(usize)}),
+        max_steps.number_string,
+    );
 }
 
 test "validation diagnostics collect independent errors in pointer order" {
@@ -1355,6 +1386,27 @@ test "validation diagnostics collect independent errors in pointer order" {
     try std.testing.expectEqualStrings("/runtime/permission_mode", diagnostics.items[1].instance_location);
     try std.testing.expectEqual(DiagnosticCode.invalid_type, diagnostics.items[1].code);
     try std.testing.expect(!diagnostics.truncated);
+}
+
+test "validation and typed parsing accept the published integer maximum" {
+    const document = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"schema_version\":1,\"agent\":{{\"max_steps\":{d}}},\"runtime\":{{\"context_limits\":{{\"skill_chunk_bytes\":{d}}}}}}}",
+        .{ std.math.maxInt(usize), std.math.maxInt(usize) },
+    );
+    defer std.testing.allocator.free(document);
+
+    var diagnostics = try collectValidationDiagnostics(std.testing.allocator, document);
+    defer diagnostics.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
+
+    var parsed = try parseDocument(std.testing.allocator, document, .non_file);
+    defer parsed.deinit(std.testing.allocator);
+    try std.testing.expectEqual(std.math.maxInt(usize), parsed.max_steps.?);
+    try std.testing.expectEqual(
+        std.math.maxInt(usize),
+        parsed.context_limit_overrides.?.get(.skill_chunk_bytes).?.value.bytes,
+    );
 }
 
 test "validation diagnostics report exact duplicate pointer" {
@@ -1395,6 +1447,20 @@ test "validation diagnostic ownership cleans every allocation failure" {
                 "{\"schema_version\":1,\"agent\":{\"fast_mode\":\"yes\"},\"runtime\":{\"permission_mode\":7}}",
             );
             defer diagnostics.deinit(alloc);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+test "valid validation diagnostics propagate every allocation failure" {
+    const Case = struct {
+        fn run(alloc: Allocator) !void {
+            var diagnostics = try collectValidationDiagnostics(
+                alloc,
+                "{\"schema_version\":1,\"agent\":{\"fast_mode\":true}}",
+            );
+            defer diagnostics.deinit(alloc);
+            try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});

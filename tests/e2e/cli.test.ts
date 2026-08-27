@@ -4959,6 +4959,14 @@ describe("cli: explicit launch config", () => {
       maxLength: 64,
       pattern: "^[A-Za-z0-9._-]+$",
     });
+    expect(schema.properties.agent.properties.enabled_tools.items).toEqual({
+      type: "string",
+      minLength: 1,
+      pattern: "^[^\\u0000]+$",
+    });
+    expect(schemaResult.stdout).toContain(
+      '"max_steps":{"type":"integer","minimum":0,"maximum":18446744073709551615}',
+    );
 
     const capabilitiesResult = await runFx([
       "config",
@@ -4999,6 +5007,7 @@ describe("cli: explicit launch config", () => {
       const duplicate = join(root, "duplicate.json");
       const unavailable = join(root, "unavailable.json");
       const invalidTypes = join(root, "invalid-types.json");
+      const emptyTool = join(root, "empty-tool.json");
       writeFileSync(join(root, "prompt.md"), "VALID PROMPT FILE\n");
       writeFileSync(
         valid,
@@ -5012,6 +5021,10 @@ describe("cli: explicit launch config", () => {
       writeFileSync(
         invalidTypes,
         '{"schema_version":1,"agent":{"fast_mode":"yes"},"runtime":{"permission_mode":7}}\n',
+      );
+      writeFileSync(
+        emptyTool,
+        '{"schema_version":1,"agent":{"enabled_tools":[""]}}\n',
       );
 
       const accepted = await runFx(["config", "validate", valid, "--json"]);
@@ -5072,6 +5085,18 @@ describe("cli: explicit launch config", () => {
           },
         ],
         truncated: false,
+      });
+
+      const emptyToolResult = await runFx([
+        "config",
+        "validate",
+        emptyTool,
+        "--json",
+      ]);
+      expect(emptyToolResult.code).toBe(1);
+      expect(JSON.parse(emptyToolResult.stdout).diagnostics[0]).toMatchObject({
+        instance_location: "/agent/enabled_tools/0",
+        code: "invalid_value",
       });
 
       const stdinFilePart = await runFx(
@@ -5237,6 +5262,37 @@ describe("cli: explicit launch config", () => {
       expect(missingEnvironment.stderr).toContain(
         "--config-env names a missing environment variable",
       );
+
+      writeFileSync(
+        join(home, ".fx", "settings.json"),
+        '{"provider":"codex","codex_model":"codex/model"}\n',
+      );
+      const providerOnly = await runFx(
+        [
+          "--set=agent.provider=gateway",
+          "config",
+          "resolve",
+          "--json",
+        ],
+        {
+          cwd: realpathSync(workspace),
+          env: {
+            HOME: realpathSync(home),
+            FX_MODEL: undefined,
+            FX_PERMISSION_MODE: undefined,
+            FX_MAX_AGENT_STEPS: undefined,
+          },
+        },
+      );
+      expect(providerOnly.code).toBe(0);
+      const providerOnlyReport = JSON.parse(providerOnly.stdout);
+      expect(providerOnlyReport.config.agent.provider).toBe("gateway");
+      expect(
+        providerOnlyReport.provenance.find(
+          (entry: { instance_location: string }) =>
+            entry.instance_location === "/agent/model",
+        ).source,
+      ).toEqual({ kind: "compiled_default" });
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

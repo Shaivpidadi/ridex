@@ -470,7 +470,16 @@ fn loadMergedSettingsDetailedForLaunchWithOptionalHome(
         };
     }
 
-    detailed.model_source = detailed.sources.models.get(detailed.settings.provider orelse .gateway);
+    const final_model_source = detailed.sources.models.get(detailed.settings.provider orelse .gateway);
+    detailed.model_source = final_model_source;
+    if (!detailed.launch_policy.explicit_fields.contains(.model)) {
+        try detailed.launch_policy.setSource(
+            alloc,
+            .model,
+            legacyLaunchSource(final_model_source),
+            false,
+        );
+    }
     return detailed;
 }
 
@@ -2518,6 +2527,45 @@ test "explicit launch model survives a later provider-only layer" {
     try std.testing.expectEqual(
         @as(usize, 0),
         detailed.launch_policy.source(.model).explicit_file.layer,
+    );
+}
+
+test "implicit provider override refreshes model provenance for the final provider" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "home/.fx");
+    try tmp.dir.createDirPath(std.testing.io, "workspace");
+    try writeFixtureFile(
+        tmp.dir,
+        "home/.fx/settings.json",
+        "{\"provider\":\"codex\",\"codex_model\":\"codex/model\"}",
+    );
+    const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace_root);
+    const overrides = [_]LaunchOverride{.{
+        .name = "agent.provider",
+        .value = "gateway",
+        .source = .{ .command = 0 },
+    }};
+
+    var detailed = try loadMergedSettingsDetailedForLaunchFromHome(
+        alloc,
+        home_root,
+        workspace_root,
+        .{ .overrides = &overrides },
+    );
+    defer detailed.deinit(alloc);
+
+    try std.testing.expectEqual(model_provider.ProviderId.gateway, detailed.settings.provider.?);
+    try std.testing.expect(detailed.settings.models.get(.gateway) == null);
+    try std.testing.expectEqual(ModelSource.compiled_default, detailed.model_source.?);
+    try std.testing.expectEqual(
+        launch_config.Source.compiled_default,
+        detailed.launch_policy.source(.model),
     );
 }
 
