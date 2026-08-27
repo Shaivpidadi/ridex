@@ -1067,6 +1067,7 @@ pub fn parseDocument(
 pub const EncodedOverrideDocument = struct {
     bytes: []u8,
     field: Field,
+    preflight_diagnostic: ?DiagnosticCode = null,
 
     pub fn deinit(self: *EncodedOverrideDocument, alloc: Allocator) void {
         alloc.free(self.bytes);
@@ -1077,6 +1078,12 @@ pub const EncodedOverrideDocument = struct {
         self: EncodedOverrideDocument,
         alloc: Allocator,
     ) Allocator.Error!ValidationDiagnostics {
+        if (self.preflight_diagnostic) |code| {
+            var collector = ValidationCollector{ .alloc = alloc };
+            defer collector.deinit();
+            try collector.add(self.field.jsonPointer(), code);
+            return collector.finish();
+        }
         var diagnostics = try collectValidationDiagnostics(alloc, self.bytes);
         errdefer diagnostics.deinit(alloc);
         for (diagnostics.items) |*diagnostic| {
@@ -1095,6 +1102,24 @@ pub fn encodeOverrideDocument(
     value: []const u8,
 ) !EncodedOverrideDocument {
     const field = overrideField(name) orelse return error.UnknownConfigField;
+    if (value.len > max_config_file_bytes) return .{
+        .bytes = try alloc.dupe(u8, ""),
+        .field = field,
+        .preflight_diagnostic = .too_large,
+    };
+    if (fieldUsesJsonValue(field)) {
+        var parsed_value = std.json.parseFromSlice(std.json.Value, alloc, value, .{
+            .duplicate_field_behavior = .use_first,
+        }) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return .{
+                .bytes = try alloc.dupe(u8, ""),
+                .field = field,
+                .preflight_diagnostic = .invalid_json,
+            },
+        };
+        defer parsed_value.deinit();
+    }
     const dotted_name = field.dottedName();
     const separator = std.mem.findScalar(u8, dotted_name, '.') orelse return error.UnknownConfigField;
     var encoded: std.Io.Writer.Allocating = .init(alloc);
@@ -1119,6 +1144,10 @@ pub fn encodeOverrideDocument(
 pub fn parseOverride(alloc: Allocator, name: []const u8, value: []const u8) !ParsedDocument {
     var encoded = try encodeOverrideDocument(alloc, name, value);
     defer encoded.deinit(alloc);
+    if (encoded.preflight_diagnostic) |code| return switch (code) {
+        .too_large => error.ConfigFileTooLarge,
+        else => error.SyntaxError,
+    };
     return parseDocument(alloc, encoded.bytes, .non_file);
 }
 
@@ -1676,6 +1705,36 @@ test "typed overrides share strict document parsing" {
         malformed_diagnostics.items[0].instance_location,
     );
     try std.testing.expectEqual(DiagnosticCode.invalid_json, malformed_diagnostics.items[0].code);
+
+    var injected = try encodeOverrideDocument(
+        std.testing.allocator,
+        "agent.fast_mode",
+        "true},\"runtime\":{\"permission_mode\":\"yolo\"",
+    );
+    defer injected.deinit(std.testing.allocator);
+    var injected_diagnostics = try injected.collectDiagnostics(std.testing.allocator);
+    defer injected_diagnostics.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), injected_diagnostics.items.len);
+    try std.testing.expectEqualStrings(
+        "/agent/fast_mode",
+        injected_diagnostics.items[0].instance_location,
+    );
+    try std.testing.expectEqual(DiagnosticCode.invalid_json, injected_diagnostics.items[0].code);
+
+    var duplicate = try encodeOverrideDocument(
+        std.testing.allocator,
+        "runtime.context_limits",
+        "{\"skill_chunk_bytes\":1,\"skill_chunk_bytes\":2}",
+    );
+    defer duplicate.deinit(std.testing.allocator);
+    var duplicate_diagnostics = try duplicate.collectDiagnostics(std.testing.allocator);
+    defer duplicate_diagnostics.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), duplicate_diagnostics.items.len);
+    try std.testing.expectEqualStrings(
+        "/runtime/context_limits/skill_chunk_bytes",
+        duplicate_diagnostics.items[0].instance_location,
+    );
+    try std.testing.expectEqual(DiagnosticCode.duplicate_field, duplicate_diagnostics.items[0].code);
 }
 
 test "strict document ownership cleans every allocation failure" {

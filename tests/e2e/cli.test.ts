@@ -5360,6 +5360,7 @@ describe("cli: explicit launch config", () => {
         ],
         env: {},
         location: "/agent/fast_mode",
+        code: "invalid_type",
         source: { kind: "command", argument_index: 0 },
       },
       {
@@ -5371,6 +5372,7 @@ describe("cli: explicit launch config", () => {
         ],
         env: { FX_TEST_CONFIG_FAST_INVALID: '"yes"' },
         location: "/agent/fast_mode",
+        code: "invalid_type",
         source: {
           kind: "environment",
           name: "FX_TEST_CONFIG_FAST_INVALID",
@@ -5380,7 +5382,20 @@ describe("cli: explicit launch config", () => {
         args: ["config", "resolve", "--json"],
         env: { FX_MAX_AGENT_STEPS: '"many"' },
         location: "/agent/max_steps",
+        code: "invalid_type",
         source: { kind: "environment", name: "FX_MAX_AGENT_STEPS" },
+      },
+      {
+        args: [
+          '--set=agent.fast_mode=true},"runtime":{"permission_mode":"yolo"',
+          "config",
+          "resolve",
+          "--json",
+        ],
+        env: {},
+        location: "/agent/fast_mode",
+        code: "invalid_json",
+        source: { kind: "command", argument_index: 0 },
       },
     ];
 
@@ -5397,7 +5412,7 @@ describe("cli: explicit launch config", () => {
             source: testCase.source,
             instance_location: testCase.location,
             severity: "error",
-            code: "invalid_type",
+            code: testCase.code,
           },
         ],
         truncated: false,
