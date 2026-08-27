@@ -23,6 +23,7 @@ const io_mod = @import("../shared/io.zig");
 const list_window = @import("../shared/list_window.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const session_runtime = @import("../session/session.zig");
+const worker_runtime = @import("../agent/worker_runtime.zig");
 const session_catalog = @import("../session/session_catalog.zig");
 const session_codec = @import("../session/session_codec.zig");
 const js_host_session_store = @import("../session/js_host_session_store.zig");
@@ -1546,6 +1547,7 @@ pub fn Runtime(comptime App: type) type {
             background_policy: BackgroundSessionPolicy,
             log_options: session_log.Options,
         ) void {
+            if (comptime @hasDecl(App, "stopSessionTitleGeneration")) app.stopSessionTitleGeneration();
             clearCachedSessionTitle(app);
             app.worker.discardEvents(std.heap.c_allocator);
 
@@ -1754,6 +1756,7 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn continueWithFreshJsHostSession(app: *App) !void {
+            if (comptime @hasDecl(App, "stopSessionTitleGeneration")) app.stopSessionTitleGeneration();
             app.session.reset(app.alloc);
             app.shell.clearTranscript(app.alloc);
             clearCachedSessionTitle(app);
@@ -2948,6 +2951,25 @@ pub fn Runtime(comptime App: type) type {
         /// resume picker does not keep serving the derived title.
         pub fn renameActiveSession(app: *App, raw: []const u8) !void {
             const title = try validateSessionTitle(raw);
+            try applyActiveSessionTitle(app, title);
+        }
+
+        /// Applies a generated title only while the originating session and
+        /// provisional title are still current. A manual rename therefore wins.
+        pub fn applyGeneratedSessionTitle(
+            app: *App,
+            generated: worker_runtime.GeneratedSessionTitle,
+        ) !void {
+            const active_id = activeSessionId(app) orelse return;
+            if (!std.mem.eql(u8, active_id, generated.session_id)) return;
+            const current = cachedSessionTitle(app) orelse return;
+            if (!std.mem.eql(u8, current, generated.expected_title)) return;
+            const title = validateSessionTitle(generated.title) catch return;
+            try applyActiveSessionTitle(app, title);
+            app.shell.render_requests.request(.footer);
+        }
+
+        fn applyActiveSessionTitle(app: *App, title: []const u8) !void {
             if (comptime !@hasField(App, "session_persistence")) return error.NoActiveSession;
             if (app.session_persistence.writable == null) return error.NoActiveSession;
 
@@ -9786,6 +9808,47 @@ test "renameActiveSession requires an active session" {
         error.NoActiveSession,
         Runtime(TestApp).renameActiveSession(&app, "no session yet"),
     );
+}
+
+test "generated session title uses compare and set so manual rename wins" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+
+    var app = try TestApp.init(alloc, paths.workspace);
+    defer app.deinit();
+    try configureTestPreferences(&app);
+    try Runtime(TestApp).initializePersistence(&app, true);
+    try Runtime(TestApp).beginFreshPersistedSession(&app);
+    Runtime(TestApp).enableSessionStores(&app);
+    const session_id = Runtime(TestApp).activeSessionId(&app).?;
+
+    try Runtime(TestApp).setCachedSessionTitle(&app, "fix the first prompt title");
+    try Runtime(TestApp).applyGeneratedSessionTitle(&app, .{
+        .session_id = @constCast(session_id),
+        .expected_title = @constCast("fix the first prompt title"),
+        .title = @constCast("Generate session titles"),
+    });
+    try std.testing.expectEqualStrings(
+        "Generate session titles",
+        Runtime(TestApp).cachedSessionTitle(&app).?,
+    );
+
+    try Runtime(TestApp).renameActiveSession(&app, "Manual title");
+    try Runtime(TestApp).applyGeneratedSessionTitle(&app, .{
+        .session_id = @constCast(session_id),
+        .expected_title = @constCast("Generate session titles"),
+        .title = @constCast("Stale automatic title"),
+    });
+    try std.testing.expectEqualStrings("Manual title", Runtime(TestApp).cachedSessionTitle(&app).?);
 }
 
 test "renameActiveSession persists the title to the sidecar and session index" {

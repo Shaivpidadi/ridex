@@ -421,6 +421,7 @@ pub fn Bindings(comptime App: type) type {
                 .command_output_complete = workerBridgeCommandOutputComplete,
                 .diff_block = workerBridgeDiffBlock,
                 .append_history_turn = workerBridgeAppendHistoryTurn,
+                .apply_generated_session_title = workerBridgeApplyGeneratedSessionTitle,
                 .session_grant = workerBridgeSessionGrant,
                 .error_text = workerBridgeErrorText,
             };
@@ -1129,6 +1130,16 @@ pub fn Bindings(comptime App: type) type {
             const app: *App = @ptrCast(@alignCast(ctx));
             if (try app.pacer.deferFinish(app.alloc, finished)) return;
             try appendHistoryTurn(app, finished);
+        }
+
+        fn workerBridgeApplyGeneratedSessionTitle(
+            ctx: *anyopaque,
+            generated: worker_runtime.GeneratedSessionTitle,
+        ) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            if (comptime @hasField(App, "session_persistence")) {
+                try app_session_runtime.Runtime(App).applyGeneratedSessionTitle(app, generated);
+            }
         }
 
         fn workerBridgeSessionGrant(ctx: *anyopaque, grant: types.PermissionGrant) !void {

@@ -503,6 +503,12 @@ pub const PendingQuestionBatchSnapshot = struct {
     }
 };
 
+pub const GeneratedSessionTitle = struct {
+    session_id: []u8,
+    expected_title: []u8,
+    title: []u8,
+};
+
 pub const WorkerEvent = union(enum) {
     begin_prompt: types.UserTurn,
     begin_prompt_with_skill_bindings: BeginPromptWithSkillBindings,
@@ -523,6 +529,7 @@ pub const WorkerEvent = union(enum) {
     turn_phase_update: types.TurnPhaseUpdate,
     diff_block: diff_mod.DiffEntryPayload,
     finish_prompt: types.FinishedPrompt,
+    generated_session_title: GeneratedSessionTitle,
     session_grant: types.PermissionGrant,
     error_text: types.SemanticNotice,
 };
@@ -2771,6 +2778,18 @@ pub fn dupeWorkerEvent(alloc: std.mem.Allocator, event: WorkerEvent) !WorkerEven
             } };
         },
         .finish_prompt => |finished| .{ .finish_prompt = try types.dupeFinishedPrompt(alloc, finished) },
+        .generated_session_title => |generated| blk: {
+            const session_id = try alloc.dupe(u8, generated.session_id);
+            errdefer alloc.free(session_id);
+            const expected_title = try alloc.dupe(u8, generated.expected_title);
+            errdefer alloc.free(expected_title);
+            const title = try alloc.dupe(u8, generated.title);
+            break :blk .{ .generated_session_title = .{
+                .session_id = session_id,
+                .expected_title = expected_title,
+                .title = title,
+            } };
+        },
         .session_grant => |grant| blk: {
             const tool_name = try alloc.dupe(u8, grant.tool_name);
             errdefer alloc.free(tool_name);
@@ -2814,6 +2833,11 @@ pub fn freeWorkerEvent(alloc: std.mem.Allocator, event: WorkerEvent) void {
         .tool_lifecycle => |lifecycle| freeToolLifecycleEvent(alloc, lifecycle),
         .diff_block => |payload| diff_mod.freeDiffEntryPayload(alloc, payload),
         .finish_prompt => |finished| types.freeFinishedPrompt(alloc, finished),
+        .generated_session_title => |generated| {
+            alloc.free(generated.session_id);
+            alloc.free(generated.expected_title);
+            alloc.free(generated.title);
+        },
         .session_grant => |grant| {
             alloc.free(grant.tool_name);
             alloc.free(grant.target_path);

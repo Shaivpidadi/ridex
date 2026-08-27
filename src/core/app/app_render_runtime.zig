@@ -1135,6 +1135,7 @@ pub fn Runtime(comptime App: type) type {
                 .turn_token_update,
                 .turn_phase_update,
                 .finish_prompt,
+                .generated_session_title,
                 .session_grant,
                 => {},
             }

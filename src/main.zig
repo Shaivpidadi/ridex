@@ -33,6 +33,7 @@ const app_agent_runtime = @import("core/app/app_agent_runtime.zig");
 const app_runtime_setup = @import("core/app/app_runtime_setup.zig");
 const app_render_runtime = @import("core/app/app_render_runtime.zig");
 const app_session_runtime = @import("core/app/app_session_runtime.zig");
+const app_session_title_runtime = @import("core/app/app_session_title_runtime.zig");
 const app_upgrade_runtime = @import("core/app/app_upgrade_runtime.zig");
 const app_worker_runtime = @import("core/app/app_worker_runtime.zig");
 const app_workspace_runtime = @import("core/app/app_workspace_runtime.zig");
@@ -386,6 +387,7 @@ const App = struct {
     const HerdrAppRuntime = builtin_hooks.Runtime(Self);
     const RenderAppRuntime = app_render_runtime.Runtime(Self);
     const SessionAppRuntime = app_session_runtime.Runtime(Self);
+    const SessionTitleAppRuntime = app_session_title_runtime.Runtime(Self);
     const UpgradeAppRuntime = app_upgrade_runtime.Runtime(Self);
     const WorkerAppRuntime = app_worker_runtime.Runtime(Self);
     const WorkspaceAppRuntime = app_workspace_runtime.Runtime(Self);
@@ -545,6 +547,7 @@ const App = struct {
 
     worker_thread: ?std.Thread = null,
     worker: WorkerRuntime = .{},
+    session_title_generation: app_session_title_runtime.State = .{},
     background: BackgroundRuntime = .{},
     terminal_client: terminal_client_runtime.Runtime = .{},
     terminal_direct: terminal_direct_runtime.Runtime = .{},
@@ -809,6 +812,7 @@ const App = struct {
         self.herdr.deinit();
         self.stopStream();
 
+        self.session_title_generation.cancel.store(true, .seq_cst);
         self.worker.requestShutdown();
         self.background.requestStop();
         self.upgrader.stop();
@@ -817,6 +821,7 @@ const App = struct {
         self.terminal_takeover.shutdown(App, self);
         self.releaseTerminal();
         if (self.worker_thread) |thread| thread.join();
+        self.stopSessionTitleGeneration();
         self.terminal_takeover.deinit(self.alloc);
         const direct_deinit_disposition = if (capture_resume_handoff)
             self.terminal_direct.deinitSettled(self.alloc)
@@ -1031,6 +1036,14 @@ const App = struct {
         return self.enqueuePromptWithSkillBindings(prompt, &.{});
     }
 
+    pub fn stopSessionTitleGeneration(self: *App) void {
+        SessionTitleAppRuntime.stop(self);
+    }
+
+    fn maybeStartSessionTitleGeneration(self: *App, prompt: []const u8) void {
+        SessionTitleAppRuntime.start(self, prompt);
+    }
+
     pub fn enqueuePromptWithSkillBindings(self: *App, prompt: []const u8, skill_tokens: []const registered_entities.SkillTokenSpan) !bool {
         return self.enqueuePromptWithOptionalReview(
             prompt,
@@ -1098,6 +1111,7 @@ const App = struct {
             skill_tokens,
             review_draft,
         )) return false;
+        self.maybeStartSessionTitleGeneration(prompt);
         WorkerAppRuntime.syncState(
             self,
             app_callbacks.Bindings(App).worker_tool_lifecycle_presenter(self),
@@ -1142,6 +1156,7 @@ const App = struct {
             draft.turn_id,
             true,
         )) return error.PendingPromptQueueRejected;
+        self.maybeStartSessionTitleGeneration(draft.prompt);
         WorkerAppRuntime.syncState(
             self,
             app_callbacks.Bindings(App).worker_tool_lifecycle_presenter(self),
@@ -3900,6 +3915,7 @@ test {
     _ = @import("core/app/app_terminal_takeover_runtime.zig");
     _ = @import("core/app/app_runtime_setup.zig");
     _ = @import("core/app/app_session_runtime.zig");
+    _ = @import("core/app/app_session_title_runtime.zig");
     _ = @import("core/app/app_upgrade_runtime.zig");
     _ = @import("core/app/app_worker_runtime.zig");
     _ = @import("ui/event_loop.zig");
