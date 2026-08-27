@@ -299,7 +299,7 @@ const McpContentLengthReader = struct {
         writer: *std.Io.Writer,
         limit: std.Io.Limit,
     ) std.Io.Reader.StreamError!usize {
-        const self: *McpContentLengthReader = @fieldParentPtr("interface", reader);
+        const self: *McpContentLengthReader = @alignCast(@fieldParentPtr("interface", reader));
         if (self.remaining == 0) return error.EndOfStream;
         const count = try self.source.stream(
             writer,
