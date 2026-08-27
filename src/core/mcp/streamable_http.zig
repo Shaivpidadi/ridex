@@ -270,6 +270,11 @@ const PreparedRequest = struct {
     }
 };
 
+// Zig 0.16's Response.reader can enter `.ready` before its content-length
+// stream reads the tagged remaining-length field, which aborts the process.
+// Keep MCP framing in independent state and requests one-shot so teardown never
+// re-enters that union. Remove this adapter when the pinned Response.reader
+// passes the fixed-length JSON and SSE regression cases.
 const McpContentLengthReader = struct {
     source: *std.Io.Reader,
     remaining: u64,
