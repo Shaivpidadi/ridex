@@ -97,6 +97,32 @@ Use `fx ask` for a single request:
 fx ask "explain the changes in this repository"
 ```
 
+Use a versioned JSON file for deterministic launch settings without changing `HOME`:
+
+```json
+{
+  "schema_version": 1,
+  "agent": {
+    "model": "openai/gpt-5.4",
+    "fast_mode": true,
+    "enabled_tools": ["read_file", "grep_files"]
+  },
+  "runtime": {
+    "permission_mode": "auto"
+  }
+}
+```
+
+```bash
+fx --config=base.json --config=review.json ask "review this repository"
+fx --no-config --set=agent.fast_mode=true config resolve --json
+fx config schema --json
+fx config capabilities --json
+fx config validate launch.json --json
+```
+
+Explicit files apply from left to right. `--set` and `--config-env` provide typed per-invocation overrides. Credentials, sessions, skills, MCP state, history, and logs continue using the real profile.
+
 With `--json`, `output` contains accumulated assistant Markdown across the request, while `final_output` contains only a completed final assistant response and is `""` for interrupted, failed, background, or otherwise absent final responses.
 
 Foreground terminal commands run with an explicit finite deadline. fx uses durable terminal sessions for services, watchers, GUI applications, and other long-lived work, and keeps captured foreground output available through an opaque bounded-read handle for the active session or `--no-save` process.

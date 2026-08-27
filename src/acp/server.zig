@@ -254,6 +254,7 @@ pub const ServerState = struct {
     pending_outbound: std.AutoHashMapUnmanaged(u64, PendingOutbound) = .empty,
     legacy_url_mutex: std.Io.Mutex = .init,
     pending_legacy_urls: std.ArrayListUnmanaged(PendingLegacyUrl) = .empty,
+    launch_policy: config_runtime.launch_config.OwnedLaunchPolicy = .{},
 
     pub fn deinit(self: *ServerState) void {
         reapActivePrompt(self, true);
@@ -288,6 +289,7 @@ pub const ServerState = struct {
         self.pending_outbound.deinit(self.alloc);
         clearPendingLegacyUrls(self);
         self.pending_legacy_urls.deinit(self.alloc);
+        self.launch_policy.deinit(self.alloc);
     }
 };
 
@@ -549,7 +551,7 @@ fn resolveSubagentAuthority(
             root_id,
             root_id,
             active.permission_rules,
-            state.cfg.mode_registry.toolAllowed(builtin_tools.advertisement_set, active.mode, "mcp_features") and
+            state.cfg.mode_registry.toolAllowed(state.launch_policy.toolSetOr(builtin_tools.advertisement_set), active.mode, "mcp_features") and
                 !permissions.rulesDenyAllTargetsForTool(active.permission_rules, "mcp_features"),
         )
     else
@@ -563,7 +565,7 @@ fn resolveSubagentAuthority(
     return subagent_tool_host.captureHostAuthorityWithMcpView(
         alloc,
         .{
-            .tool_set = builtin_tools.advertisement_set,
+            .tool_set = state.launch_policy.toolSetOr(builtin_tools.advertisement_set),
             .mode = .{
                 .active = .{
                     .registry = state.cfg.mode_registry,
@@ -1269,23 +1271,29 @@ fn parseInitializeRequest(
 }
 
 fn loadConfiguredStartupState(state: *const ServerState, alloc: Allocator) !app_lifecycle.StartupState {
+    var request = state.cfg.launch_request;
+    request.context_limit_overrides = state.cfg.context_limit_overrides;
+    request.additional_directories = state.cfg.additional_directories;
+    request.saved_directories_suppressed = state.cfg.saved_directories_suppressed;
     if (state.cfg.home_override) |home_dir| {
         if (state.cfg.workspace_root_override) |workspace_root| {
-            return app_lifecycle.loadEmbeddedStartupState(
+            return app_lifecycle.loadEmbeddedStartupStateForLaunch(
                 alloc,
                 home_dir,
                 workspace_root,
                 state.cfg.default_model,
                 state.cfg.default_agent_step_limit,
+                request,
             );
         }
     }
-    return app_lifecycle.loadStartupState(
+    return app_lifecycle.loadStartupStateForLaunch(
         alloc,
         state.cfg.gateway_provider.oauth_transport,
         state.cfg.secret_store,
         state.cfg.default_model,
         state.cfg.default_agent_step_limit,
+        request,
     );
 }
 
@@ -1311,12 +1319,6 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
         });
     };
     defer startup.deinit(alloc);
-    try app_lifecycle.applyWorkspaceLaunch(
-        &startup,
-        alloc,
-        state.cfg.additional_directories,
-        state.cfg.saved_directories_suppressed,
-    );
     for (startup.config_diagnostics) |diagnostic| {
         if (diagnostic.recovery_path != null) {
             debug_trace.logf("config", "acp startup diagnostic layer={s} cause={s} recovery_available=true", .{
@@ -1333,6 +1335,13 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
 
     state.workspace_root = startup.takeWorkspaceRoot();
     state.workspace_access = startup.takeWorkspaceAccess();
+    state.launch_policy.deinit(alloc);
+    state.launch_policy = startup.takeLaunchPolicy();
+    try state.launch_policy.composeSystemPrompt(alloc, state.cfg.prompt_policy.system_prompt);
+    try state.launch_policy.resolveEnabledTools(alloc, builtin_tools.advertisement_set);
+    if (state.launch_policy.system_prompt) |system_prompt| {
+        state.cfg.prompt_policy.system_prompt = system_prompt;
+    }
 
     if (state.cfg.model_override) |override| {
         state.selected_model = try alloc.dupe(u8, override);
@@ -1403,7 +1412,6 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     state.agent_step_limit = startup.agent_step_limit;
     state.max_tool_result_bytes = startup.max_tool_result_bytes;
     state.context_limits = startup.context_limits;
-    state.context_limits.applyCommandLine(state.cfg.context_limit_overrides);
     state.fast_mode = startup.fast_mode and
         (state.cfg.model_override == null or startup.fast_mode_source != .compiled_default);
     state.effort = startup.effort;

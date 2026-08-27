@@ -2083,6 +2083,7 @@ describe("cli: read-only no-create matrix", () => {
     { args: ["background", "--json"], code: 0, kind: "background", count: 0 },
     { args: ["background", "999999", "--json"], code: 1, error: "no persisted records" },
     { args: ["doctor", "--json"], code: 0, kind: "doctor" },
+    { args: ["config", "resolve", "--json"], code: 0, ok: true },
   ] as const;
 
   for (const probe of probes) {
@@ -2112,6 +2113,8 @@ describe("cli: read-only no-create matrix", () => {
             const output = JSON.parse(result.stdout);
             expect(output.kind).toBe(probe.kind);
             if ("count" in probe) expect(output.count).toBe(probe.count);
+          } else if ("ok" in probe) {
+            expect(JSON.parse(result.stdout).ok).toBe(probe.ok);
           } else {
             const output = JSON.parse(result.stdout);
             expect(output.error).toContain(probe.error);
@@ -4939,5 +4942,301 @@ describe("cli: workspace access", () => {
       }
     },
     30_000,
+  );
+});
+
+describe("cli: explicit launch config", () => {
+  test("schema and capabilities are deterministic offline contracts", async () => {
+    const schemaResult = await runFx(["config", "schema", "--json"]);
+    expect(schemaResult.code).toBe(0);
+    expect(schemaResult.stderr).toBe("");
+    const schema = JSON.parse(schemaResult.stdout);
+    expect(schema.$schema).toBe("https://json-schema.org/draft/2020-12/schema");
+    expect(schema.properties.schema_version.const).toBe(1);
+
+    const capabilitiesResult = await runFx([
+      "config",
+      "capabilities",
+      "--json",
+    ]);
+    expect(capabilitiesResult.code).toBe(0);
+    expect(capabilitiesResult.stderr).toBe("");
+    const capabilities = JSON.parse(capabilitiesResult.stdout);
+    expect(capabilities).toMatchObject({
+      output_version: 1,
+      schema_version: 1,
+      limits: {
+        config_file_bytes: 65_536,
+        system_prompt_parts: 16,
+        system_prompt_part_bytes: 65_536,
+        system_prompt_total_bytes: 131_072,
+      },
+    });
+    expect(capabilities.fields).toContain("agent.fast_mode");
+    expect(capabilities.built_in_tools).toContain("read_file");
+
+    const rejected = await runFx([
+      "--config=/definitely/missing/config.json",
+      "config",
+      "schema",
+      "--json",
+    ]);
+    expect(rejected.code).toBe(1);
+    expect(rejected.stdout).toBe("");
+    expect(rejected.stderr).toBe("usage: fx config schema --json\n");
+  });
+
+  test("validate is strict and stdin cannot declare prompt files", async () => {
+    const root = mkdtempSync(join(tmpdir(), "fx-e2e-config-validate-"));
+    try {
+      const valid = join(root, "valid.json");
+      const duplicate = join(root, "duplicate.json");
+      const unavailable = join(root, "unavailable.json");
+      writeFileSync(join(root, "prompt.md"), "VALID PROMPT FILE\n");
+      writeFileSync(
+        valid,
+        '{"schema_version":1,"prompt":{"system_parts":[{"type":"file","path":"prompt.md"}]}}\n',
+      );
+      writeFileSync(duplicate, '{"schema_version":1,"agent":{"fast_mode":true,"fast_mode":false}}\n');
+      writeFileSync(
+        unavailable,
+        '{"schema_version":1,"agent":{"enabled_tools":["missing_tool"]}}\n',
+      );
+
+      const accepted = await runFx(["config", "validate", valid, "--json"]);
+      expect(accepted.code).toBe(0);
+      expect(JSON.parse(accepted.stdout)).toMatchObject({
+        output_version: 1,
+        ok: true,
+        config: null,
+        provenance: [],
+        diagnostics: [],
+        truncated: false,
+      });
+
+      const rejected = await runFx([
+        "config",
+        "validate",
+        duplicate,
+        "--json",
+      ]);
+      expect(rejected.code).toBe(1);
+      expect(JSON.parse(rejected.stdout).diagnostics[0].code).toBe(
+        "duplicate_field",
+      );
+
+      const unavailableTool = await runFx([
+        "config",
+        "validate",
+        unavailable,
+        "--json",
+      ]);
+      expect(unavailableTool.code).toBe(1);
+      expect(JSON.parse(unavailableTool.stdout).diagnostics[0].code).toBe(
+        "capability_unavailable",
+      );
+
+      const stdinFilePart = await runFx(
+        ["config", "validate", "-", "--json"],
+        {
+          stdin:
+            '{"schema_version":1,"prompt":{"system_parts":[{"type":"file","path":"prompt.md"}]}}',
+        },
+      );
+      expect(stdinFilePart.code).toBe(1);
+      expect(JSON.parse(stdinFilePart.stdout).diagnostics[0].code).toBe(
+        "file_part_requires_regular_config_source",
+      );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("resolve shares ordered launch layers and preserves canonical tool order", async () => {
+    const root = mkdtempSync(join(tmpdir(), "fx-e2e-config-resolve-"));
+    try {
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const extraWorkspace = join(root, "extra-workspace");
+      mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
+      mkdirSync(workspace);
+      mkdirSync(extraWorkspace);
+      writeFileSync(
+        join(home, ".fx", "settings.json"),
+        '{"fast_mode":true,"max_agent_steps":99}\n',
+      );
+      const base = join(root, "base.json");
+      const override = join(root, "override.json");
+      writeFileSync(
+        base,
+        '{"schema_version":1,"agent":{"fast_mode":false,"enabled_tools":["grep_files","read_file"]}}\n',
+      );
+      writeFileSync(
+        override,
+        '{"schema_version":1,"agent":{"max_steps":6}}\n',
+      );
+      const result = await runFx(
+        [
+          `--config=${base}`,
+          `--config=${override}`,
+          "--set=agent.max_steps=7",
+          "--context-limit=skill_chunk_bytes=99",
+          `--add-dir=${extraWorkspace}`,
+          "config",
+          "resolve",
+          "--json",
+        ],
+        {
+          cwd: realpathSync(workspace),
+          env: {
+            HOME: realpathSync(home),
+            FX_MODEL: undefined,
+            FX_PERMISSION_MODE: undefined,
+            FX_MAX_AGENT_STEPS: undefined,
+          },
+        },
+      );
+      expect(result.code).toBe(0);
+      expect(result.stderr).toBe("");
+      const report = JSON.parse(result.stdout);
+      expect(report.config.agent.fast_mode).toBe(false);
+      expect(report.config.agent.max_steps).toBe(7);
+      expect(report.config.agent.enabled_tools).toEqual([
+        "read_file",
+        "grep_files",
+      ]);
+      expect(report.config.runtime.context_limits.skill_chunk_bytes).toBe(99);
+      expect(report.config.runtime.additional_directories).toEqual([
+        realpathSync(extraWorkspace),
+      ]);
+      const maxSteps = report.provenance.find(
+        (entry: { instance_location: string }) =>
+          entry.instance_location === "/agent/max_steps",
+      );
+      expect(maxSteps.source).toEqual({ kind: "command", argument_index: 2 });
+      const contextLimits = report.provenance.find(
+        (entry: { instance_location: string }) =>
+          entry.instance_location === "/runtime/context_limits",
+      );
+      expect(contextLimits.source).toEqual({
+        kind: "command",
+        argument_index: 3,
+      });
+
+      const rejected = await runFx([`--config=${base}`, "status", "--json"]);
+      expect(rejected.code).toBe(1);
+      expect(rejected.stdout).toBe("");
+      expect(rejected.stderr).toContain("only supported for launches and config resolve");
+
+      const fromEnvironment = await runFx(
+        [
+          "--no-config",
+          "--config-env=agent.fast_mode=FX_TEST_CONFIG_FAST",
+          "config",
+          "resolve",
+          "--json",
+        ],
+        { env: { FX_TEST_CONFIG_FAST: "false" } },
+      );
+      expect(fromEnvironment.code).toBe(0);
+      const environmentReport = JSON.parse(fromEnvironment.stdout);
+      const fastMode = environmentReport.provenance.find(
+        (entry: { instance_location: string }) =>
+          entry.instance_location === "/agent/fast_mode",
+      );
+      expect(fastMode.source).toEqual({
+        kind: "environment",
+        name: "FX_TEST_CONFIG_FAST",
+      });
+
+      const missingEnvironment = await runFx([
+        "--config-env=agent.fast_mode=FX_TEST_CONFIG_MISSING",
+        "config",
+        "resolve",
+        "--json",
+      ], { env: { FX_TEST_CONFIG_MISSING: undefined } });
+      expect(missingEnvironment.code).toBe(1);
+      expect(missingEnvironment.stderr).toContain(
+        "--config-env names a missing environment variable",
+      );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test(
+    "ask applies explicit prompt and tool policy against the fake gateway",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "fx-e2e-config-ask-"));
+      const gateway = startFakeGateway([
+        fakeGatewayFinalText("configured launch complete"),
+      ]);
+      try {
+        const home = join(root, "home");
+        const workspace = join(root, "workspace");
+        mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
+        mkdirSync(workspace);
+        const config = join(root, "launch.json");
+        writeFileSync(
+          config,
+          JSON.stringify({
+            schema_version: 1,
+            agent: {
+              provider: "gateway",
+              model: FAKE_GATEWAY_MODEL,
+              fast_mode: false,
+              max_steps: 4,
+              enabled_tools: ["read_file"],
+            },
+            prompt: {
+              system_parts: [
+                { type: "inline", text: "CONFIGURED SYSTEM PROMPT" },
+              ],
+            },
+            runtime: { permission_mode: "auto" },
+          }) + "\n",
+        );
+
+        const result = await runFx(
+          [
+            `--config=${config}`,
+            "ask",
+            "--json",
+            "--no-save",
+            "Use the configured launch.",
+          ],
+          {
+            cwd: realpathSync(workspace),
+            env: {
+              HOME: realpathSync(home),
+              AI_GATEWAY_API_KEY: "fake-config-key",
+              VERCEL_OIDC_TOKEN: undefined,
+              FX_GATEWAY_BASE_URL: gateway.baseUrl,
+              FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+              FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+            },
+            timeoutMs: 60_000,
+          },
+        );
+        expect(result.code).toBe(0);
+        expect(JSON.parse(result.stdout).output.trim()).toBe(
+          "configured launch complete",
+        );
+        expect(gateway.requests).toHaveLength(1);
+        const request = JSON.parse(gateway.requests[0]!.body) as {
+          prompt: Array<{ role: string; content: string }>;
+          tools?: Array<{ name?: string; function?: { name?: string } }>;
+        };
+        expect(JSON.stringify(request.prompt)).toContain(
+          "CONFIGURED SYSTEM PROMPT",
+        );
+        expect(JSON.stringify(request.tools)).toContain("read_file");
+        expect(JSON.stringify(request.tools)).not.toContain("grep_files");
+      } finally {
+        gateway.stop();
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    60_000,
   );
 });

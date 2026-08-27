@@ -403,8 +403,12 @@ const App = struct {
         return null;
     }
 
-    pub fn promptPolicy(_: *const Self) prompt_policy.Policy {
-        return builtin_context.prompt_policy;
+    pub fn promptPolicy(self: *const Self) prompt_policy.Policy {
+        var policy = builtin_context.prompt_policy;
+        if (self.session_persistence.launch_policy.system_prompt) |system_prompt| {
+            policy.system_prompt = system_prompt;
+        }
+        return policy;
     }
 
     pub fn slashRegistry(_: *const Self) command_specs.SlashRegistry {
@@ -616,6 +620,9 @@ const App = struct {
             launch.requested_resume = null;
         }
         errdefer if (app.requested_resume) |*target| target.deinit(alloc);
+        var launch_request = launch.modifiers.resolutionRequest();
+        launch_request.available_tool_names = app.baseToolSet().order;
+        launch_request.builtin_system_prompt = builtin_context.prompt_policy.system_prompt;
         try BootstrapAppRuntime.bootstrap(
             &app,
             footer_rows,
@@ -623,6 +630,7 @@ const App = struct {
             default_max_agent_steps,
             handle_sigwinch,
             launch.record_requested,
+            launch_request,
             .{
                 .load_mcp_runtime = if (comptime host_target.is_wasm) loadNoMcpRuntime else builtin_mcp.loadRuntime,
                 .skill_root_policy = if (comptime host_target.is_wasm) wasm_skill_root_policy else builtin_skills.root_policy,
@@ -630,12 +638,14 @@ const App = struct {
             },
         );
         errdefer app.deinit();
-        try WorkspaceAppRuntime.applyLaunch(
-            &app,
-            launch.modifiers.additional_directories,
-            launch.modifiers.saved_directories_suppressed,
+        try app.session_persistence.launch_policy.composeSystemPrompt(
+            alloc,
+            builtin_context.prompt_policy.system_prompt,
         );
-        app.context_limits.applyCommandLine(launch.modifiers.context_limit_overrides);
+        try app.session_persistence.launch_policy.resolveEnabledTools(
+            alloc,
+            app.baseToolSet(),
+        );
         if (comptime host_profile.durable_sessions or host_profile.js_host_sessions) {
             if (app.requested_resume != null) {
                 if (launch.upgrade_relaunch) {
@@ -1525,7 +1535,7 @@ const App = struct {
         self.mcp.startDiscovery(self.toolRegistry());
     }
 
-    fn effectiveToolSet(self: *const App) tool_set_contract.ToolSet {
+    fn baseToolSet(self: *const App) tool_set_contract.ToolSet {
         if (comptime host_profile.tools) {
             return builtin_tools.advertisement_set;
         }
@@ -1533,6 +1543,10 @@ const App = struct {
             false,
             self.workspaceHostInfo() != null,
         );
+    }
+
+    fn effectiveToolSet(self: *const App) tool_set_contract.ToolSet {
+        return self.session_persistence.launch_policy.toolSetOr(self.baseToolSet());
     }
 
     pub fn toolRegistry(self: *const App) tool_dispatch.Registry {
