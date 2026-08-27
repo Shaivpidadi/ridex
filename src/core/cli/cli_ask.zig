@@ -1263,8 +1263,9 @@ fn runWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: 
     if (interrupt_scope.requested()) return headless_interrupt.exitCode();
 
     var effective_cfg = cfg;
-    const extra_override_count: usize = @intFromBool(options.system_prompt_override != null) +
-        @intFromBool(options.permission_override != null);
+    const extra_override_count =
+        @as(usize, @intFromBool(options.system_prompt_override != null)) +
+        @as(usize, @intFromBool(options.permission_override != null));
     var merged_overrides: ?[]config_runtime.LaunchOverride = null;
     defer if (merged_overrides) |overrides| alloc.free(overrides);
     var system_parts_json: ?[]u8 = null;

@@ -4953,6 +4953,12 @@ describe("cli: explicit launch config", () => {
     const schema = JSON.parse(schemaResult.stdout);
     expect(schema.$schema).toBe("https://json-schema.org/draft/2020-12/schema");
     expect(schema.properties.schema_version.const).toBe(1);
+    expect(schema.properties.agent.properties.effort).toEqual({
+      type: "string",
+      minLength: 1,
+      maxLength: 64,
+      pattern: "^[A-Za-z0-9._-]+$",
+    });
 
     const capabilitiesResult = await runFx([
       "config",
@@ -4992,6 +4998,7 @@ describe("cli: explicit launch config", () => {
       const valid = join(root, "valid.json");
       const duplicate = join(root, "duplicate.json");
       const unavailable = join(root, "unavailable.json");
+      const invalidTypes = join(root, "invalid-types.json");
       writeFileSync(join(root, "prompt.md"), "VALID PROMPT FILE\n");
       writeFileSync(
         valid,
@@ -5001,6 +5008,10 @@ describe("cli: explicit launch config", () => {
       writeFileSync(
         unavailable,
         '{"schema_version":1,"agent":{"enabled_tools":["missing_tool"]}}\n',
+      );
+      writeFileSync(
+        invalidTypes,
+        '{"schema_version":1,"agent":{"fast_mode":"yes"},"runtime":{"permission_mode":7}}\n',
       );
 
       const accepted = await runFx(["config", "validate", valid, "--json"]);
@@ -5021,9 +5032,10 @@ describe("cli: explicit launch config", () => {
         "--json",
       ]);
       expect(rejected.code).toBe(1);
-      expect(JSON.parse(rejected.stdout).diagnostics[0].code).toBe(
-        "duplicate_field",
-      );
+      expect(JSON.parse(rejected.stdout).diagnostics[0]).toMatchObject({
+        instance_location: "/agent/fast_mode",
+        code: "duplicate_field",
+      });
 
       const unavailableTool = await runFx([
         "config",
@@ -5035,6 +5047,32 @@ describe("cli: explicit launch config", () => {
       expect(JSON.parse(unavailableTool.stdout).diagnostics[0].code).toBe(
         "capability_unavailable",
       );
+
+      const invalidTypedValues = await runFx([
+        "config",
+        "validate",
+        invalidTypes,
+        "--json",
+      ]);
+      expect(invalidTypedValues.code).toBe(1);
+      expect(JSON.parse(invalidTypedValues.stdout)).toMatchObject({
+        ok: false,
+        config: null,
+        provenance: [],
+        diagnostics: [
+          {
+            instance_location: "/agent/fast_mode",
+            severity: "error",
+            code: "invalid_type",
+          },
+          {
+            instance_location: "/runtime/permission_mode",
+            severity: "error",
+            code: "invalid_type",
+          },
+        ],
+        truncated: false,
+      });
 
       const stdinFilePart = await runFx(
         ["config", "validate", "-", "--json"],
@@ -5070,13 +5108,16 @@ describe("cli: explicit launch config", () => {
       const invalid = join(root, "invalid.json");
       writeFileSync(
         base,
-        '{"schema_version":1,"agent":{"fast_mode":false,"enabled_tools":["grep_files","read_file"]}}\n',
+        '{"schema_version":1,"agent":{"provider":"codex","model":"codex/model","fast_mode":false,"enabled_tools":["grep_files","read_file"]}}\n',
       );
       writeFileSync(
         override,
-        '{"schema_version":1,"agent":{"max_steps":6}}\n',
+        '{"schema_version":1,"agent":{"provider":"gateway","max_steps":6}}\n',
       );
-      writeFileSync(invalid, '{"schema_version":1,"unknown":true}\n');
+      writeFileSync(
+        invalid,
+        '{"schema_version":1,"agent":{"fast_mode":"yes"},"runtime":{"permission_mode":7}}\n',
+      );
       const result = await runFx(
         [
           `--config=${base}`,
@@ -5102,6 +5143,8 @@ describe("cli: explicit launch config", () => {
       expect(result.stderr).toBe("");
       const report = JSON.parse(result.stdout);
       expect(report.config.agent.fast_mode).toBe(false);
+      expect(report.config.agent.provider).toBe("gateway");
+      expect(report.config.agent.model).toBe("codex/model");
       expect(report.config.agent.max_steps).toBe(7);
       expect(report.config.agent.enabled_tools).toEqual([
         "read_file",
@@ -5124,6 +5167,15 @@ describe("cli: explicit launch config", () => {
         kind: "command",
         argument_index: 3,
       });
+      const model = report.provenance.find(
+        (entry: { instance_location: string }) =>
+          entry.instance_location === "/agent/model",
+      );
+      expect(model.source).toEqual({
+        kind: "explicit_file",
+        path: base,
+        layer: 0,
+      });
 
       const invalidLayer = await runFx([
         `--config=${invalid}`,
@@ -5133,10 +5185,20 @@ describe("cli: explicit launch config", () => {
         "--json",
       ]);
       expect(invalidLayer.code).toBe(1);
-      expect(JSON.parse(invalidLayer.stdout).diagnostics[0].source).toEqual({
-        kind: "explicit_file",
-        path: invalid,
-        layer: 0,
+      expect(JSON.parse(invalidLayer.stdout)).toMatchObject({
+        diagnostics: [
+          {
+            source: { kind: "explicit_file", path: invalid, layer: 0 },
+            instance_location: "/agent/fast_mode",
+            code: "invalid_type",
+          },
+          {
+            source: { kind: "explicit_file", path: invalid, layer: 0 },
+            instance_location: "/runtime/permission_mode",
+            code: "invalid_type",
+          },
+        ],
+        truncated: false,
       });
 
       const rejected = await runFx([`--config=${base}`, "status", "--json"]);
@@ -5179,6 +5241,67 @@ describe("cli: explicit launch config", () => {
       rmSync(root, { recursive: true, force: true });
     }
   });
+
+  test(
+    "ask combines --system with permission aliases",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "fx-e2e-ask-launch-aliases-"));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const gateway = startFakeGateway([
+        fakeGatewayFinalText("auto aliases complete"),
+        fakeGatewayFinalText("yolo aliases complete"),
+      ]);
+      try {
+        mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
+        mkdirSync(workspace);
+        writeFileSync(
+          join(home, ".fx", "settings.json"),
+          '{"yolo_acknowledged":true}\n',
+        );
+        const env = {
+          HOME: realpathSync(home),
+          AI_GATEWAY_API_KEY: "ask-launch-aliases-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_MODEL: FAKE_GATEWAY_MODEL,
+          FX_AUTO_UPGRADE: "0",
+        };
+
+        for (const [index, permissionAlias] of ["--auto", "--yolo"].entries()) {
+          const systemPrompt = `SYSTEM PROMPT ${permissionAlias}`;
+          const result = await runFx(
+            [
+              "ask",
+              "--json",
+              "--no-save",
+              permissionAlias,
+              "--system",
+              systemPrompt,
+              `Run ${permissionAlias}.`,
+            ],
+            {
+              cwd: realpathSync(workspace),
+              env,
+              timeoutMs: 60_000,
+            },
+          );
+          expect(result.code).toBe(0);
+          expect(result.stderr).toBe("");
+          const request = JSON.parse(gateway.requests[index]!.body) as {
+            prompt: Array<{ role: string; content: string }>;
+          };
+          expect(JSON.stringify(request.prompt)).toContain(systemPrompt);
+        }
+        expect(gateway.requests).toHaveLength(2);
+      } finally {
+        gateway.stop();
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    120_000,
+  );
 
   test(
     "ask applies explicit prompt and tool policy against the fake gateway",

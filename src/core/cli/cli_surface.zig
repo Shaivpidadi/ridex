@@ -3297,6 +3297,19 @@ fn validateConfigCandidate(
     };
     defer alloc.free(owned);
 
+    var validation = try config_runtime.launch_config.collectValidationDiagnostics(alloc, owned);
+    defer validation.deinit(alloc);
+    if (validation.items.len > 0) {
+        const json = try renderConfigValidationFailure(
+            alloc,
+            if (from_stdin) .stdin else .{ .explicit_file = .{ .path = candidate, .layer = 0 } },
+            validation,
+        );
+        defer alloc.free(json);
+        try writeStdout(deps, json);
+        return .handled_failure;
+    }
+
     var parsed = config_runtime.launch_config.parseDocument(
         alloc,
         owned,
@@ -3365,17 +3378,20 @@ fn resolveLaunchConfig(
     request.builtin_system_prompt = cfg.prompt_policy.system_prompt;
     var failure: ?config_runtime.LaunchFailure = null;
     request.failure_out = &failure;
+    var validation: ?config_runtime.launch_config.ValidationDiagnostics = null;
+    defer if (validation) |*diagnostics| diagnostics.deinit(alloc);
+    request.validation_diagnostics_out = &validation;
     var startup = app_lifecycle.loadStartupStateWithoutCredentialsForLaunch(
         alloc,
         cfg.default_model,
         cfg.default_agent_step_limit,
         request,
     ) catch |err| {
-        const json = try renderConfigFailure(
-            alloc,
-            if (failure) |value| value.source else .compiled_default,
-            err,
-        );
+        const source = if (failure) |value| value.source else .compiled_default;
+        const json = if (validation) |diagnostics|
+            try renderConfigValidationFailure(alloc, source, diagnostics)
+        else
+            try renderConfigFailure(alloc, source, err);
         defer alloc.free(json);
         try writeStdout(deps, json);
         return .handled_failure;
@@ -3429,16 +3445,33 @@ fn renderConfigFailure(
     return renderConfigReportLine(alloc, .{
         .ok = false,
         .diagnostics = &diagnostics,
-        .truncated = switch (err) {
-            error.ConfigSourceMissing,
-            error.ConfigSourceUnsafe,
-            error.InvalidConfigPath,
-            error.ConfigFileTooLarge,
-            error.PromptFileMissing,
-            error.UnsafePromptFile,
-            => false,
-            else => true,
-        },
+        .truncated = false,
+    });
+}
+
+fn renderConfigValidationFailure(
+    alloc: Allocator,
+    source: config_runtime.launch_config.Source,
+    validation: config_runtime.launch_config.ValidationDiagnostics,
+) ![]u8 {
+    const diagnostics = try alloc.alloc(
+        output_contracts.ConfigDiagnosticSnapshot,
+        validation.items.len,
+    );
+    defer alloc.free(diagnostics);
+    for (validation.items, 0..) |item, index| {
+        diagnostics[index] = .{
+            .source = source,
+            .instance_location = item.instance_location,
+            .severity = .@"error",
+            .code = @tagName(item.code),
+            .message = item.code.message(),
+        };
+    }
+    return renderConfigReportLine(alloc, .{
+        .ok = false,
+        .diagnostics = diagnostics,
+        .truncated = validation.truncated,
     });
 }
 

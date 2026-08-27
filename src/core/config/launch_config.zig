@@ -19,7 +19,7 @@ pub const json_schema =
     "{\"$schema\":\"https://json-schema.org/draft/2020-12/schema\",\"$id\":\"https://fx.sh/schema/launch-config-v1.json\",\"title\":\"fx launch configuration\",\"type\":\"object\",\"additionalProperties\":false,\"required\":[\"schema_version\"],\"$defs\":{\"contextLimit\":{\"oneOf\":[{\"type\":\"integer\",\"minimum\":0},{\"const\":\"off\"}]}},\"properties\":{" ++
     "\"schema_version\":{\"const\":1}," ++
     "\"agent\":{\"type\":\"object\",\"additionalProperties\":false,\"properties\":{" ++
-    "\"provider\":{\"enum\":[\"gateway\",\"codex\",\"grok\"]},\"model\":{\"type\":\"string\",\"minLength\":1,\"maxLength\":1024},\"effort\":{\"type\":\"string\"},\"fast_mode\":{\"type\":\"boolean\"},\"max_steps\":{\"type\":\"integer\",\"minimum\":0},\"first_call_tool_choice\":{\"enum\":[\"auto\",\"none\",\"required\"]},\"enabled_tools\":{\"type\":\"array\",\"uniqueItems\":true,\"items\":{\"type\":\"string\"}}}}," ++
+    "\"provider\":{\"enum\":[\"gateway\",\"codex\",\"grok\"]},\"model\":{\"type\":\"string\",\"minLength\":1,\"maxLength\":1024},\"effort\":{\"type\":\"string\",\"minLength\":1,\"maxLength\":64,\"pattern\":\"^[A-Za-z0-9._-]+$\"},\"fast_mode\":{\"type\":\"boolean\"},\"max_steps\":{\"type\":\"integer\",\"minimum\":0},\"first_call_tool_choice\":{\"enum\":[\"auto\",\"none\",\"required\"]},\"enabled_tools\":{\"type\":\"array\",\"uniqueItems\":true,\"items\":{\"type\":\"string\"}}}}," ++
     "\"prompt\":{\"type\":\"object\",\"additionalProperties\":false,\"properties\":{\"system_parts\":{\"type\":\"array\",\"maxItems\":16,\"items\":{\"oneOf\":[" ++
     "{\"type\":\"object\",\"additionalProperties\":false,\"required\":[\"type\",\"id\"],\"properties\":{\"type\":{\"const\":\"builtin\"},\"id\":{\"const\":\"default\"}}}," ++
     "{\"type\":\"object\",\"additionalProperties\":false,\"required\":[\"type\",\"text\"],\"properties\":{\"type\":{\"const\":\"inline\"},\"text\":{\"type\":\"string\",\"maxLength\":65536}}}," ++
@@ -349,6 +349,666 @@ const RawContextLimits = struct {
     image_adapter_output_bytes: ?std.json.Value = null,
 };
 
+const max_validation_diagnostics: usize = 64;
+
+pub const DiagnosticCode = enum {
+    invalid_json,
+    unsupported_schema_version,
+    unknown_field,
+    duplicate_field,
+    invalid_type,
+    invalid_value,
+    too_large,
+
+    pub fn message(self: DiagnosticCode) []const u8 {
+        return switch (self) {
+            .invalid_json => "Invalid JSON document",
+            .unsupported_schema_version => "Unsupported schema version",
+            .unknown_field => "Unknown configuration field",
+            .duplicate_field => "Duplicate configuration field",
+            .invalid_type => "Value has an invalid type",
+            .invalid_value => "Value does not satisfy the field contract",
+            .too_large => "Value exceeds a configured limit",
+        };
+    }
+};
+
+pub const ValidationDiagnostic = struct {
+    instance_location: []u8,
+    code: DiagnosticCode,
+
+    fn deinit(self: *ValidationDiagnostic, alloc: Allocator) void {
+        alloc.free(self.instance_location);
+        self.* = undefined;
+    }
+};
+
+pub const ValidationDiagnostics = struct {
+    items: []ValidationDiagnostic = &.{},
+    truncated: bool = false,
+
+    pub fn deinit(self: *ValidationDiagnostics, alloc: Allocator) void {
+        if (self.items.len > 0) {
+            for (self.items) |*item| item.deinit(alloc);
+            alloc.free(self.items);
+        }
+        self.* = .{};
+    }
+};
+
+const ValidationCollector = struct {
+    alloc: Allocator,
+    items: std.ArrayList(ValidationDiagnostic) = .empty,
+
+    fn deinit(self: *ValidationCollector) void {
+        for (self.items.items) |*item| item.deinit(self.alloc);
+        self.items.deinit(self.alloc);
+        self.* = undefined;
+    }
+
+    fn add(self: *ValidationCollector, instance_location: []const u8, code: DiagnosticCode) !void {
+        const owned_location = try self.alloc.dupe(u8, instance_location);
+        errdefer self.alloc.free(owned_location);
+        try self.items.append(self.alloc, .{
+            .instance_location = owned_location,
+            .code = code,
+        });
+    }
+
+    fn finish(self: *ValidationCollector) !ValidationDiagnostics {
+        std.mem.sort(ValidationDiagnostic, self.items.items, {}, validationDiagnosticLessThan);
+        var unique_count: usize = 0;
+        for (self.items.items) |item| {
+            if (unique_count > 0) {
+                const prior = self.items.items[unique_count - 1];
+                if (prior.code == item.code and
+                    std.mem.eql(u8, prior.instance_location, item.instance_location))
+                {
+                    var duplicate = item;
+                    duplicate.deinit(self.alloc);
+                    continue;
+                }
+            }
+            self.items.items[unique_count] = item;
+            unique_count += 1;
+        }
+        self.items.items.len = unique_count;
+        const all = try self.items.toOwnedSlice(self.alloc);
+        self.items = .empty;
+        if (all.len <= max_validation_diagnostics) return .{ .items = all };
+
+        errdefer {
+            for (all) |*item| item.deinit(self.alloc);
+            self.alloc.free(all);
+        }
+        const kept = try self.alloc.alloc(ValidationDiagnostic, max_validation_diagnostics);
+        @memcpy(kept, all[0..max_validation_diagnostics]);
+        for (all[max_validation_diagnostics..]) |*item| item.deinit(self.alloc);
+        self.alloc.free(all);
+        return .{ .items = kept, .truncated = true };
+    }
+};
+
+fn validationDiagnosticLessThan(_: void, lhs: ValidationDiagnostic, rhs: ValidationDiagnostic) bool {
+    return switch (std.mem.order(u8, lhs.instance_location, rhs.instance_location)) {
+        .lt => true,
+        .gt => false,
+        .eq => @intFromEnum(lhs.code) < @intFromEnum(rhs.code),
+    };
+}
+
+fn pointerForKey(alloc: Allocator, parent: []const u8, key: []const u8) Allocator.Error![]u8 {
+    var escaped_key_len = key.len;
+    for (key) |byte| {
+        if (byte == '~' or byte == '/') escaped_key_len += 1;
+    }
+    const output = try alloc.alloc(u8, parent.len + 1 + escaped_key_len);
+    @memcpy(output[0..parent.len], parent);
+    output[parent.len] = '/';
+    var index = parent.len + 1;
+    for (key) |byte| switch (byte) {
+        '~' => {
+            @memcpy(output[index..][0..2], "~0");
+            index += 2;
+        },
+        '/' => {
+            @memcpy(output[index..][0..2], "~1");
+            index += 2;
+        },
+        else => {
+            output[index] = byte;
+            index += 1;
+        },
+    };
+    return output;
+}
+
+fn pointerForIndex(alloc: Allocator, parent: []const u8, index: usize) Allocator.Error![]u8 {
+    var index_buffer: [32]u8 = undefined;
+    const index_text = std.fmt.bufPrint(&index_buffer, "{d}", .{index}) catch unreachable;
+    const output = try alloc.alloc(u8, parent.len + 1 + index_text.len);
+    @memcpy(output[0..parent.len], parent);
+    output[parent.len] = '/';
+    @memcpy(output[parent.len + 1 ..], index_text);
+    return output;
+}
+
+fn collectUnknownFields(
+    collector: *ValidationCollector,
+    object: std.json.ObjectMap,
+    parent: []const u8,
+    allowed: []const []const u8,
+) !void {
+    var iterator = object.iterator();
+    while (iterator.next()) |entry| {
+        if (containsName(allowed, entry.key_ptr.*)) continue;
+        const location = try pointerForKey(collector.alloc, parent, entry.key_ptr.*);
+        defer collector.alloc.free(location);
+        try collector.add(location, .unknown_field);
+    }
+}
+
+fn collectInteger(
+    collector: *ValidationCollector,
+    value: std.json.Value,
+    location: []const u8,
+    minimum: usize,
+) !void {
+    switch (value) {
+        .integer => |integer| {
+            const converted = std.math.cast(usize, integer) orelse {
+                try collector.add(location, .invalid_value);
+                return;
+            };
+            if (converted < minimum) try collector.add(location, .invalid_value);
+        },
+        else => try collector.add(location, .invalid_type),
+    }
+}
+
+const DuplicateScanError = std.json.Scanner.AllocError;
+
+fn findFirstDuplicatePointer(alloc: Allocator, bytes: []const u8) DuplicateScanError!?[]u8 {
+    var scanner = std.json.Scanner.initCompleteInput(alloc, bytes);
+    defer scanner.deinit();
+    const first = try scanner.nextAllocMax(alloc, .alloc_always, max_config_file_bytes);
+    return findDuplicateInValue(alloc, &scanner, first, "");
+}
+
+fn findDuplicateInValue(
+    alloc: Allocator,
+    scanner: *std.json.Scanner,
+    token: std.json.Token,
+    location: []const u8,
+) DuplicateScanError!?[]u8 {
+    return switch (token) {
+        .object_begin => findDuplicateInObject(alloc, scanner, location),
+        .array_begin => findDuplicateInArray(alloc, scanner, location),
+        .allocated_number, .allocated_string => |bytes| blk: {
+            alloc.free(bytes);
+            break :blk null;
+        },
+        .number, .string, .true, .false, .null => null,
+        else => unreachable,
+    };
+}
+
+fn findDuplicateInObject(
+    alloc: Allocator,
+    scanner: *std.json.Scanner,
+    location: []const u8,
+) DuplicateScanError!?[]u8 {
+    var keys: std.ArrayList([]u8) = .empty;
+    defer {
+        for (keys.items) |key| alloc.free(key);
+        keys.deinit(alloc);
+    }
+    while (true) {
+        const key_token = try scanner.nextAllocMax(alloc, .alloc_always, max_config_file_bytes);
+        const key = switch (key_token) {
+            .object_end => return null,
+            .allocated_string => |value| value,
+            else => unreachable,
+        };
+        for (keys.items) |prior| {
+            if (!std.mem.eql(u8, key, prior)) continue;
+            defer alloc.free(key);
+            return @as(?[]u8, try pointerForKey(alloc, location, key));
+        }
+        errdefer alloc.free(key);
+        try keys.append(alloc, key);
+
+        const child_location = try pointerForKey(alloc, location, key);
+        defer alloc.free(child_location);
+        const value_token = try scanner.nextAllocMax(alloc, .alloc_always, max_config_file_bytes);
+        if (try findDuplicateInValue(alloc, scanner, value_token, child_location)) |duplicate| {
+            return duplicate;
+        }
+    }
+}
+
+fn findDuplicateInArray(
+    alloc: Allocator,
+    scanner: *std.json.Scanner,
+    location: []const u8,
+) DuplicateScanError!?[]u8 {
+    var index: usize = 0;
+    while (true) : (index += 1) {
+        const token = try scanner.nextAllocMax(alloc, .alloc_always, max_config_file_bytes);
+        if (token == .array_end) return null;
+        const child_location = try pointerForIndex(alloc, location, index);
+        defer alloc.free(child_location);
+        if (try findDuplicateInValue(alloc, scanner, token, child_location)) |duplicate| {
+            return duplicate;
+        }
+    }
+}
+
+/// Returns owned diagnostics. The caller deinitializes the result with `alloc`.
+pub fn collectValidationDiagnostics(
+    alloc: Allocator,
+    bytes: []const u8,
+) Allocator.Error!ValidationDiagnostics {
+    var collector = ValidationCollector{ .alloc = alloc };
+    defer collector.deinit();
+    if (bytes.len > max_config_file_bytes) {
+        try collector.add("", .too_large);
+        return collector.finish();
+    }
+
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, bytes, .{
+        .duplicate_field_behavior = .@"error",
+    }) catch |err| {
+        if (err == error.DuplicateField) {
+            const location = findFirstDuplicatePointer(alloc, bytes) catch |scan_error| switch (scan_error) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => null,
+            };
+            defer if (location) |owned| alloc.free(owned);
+            try collector.add(location orelse "", .duplicate_field);
+        } else {
+            try collector.add("", .invalid_json);
+        }
+        return collector.finish();
+    };
+    defer parsed.deinit();
+    try collectRootDiagnostics(&collector, parsed.value);
+    return collector.finish();
+}
+
+fn collectRootDiagnostics(collector: *ValidationCollector, value: std.json.Value) !void {
+    const object = switch (value) {
+        .object => |object| object,
+        else => {
+            try collector.add("", .invalid_type);
+            return;
+        },
+    };
+    try collectUnknownFields(collector, object, "", &.{ "schema_version", "agent", "prompt", "runtime" });
+    if (object.get("schema_version")) |version| {
+        switch (version) {
+            .integer => |integer| if (integer != schema_version) {
+                try collector.add("/schema_version", .unsupported_schema_version);
+            },
+            else => try collector.add("/schema_version", .invalid_type),
+        }
+    } else {
+        try collector.add("/schema_version", .invalid_value);
+    }
+    if (object.get("agent")) |agent| try collectAgentDiagnostics(collector, agent);
+    if (object.get("prompt")) |prompt| try collectPromptDiagnostics(collector, prompt);
+    if (object.get("runtime")) |runtime| try collectRuntimeDiagnostics(collector, runtime);
+}
+
+fn collectAgentDiagnostics(collector: *ValidationCollector, value: std.json.Value) !void {
+    const object = switch (value) {
+        .object => |object| object,
+        else => {
+            try collector.add("/agent", .invalid_type);
+            return;
+        },
+    };
+    try collectUnknownFields(collector, object, "/agent", &.{
+        "provider",
+        "model",
+        "effort",
+        "fast_mode",
+        "max_steps",
+        "first_call_tool_choice",
+        "enabled_tools",
+    });
+    if (object.get("provider")) |provider| switch (provider) {
+        .string => |text| if (std.meta.stringToEnum(model_provider.ProviderId, text) == null) {
+            try collector.add("/agent/provider", .invalid_value);
+        },
+        else => try collector.add("/agent/provider", .invalid_type),
+    };
+    if (object.get("model")) |model| switch (model) {
+        .string => |text| settings_store.validateModel(text) catch
+            try collector.add("/agent/model", .invalid_value),
+        else => try collector.add("/agent/model", .invalid_type),
+    };
+    if (object.get("effort")) |effort| switch (effort) {
+        .string => |text| if (types.ReasoningEffort.parse(text) == null) {
+            try collector.add("/agent/effort", .invalid_value);
+        },
+        else => try collector.add("/agent/effort", .invalid_type),
+    };
+    if (object.get("fast_mode")) |fast_mode| if (fast_mode != .bool) {
+        try collector.add("/agent/fast_mode", .invalid_type);
+    };
+    if (object.get("max_steps")) |max_steps| {
+        try collectInteger(collector, max_steps, "/agent/max_steps", 0);
+    }
+    if (object.get("first_call_tool_choice")) |choice| switch (choice) {
+        .string => |text| if (std.meta.stringToEnum(types.ToolChoice, text) == null) {
+            try collector.add("/agent/first_call_tool_choice", .invalid_value);
+        },
+        else => try collector.add("/agent/first_call_tool_choice", .invalid_type),
+    };
+    if (object.get("enabled_tools")) |enabled_tools| {
+        try collectUniqueStringArrayDiagnostics(
+            collector,
+            enabled_tools,
+            "/agent/enabled_tools",
+            null,
+        );
+        if (enabled_tools == .array) {
+            for (enabled_tools.array.items, 0..) |tool, index| switch (tool) {
+                .string => |text| if (text.len == 0 or std.mem.findScalar(u8, text, 0) != null) {
+                    const location = try pointerForIndex(
+                        collector.alloc,
+                        "/agent/enabled_tools",
+                        index,
+                    );
+                    defer collector.alloc.free(location);
+                    try collector.add(location, .invalid_value);
+                },
+                else => {},
+            };
+        }
+    }
+}
+
+fn collectUniqueStringArrayDiagnostics(
+    collector: *ValidationCollector,
+    value: std.json.Value,
+    location: []const u8,
+    max_items: ?usize,
+) !void {
+    const array = switch (value) {
+        .array => |array| array,
+        else => {
+            try collector.add(location, .invalid_type);
+            return;
+        },
+    };
+    if (max_items) |limit| if (array.items.len > limit) {
+        try collector.add(location, .too_large);
+    };
+    for (array.items, 0..) |item, index| {
+        const item_location = try pointerForIndex(collector.alloc, location, index);
+        defer collector.alloc.free(item_location);
+        const text = switch (item) {
+            .string => |text| text,
+            else => {
+                try collector.add(item_location, .invalid_type);
+                continue;
+            },
+        };
+        for (array.items[0..index]) |prior| switch (prior) {
+            .string => |prior_text| if (std.mem.eql(u8, text, prior_text)) {
+                try collector.add(item_location, .invalid_value);
+                break;
+            },
+            else => {},
+        };
+    }
+}
+
+fn collectPromptDiagnostics(collector: *ValidationCollector, value: std.json.Value) !void {
+    const object = switch (value) {
+        .object => |object| object,
+        else => {
+            try collector.add("/prompt", .invalid_type);
+            return;
+        },
+    };
+    try collectUnknownFields(collector, object, "/prompt", &.{"system_parts"});
+    const system_parts = object.get("system_parts") orelse return;
+    const array = switch (system_parts) {
+        .array => |array| array,
+        else => {
+            try collector.add("/prompt/system_parts", .invalid_type);
+            return;
+        },
+    };
+    if (array.items.len > max_system_prompt_parts) {
+        try collector.add("/prompt/system_parts", .too_large);
+    }
+    for (array.items, 0..) |part, index| {
+        const location = try pointerForIndex(collector.alloc, "/prompt/system_parts", index);
+        defer collector.alloc.free(location);
+        try collectSystemPartDiagnostics(collector, part, location);
+    }
+}
+
+fn collectSystemPartDiagnostics(
+    collector: *ValidationCollector,
+    value: std.json.Value,
+    location: []const u8,
+) !void {
+    const object = switch (value) {
+        .object => |object| object,
+        else => {
+            try collector.add(location, .invalid_type);
+            return;
+        },
+    };
+    try collectUnknownFields(collector, object, location, &.{ "type", "id", "path", "text" });
+    const type_location = try pointerForKey(collector.alloc, location, "type");
+    defer collector.alloc.free(type_location);
+    const type_value = object.get("type") orelse {
+        try collector.add(type_location, .invalid_value);
+        return;
+    };
+    const part_type = switch (type_value) {
+        .string => |text| text,
+        else => {
+            try collector.add(type_location, .invalid_type);
+            return;
+        },
+    };
+
+    if (std.mem.eql(u8, part_type, "builtin")) {
+        try collectRequiredStringValue(collector, object, location, "id", "default");
+        try collectForbiddenFields(collector, object, location, &.{ "path", "text" });
+        return;
+    }
+    if (std.mem.eql(u8, part_type, "inline")) {
+        try collectRequiredPromptText(collector, object, location);
+        try collectForbiddenFields(collector, object, location, &.{ "id", "path" });
+        return;
+    }
+    if (std.mem.eql(u8, part_type, "file")) {
+        try collectRequiredPath(collector, object, location);
+        try collectForbiddenFields(collector, object, location, &.{ "id", "text" });
+        return;
+    }
+    try collector.add(type_location, .invalid_value);
+}
+
+fn collectRequiredStringValue(
+    collector: *ValidationCollector,
+    object: std.json.ObjectMap,
+    parent: []const u8,
+    field: []const u8,
+    expected: []const u8,
+) !void {
+    const location = try pointerForKey(collector.alloc, parent, field);
+    defer collector.alloc.free(location);
+    const value = object.get(field) orelse {
+        try collector.add(location, .invalid_value);
+        return;
+    };
+    switch (value) {
+        .string => |text| if (!std.mem.eql(u8, text, expected)) {
+            try collector.add(location, .invalid_value);
+        },
+        else => try collector.add(location, .invalid_type),
+    }
+}
+
+fn collectRequiredPromptText(
+    collector: *ValidationCollector,
+    object: std.json.ObjectMap,
+    parent: []const u8,
+) !void {
+    const location = try pointerForKey(collector.alloc, parent, "text");
+    defer collector.alloc.free(location);
+    const value = object.get("text") orelse {
+        try collector.add(location, .invalid_value);
+        return;
+    };
+    switch (value) {
+        .string => |text| validatePromptText(text) catch |err| try collector.add(
+            location,
+            if (err == error.SystemPromptPartTooLarge) .too_large else .invalid_value,
+        ),
+        else => try collector.add(location, .invalid_type),
+    }
+}
+
+fn collectRequiredPath(
+    collector: *ValidationCollector,
+    object: std.json.ObjectMap,
+    parent: []const u8,
+) !void {
+    const location = try pointerForKey(collector.alloc, parent, "path");
+    defer collector.alloc.free(location);
+    const value = object.get("path") orelse {
+        try collector.add(location, .invalid_value);
+        return;
+    };
+    switch (value) {
+        .string => |path| if (!validPathText(path)) try collector.add(location, .invalid_value),
+        else => try collector.add(location, .invalid_type),
+    }
+}
+
+fn collectForbiddenFields(
+    collector: *ValidationCollector,
+    object: std.json.ObjectMap,
+    parent: []const u8,
+    fields: []const []const u8,
+) !void {
+    for (fields) |field| {
+        if (object.get(field) == null) continue;
+        const location = try pointerForKey(collector.alloc, parent, field);
+        defer collector.alloc.free(location);
+        try collector.add(location, .invalid_value);
+    }
+}
+
+fn collectRuntimeDiagnostics(collector: *ValidationCollector, value: std.json.Value) !void {
+    const object = switch (value) {
+        .object => |object| object,
+        else => {
+            try collector.add("/runtime", .invalid_type);
+            return;
+        },
+    };
+    try collectUnknownFields(collector, object, "/runtime", &.{
+        "permission_mode",
+        "max_tool_result_bytes",
+        "context_enabled",
+        "context_limits",
+        "additional_directories",
+    });
+    if (object.get("permission_mode")) |permission_mode| switch (permission_mode) {
+        .string => |text| if (std.meta.stringToEnum(types.PermissionMode, text) == null) {
+            try collector.add("/runtime/permission_mode", .invalid_value);
+        },
+        else => try collector.add("/runtime/permission_mode", .invalid_type),
+    };
+    if (object.get("max_tool_result_bytes")) |max_tool_result_bytes| {
+        try collectInteger(
+            collector,
+            max_tool_result_bytes,
+            "/runtime/max_tool_result_bytes",
+            tool_result_limits.min_configured_tool_result_bytes,
+        );
+    }
+    if (object.get("context_enabled")) |context_enabled| if (context_enabled != .bool) {
+        try collector.add("/runtime/context_enabled", .invalid_type);
+    };
+    if (object.get("context_limits")) |limits| try collectContextLimitDiagnostics(collector, limits);
+    if (object.get("additional_directories")) |paths| {
+        try collectUniqueStringArrayDiagnostics(
+            collector,
+            paths,
+            "/runtime/additional_directories",
+            workspace_access.max_additional_directories,
+        );
+        if (paths == .array) {
+            for (paths.array.items, 0..) |path, index| switch (path) {
+                .string => |text| if (!validPathText(text)) {
+                    const location = try pointerForIndex(
+                        collector.alloc,
+                        "/runtime/additional_directories",
+                        index,
+                    );
+                    defer collector.alloc.free(location);
+                    try collector.add(location, .invalid_value);
+                },
+                else => {},
+            };
+        }
+    }
+}
+
+fn collectContextLimitDiagnostics(collector: *ValidationCollector, value: std.json.Value) !void {
+    const object = switch (value) {
+        .object => |object| object,
+        else => {
+            try collector.add("/runtime/context_limits", .invalid_type);
+            return;
+        },
+    };
+    try collectUnknownFields(collector, object, "/runtime/context_limits", &.{
+        "skill_description_bytes",
+        "skill_catalog_bytes",
+        "skill_chunk_bytes",
+        "skill_file_bytes",
+        "mcp_description_bytes",
+        "mcp_search_result_bytes",
+        "mcp_server_instructions_bytes",
+        "mcp_selected_schema_bytes",
+        "project_instruction_file_bytes",
+        "project_instructions_total_bytes",
+        "image_adapter_output_bytes",
+    });
+    var iterator = object.iterator();
+    while (iterator.next()) |entry| {
+        if (context_limits.Name.parse(entry.key_ptr.*) == null) continue;
+        const location = try pointerForKey(
+            collector.alloc,
+            "/runtime/context_limits",
+            entry.key_ptr.*,
+        );
+        defer collector.alloc.free(location);
+        switch (entry.value_ptr.*) {
+            .integer => |integer| if (std.math.cast(usize, integer) == null) {
+                try collector.add(location, .invalid_value);
+            },
+            .string => |text| if (!std.mem.eql(u8, text, "off")) {
+                try collector.add(location, .invalid_value);
+            },
+            else => try collector.add(location, .invalid_type),
+        }
+    }
+}
+
 pub fn parseDocument(
     alloc: Allocator,
     bytes: []const u8,
@@ -668,6 +1328,69 @@ test "published schema is valid JSON and describes the strict root" {
     try std.testing.expect(parsed.value == .object);
     try std.testing.expectEqual(false, parsed.value.object.get("additionalProperties").?.bool);
     try std.testing.expect(parsed.value.object.get("$defs") != null);
+    const effort = parsed.value.object.get("properties").?.object
+        .get("agent").?.object.get("properties").?.object.get("effort").?.object;
+    try std.testing.expectEqual(@as(i64, 1), effort.get("minLength").?.integer);
+    try std.testing.expectEqual(@as(i64, 64), effort.get("maxLength").?.integer);
+    try std.testing.expectEqualStrings("^[A-Za-z0-9._-]+$", effort.get("pattern").?.string);
+}
+
+test "validation diagnostics collect independent errors in pointer order" {
+    var diagnostics = try collectValidationDiagnostics(
+        std.testing.allocator,
+        "{\"schema_version\":1,\"agent\":{\"fast_mode\":\"yes\"},\"runtime\":{\"permission_mode\":7}}",
+    );
+    defer diagnostics.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), diagnostics.items.len);
+    try std.testing.expectEqualStrings("/agent/fast_mode", diagnostics.items[0].instance_location);
+    try std.testing.expectEqual(DiagnosticCode.invalid_type, diagnostics.items[0].code);
+    try std.testing.expectEqualStrings("/runtime/permission_mode", diagnostics.items[1].instance_location);
+    try std.testing.expectEqual(DiagnosticCode.invalid_type, diagnostics.items[1].code);
+    try std.testing.expect(!diagnostics.truncated);
+}
+
+test "validation diagnostics report exact duplicate pointer" {
+    var diagnostics = try collectValidationDiagnostics(
+        std.testing.allocator,
+        "{\"schema_version\":1,\"agent\":{\"fast_mode\":true,\"fast_mode\":false}}",
+    );
+    defer diagnostics.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
+    try std.testing.expectEqualStrings("/agent/fast_mode", diagnostics.items[0].instance_location);
+    try std.testing.expectEqual(DiagnosticCode.duplicate_field, diagnostics.items[0].code);
+    try std.testing.expect(!diagnostics.truncated);
+}
+
+test "validation diagnostic output is bounded after pointer ordering" {
+    var document: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer document.deinit();
+    try document.writer.writeAll("{\"schema_version\":1");
+    for (0..max_validation_diagnostics + 1) |index| {
+        try document.writer.print(",\"unknown_{d:0>2}\":true", .{index});
+    }
+    try document.writer.writeByte('}');
+
+    var diagnostics = try collectValidationDiagnostics(std.testing.allocator, document.written());
+    defer diagnostics.deinit(std.testing.allocator);
+    try std.testing.expectEqual(max_validation_diagnostics, diagnostics.items.len);
+    try std.testing.expect(diagnostics.truncated);
+    try std.testing.expectEqualStrings("/unknown_00", diagnostics.items[0].instance_location);
+    try std.testing.expectEqualStrings("/unknown_63", diagnostics.items[63].instance_location);
+}
+
+test "validation diagnostic ownership cleans every allocation failure" {
+    const Case = struct {
+        fn run(alloc: Allocator) !void {
+            var diagnostics = try collectValidationDiagnostics(
+                alloc,
+                "{\"schema_version\":1,\"agent\":{\"fast_mode\":\"yes\"},\"runtime\":{\"permission_mode\":7}}",
+            );
+            defer diagnostics.deinit(alloc);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
 }
 
 test "strict explicit document rejects unknown duplicate null and unsupported version" {

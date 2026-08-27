@@ -234,6 +234,8 @@ pub const LaunchResolutionRequest = struct {
     context_limit_argument_index: ?usize = null,
     additional_directories_argument_index: ?usize = null,
     failure_out: ?*?LaunchFailure = null,
+    /// The caller owns a non-null result and deinitializes it with the request allocator.
+    validation_diagnostics_out: ?*?launch_config.ValidationDiagnostics = null,
 };
 
 pub const LaunchFailure = struct {
@@ -335,6 +337,8 @@ fn loadMergedSettingsDetailedForLaunchWithOptionalHome(
         !isolates_implicit_launch_policy,
     );
     errdefer detailed.deinit(alloc);
+    var launch_model: ?[]u8 = null;
+    defer if (launch_model) |value| alloc.free(value);
     seedLaunchPolicySources(&detailed);
 
     if (request.no_config or request.explicit_files.len > 0) {
@@ -349,6 +353,20 @@ fn loadMergedSettingsDetailedForLaunchWithOptionalHome(
             return err;
         };
         defer alloc.free(bytes);
+        if (request.validation_diagnostics_out) |diagnostics_out| {
+            var validation = launch_config.collectValidationDiagnostics(alloc, bytes) catch |err| {
+                recordLaunchFailure(request.failure_out, source);
+                return err;
+            };
+            if (validation.items.len > 0) {
+                if (diagnostics_out.*) |*previous| previous.deinit(alloc);
+                diagnostics_out.* = validation;
+                validation = .{};
+                recordLaunchFailure(request.failure_out, source);
+                return error.InvalidLaunchConfiguration;
+            }
+            validation.deinit(alloc);
+        }
         var parsed = launch_config.parseDocument(alloc, bytes, .{ .regular_file = path }) catch |err| {
             recordLaunchFailure(request.failure_out, source);
             return err;
@@ -359,6 +377,7 @@ fn loadMergedSettingsDetailedForLaunchWithOptionalHome(
             workspace_root,
             &detailed,
             &parsed,
+            &launch_model,
             source,
             request.available_tool_names,
         ) catch |err| {
@@ -371,6 +390,7 @@ fn loadMergedSettingsDetailedForLaunchWithOptionalHome(
         alloc,
         workspace_root,
         &detailed,
+        &launch_model,
         request.available_tool_names,
         request.failure_out,
     ) catch |err| return err;
@@ -389,12 +409,20 @@ fn loadMergedSettingsDetailedForLaunchWithOptionalHome(
             workspace_root,
             &detailed,
             &parsed,
+            &launch_model,
             source,
             request.available_tool_names,
         ) catch |err| {
             recordLaunchFailure(request.failure_out, source);
             return err;
         };
+    }
+    if (launch_model) |value| {
+        const provider = detailed.settings.provider orelse .gateway;
+        detailed.settings.models.putOwned(alloc, provider, value);
+        detailed.sources.models.set(provider, .process_override);
+        detailed.model_source = .process_override;
+        launch_model = null;
     }
     if (request.context_limit_overrides.len > 0) {
         for (request.context_limit_overrides) |override| {
@@ -489,6 +517,7 @@ fn applyRetainedEnvironmentAliases(
     alloc: Allocator,
     workspace_root: []const u8,
     detailed: *DetailedSettings,
+    launch_model: *?[]u8,
     available_tool_names: []const []const u8,
     failure_out: ?*?LaunchFailure,
 ) !void {
@@ -512,6 +541,7 @@ fn applyRetainedEnvironmentAliases(
             workspace_root,
             detailed,
             &parsed,
+            launch_model,
             source,
             available_tool_names,
         ) catch |err| {
@@ -626,6 +656,7 @@ fn applyExplicitDocument(
     workspace_root: []const u8,
     detailed: *DetailedSettings,
     parsed: *launch_config.ParsedDocument,
+    launch_model: *?[]u8,
     source: launch_config.Source,
     available_tool_names: []const []const u8,
 ) !void {
@@ -639,10 +670,9 @@ fn applyExplicitDocument(
         try detailed.launch_policy.setSource(alloc, .provider, source, explicit);
     }
     if (parsed.model) |value| {
-        detailed.settings.models.putOwned(alloc, detailed.settings.provider orelse .gateway, value);
+        if (launch_model.*) |old| alloc.free(old);
+        launch_model.* = value;
         parsed.model = null;
-        detailed.model_source = .process_override;
-        detailed.sources.models.set(detailed.settings.provider orelse .gateway, .process_override);
         try detailed.launch_policy.setSource(alloc, .model, source, explicit);
     }
     if (parsed.effort) |value| {
@@ -2443,6 +2473,51 @@ test "explicit launch files replace retained implicit settings in order" {
     try std.testing.expectEqual(
         @as(usize, 5),
         detailed.launch_policy.source(.max_steps).command.argument_index,
+    );
+}
+
+test "explicit launch model survives a later provider-only layer" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "home/.fx");
+    try tmp.dir.createDirPath(std.testing.io, "workspace");
+    try writeFixtureFile(
+        tmp.dir,
+        "base.json",
+        "{\"schema_version\":1,\"agent\":{\"provider\":\"codex\",\"model\":\"codex/model\"}}",
+    );
+    try writeFixtureFile(
+        tmp.dir,
+        "override.json",
+        "{\"schema_version\":1,\"agent\":{\"provider\":\"gateway\"}}",
+    );
+
+    const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace_root);
+    const base_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "base.json");
+    defer alloc.free(base_path);
+    const override_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "override.json");
+    defer alloc.free(override_path);
+    const files = [_][]const u8{ base_path, override_path };
+
+    var detailed = try loadMergedSettingsDetailedForLaunchFromHome(
+        alloc,
+        home_root,
+        workspace_root,
+        .{ .explicit_files = &files },
+    );
+    defer detailed.deinit(alloc);
+
+    try std.testing.expectEqual(model_provider.ProviderId.gateway, detailed.settings.provider.?);
+    try std.testing.expectEqualStrings("codex/model", detailed.settings.models.get(.gateway).?);
+    try std.testing.expect(detailed.settings.models.get(.codex) == null);
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        detailed.launch_policy.source(.model).explicit_file.layer,
     );
 }
 
