@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
-  "id": "fx-x6-ask",
-  "version": "0.0.6-x6.dd87df1",
+  "id": "fx-x9-ask",
+  "version": "0.0.6-x9.efeae8b",
   "protocol": "acp",
   "runtime": {
     "kind": "python-uv",

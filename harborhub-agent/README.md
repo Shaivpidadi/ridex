@@ -1,16 +1,28 @@
-# FX X6 Harbor Hub agent source
+# FX X9 Harbor Hub factorial agent
 
-This source package lets Harbor Hub stage the exact X6 Linux binary while
-preserving the benchmarked `fx ask --yolo --json` execution path. ACP is used
-only as the hosted transport envelope; the task itself is solved by the pinned
-FX CLI binary.
+This source package lets Harbor Hub stage one exact Linux binary for the X9
+control, Patch v3, and adaptive provider-retry runs. It preserves the benchmarked
+`fx ask --yolo --json` execution path; ACP is only the hosted transport envelope.
 
-- FX source commit: `dd87df1578d2390482fcb1432387c9755929fcb4`
-- Binary SHA-256: `a02d34b3c34783ef0af9610bded4ac2610a695fed3ba4305cc419f39122f3b2c`
+- FX experiment source commit: `efeae8be879b3d7db9e85272dd8ce1586ec8683c`
+- Binary SHA-256: `ababc24f21d6376cd2e3419b24d8260d3a0f1224906f677afba0e32e7e93c169`
 - Binary target: `x86_64-linux-musl`
 - Model: `vercel_ai_gateway/openai/gpt-5.6-sol`
 - Effort: `xhigh`
+- Logs: `/logs/agent/fx.json`, `/logs/agent/fx-stderr.log`, and
+  `/logs/agent/fx-trace.log`
 
-The efficiency and compaction variants are selected independently with
-`FX_EXPERIMENT_X6_EFFICIENCY` and `FX_EXPERIMENT_X6_COMPACTION` in the hosted
-job's non-secret agent environment.
+Use Harbor's direct credential mode with `AI_GATEWAY_API_KEY` and
+`HOSTED_INFERENCE_URL=https://ai-gateway.vercel.sh`. Keep the agent repository,
+Git ref, source directory, manifest path, model, effort, task set, and concurrency
+identical across all three jobs. Only the following non-secret environment varies:
+
+| Run | `FX_EXPERIMENT_X9_EDITOR` | `FX_EXPERIMENT_X9_PROVIDER_RETRY` |
+| --- | --- | --- |
+| Control | `control` | `control` |
+| Patch v3 | `patch_v3` | `control` |
+| Adaptive retry | `control` | `adaptive_v1` |
+
+Patch v3 replaces `edit_file` with the transactional multi-file/multi-hunk
+`apply_patch` tool. Adaptive retry caps transient provider recovery at three
+attempts with 30, 60, and 120 second response-head deadlines.

@@ -41,9 +41,10 @@ from acp.schema import (
 
 REQUESTED_MODEL = "vercel_ai_gateway/openai/gpt-5.6-sol"
 FX_BINARY = Path(__file__).resolve().parent.parent / "bin" / "fx"
-FX_BINARY_SHA256 = "a02d34b3c34783ef0af9610bded4ac2610a695fed3ba4305cc419f39122f3b2c"
+FX_BINARY_SHA256 = "ababc24f21d6376cd2e3419b24d8260d3a0f1224906f677afba0e32e7e93c169"
 FX_LOG = Path("/logs/agent/fx.json")
 FX_STDERR_LOG = Path("/logs/agent/fx-stderr.log")
+FX_TRACE_LOG = Path("/logs/agent/fx-trace.log")
 
 
 class FxAskAgent(Agent):
@@ -86,9 +87,9 @@ class FxAskAgent(Agent):
             protocol_version=PROTOCOL_VERSION,
             agent_capabilities=AgentCapabilities(),
             agent_info=Implementation(
-                name="fx-x6-ask",
-                title="FX X6 ask wrapper",
-                version="0.0.6-x6.dd87df1",
+                name="fx-x9-ask",
+                title="FX X9 factorial wrapper",
+                version="0.0.6-x9.efeae8b",
             ),
         )
 
@@ -243,6 +244,8 @@ class FxAskAgent(Agent):
                 "FX_AUTO_UPGRADE": "0",
                 "FX_MODEL": model,
                 "FX_SOUND": "0",
+                "FX_TRACE_LOG": str(FX_TRACE_LOG),
+                "FX_TRACE_SCOPES": "quality,gateway,recovery,tool",
             }
         )
 

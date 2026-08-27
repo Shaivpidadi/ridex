@@ -1,5 +1,5 @@
 [project]
-name = "fx-x6-harborhub-agent"
+name = "fx-x9-harborhub-agent"
 version = "0.0.6"
 requires-python = ">=3.12,<3.13"
 dependencies = [
