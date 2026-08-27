@@ -3141,7 +3141,7 @@ fn stripAnsiEscapes(alloc: std.mem.Allocator, input: []const u8) ![]u8 {
     return out.toOwnedSlice(alloc);
 }
 
-fn handleForkCommand(app: anytype, rest: []const u8) !void {
+fn handleForkCommand(app: anytype, rest: []const u8) anyerror!void {
     const App = @TypeOf(app.*);
     try app_session_runtime.Runtime(App).forkSession(app, rest);
 }

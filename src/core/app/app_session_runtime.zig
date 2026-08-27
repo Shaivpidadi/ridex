@@ -1453,7 +1453,7 @@ pub fn Runtime(comptime App: type) type {
 
         /// Creates the fork before closing the source, so a creation failure leaves
         /// the current session writable and visible.
-        pub fn forkSession(app: *App, raw_title: []const u8) !void {
+        pub fn forkSession(app: *App, raw_title: []const u8) anyerror!void {
             if (comptime !runtime_profile.allows(App, .durable_sessions)) {
                 return error.SessionPersistenceUnavailable;
             }
