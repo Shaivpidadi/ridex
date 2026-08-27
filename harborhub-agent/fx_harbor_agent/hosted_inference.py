@@ -1,0 +1,268 @@
+from __future__ import annotations
+
+import asyncio
+import ipaddress
+import ssl
+from collections.abc import Iterable
+from urllib.parse import SplitResult, urlsplit
+
+
+_MAX_REQUEST_HEAD_BYTES = 64 * 1024
+_STREAM_CHUNK_BYTES = 64 * 1024
+_HOP_BY_HOP_HEADERS = {
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "proxy-connection",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+}
+
+
+class HostedInferenceProxy:
+    """Stream FX's loopback-only gateway requests to Harbor's credential proxy."""
+
+    def __init__(self, upstream_url: str, token: str) -> None:
+        if not token:
+            raise ValueError("HOSTED_INFERENCE_TOKEN is empty")
+        self._upstream = _validated_upstream(upstream_url)
+        self._token = token
+        self._server: asyncio.Server | None = None
+
+    @property
+    def local_url(self) -> str:
+        if self._server is None or not self._server.sockets:
+            raise RuntimeError("hosted inference proxy has not started")
+        port = self._server.sockets[0].getsockname()[1]
+        return f"http://127.0.0.1:{port}/v3/ai/language-model"
+
+    async def start(self) -> None:
+        if self._server is not None:
+            raise RuntimeError("hosted inference proxy is already running")
+        self._server = await asyncio.start_server(
+            self._handle_client,
+            host="127.0.0.1",
+            port=0,
+            limit=_MAX_REQUEST_HEAD_BYTES,
+        )
+
+    async def close(self) -> None:
+        if self._server is None:
+            return
+        self._server.close()
+        await self._server.wait_closed()
+        self._server = None
+
+    async def __aenter__(self) -> HostedInferenceProxy:
+        await self.start()
+        return self
+
+    async def __aexit__(self, *_: object) -> None:
+        await self.close()
+
+    async def _handle_client(
+        self,
+        client_reader: asyncio.StreamReader,
+        client_writer: asyncio.StreamWriter,
+    ) -> None:
+        upstream_writer: asyncio.StreamWriter | None = None
+        response_started = False
+        try:
+            raw_head = await client_reader.readuntil(b"\r\n\r\n")
+            if len(raw_head) > _MAX_REQUEST_HEAD_BYTES:
+                raise ValueError("FX gateway request headers are too large")
+            method, headers = _parse_request_head(raw_head)
+            content_length = _content_length(headers)
+            upstream_reader, upstream_writer = await asyncio.wait_for(
+                self._open_upstream(),
+                timeout=30,
+            )
+            upstream_writer.write(
+                _upstream_request_head(
+                    method=method,
+                    upstream=self._upstream,
+                    token=self._token,
+                    headers=headers,
+                    content_length=content_length,
+                )
+            )
+            await _relay_exactly(
+                client_reader,
+                upstream_writer,
+                content_length,
+            )
+            await upstream_writer.drain()
+
+            while chunk := await upstream_reader.read(_STREAM_CHUNK_BYTES):
+                response_started = True
+                client_writer.write(chunk)
+                await client_writer.drain()
+        except (asyncio.IncompleteReadError, asyncio.LimitOverrunError, OSError, ValueError):
+            if not response_started:
+                await _write_bad_gateway(client_writer)
+        finally:
+            if upstream_writer is not None:
+                upstream_writer.close()
+                await _wait_closed(upstream_writer)
+            client_writer.close()
+            await _wait_closed(client_writer)
+
+    async def _open_upstream(
+        self,
+    ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+        host = self._upstream.hostname
+        if host is None:
+            raise ValueError("HOSTED_INFERENCE_URL has no hostname")
+        if self._upstream.scheme == "https":
+            context = ssl.create_default_context()
+            return await asyncio.open_connection(
+                host,
+                self._upstream.port or 443,
+                ssl=context,
+                server_hostname=host,
+            )
+        return await asyncio.open_connection(host, self._upstream.port or 80)
+
+
+def _validated_upstream(value: str) -> SplitResult:
+    if not value:
+        raise ValueError("HOSTED_INFERENCE_URL is empty")
+    parsed = urlsplit(value)
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("HOSTED_INFERENCE_URL must not contain user information")
+    if parsed.fragment:
+        raise ValueError("HOSTED_INFERENCE_URL must not contain a fragment")
+    if parsed.hostname is None:
+        raise ValueError("HOSTED_INFERENCE_URL must contain a hostname")
+    if parsed.scheme == "https":
+        return parsed
+    if parsed.scheme == "http" and _is_loopback(parsed.hostname):
+        return parsed
+    raise ValueError("HOSTED_INFERENCE_URL must use HTTPS")
+
+
+def _is_loopback(host: str) -> bool:
+    if host.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _parse_request_head(raw_head: bytes) -> tuple[str, list[tuple[str, str]]]:
+    try:
+        lines = raw_head.decode("iso-8859-1").split("\r\n")
+        method, _target, version = lines[0].split(" ", 2)
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise ValueError("invalid FX gateway HTTP request") from exc
+    if version != "HTTP/1.1":
+        raise ValueError("FX gateway request must use HTTP/1.1")
+    if method not in {"POST", "GET"}:
+        raise ValueError("unsupported FX gateway HTTP method")
+
+    headers: list[tuple[str, str]] = []
+    for line in lines[1:]:
+        if not line:
+            break
+        if ":" not in line:
+            raise ValueError("invalid FX gateway HTTP header")
+        name, value = line.split(":", 1)
+        name = name.strip()
+        if not name:
+            raise ValueError("invalid FX gateway HTTP header name")
+        headers.append((name, value.strip()))
+    return method, headers
+
+
+def _content_length(headers: Iterable[tuple[str, str]]) -> int:
+    values = [value for name, value in headers if name.lower() == "content-length"]
+    if not values:
+        return 0
+    if len(set(values)) != 1:
+        raise ValueError("conflicting FX gateway Content-Length headers")
+    try:
+        length = int(values[0], 10)
+    except ValueError as exc:
+        raise ValueError("invalid FX gateway Content-Length") from exc
+    if length < 0:
+        raise ValueError("invalid FX gateway Content-Length")
+    return length
+
+
+def _upstream_request_head(
+    *,
+    method: str,
+    upstream: SplitResult,
+    token: str,
+    headers: Iterable[tuple[str, str]],
+    content_length: int,
+) -> bytes:
+    target = upstream.path or "/"
+    if upstream.query:
+        target = f"{target}?{upstream.query}"
+    default_port = 443 if upstream.scheme == "https" else 80
+    port = upstream.port or default_port
+    host = upstream.hostname or ""
+    host_header = host if port == default_port else f"{host}:{port}"
+
+    output = [
+        f"{method} {target} HTTP/1.1",
+        f"Host: {host_header}",
+        f"Authorization: Bearer {token}",
+    ]
+    for name, value in headers:
+        normalized = name.lower()
+        if normalized in _HOP_BY_HOP_HEADERS:
+            continue
+        if normalized in {"host", "authorization", "content-length"}:
+            continue
+        output.append(f"{name}: {value}")
+    output.extend(
+        [
+            f"Content-Length: {content_length}",
+            "Connection: close",
+            "",
+            "",
+        ]
+    )
+    return "\r\n".join(output).encode("iso-8859-1")
+
+
+async def _relay_exactly(
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    byte_count: int,
+) -> None:
+    remaining = byte_count
+    while remaining:
+        chunk = await reader.read(min(remaining, _STREAM_CHUNK_BYTES))
+        if not chunk:
+            raise asyncio.IncompleteReadError(b"", remaining)
+        writer.write(chunk)
+        remaining -= len(chunk)
+
+
+async def _write_bad_gateway(writer: asyncio.StreamWriter) -> None:
+    body = b'{"error":"Harbor hosted inference proxy failed"}'
+    writer.write(
+        b"HTTP/1.1 502 Bad Gateway\r\n"
+        b"Content-Type: application/json\r\n"
+        + f"Content-Length: {len(body)}\r\n".encode("ascii")
+        + b"Connection: close\r\n\r\n"
+        + body
+    )
+    try:
+        await writer.drain()
+    except (ConnectionError, OSError):
+        pass
+
+
+async def _wait_closed(writer: asyncio.StreamWriter) -> None:
+    try:
+        await writer.wait_closed()
+    except (ConnectionError, OSError):
+        pass

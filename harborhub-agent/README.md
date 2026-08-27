@@ -11,6 +11,11 @@ FX CLI binary.
 - Model: `vercel_ai_gateway/openai/gpt-5.6-sol`
 - Effort: `xhigh`
 
+Harbor custom agents run in credential-proxy mode. The ACP wrapper consumes
+Harbor's injected `HOSTED_INFERENCE_URL` and `HOSTED_INFERENCE_TOKEN`, then
+streams FX's normal AI Gateway request through a loopback-only compatibility
+proxy. The hosted provider credential is never exposed to the FX process.
+
 The efficiency and compaction variants are selected independently with
 `FX_EXPERIMENT_X6_EFFICIENCY` and `FX_EXPERIMENT_X6_COMPACTION` in the hosted
 job's non-secret agent environment.

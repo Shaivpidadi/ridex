@@ -38,6 +38,8 @@ from acp.schema import (
     TextContentBlock,
 )
 
+from .hosted_inference import HostedInferenceProxy
+
 
 REQUESTED_MODEL = "vercel_ai_gateway/openai/gpt-5.6-sol"
 FX_BINARY = Path(__file__).resolve().parent.parent / "bin" / "fx"
@@ -88,7 +90,7 @@ class FxAskAgent(Agent):
             agent_info=Implementation(
                 name="fx-x6-ask",
                 title="FX X6 ask wrapper",
-                version="0.0.6-x6.dd87df1",
+                version="0.0.6-x6.dd87df1-hg1",
             ),
         )
 
@@ -237,34 +239,47 @@ class FxAskAgent(Agent):
         FX_LOG.parent.mkdir(parents=True, exist_ok=True)
 
         model = session["model"].removeprefix("vercel_ai_gateway/")
+        hosted_inference_url = os.environ.get("HOSTED_INFERENCE_URL", "")
+        hosted_inference_token = os.environ.get("HOSTED_INFERENCE_TOKEN", "")
+        if not hosted_inference_url or not hosted_inference_token:
+            raise RuntimeError(
+                "Harbor must provide HOSTED_INFERENCE_URL and "
+                "HOSTED_INFERENCE_TOKEN in gateway credential mode"
+            )
         env = dict(os.environ)
         env.update(
             {
+                "AI_GATEWAY_API_KEY": hosted_inference_token,
                 "FX_AUTO_UPGRADE": "0",
                 "FX_MODEL": model,
                 "FX_SOUND": "0",
             }
         )
 
-        process = await asyncio.create_subprocess_exec(
-            str(FX_BINARY),
-            "ask",
-            "--yolo",
-            "--json",
-            "--",
-            instruction,
-            cwd=session["cwd"],
-            env=env,
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            start_new_session=True,
-        )
-        self._processes[session_id] = process
-        try:
-            stdout_bytes, stderr_bytes = await process.communicate()
-        finally:
-            self._processes.pop(session_id, None)
+        async with HostedInferenceProxy(
+            hosted_inference_url,
+            hosted_inference_token,
+        ) as hosted_proxy:
+            env["FX_GATEWAY_CHAT_URL"] = hosted_proxy.local_url
+            process = await asyncio.create_subprocess_exec(
+                str(FX_BINARY),
+                "ask",
+                "--yolo",
+                "--json",
+                "--",
+                instruction,
+                cwd=session["cwd"],
+                env=env,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,
+            )
+            self._processes[session_id] = process
+            try:
+                stdout_bytes, stderr_bytes = await process.communicate()
+            finally:
+                self._processes.pop(session_id, None)
 
         stdout = stdout_bytes.decode("utf-8", "replace")
         stderr = stderr_bytes.decode("utf-8", "replace")
