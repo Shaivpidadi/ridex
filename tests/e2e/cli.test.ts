@@ -4964,6 +4964,18 @@ describe("cli: explicit launch config", () => {
       minLength: 1,
       pattern: "^[^\\u0000]+$",
     });
+    expect(
+      schema.properties.agent.properties.model["x-fx-max-utf8-bytes"],
+    ).toBe(1024);
+    const inlinePart =
+      schema.properties.prompt.properties.system_parts.items.oneOf.find(
+        (part: { properties?: { type?: { const?: string } } }) =>
+          part.properties?.type?.const === "inline",
+      );
+    expect(inlinePart.properties.text).toMatchObject({
+      pattern: "^[^\\u0000]*$",
+      "x-fx-max-utf8-bytes": 65_536,
+    });
     expect(schemaResult.stdout).toContain(
       '"max_steps":{"type":"integer","minimum":0,"maximum":18446744073709551615}',
     );
@@ -5008,6 +5020,8 @@ describe("cli: explicit launch config", () => {
       const unavailable = join(root, "unavailable.json");
       const invalidTypes = join(root, "invalid-types.json");
       const emptyTool = join(root, "empty-tool.json");
+      const nulPrompt = join(root, "nul-prompt.json");
+      const multibyteModel = join(root, "multibyte-model.json");
       writeFileSync(join(root, "prompt.md"), "VALID PROMPT FILE\n");
       writeFileSync(
         valid,
@@ -5025,6 +5039,17 @@ describe("cli: explicit launch config", () => {
       writeFileSync(
         emptyTool,
         '{"schema_version":1,"agent":{"enabled_tools":[""]}}\n',
+      );
+      writeFileSync(
+        nulPrompt,
+        '{"schema_version":1,"prompt":{"system_parts":[{"type":"inline","text":"\\u0000"}]}}\n',
+      );
+      writeFileSync(
+        multibyteModel,
+        JSON.stringify({
+          schema_version: 1,
+          agent: { model: "é".repeat(600) },
+        }) + "\n",
       );
 
       const accepted = await runFx(["config", "validate", valid, "--json"]);
@@ -5096,6 +5121,32 @@ describe("cli: explicit launch config", () => {
       expect(emptyToolResult.code).toBe(1);
       expect(JSON.parse(emptyToolResult.stdout).diagnostics[0]).toMatchObject({
         instance_location: "/agent/enabled_tools/0",
+        code: "invalid_value",
+      });
+
+      const nulPromptResult = await runFx([
+        "config",
+        "validate",
+        nulPrompt,
+        "--json",
+      ]);
+      expect(nulPromptResult.code).toBe(1);
+      expect(JSON.parse(nulPromptResult.stdout).diagnostics[0]).toMatchObject({
+        instance_location: "/prompt/system_parts/0/text",
+        code: "invalid_value",
+      });
+
+      const multibyteModelResult = await runFx([
+        "config",
+        "validate",
+        multibyteModel,
+        "--json",
+      ]);
+      expect(multibyteModelResult.code).toBe(1);
+      expect(
+        JSON.parse(multibyteModelResult.stdout).diagnostics[0],
+      ).toMatchObject({
+        instance_location: "/agent/model",
         code: "invalid_value",
       });
 
@@ -5295,6 +5346,62 @@ describe("cli: explicit launch config", () => {
       ).toEqual({ kind: "compiled_default" });
     } finally {
       rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("resolve reports field diagnostics for typed override sources", async () => {
+    const cases = [
+      {
+        args: [
+          '--set=agent.fast_mode="yes"',
+          "config",
+          "resolve",
+          "--json",
+        ],
+        env: {},
+        location: "/agent/fast_mode",
+        source: { kind: "command", argument_index: 0 },
+      },
+      {
+        args: [
+          "--config-env=agent.fast_mode=FX_TEST_CONFIG_FAST_INVALID",
+          "config",
+          "resolve",
+          "--json",
+        ],
+        env: { FX_TEST_CONFIG_FAST_INVALID: '"yes"' },
+        location: "/agent/fast_mode",
+        source: {
+          kind: "environment",
+          name: "FX_TEST_CONFIG_FAST_INVALID",
+        },
+      },
+      {
+        args: ["config", "resolve", "--json"],
+        env: { FX_MAX_AGENT_STEPS: '"many"' },
+        location: "/agent/max_steps",
+        source: { kind: "environment", name: "FX_MAX_AGENT_STEPS" },
+      },
+    ];
+
+    for (const testCase of cases) {
+      const result = await runFx(testCase.args, { env: testCase.env });
+      expect(result.code).toBe(1);
+      expect(result.stderr).toBe("");
+      expect(JSON.parse(result.stdout)).toMatchObject({
+        ok: false,
+        config: null,
+        provenance: [],
+        diagnostics: [
+          {
+            source: testCase.source,
+            instance_location: testCase.location,
+            severity: "error",
+            code: "invalid_type",
+          },
+        ],
+        truncated: false,
+      });
     }
   });
 

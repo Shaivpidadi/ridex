@@ -393,13 +393,19 @@ fn loadMergedSettingsDetailedForLaunchWithOptionalHome(
         &launch_model,
         request.available_tool_names,
         request.failure_out,
+        request.validation_diagnostics_out,
     ) catch |err| return err;
     for (request.overrides) |override| {
         const source: launch_config.Source = switch (override.source) {
             .environment => |name| .{ .environment = .{ .name = name } },
             .command => |argument_index| .{ .command = .{ .argument_index = argument_index } },
         };
-        var parsed = launch_config.parseOverride(alloc, override.name, override.value) catch |err| {
+        var parsed = parseLaunchOverride(
+            alloc,
+            override.name,
+            override.value,
+            request.validation_diagnostics_out,
+        ) catch |err| {
             recordLaunchFailure(request.failure_out, source);
             return err;
         };
@@ -529,6 +535,7 @@ fn applyRetainedEnvironmentAliases(
     launch_model: *?[]u8,
     available_tool_names: []const []const u8,
     failure_out: ?*?LaunchFailure,
+    validation_diagnostics_out: ?*?launch_config.ValidationDiagnostics,
 ) !void {
     const Mapping = struct { environment: []const u8, field: []const u8 };
     const mappings = [_]Mapping{
@@ -540,7 +547,12 @@ fn applyRetainedEnvironmentAliases(
         const value = io_mod.getenv(mapping.environment) orelse continue;
         if (std.mem.trim(u8, value, " \t\r\n").len == 0) continue;
         const source: launch_config.Source = .{ .environment = .{ .name = mapping.environment } };
-        var parsed = launch_config.parseOverride(alloc, mapping.field, value) catch |err| {
+        var parsed = parseLaunchOverride(
+            alloc,
+            mapping.field,
+            value,
+            validation_diagnostics_out,
+        ) catch |err| {
             recordLaunchFailure(failure_out, source);
             return err;
         };
@@ -558,6 +570,27 @@ fn applyRetainedEnvironmentAliases(
             return err;
         };
     }
+}
+
+fn parseLaunchOverride(
+    alloc: Allocator,
+    name: []const u8,
+    value: []const u8,
+    validation_diagnostics_out: ?*?launch_config.ValidationDiagnostics,
+) !launch_config.ParsedDocument {
+    const diagnostics_out = validation_diagnostics_out orelse
+        return launch_config.parseOverride(alloc, name, value);
+    var encoded = try launch_config.encodeOverrideDocument(alloc, name, value);
+    defer encoded.deinit(alloc);
+    var validation = try encoded.collectDiagnostics(alloc);
+    if (validation.items.len == 0) {
+        validation.deinit(alloc);
+        return launch_config.parseDocument(alloc, encoded.bytes, .non_file);
+    }
+    if (diagnostics_out.*) |*previous| previous.deinit(alloc);
+    diagnostics_out.* = validation;
+    validation = .{};
+    return error.InvalidLaunchConfiguration;
 }
 
 pub fn readRequiredExplicitConfig(alloc: Allocator, path: []const u8) ![]u8 {

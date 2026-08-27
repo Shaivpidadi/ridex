@@ -15,18 +15,29 @@ pub const max_system_prompt_parts: usize = 16;
 pub const max_system_prompt_part_bytes: usize = 64 * 1024;
 pub const max_system_prompt_total_bytes: usize = 128 * 1024;
 const max_integer_json = std.fmt.comptimePrint("{d}", .{std.math.maxInt(usize)});
+const max_model_bytes_json = std.fmt.comptimePrint("{d}", .{settings_store.max_model_bytes});
+const max_prompt_part_bytes_json = std.fmt.comptimePrint("{d}", .{max_system_prompt_part_bytes});
+const max_path_bytes_json = std.fmt.comptimePrint("{d}", .{std.fs.max_path_bytes});
+const model_json_schema =
+    "{\"type\":\"string\",\"minLength\":1,\"maxLength\":" ++ max_model_bytes_json ++
+    ",\"pattern\":\"^[^\\\\u0000-\\\\u0020\\\\u007F](?:[^\\\\u0000-\\\\u001F\\\\u007F]*[^\\\\u0000-\\\\u0020\\\\u007F])?$\",\"x-fx-max-utf8-bytes\":" ++ max_model_bytes_json ++ "}";
+const inline_text_json_schema =
+    "{\"type\":\"string\",\"maxLength\":" ++ max_prompt_part_bytes_json ++
+    ",\"pattern\":\"^[^\\\\u0000]*$\",\"x-fx-max-utf8-bytes\":" ++ max_prompt_part_bytes_json ++ "}";
+const path_json_schema =
+    "{\"type\":\"string\",\"minLength\":1,\"pattern\":\"^[^\\\\u0000]+$\",\"x-fx-max-utf8-bytes\":" ++ max_path_bytes_json ++ "}";
 
 pub const json_schema =
-    "{\"$schema\":\"https://json-schema.org/draft/2020-12/schema\",\"$id\":\"https://fx.sh/schema/launch-config-v1.json\",\"title\":\"fx launch configuration\",\"type\":\"object\",\"additionalProperties\":false,\"required\":[\"schema_version\"],\"$defs\":{\"contextLimit\":{\"oneOf\":[{\"type\":\"integer\",\"minimum\":0,\"maximum\":" ++ max_integer_json ++ "},{\"const\":\"off\"}]}},\"properties\":{" ++
+    "{\"$schema\":\"https://json-schema.org/draft/2020-12/schema\",\"$id\":\"https://fx.sh/schema/launch-config-v1.json\",\"title\":\"fx launch configuration\",\"$comment\":\"x-fx-max-utf8-bytes is a required fx annotation because standard maxLength counts Unicode characters, not encoded bytes.\",\"type\":\"object\",\"additionalProperties\":false,\"required\":[\"schema_version\"],\"$defs\":{\"contextLimit\":{\"oneOf\":[{\"type\":\"integer\",\"minimum\":0,\"maximum\":" ++ max_integer_json ++ "},{\"const\":\"off\"}]}},\"properties\":{" ++
     "\"schema_version\":{\"const\":1}," ++
     "\"agent\":{\"type\":\"object\",\"additionalProperties\":false,\"properties\":{" ++
-    "\"provider\":{\"enum\":[\"gateway\",\"codex\",\"grok\"]},\"model\":{\"type\":\"string\",\"minLength\":1,\"maxLength\":1024,\"pattern\":\"^[^\\\\u0000-\\\\u0020\\\\u007F](?:[^\\\\u0000-\\\\u001F\\\\u007F]*[^\\\\u0000-\\\\u0020\\\\u007F])?$\"},\"effort\":{\"type\":\"string\",\"minLength\":1,\"maxLength\":64,\"pattern\":\"^[A-Za-z0-9._-]+$\"},\"fast_mode\":{\"type\":\"boolean\"},\"max_steps\":{\"type\":\"integer\",\"minimum\":0,\"maximum\":" ++ max_integer_json ++ "},\"first_call_tool_choice\":{\"enum\":[\"auto\",\"none\",\"required\"]},\"enabled_tools\":{\"type\":\"array\",\"uniqueItems\":true,\"items\":{\"type\":\"string\",\"minLength\":1,\"pattern\":\"^[^\\\\u0000]+$\"}}}}," ++
+    "\"provider\":{\"enum\":[\"gateway\",\"codex\",\"grok\"]},\"model\":" ++ model_json_schema ++ ",\"effort\":{\"type\":\"string\",\"minLength\":1,\"maxLength\":64,\"pattern\":\"^[A-Za-z0-9._-]+$\"},\"fast_mode\":{\"type\":\"boolean\"},\"max_steps\":{\"type\":\"integer\",\"minimum\":0,\"maximum\":" ++ max_integer_json ++ "},\"first_call_tool_choice\":{\"enum\":[\"auto\",\"none\",\"required\"]},\"enabled_tools\":{\"type\":\"array\",\"uniqueItems\":true,\"items\":{\"type\":\"string\",\"minLength\":1,\"pattern\":\"^[^\\\\u0000]+$\"}}}}," ++
     "\"prompt\":{\"type\":\"object\",\"additionalProperties\":false,\"properties\":{\"system_parts\":{\"type\":\"array\",\"maxItems\":16,\"items\":{\"oneOf\":[" ++
     "{\"type\":\"object\",\"additionalProperties\":false,\"required\":[\"type\",\"id\"],\"properties\":{\"type\":{\"const\":\"builtin\"},\"id\":{\"const\":\"default\"}}}," ++
-    "{\"type\":\"object\",\"additionalProperties\":false,\"required\":[\"type\",\"text\"],\"properties\":{\"type\":{\"const\":\"inline\"},\"text\":{\"type\":\"string\",\"maxLength\":65536}}}," ++
-    "{\"type\":\"object\",\"additionalProperties\":false,\"required\":[\"type\",\"path\"],\"properties\":{\"type\":{\"const\":\"file\"},\"path\":{\"type\":\"string\",\"minLength\":1,\"pattern\":\"^[^\\\\u0000]+$\"}}}]}}}}," ++
+    "{\"type\":\"object\",\"additionalProperties\":false,\"required\":[\"type\",\"text\"],\"properties\":{\"type\":{\"const\":\"inline\"},\"text\":" ++ inline_text_json_schema ++ "}}," ++
+    "{\"type\":\"object\",\"additionalProperties\":false,\"required\":[\"type\",\"path\"],\"properties\":{\"type\":{\"const\":\"file\"},\"path\":" ++ path_json_schema ++ "}}]}}}}," ++
     "\"runtime\":{\"type\":\"object\",\"additionalProperties\":false,\"properties\":{\"permission_mode\":{\"enum\":[\"ask\",\"auto\",\"yolo\"]},\"max_tool_result_bytes\":{\"type\":\"integer\",\"minimum\":1024,\"maximum\":" ++ max_integer_json ++ "},\"context_enabled\":{\"type\":\"boolean\"},\"context_limits\":{\"type\":\"object\",\"additionalProperties\":false,\"properties\":{" ++
-    "\"skill_description_bytes\":{\"$ref\":\"#/$defs/contextLimit\"},\"skill_catalog_bytes\":{\"$ref\":\"#/$defs/contextLimit\"},\"skill_chunk_bytes\":{\"$ref\":\"#/$defs/contextLimit\"},\"skill_file_bytes\":{\"$ref\":\"#/$defs/contextLimit\"},\"mcp_description_bytes\":{\"$ref\":\"#/$defs/contextLimit\"},\"mcp_search_result_bytes\":{\"$ref\":\"#/$defs/contextLimit\"},\"mcp_server_instructions_bytes\":{\"$ref\":\"#/$defs/contextLimit\"},\"mcp_selected_schema_bytes\":{\"$ref\":\"#/$defs/contextLimit\"},\"project_instruction_file_bytes\":{\"$ref\":\"#/$defs/contextLimit\"},\"project_instructions_total_bytes\":{\"$ref\":\"#/$defs/contextLimit\"},\"image_adapter_output_bytes\":{\"$ref\":\"#/$defs/contextLimit\"}}},\"additional_directories\":{\"type\":\"array\",\"maxItems\":16,\"uniqueItems\":true,\"items\":{\"type\":\"string\",\"minLength\":1,\"pattern\":\"^[^\\\\u0000]+$\"}}}}}}\n";
+    "\"skill_description_bytes\":{\"$ref\":\"#/$defs/contextLimit\"},\"skill_catalog_bytes\":{\"$ref\":\"#/$defs/contextLimit\"},\"skill_chunk_bytes\":{\"$ref\":\"#/$defs/contextLimit\"},\"skill_file_bytes\":{\"$ref\":\"#/$defs/contextLimit\"},\"mcp_description_bytes\":{\"$ref\":\"#/$defs/contextLimit\"},\"mcp_search_result_bytes\":{\"$ref\":\"#/$defs/contextLimit\"},\"mcp_server_instructions_bytes\":{\"$ref\":\"#/$defs/contextLimit\"},\"mcp_selected_schema_bytes\":{\"$ref\":\"#/$defs/contextLimit\"},\"project_instruction_file_bytes\":{\"$ref\":\"#/$defs/contextLimit\"},\"project_instructions_total_bytes\":{\"$ref\":\"#/$defs/contextLimit\"},\"image_adapter_output_bytes\":{\"$ref\":\"#/$defs/contextLimit\"}}},\"additional_directories\":{\"type\":\"array\",\"maxItems\":16,\"uniqueItems\":true,\"items\":" ++ path_json_schema ++ "}}}}}\n";
 
 pub const InputSource = union(enum) {
     regular_file: []const u8,
@@ -1053,53 +1064,89 @@ pub fn parseDocument(
     return result;
 }
 
-pub fn parseOverride(alloc: Allocator, name: []const u8, value: []const u8) !ParsedDocument {
-    const placement = overridePlacement(name) orelse return error.UnknownConfigField;
+pub const EncodedOverrideDocument = struct {
+    bytes: []u8,
+    field: Field,
+
+    pub fn deinit(self: *EncodedOverrideDocument, alloc: Allocator) void {
+        alloc.free(self.bytes);
+        self.* = undefined;
+    }
+
+    pub fn collectDiagnostics(
+        self: EncodedOverrideDocument,
+        alloc: Allocator,
+    ) Allocator.Error!ValidationDiagnostics {
+        var diagnostics = try collectValidationDiagnostics(alloc, self.bytes);
+        errdefer diagnostics.deinit(alloc);
+        for (diagnostics.items) |*diagnostic| {
+            if (diagnostic.instance_location.len != 0) continue;
+            const replacement = try alloc.dupe(u8, self.field.jsonPointer());
+            alloc.free(diagnostic.instance_location);
+            diagnostic.instance_location = replacement;
+        }
+        return diagnostics;
+    }
+};
+
+pub fn encodeOverrideDocument(
+    alloc: Allocator,
+    name: []const u8,
+    value: []const u8,
+) !EncodedOverrideDocument {
+    const field = overrideField(name) orelse return error.UnknownConfigField;
+    const dotted_name = field.dottedName();
+    const separator = std.mem.findScalar(u8, dotted_name, '.') orelse return error.UnknownConfigField;
     var encoded: std.Io.Writer.Allocating = .init(alloc);
     defer encoded.deinit();
 
     try encoded.writer.print("{{\"schema_version\":1,\"{s}\":{{\"{s}\":", .{
-        placement.namespace,
-        placement.field,
+        dotted_name[0..separator],
+        dotted_name[separator + 1 ..],
     });
-    if (placement.structured) {
+    if (fieldUsesJsonValue(field)) {
         try encoded.writer.writeAll(value);
     } else {
         try std.json.Stringify.value(value, .{}, &encoded.writer);
     }
     try encoded.writer.writeAll("}}");
-    return parseDocument(alloc, encoded.written(), .non_file);
+    return .{
+        .bytes = try encoded.toOwnedSlice(),
+        .field = field,
+    };
 }
 
-const OverridePlacement = struct {
-    namespace: []const u8,
-    field: []const u8,
-    structured: bool,
-};
+pub fn parseOverride(alloc: Allocator, name: []const u8, value: []const u8) !ParsedDocument {
+    var encoded = try encodeOverrideDocument(alloc, name, value);
+    defer encoded.deinit(alloc);
+    return parseDocument(alloc, encoded.bytes, .non_file);
+}
 
-fn overridePlacement(name: []const u8) ?OverridePlacement {
-    inline for (&.{
-        .{ "agent.provider", "agent", "provider", false },
-        .{ "agent.model", "agent", "model", false },
-        .{ "agent.effort", "agent", "effort", false },
-        .{ "agent.fast_mode", "agent", "fast_mode", true },
-        .{ "agent.max_steps", "agent", "max_steps", true },
-        .{ "agent.first_call_tool_choice", "agent", "first_call_tool_choice", false },
-        .{ "agent.enabled_tools", "agent", "enabled_tools", true },
-        .{ "prompt.system_parts", "prompt", "system_parts", true },
-        .{ "runtime.permission_mode", "runtime", "permission_mode", false },
-        .{ "runtime.max_tool_result_bytes", "runtime", "max_tool_result_bytes", true },
-        .{ "runtime.context_enabled", "runtime", "context_enabled", true },
-        .{ "runtime.context_limits", "runtime", "context_limits", true },
-        .{ "runtime.additional_directories", "runtime", "additional_directories", true },
-    }) |entry| {
-        if (std.mem.eql(u8, name, entry[0])) return .{
-            .namespace = entry[1],
-            .field = entry[2],
-            .structured = entry[3],
-        };
+fn overrideField(name: []const u8) ?Field {
+    inline for (std.meta.tags(Field)) |field| {
+        if (std.mem.eql(u8, name, field.dottedName())) return field;
     }
     return null;
+}
+
+fn fieldUsesJsonValue(field: Field) bool {
+    return switch (field) {
+        .provider,
+        .model,
+        .effort,
+        .first_call_tool_choice,
+        .permission_mode,
+        => false,
+        .fast_mode,
+        .max_steps,
+        .enabled_tools,
+        .system_parts,
+        .max_tool_result_bytes,
+        .context_enabled,
+        .context_limits,
+        .additional_directories,
+        => true,
+    };
 }
 
 fn rejectNullValues(alloc: Allocator, bytes: []const u8) !void {
@@ -1362,6 +1409,10 @@ test "published schema is valid JSON and describes the strict root" {
         "^[^\\u0000-\\u0020\\u007F](?:[^\\u0000-\\u001F\\u007F]*[^\\u0000-\\u0020\\u007F])?$",
         model.get("pattern").?.string,
     );
+    try std.testing.expectEqual(
+        @as(i64, settings_store.max_model_bytes),
+        model.get("x-fx-max-utf8-bytes").?.integer,
+    );
     const enabled_tool_items = agent_properties.get("enabled_tools").?.object
         .get("items").?.object;
     try std.testing.expectEqual(@as(i64, 1), enabled_tool_items.get("minLength").?.integer);
@@ -1371,6 +1422,59 @@ test "published schema is valid JSON and describes the strict root" {
         std.fmt.comptimePrint("{d}", .{std.math.maxInt(usize)}),
         max_steps.number_string,
     );
+    const system_parts = parsed.value.object.get("properties").?.object
+        .get("prompt").?.object.get("properties").?.object
+        .get("system_parts").?.object.get("items").?.object
+        .get("oneOf").?.array.items;
+    const inline_text = system_parts[1].object.get("properties").?.object
+        .get("text").?.object;
+    try std.testing.expectEqualStrings("^[^\\u0000]*$", inline_text.get("pattern").?.string);
+    try std.testing.expectEqual(
+        @as(i64, max_system_prompt_part_bytes),
+        inline_text.get("x-fx-max-utf8-bytes").?.integer,
+    );
+    const file_path = system_parts[2].object.get("properties").?.object
+        .get("path").?.object;
+    try std.testing.expectEqual(
+        @as(i64, std.fs.max_path_bytes),
+        file_path.get("x-fx-max-utf8-bytes").?.integer,
+    );
+}
+
+test "string validation enforces NUL-free prompt text and UTF-8 byte limits" {
+    var nul_prompt = try collectValidationDiagnostics(
+        std.testing.allocator,
+        "{\"schema_version\":1,\"prompt\":{\"system_parts\":[{\"type\":\"inline\",\"text\":\"\\u0000\"}]}}",
+    );
+    defer nul_prompt.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), nul_prompt.items.len);
+    try std.testing.expectEqualStrings(
+        "/prompt/system_parts/0/text",
+        nul_prompt.items[0].instance_location,
+    );
+    try std.testing.expectEqual(DiagnosticCode.invalid_value, nul_prompt.items[0].code);
+
+    var model: std.ArrayList(u8) = .empty;
+    defer model.deinit(std.testing.allocator);
+    for (0..600) |_| try model.appendSlice(std.testing.allocator, "é");
+    try std.testing.expectEqual(@as(usize, 1200), model.items.len);
+    var document: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer document.deinit();
+    try document.writer.writeAll("{\"schema_version\":1,\"agent\":{\"model\":");
+    try std.json.Stringify.value(model.items, .{}, &document.writer);
+    try document.writer.writeAll("}}");
+
+    var oversized_model = try collectValidationDiagnostics(
+        std.testing.allocator,
+        document.written(),
+    );
+    defer oversized_model.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), oversized_model.items.len);
+    try std.testing.expectEqualStrings(
+        "/agent/model",
+        oversized_model.items[0].instance_location,
+    );
+    try std.testing.expectEqual(DiagnosticCode.invalid_value, oversized_model.items[0].code);
 }
 
 test "validation diagnostics collect independent errors in pointer order" {
@@ -1542,6 +1646,36 @@ test "typed overrides share strict document parsing" {
         error.UnknownConfigField,
         parseOverride(std.testing.allocator, "agent.unknown", "true"),
     );
+
+    var wrong_type = try encodeOverrideDocument(
+        std.testing.allocator,
+        "agent.fast_mode",
+        "\"yes\"",
+    );
+    defer wrong_type.deinit(std.testing.allocator);
+    var wrong_type_diagnostics = try wrong_type.collectDiagnostics(std.testing.allocator);
+    defer wrong_type_diagnostics.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), wrong_type_diagnostics.items.len);
+    try std.testing.expectEqualStrings(
+        "/agent/fast_mode",
+        wrong_type_diagnostics.items[0].instance_location,
+    );
+    try std.testing.expectEqual(DiagnosticCode.invalid_type, wrong_type_diagnostics.items[0].code);
+
+    var malformed = try encodeOverrideDocument(
+        std.testing.allocator,
+        "agent.fast_mode",
+        "yes",
+    );
+    defer malformed.deinit(std.testing.allocator);
+    var malformed_diagnostics = try malformed.collectDiagnostics(std.testing.allocator);
+    defer malformed_diagnostics.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), malformed_diagnostics.items.len);
+    try std.testing.expectEqualStrings(
+        "/agent/fast_mode",
+        malformed_diagnostics.items[0].instance_location,
+    );
+    try std.testing.expectEqual(DiagnosticCode.invalid_json, malformed_diagnostics.items[0].code);
 }
 
 test "strict document ownership cleans every allocation failure" {
