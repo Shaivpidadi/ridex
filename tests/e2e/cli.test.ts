@@ -5365,6 +5365,18 @@ describe("cli: explicit launch config", () => {
       },
       {
         args: [
+          "--set=agent.unknown=true",
+          "config",
+          "resolve",
+          "--json",
+        ],
+        env: {},
+        location: "/agent/unknown",
+        code: "unknown_field",
+        source: { kind: "command", argument_index: 0 },
+      },
+      {
+        args: [
           "--config-env=agent.fast_mode=FX_TEST_CONFIG_FAST_INVALID",
           "config",
           "resolve",
@@ -5376,6 +5388,21 @@ describe("cli: explicit launch config", () => {
         source: {
           kind: "environment",
           name: "FX_TEST_CONFIG_FAST_INVALID",
+        },
+      },
+      {
+        args: [
+          "--config-env=agent.unknown=FX_TEST_CONFIG_UNKNOWN",
+          "config",
+          "resolve",
+          "--json",
+        ],
+        env: { FX_TEST_CONFIG_UNKNOWN: "true" },
+        location: "/agent/unknown",
+        code: "unknown_field",
+        source: {
+          kind: "environment",
+          name: "FX_TEST_CONFIG_UNKNOWN",
         },
       },
       {

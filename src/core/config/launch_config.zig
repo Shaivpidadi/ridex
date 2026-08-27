@@ -495,6 +495,37 @@ fn pointerForKey(alloc: Allocator, parent: []const u8, key: []const u8) Allocato
     return output;
 }
 
+fn pointerForDottedName(alloc: Allocator, name: []const u8) Allocator.Error![]u8 {
+    var output_len = std.math.add(usize, name.len, 1) catch return error.OutOfMemory;
+    for (name) |byte| {
+        if (byte == '~' or byte == '/') {
+            output_len = std.math.add(usize, output_len, 1) catch return error.OutOfMemory;
+        }
+    }
+    const output = try alloc.alloc(u8, output_len);
+    output[0] = '/';
+    var index: usize = 1;
+    for (name) |byte| switch (byte) {
+        '.' => {
+            output[index] = '/';
+            index += 1;
+        },
+        '~' => {
+            @memcpy(output[index..][0..2], "~0");
+            index += 2;
+        },
+        '/' => {
+            @memcpy(output[index..][0..2], "~1");
+            index += 2;
+        },
+        else => {
+            output[index] = byte;
+            index += 1;
+        },
+    };
+    return output;
+}
+
 fn pointerForIndex(alloc: Allocator, parent: []const u8, index: usize) Allocator.Error![]u8 {
     var digit_count: usize = 1;
     var remaining = index;
@@ -1064,13 +1095,34 @@ pub fn parseDocument(
     return result;
 }
 
+const OverrideTarget = union(enum) {
+    known: Field,
+    unknown: []u8,
+
+    fn deinit(self: *OverrideTarget, alloc: Allocator) void {
+        switch (self.*) {
+            .known => {},
+            .unknown => |instance_location| alloc.free(instance_location),
+        }
+        self.* = undefined;
+    }
+
+    fn instanceLocation(self: OverrideTarget) []const u8 {
+        return switch (self) {
+            .known => |field| field.jsonPointer(),
+            .unknown => |instance_location| instance_location,
+        };
+    }
+};
+
 pub const EncodedOverrideDocument = struct {
     bytes: []u8,
-    field: Field,
+    target: OverrideTarget,
     preflight_diagnostic: ?DiagnosticCode = null,
 
     pub fn deinit(self: *EncodedOverrideDocument, alloc: Allocator) void {
         alloc.free(self.bytes);
+        self.target.deinit(alloc);
         self.* = undefined;
     }
 
@@ -1081,14 +1133,14 @@ pub const EncodedOverrideDocument = struct {
         if (self.preflight_diagnostic) |code| {
             var collector = ValidationCollector{ .alloc = alloc };
             defer collector.deinit();
-            try collector.add(self.field.jsonPointer(), code);
+            try collector.add(self.target.instanceLocation(), code);
             return collector.finish();
         }
         var diagnostics = try collectValidationDiagnostics(alloc, self.bytes);
         errdefer diagnostics.deinit(alloc);
         for (diagnostics.items) |*diagnostic| {
             if (diagnostic.instance_location.len != 0) continue;
-            const replacement = try alloc.dupe(u8, self.field.jsonPointer());
+            const replacement = try alloc.dupe(u8, self.target.instanceLocation());
             alloc.free(diagnostic.instance_location);
             diagnostic.instance_location = replacement;
         }
@@ -1101,10 +1153,18 @@ pub fn encodeOverrideDocument(
     name: []const u8,
     value: []const u8,
 ) !EncodedOverrideDocument {
-    const field = overrideField(name) orelse return error.UnknownConfigField;
+    const field = overrideField(name) orelse {
+        const instance_location = try pointerForDottedName(alloc, name);
+        errdefer alloc.free(instance_location);
+        return .{
+            .bytes = try alloc.dupe(u8, ""),
+            .target = .{ .unknown = instance_location },
+            .preflight_diagnostic = .unknown_field,
+        };
+    };
     if (value.len > max_config_file_bytes) return .{
         .bytes = try alloc.dupe(u8, ""),
-        .field = field,
+        .target = .{ .known = field },
         .preflight_diagnostic = .too_large,
     };
     if (fieldUsesJsonValue(field)) {
@@ -1114,7 +1174,7 @@ pub fn encodeOverrideDocument(
             error.OutOfMemory => return error.OutOfMemory,
             else => return .{
                 .bytes = try alloc.dupe(u8, ""),
-                .field = field,
+                .target = .{ .known = field },
                 .preflight_diagnostic = .invalid_json,
             },
         };
@@ -1137,7 +1197,7 @@ pub fn encodeOverrideDocument(
     try encoded.writer.writeAll("}}");
     return .{
         .bytes = try encoded.toOwnedSlice(),
-        .field = field,
+        .target = .{ .known = field },
     };
 }
 
@@ -1146,6 +1206,7 @@ pub fn parseOverride(alloc: Allocator, name: []const u8, value: []const u8) !Par
     defer encoded.deinit(alloc);
     if (encoded.preflight_diagnostic) |code| return switch (code) {
         .too_large => error.ConfigFileTooLarge,
+        .unknown_field => error.UnknownConfigField,
         else => error.SyntaxError,
     };
     return parseDocument(alloc, encoded.bytes, .non_file);
@@ -1675,6 +1736,21 @@ test "typed overrides share strict document parsing" {
         error.UnknownConfigField,
         parseOverride(std.testing.allocator, "agent.unknown", "true"),
     );
+
+    var unknown = try encodeOverrideDocument(
+        std.testing.allocator,
+        "agent.unknown",
+        "true",
+    );
+    defer unknown.deinit(std.testing.allocator);
+    var unknown_diagnostics = try unknown.collectDiagnostics(std.testing.allocator);
+    defer unknown_diagnostics.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), unknown_diagnostics.items.len);
+    try std.testing.expectEqualStrings(
+        "/agent/unknown",
+        unknown_diagnostics.items[0].instance_location,
+    );
+    try std.testing.expectEqual(DiagnosticCode.unknown_field, unknown_diagnostics.items[0].code);
 
     var wrong_type = try encodeOverrideDocument(
         std.testing.allocator,
