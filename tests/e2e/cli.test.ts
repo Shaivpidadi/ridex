@@ -5067,6 +5067,7 @@ describe("cli: explicit launch config", () => {
       );
       const base = join(root, "base.json");
       const override = join(root, "override.json");
+      const invalid = join(root, "invalid.json");
       writeFileSync(
         base,
         '{"schema_version":1,"agent":{"fast_mode":false,"enabled_tools":["grep_files","read_file"]}}\n',
@@ -5075,6 +5076,7 @@ describe("cli: explicit launch config", () => {
         override,
         '{"schema_version":1,"agent":{"max_steps":6}}\n',
       );
+      writeFileSync(invalid, '{"schema_version":1,"unknown":true}\n');
       const result = await runFx(
         [
           `--config=${base}`,
@@ -5121,6 +5123,20 @@ describe("cli: explicit launch config", () => {
       expect(contextLimits.source).toEqual({
         kind: "command",
         argument_index: 3,
+      });
+
+      const invalidLayer = await runFx([
+        `--config=${invalid}`,
+        `--config=${override}`,
+        "config",
+        "resolve",
+        "--json",
+      ]);
+      expect(invalidLayer.code).toBe(1);
+      expect(JSON.parse(invalidLayer.stdout).diagnostics[0].source).toEqual({
+        kind: "explicit_file",
+        path: invalid,
+        layer: 0,
       });
 
       const rejected = await runFx([`--config=${base}`, "status", "--json"]);
@@ -5170,6 +5186,7 @@ describe("cli: explicit launch config", () => {
       const root = mkdtempSync(join(tmpdir(), "fx-e2e-config-ask-"));
       const gateway = startFakeGateway([
         fakeGatewayFinalText("configured launch complete"),
+        fakeGatewayFinalText("configured PR complete"),
       ]);
       try {
         const home = join(root, "home");
@@ -5193,7 +5210,7 @@ describe("cli: explicit launch config", () => {
                 { type: "inline", text: "CONFIGURED SYSTEM PROMPT" },
               ],
             },
-            runtime: { permission_mode: "auto" },
+            runtime: { permission_mode: "ask" },
           }) + "\n",
         );
 
@@ -5232,6 +5249,28 @@ describe("cli: explicit launch config", () => {
         );
         expect(JSON.stringify(request.tools)).toContain("read_file");
         expect(JSON.stringify(request.tools)).not.toContain("grep_files");
+
+        const prResult = await runFx(
+          [`--config=${config}`, "pr", "--auto", "Summarize the branch."],
+          {
+            cwd: REPO_ROOT,
+            env: {
+              HOME: realpathSync(home),
+              AI_GATEWAY_API_KEY: "fake-config-key",
+              VERCEL_OIDC_TOKEN: undefined,
+              FX_GATEWAY_BASE_URL: gateway.baseUrl,
+              FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+              FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+            },
+            timeoutMs: 60_000,
+          },
+        );
+        expect(prResult.code).toBe(0);
+        expect(gateway.requests).toHaveLength(2);
+        const prRequest = JSON.parse(gateway.requests[1]!.body);
+        expect(JSON.stringify(prRequest.prompt)).toContain(
+          "permission mode is auto",
+        );
       } finally {
         gateway.stop();
         rmSync(root, { recursive: true, force: true });

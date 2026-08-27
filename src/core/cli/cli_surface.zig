@@ -1096,8 +1096,8 @@ fn runNonInteractiveWithDeps(
             });
             return .handled_success;
         },
-        .pr => |rest| return runGithubWorkflow(alloc, rest, cfg, global_args.modifiers, deps, .pull_request),
-        .issue => |rest| return runGithubWorkflow(alloc, rest, cfg, global_args.modifiers, deps, .issue),
+        .pr => |rest| return runGithubWorkflow(alloc, rest, cfg, global_args.modifiers, global_args.argument_offset, deps, .pull_request),
+        .issue => |rest| return runGithubWorkflow(alloc, rest, cfg, global_args.modifiers, global_args.argument_offset, deps, .issue),
         .login => |rest| {
             const maybe_login_provider = parseLoginProvider(rest) catch {
                 try writeStderr(deps, "usage: fx login [vercel|codex|grok]\n");
@@ -1902,6 +1902,7 @@ fn runGithubWorkflow(
     args: []const [:0]const u8,
     cfg: Config,
     launch_modifiers: LaunchModifiers,
+    argument_offset: usize,
     deps: RunDeps,
     workflow: github_workflows.Workflow,
 ) !RunResult {
@@ -1920,7 +1921,26 @@ fn runGithubWorkflow(
     };
     defer alloc.free(prompt);
 
-    const workflow_cfg = workflowConfigWithLaunchModifiers(cfg, launch_modifiers);
+    var workflow_cfg = workflowConfigWithLaunchModifiers(cfg, launch_modifiers);
+    var permission_overrides: ?[]config_runtime.LaunchOverride = null;
+    defer if (permission_overrides) |overrides| alloc.free(overrides);
+    if (opts.auto_permission) {
+        const overrides = try alloc.alloc(
+            config_runtime.LaunchOverride,
+            workflow_cfg.launch_request.overrides.len + 1,
+        );
+        @memcpy(overrides[0..workflow_cfg.launch_request.overrides.len], workflow_cfg.launch_request.overrides);
+        const local_index = for (args, 0..) |arg, index| {
+            if (std.mem.eql(u8, arg, "--auto")) break index;
+        } else unreachable;
+        overrides[overrides.len - 1] = .{
+            .name = "runtime.permission_mode",
+            .value = "auto",
+            .source = .{ .command = argument_offset + 1 + local_index },
+        };
+        permission_overrides = overrides;
+        workflow_cfg.launch_request.overrides = overrides;
+    }
     if (!opts.create) {
         const exit_code = try cli_ask.runPrompt(alloc, prompt, opts.auto_permission, workflow_cfg, cfg.context_registry, cfg.tool_set);
         return if (exit_code == 0) .handled_success else .handled_failure;
@@ -3343,20 +3363,19 @@ fn resolveLaunchConfig(
     var request = modifiers.resolutionRequest();
     request.available_tool_names = cfg.tool_set.order;
     request.builtin_system_prompt = cfg.prompt_policy.system_prompt;
+    var failure: ?config_runtime.LaunchFailure = null;
+    request.failure_out = &failure;
     var startup = app_lifecycle.loadStartupStateWithoutCredentialsForLaunch(
         alloc,
         cfg.default_model,
         cfg.default_agent_step_limit,
         request,
     ) catch |err| {
-        const source: config_runtime.launch_config.Source = if (modifiers.config_files.len > 0)
-            .{ .explicit_file = .{
-                .path = modifiers.config_files[modifiers.config_files.len - 1],
-                .layer = modifiers.config_files.len - 1,
-            } }
-        else
-            .compiled_default;
-        const json = try renderConfigFailure(alloc, source, err);
+        const json = try renderConfigFailure(
+            alloc,
+            if (failure) |value| value.source else .compiled_default,
+            err,
+        );
         defer alloc.free(json);
         try writeStdout(deps, json);
         return .handled_failure;

@@ -233,6 +233,11 @@ pub const LaunchResolutionRequest = struct {
     saved_directories_suppressed: bool = false,
     context_limit_argument_index: ?usize = null,
     additional_directories_argument_index: ?usize = null,
+    failure_out: ?*?LaunchFailure = null,
+};
+
+pub const LaunchFailure = struct {
+    source: launch_config.Source,
 };
 
 pub const LaunchOverride = struct {
@@ -338,41 +343,58 @@ fn loadMergedSettingsDetailedForLaunchWithOptionalHome(
     }
 
     for (request.explicit_files, 0..) |path, layer| {
-        const bytes = try readRequiredExplicitConfig(alloc, path);
-        defer alloc.free(bytes);
-        var parsed = try launch_config.parseDocument(alloc, bytes, .{ .regular_file = path });
-        defer parsed.deinit(alloc);
-        try applyExplicitDocument(
-            alloc,
-            workspace_root,
-            &detailed,
-            &parsed,
-            .{ .explicit_file = .{ .path = path, .layer = layer } },
-            request.available_tool_names,
-        );
-    }
-
-    try applyRetainedEnvironmentAliases(
-        alloc,
-        workspace_root,
-        &detailed,
-        request.available_tool_names,
-    );
-    for (request.overrides) |override| {
-        var parsed = try launch_config.parseOverride(alloc, override.name, override.value);
-        defer parsed.deinit(alloc);
-        const source: launch_config.Source = switch (override.source) {
-            .environment => |name| .{ .environment = .{ .name = name } },
-            .command => |argument_index| .{ .command = .{ .argument_index = argument_index } },
+        const source: launch_config.Source = .{ .explicit_file = .{ .path = path, .layer = layer } };
+        const bytes = readRequiredExplicitConfig(alloc, path) catch |err| {
+            recordLaunchFailure(request.failure_out, source);
+            return err;
         };
-        try applyExplicitDocument(
+        defer alloc.free(bytes);
+        var parsed = launch_config.parseDocument(alloc, bytes, .{ .regular_file = path }) catch |err| {
+            recordLaunchFailure(request.failure_out, source);
+            return err;
+        };
+        defer parsed.deinit(alloc);
+        applyExplicitDocument(
             alloc,
             workspace_root,
             &detailed,
             &parsed,
             source,
             request.available_tool_names,
-        );
+        ) catch |err| {
+            recordLaunchFailure(request.failure_out, source);
+            return err;
+        };
+    }
+
+    applyRetainedEnvironmentAliases(
+        alloc,
+        workspace_root,
+        &detailed,
+        request.available_tool_names,
+        request.failure_out,
+    ) catch |err| return err;
+    for (request.overrides) |override| {
+        const source: launch_config.Source = switch (override.source) {
+            .environment => |name| .{ .environment = .{ .name = name } },
+            .command => |argument_index| .{ .command = .{ .argument_index = argument_index } },
+        };
+        var parsed = launch_config.parseOverride(alloc, override.name, override.value) catch |err| {
+            recordLaunchFailure(request.failure_out, source);
+            return err;
+        };
+        defer parsed.deinit(alloc);
+        applyExplicitDocument(
+            alloc,
+            workspace_root,
+            &detailed,
+            &parsed,
+            source,
+            request.available_tool_names,
+        ) catch |err| {
+            recordLaunchFailure(request.failure_out, source);
+            return err;
+        };
     }
     if (request.context_limit_overrides.len > 0) {
         for (request.context_limit_overrides) |override| {
@@ -382,31 +404,53 @@ fn loadMergedSettingsDetailedForLaunchWithOptionalHome(
             });
         }
         detailed.sources.context_limits = .process_override;
-        try detailed.launch_policy.setSource(
+        detailed.launch_policy.setSource(
             alloc,
             .context_limits,
             .{ .command = .{
                 .argument_index = request.context_limit_argument_index orelse 0,
             } },
             true,
-        );
+        ) catch |err| {
+            const source: launch_config.Source = .{ .command = .{
+                .argument_index = request.context_limit_argument_index orelse 0,
+            } };
+            recordLaunchFailure(request.failure_out, source);
+            return err;
+        };
     }
     if (request.additional_directories.len > 0 or request.saved_directories_suppressed) {
-        try detailed.launch_policy.setSource(
+        detailed.launch_policy.setSource(
             alloc,
             .additional_directories,
             .{ .command = .{
                 .argument_index = request.additional_directories_argument_index orelse 0,
             } },
             true,
-        );
+        ) catch |err| {
+            const source: launch_config.Source = .{ .command = .{
+                .argument_index = request.additional_directories_argument_index orelse 0,
+            } };
+            recordLaunchFailure(request.failure_out, source);
+            return err;
+        };
     }
     if (request.builtin_system_prompt) |builtin_prompt| {
-        try detailed.launch_policy.composeSystemPrompt(alloc, builtin_prompt);
+        detailed.launch_policy.composeSystemPrompt(alloc, builtin_prompt) catch |err| {
+            recordLaunchFailure(request.failure_out, detailed.launch_policy.source(.system_parts));
+            return err;
+        };
     }
 
     detailed.model_source = detailed.sources.models.get(detailed.settings.provider orelse .gateway);
     return detailed;
+}
+
+fn recordLaunchFailure(
+    output: ?*?LaunchFailure,
+    source: launch_config.Source,
+) void {
+    if (output) |value| value.* = .{ .source = source };
 }
 
 fn loadProfileAuthSelectionWithOptionalHome(
@@ -446,6 +490,7 @@ fn applyRetainedEnvironmentAliases(
     workspace_root: []const u8,
     detailed: *DetailedSettings,
     available_tool_names: []const []const u8,
+    failure_out: ?*?LaunchFailure,
 ) !void {
     const Mapping = struct { environment: []const u8, field: []const u8 };
     const mappings = [_]Mapping{
@@ -456,16 +501,23 @@ fn applyRetainedEnvironmentAliases(
     for (&mappings) |mapping| {
         const value = io_mod.getenv(mapping.environment) orelse continue;
         if (std.mem.trim(u8, value, " \t\r\n").len == 0) continue;
-        var parsed = try launch_config.parseOverride(alloc, mapping.field, value);
+        const source: launch_config.Source = .{ .environment = .{ .name = mapping.environment } };
+        var parsed = launch_config.parseOverride(alloc, mapping.field, value) catch |err| {
+            recordLaunchFailure(failure_out, source);
+            return err;
+        };
         defer parsed.deinit(alloc);
-        try applyExplicitDocument(
+        applyExplicitDocument(
             alloc,
             workspace_root,
             detailed,
             &parsed,
-            .{ .environment = .{ .name = mapping.environment } },
+            source,
             available_tool_names,
-        );
+        ) catch |err| {
+            recordLaunchFailure(failure_out, source);
+            return err;
+        };
     }
 }
 

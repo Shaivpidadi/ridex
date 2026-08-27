@@ -1486,7 +1486,11 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
 
     var permission_mode = toCorePermissionMode(startup.permission_mode);
     const mode_id: []const u8 = cfg.mode_registry.default_mode_id;
-    if (permission_override) |explicit| permission_mode = explicit;
+    if (permission_override) |explicit| {
+        if (!startup.launch_policy.explicit_fields.contains(.permission_mode)) {
+            permission_mode = explicit;
+        }
+    }
 
     if (permission_mode == .yolo and !startup.yolo_acknowledged) {
         try emitHeadlessYoloWarning(alloc, options);
