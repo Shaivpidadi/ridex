@@ -52,6 +52,7 @@ const runtime_tool_admission = @import("tool_admission.zig");
 const runtime_interruption = @import("interruption.zig");
 const runtime_parallel_execution = @import("parallel_execution.zig");
 const runtime_tool_batch = @import("tool_batch.zig");
+const runtime_within_turn_compaction = @import("within_turn_compaction.zig");
 const model_response_recovery = @import("model_response_recovery.zig");
 
 const Allocator = std.mem.Allocator;
@@ -2738,6 +2739,9 @@ fn processQueuedPromptInner(
     if (config.custom_tool_guidance.len > 0) {
         try stable_prefix.append(arena, .{ .role = .system, .content = config.custom_tool_guidance });
     }
+    if (config.experiment_prompt_section.len > 0) {
+        try stable_prefix.append(arena, .{ .role = .system, .content = config.experiment_prompt_section });
+    }
     if (config.skills_prompt_section.len > 0) {
         try stable_prefix.append(arena, .{ .role = .system, .content = config.skills_prompt_section });
     }
@@ -3225,7 +3229,27 @@ fn processQueuedPromptLoop(
             overlay_arena,
             &ephemeral_overlay,
         );
-        var gateway_messages = try runtime_prompt_context.buildGatewayMessages(overlay_arena, stable_prefix.items, ephemeral_overlay.items, history_messages.items, current_user_effective, within_turn_suffix.items);
+        const within_turn_projection = try runtime_within_turn_compaction.project(
+            overlay_arena,
+            within_turn_suffix.items,
+            config.active_turn_compaction,
+        );
+        if (within_turn_projection.compacted) {
+            debug_trace.eventf(
+                "history",
+                "active_turn_compaction",
+                step_ctx,
+                "source_messages={d} projected_messages={d} source_bytes={d} projected_bytes={d} omitted_messages={d}",
+                .{
+                    within_turn_projection.source_messages,
+                    within_turn_projection.projected_messages,
+                    within_turn_projection.source_bytes,
+                    within_turn_projection.projected_bytes,
+                    within_turn_projection.omitted_messages,
+                },
+            );
+        }
+        var gateway_messages = try runtime_prompt_context.buildGatewayMessages(overlay_arena, stable_prefix.items, ephemeral_overlay.items, history_messages.items, current_user_effective, within_turn_projection.messages);
         last_gateway_message_count = gateway_messages.items.len;
         const history_start_index = stable_prefix.items.len + ephemeral_overlay.items.len;
         const current_user_message_index = history_start_index + history_messages.items.len;

@@ -2,6 +2,7 @@ const std = @import("std");
 const std_builtin = @import("builtin");
 const command_admission = @import("../permissions/command_admission.zig");
 const agent_runtime = @import("../agent/agent_runtime.zig");
+const x6_factorial = @import("../agent/x6_factorial.zig");
 const agent_stream_provider = @import("../agent/stream_provider.zig");
 const app_lifecycle = @import("../app/app_lifecycle.zig");
 const app_runtime_setup = @import("../app/app_runtime_setup.zig");
@@ -576,6 +577,7 @@ const AskContext = struct {
     image_snapshot_temp_dir: ?[]u8 = null,
     prompt_snapshot_committed: bool = false,
     last_recovery_status: ?types.RouteRecoveryStatus = null,
+    x6_arms: x6_factorial.Arms = .{},
 
     fn init(alloc: Allocator, cfg: Config, deps: RunDeps, workspace_root: []const u8) AskContext {
         const lifecycle_runtime = hooks.Runtime.init(alloc);
@@ -1457,6 +1459,12 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     defer if (owned_resumed_model) |model| alloc.free(model);
     var ctx = AskContext.init(alloc, cfg, options.deps, startup.workspace_root);
     defer ctx.deinit();
+    ctx.x6_arms = try x6_factorial.currentArms();
+    debug_trace.logf(
+        "quality",
+        "event=x6_factorial efficiency={s} compaction={s}",
+        .{ @tagName(ctx.x6_arms.efficiency), @tagName(ctx.x6_arms.compaction) },
+    );
     if (options.save_session) {
         _ = try ctx.session.initializeProfileUsage(alloc, io_mod.getenv("HOME"));
         ctx.session.attachProfileUsagePublisher(alloc);
@@ -1726,6 +1734,8 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         .advertised_functions = tool_projection.advertised_functions,
         .provider_capabilities = cfg.provider_set.select(ctx.provider).capabilities,
         .custom_tool_guidance = tool_projection.custom_guidance,
+        .experiment_prompt_section = ctx.x6_arms.prompt(),
+        .active_turn_compaction = ctx.x6_arms.compaction == .active,
         .agent_step_limit = startup.agent_step_limit,
         .max_tool_result_bytes = startup.max_tool_result_bytes,
         .cancel_flag = ctx.cancelFlag(),
