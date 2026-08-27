@@ -24,6 +24,7 @@ pub fn Runtime(comptime App: type) type {
 
         pub fn start(app: *App, prompt: []const u8) void {
             if (comptime builtin.single_threaded) return;
+            if (io_mod.getenv("FX_E2E_DISABLE_SESSION_TITLE_GENERATION") != null) return;
             if (app.session_title_generation.thread != null) return;
             if (SessionRuntime.cachedSessionTitle(app) != null) return;
             const session_id = SessionRuntime.activeSessionId(app) orelse return;

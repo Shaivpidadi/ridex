@@ -49,6 +49,7 @@ test.skipIf(!tmuxAvailable())("interactive session replaces the provisional titl
       FX_DISABLE_KEYCHAIN: "1",
       FX_SKIP_ONBOARDING: "1",
       FX_AUTO_UPGRADE: "0",
+      FX_E2E_DISABLE_SESSION_TITLE_GENERATION: undefined,
       FX_MODEL: FAKE_GATEWAY_MODEL,
       FX_GATEWAY_BASE_URL: gateway.baseUrl,
       FX_GATEWAY_CHAT_URL: gateway.chatUrl,
