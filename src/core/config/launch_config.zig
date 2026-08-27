@@ -484,12 +484,19 @@ fn pointerForKey(alloc: Allocator, parent: []const u8, key: []const u8) Allocato
 }
 
 fn pointerForIndex(alloc: Allocator, parent: []const u8, index: usize) Allocator.Error![]u8 {
-    var index_buffer: [32]u8 = undefined;
-    const index_text = std.fmt.bufPrint(&index_buffer, "{d}", .{index}) catch unreachable;
-    const output = try alloc.alloc(u8, parent.len + 1 + index_text.len);
+    var digit_count: usize = 1;
+    var remaining = index;
+    while (remaining >= 10) : (digit_count += 1) remaining /= 10;
+    const output = try alloc.alloc(u8, parent.len + 1 + digit_count);
     @memcpy(output[0..parent.len], parent);
     output[parent.len] = '/';
-    @memcpy(output[parent.len + 1 ..], index_text);
+    remaining = index;
+    var cursor = output.len;
+    while (cursor > parent.len + 1) {
+        cursor -= 1;
+        output[cursor] = '0' + @as(u8, @intCast(remaining % 10));
+        remaining /= 10;
+    }
     return output;
 }
 
