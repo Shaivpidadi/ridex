@@ -2,10 +2,22 @@ const std = @import("std");
 const agent_stream_provider = @import("../agent/stream_provider.zig");
 const runtime_gateway_step = @import("../agent/runtime/gateway_step.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
-const session_usage = @import("session_usage.zig");
 const types = @import("../shared/types.zig");
 
 const Allocator = std.mem.Allocator;
+
+pub const GeneratedTitle = struct {
+    session_id: []u8,
+    expected_title: []u8,
+    title: []u8,
+
+    pub fn deinit(self: GeneratedTitle) void {
+        const alloc = std.heap.c_allocator;
+        alloc.free(self.session_id);
+        alloc.free(self.expected_title);
+        alloc.free(self.title);
+    }
+};
 
 pub const max_title_chars: usize = 50;
 const max_prompt_bytes: usize = 960;
@@ -25,7 +37,6 @@ pub const Request = struct {
     retry_count: usize,
     user_prompt: []const u8,
     cancel_flag: *std.atomic.Value(bool),
-    usage: ?*session_usage.Usage = null,
     trace_ctx: debug_trace.TraceContext,
 };
 
@@ -35,8 +46,7 @@ pub fn generate(alloc: Allocator, request: Request) !?[]u8 {
     const prompt = try buildPrompt(alloc, request.user_prompt);
     defer alloc.free(prompt);
     const messages = [_]types.ChatMessage{.{ .role = .user, .content = prompt }};
-    var capture = StreamCapture{ .alloc = alloc };
-    defer capture.deinit();
+    var capture: StreamCapture = .{};
     var delivery = runtime_gateway_step.DeliveryCertainty.init();
     var attempt_evidence: agent_stream_provider.AttemptEvidence = .{};
 
@@ -60,7 +70,7 @@ pub fn generate(alloc: Allocator, request: Request) !?[]u8 {
             .events = .{ .context = &capture, .emit_fn = StreamCapture.onEvent },
             .cancel_flag = request.cancel_flag,
         },
-        request.usage,
+        null,
         alloc,
     );
     defer streamed.deinit(alloc);
@@ -68,8 +78,8 @@ pub fn generate(alloc: Allocator, request: Request) !?[]u8 {
     if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
     if (std.meta.activeTag(streamed) == .failed) return null;
     const completion = streamed.completed.completion;
-    const raw = if (capture.text.items.len > 0)
-        capture.text.items
+    const raw = if (capture.len > 0)
+        capture.buffer[0..capture.len]
     else
         completion.content orelse return null;
     return try parseTitle(alloc, raw);
@@ -132,12 +142,8 @@ fn utf8PrefixByChars(text: []const u8, max_chars: usize) []const u8 {
 }
 
 const StreamCapture = struct {
-    alloc: Allocator,
-    text: std.ArrayList(u8) = .empty,
-
-    fn deinit(self: *StreamCapture) void {
-        self.text.deinit(self.alloc);
-    }
+    buffer: [max_response_bytes]u8 = undefined,
+    len: usize = 0,
 
     fn onEvent(raw: *anyopaque, event: agent_stream_provider.Event) void {
         const self: *StreamCapture = @ptrCast(@alignCast(raw));
@@ -145,8 +151,9 @@ const StreamCapture = struct {
             .content_delta => |value| value,
             else => return,
         };
-        const remaining = max_response_bytes -| self.text.items.len;
-        self.text.appendSlice(self.alloc, chunk[0..@min(chunk.len, remaining)]) catch {};
+        const length = @min(chunk.len, self.buffer.len - self.len);
+        @memcpy(self.buffer[self.len..][0..length], chunk[0..length]);
+        self.len += length;
     }
 };
 

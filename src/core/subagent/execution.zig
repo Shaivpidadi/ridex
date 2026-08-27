@@ -1284,7 +1284,6 @@ fn livePresentationEventBytes(event: worker_runtime.WorkerEvent) ?usize {
         .begin_prompt_with_skill_bindings,
         .begin_presented_prompt,
         .finish_prompt,
-        .generated_session_title,
         .notification,
         .question_requested,
         .open_model_picker,

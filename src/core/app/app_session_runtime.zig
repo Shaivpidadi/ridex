@@ -23,7 +23,7 @@ const io_mod = @import("../shared/io.zig");
 const list_window = @import("../shared/list_window.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const session_runtime = @import("../session/session.zig");
-const worker_runtime = @import("../agent/worker_runtime.zig");
+const session_title_generator = @import("../session/session_title_generator.zig");
 const session_catalog = @import("../session/session_catalog.zig");
 const session_codec = @import("../session/session_codec.zig");
 const js_host_session_store = @import("../session/js_host_session_store.zig");
@@ -2958,15 +2958,23 @@ pub fn Runtime(comptime App: type) type {
         /// provisional title are still current. A manual rename therefore wins.
         pub fn applyGeneratedSessionTitle(
             app: *App,
-            generated: worker_runtime.GeneratedSessionTitle,
+            generated: session_title_generator.GeneratedTitle,
         ) !void {
             const active_id = activeSessionId(app) orelse return;
-            if (!std.mem.eql(u8, active_id, generated.session_id)) return;
             const current = cachedSessionTitle(app) orelse return;
-            if (!std.mem.eql(u8, current, generated.expected_title)) return;
+            if (!shouldApplyGeneratedTitle(active_id, current, generated)) return;
             const title = validateSessionTitle(generated.title) catch return;
             try applyActiveSessionTitle(app, title);
             app.shell.render_requests.request(.footer);
+        }
+
+        fn shouldApplyGeneratedTitle(
+            active_session_id: []const u8,
+            current_title: []const u8,
+            generated: session_title_generator.GeneratedTitle,
+        ) bool {
+            return std.mem.eql(u8, active_session_id, generated.session_id) and
+                std.mem.eql(u8, current_title, generated.expected_title);
         }
 
         fn applyActiveSessionTitle(app: *App, title: []const u8) !void {
@@ -9810,45 +9818,15 @@ test "renameActiveSession requires an active session" {
     );
 }
 
-test "generated session title uses compare and set so manual rename wins" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const paths = try testPaths(alloc, &tmp);
-    defer {
-        alloc.free(paths.home);
-        alloc.free(paths.workspace);
-    }
-    const home = try TestHome.install(alloc, paths.home);
-    defer home.deinit();
-
-    var app = try TestApp.init(alloc, paths.workspace);
-    defer app.deinit();
-    try configureTestPreferences(&app);
-    try Runtime(TestApp).initializePersistence(&app, true);
-    try Runtime(TestApp).beginFreshPersistedSession(&app);
-    Runtime(TestApp).enableSessionStores(&app);
-    const session_id = Runtime(TestApp).activeSessionId(&app).?;
-
-    try Runtime(TestApp).setCachedSessionTitle(&app, "fix the first prompt title");
-    try Runtime(TestApp).applyGeneratedSessionTitle(&app, .{
-        .session_id = @constCast(session_id),
-        .expected_title = @constCast("fix the first prompt title"),
-        .title = @constCast("Generate session titles"),
-    });
-    try std.testing.expectEqualStrings(
-        "Generate session titles",
-        Runtime(TestApp).cachedSessionTitle(&app).?,
-    );
-
-    try Runtime(TestApp).renameActiveSession(&app, "Manual title");
-    try Runtime(TestApp).applyGeneratedSessionTitle(&app, .{
-        .session_id = @constCast(session_id),
-        .expected_title = @constCast("Generate session titles"),
-        .title = @constCast("Stale automatic title"),
-    });
-    try std.testing.expectEqualStrings("Manual title", Runtime(TestApp).cachedSessionTitle(&app).?);
+test "generated session title requires matching session and provisional title" {
+    const generated = session_title_generator.GeneratedTitle{
+        .session_id = @constCast("session-a"),
+        .expected_title = @constCast("provisional"),
+        .title = @constCast("Generated title"),
+    };
+    try std.testing.expect(Runtime(TestApp).shouldApplyGeneratedTitle("session-a", "provisional", generated));
+    try std.testing.expect(!Runtime(TestApp).shouldApplyGeneratedTitle("session-b", "provisional", generated));
+    try std.testing.expect(!Runtime(TestApp).shouldApplyGeneratedTitle("session-a", "Manual title", generated));
 }
 
 test "renameActiveSession persists the title to the sidecar and session index" {

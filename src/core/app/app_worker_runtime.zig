@@ -73,7 +73,6 @@ pub const WorkerEventHandlers = struct {
     command_output_complete: *const fn (*anyopaque, ?types.ToolLifecycleId) anyerror!void,
     diff_block: *const fn (*anyopaque, diff_mod.DiffEntryPayload) anyerror!void,
     append_history_turn: *const fn (*anyopaque, types.FinishedPrompt) anyerror!void,
-    apply_generated_session_title: ?*const fn (*anyopaque, worker_runtime.GeneratedSessionTitle) anyerror!void = null,
     session_grant: *const fn (*anyopaque, types.PermissionGrant) anyerror!void,
     error_text: *const fn (*anyopaque, types.SemanticNotice) anyerror!void,
 };
@@ -218,7 +217,6 @@ pub fn Runtime(comptime App: type) type {
                 .clear_route_recovery_status,
                 .api_status_text,
                 .finish_prompt,
-                .generated_session_title,
                 .session_grant,
                 .error_text,
                 => .admit,
@@ -895,11 +893,6 @@ pub fn Runtime(comptime App: type) type {
                         resetStream(app, false);
                         app.shell.render_requests.request(.footer);
                         try handlers.append_history_turn(handlers.ctx, finished);
-                    },
-                    .generated_session_title => |generated| {
-                        if (handlers.apply_generated_session_title) |apply| {
-                            try apply(handlers.ctx, generated);
-                        }
                     },
                     .session_grant => |grant| {
                         try handlers.session_grant(handlers.ctx, grant);

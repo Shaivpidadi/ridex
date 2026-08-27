@@ -1,16 +1,20 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const agent_stream_provider = @import("../agent/stream_provider.zig");
-const worker_runtime = @import("../agent/worker_runtime.zig");
 const provider_runtime = @import("provider_runtime.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
 const session_display_metadata = @import("../session/session_display_metadata.zig");
 const session_title_generator = @import("../session/session_title_generator.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
+const io_mod = @import("../shared/io.zig");
 const types = @import("../shared/types.zig");
 
+pub const GeneratedTitle = session_title_generator.GeneratedTitle;
+
 pub const State = struct {
+    mutex: std.Io.Mutex = .init,
     thread: ?std.Thread = null,
+    result: ?GeneratedTitle = null,
     cancel: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 };
 
@@ -36,10 +40,29 @@ pub fn Runtime(comptime App: type) type {
             };
         }
 
+        pub fn poll(app: *App) !void {
+            const state = &app.session_title_generation;
+            state.mutex.lockUncancelable(io_mod.getIo());
+            const result = state.result;
+            state.result = null;
+            state.mutex.unlock(io_mod.getIo());
+            const generated = result orelse return;
+            defer generated.deinit();
+            if (state.thread) |thread| thread.join();
+            state.thread = null;
+            try SessionRuntime.applyGeneratedSessionTitle(app, generated);
+        }
+
         pub fn stop(app: *App) void {
-            app.session_title_generation.cancel.store(true, .seq_cst);
-            if (app.session_title_generation.thread) |thread| thread.join();
-            app.session_title_generation.thread = null;
+            const state = &app.session_title_generation;
+            state.cancel.store(true, .seq_cst);
+            if (state.thread) |thread| thread.join();
+            state.thread = null;
+            state.mutex.lockUncancelable(io_mod.getIo());
+            const result = state.result;
+            state.result = null;
+            state.mutex.unlock(io_mod.getIo());
+            if (result) |generated| generated.deinit();
         }
 
         const Task = struct {
@@ -54,13 +77,7 @@ pub fn Runtime(comptime App: type) type {
             account_id: ?[]u8,
             credential_source: ?types.CredentialSource,
 
-            fn create(
-                app: *App,
-                session_id: []const u8,
-                expected_title: []const u8,
-                prompt: []const u8,
-                credential: []const u8,
-            ) !*Task {
+            fn create(app: *App, session_id: []const u8, expected_title: []const u8, prompt: []const u8, credential: []const u8) !*Task {
                 const alloc = std.heap.c_allocator;
                 const task = try alloc.create(Task);
                 errdefer alloc.destroy(task);
@@ -93,8 +110,8 @@ pub fn Runtime(comptime App: type) type {
 
             fn deinit(self: *Task) void {
                 const alloc = std.heap.c_allocator;
-                alloc.free(self.session_id);
-                alloc.free(self.expected_title);
+                if (self.session_id.len > 0) alloc.free(self.session_id);
+                if (self.expected_title.len > 0) alloc.free(self.expected_title);
                 alloc.free(self.prompt);
                 alloc.free(self.credential);
                 alloc.free(self.model);
@@ -108,34 +125,33 @@ pub fn Runtime(comptime App: type) type {
                 const app = self.app;
                 const title = session_title_generator.generate(std.heap.c_allocator, .{
                     .stream_provider = self.stream_provider,
-                    .credential = .{
-                        .secret = self.credential,
-                        .source = self.credential_source,
-                        .account_id = self.account_id,
-                        .tenant = self.gateway_team,
-                    },
+                    .credential = .{ .secret = self.credential, .source = self.credential_source, .account_id = self.account_id, .tenant = self.gateway_team },
                     .session_id = self.session_id,
                     .model = self.model,
                     .retry_count = 1,
                     .user_prompt = self.prompt,
                     .cancel_flag = &app.session_title_generation.cancel,
-                    .usage = null,
                     .trace_ctx = .{},
                 }) catch |err| {
                     debug_trace.logf("session", "event=title_generation_failed err={s}", .{@errorName(err)});
                     return;
                 } orelse return;
-                defer std.heap.c_allocator.free(title);
-                app.worker.pushEvent(std.heap.c_allocator, .{ .generated_session_title = .{
+
+                const state = &app.session_title_generation;
+                state.mutex.lockUncancelable(io_mod.getIo());
+                defer state.mutex.unlock(io_mod.getIo());
+                if (state.cancel.load(.seq_cst)) {
+                    std.heap.c_allocator.free(title);
+                    return;
+                }
+                state.result = .{
                     .session_id = self.session_id,
                     .expected_title = self.expected_title,
                     .title = title,
-                } }) catch {};
+                };
+                self.session_id = &.{};
+                self.expected_title = &.{};
             }
         };
     };
-}
-
-test {
-    _ = worker_runtime;
 }
