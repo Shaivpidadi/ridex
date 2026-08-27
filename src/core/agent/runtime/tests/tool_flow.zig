@@ -471,11 +471,14 @@ fn expectPermissionDeniedToolResult(gateway: *const FakeGateway, index: usize, t
             if (part_tool_name != .string or !std.mem.eql(u8, part_tool_name.string, tool_name)) continue;
             const output = part.object.get("output") orelse continue;
             if (output != .object) continue;
-            const value = output.object.get("value") orelse continue;
-            if (value != .string) continue;
+            const output_type = output.object.get("type") orelse continue;
+            if (output_type != .string or !std.mem.eql(u8, output_type.string, "execution-denied")) continue;
+            try std.testing.expect(output.object.get("value") == null);
+            const reason_value = output.object.get("reason") orelse continue;
+            if (reason_value != .string) continue;
 
-            try std.testing.expect(tool_result_errors.isToolPermissionDeniedOutput(value.string));
-            var payload = try std.json.parseFromSlice(std.json.Value, alloc, value.string, .{});
+            try std.testing.expect(tool_result_errors.isToolPermissionDeniedOutput(reason_value.string));
+            var payload = try std.json.parseFromSlice(std.json.Value, alloc, reason_value.string, .{});
             defer payload.deinit();
             const error_obj = payload.value.object.get("error").?.object;
             try std.testing.expectEqualStrings("tool_permission_denied", error_obj.get("type").?.string);
@@ -1512,6 +1515,47 @@ test "selected dynamic MCP allow returned after cancellation never executes" {
     try std.testing.expectEqualStrings("mcp_select_tool", hooks.executed_names.items[0]);
     try std.testing.expectEqual(types.TurnPresentationOutcome.interrupted, hooks.finalized_outcome.?);
     try std.testing.expectEqual(@as(usize, 0), hooks.rejected_names.items.len);
+}
+
+test "selected dynamic MCP execution carries its validation generation" {
+    const alloc = std.testing.allocator;
+    const select_calls = [_]ToolCall{
+        toolCall("select", "mcp_select_tool", "{\"name\":\"mcp_fixture_echo\"}"),
+    };
+    const dynamic_calls = [_]ToolCall{
+        toolCall("dynamic", "mcp_fixture_echo", "{}"),
+    };
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &select_calls },
+        .{ .tool_calls = &dynamic_calls },
+        .{ .content = "Final" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.permission_decisions = &.{ .once, .once };
+    hooks.validation_mcp_tool_name = "mcp_fixture_echo";
+    hooks.validation_mcp_runtime_generation = 41;
+    hooks.exec_plans = &.{
+        .{ .result = .{
+            .model_output = "selected",
+            .selected_dynamic_tool_name = "mcp_fixture_echo",
+            .selected_dynamic_tool_schema_json = "{\"type\":\"function\",\"name\":\"mcp_fixture_echo\",\"description\":\"Echo\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}}",
+        } },
+        .{ .result = .{ .model_output = "called" } },
+    };
+    var fixture = PromptFixture{};
+    var job = fixture.job();
+    job.permission_mode = .auto;
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+
+    try std.testing.expectEqualSlices(
+        ?u64,
+        &.{ null, 41 },
+        hooks.execution_mcp_runtime_generations.items,
+    );
 }
 
 test "resumed persistent child review rejects child-authored authority provenance" {

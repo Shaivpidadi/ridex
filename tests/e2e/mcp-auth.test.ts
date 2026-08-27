@@ -195,6 +195,7 @@ function startAuthFixture(
     authorizationServerTrailingSlash?: boolean;
     authorizationResponseIssuer?: string;
     omitScopes?: boolean;
+    rejectDiscoveryWithoutChallenge?: boolean;
   } = {},
 ) {
   const transport = options.transport ?? "http";
@@ -254,6 +255,12 @@ function startAuthFixture(
           });
         }
         const message = body === "" ? null : JSON.parse(body);
+        if (
+          message?.method === "server/discover" &&
+          options.rejectDiscoveryWithoutChallenge
+        ) {
+          return new Response("", { status: 403 });
+        }
         if (message?.method === "resources/read") {
           resourceReadRequests += 1;
           if (
@@ -729,7 +736,11 @@ function collectRegularFiles(root: string): string[] {
   return files;
 }
 
-function toolResultText(body: string, toolCallId: string): string {
+function toolResultText(
+  body: string,
+  toolCallId: string,
+  outputType: "text" | "error-text" = "text",
+): string {
   const request = JSON.parse(body) as {
     prompt?: Array<{ content?: Array<Record<string, unknown>> }>;
   };
@@ -740,7 +751,7 @@ function toolResultText(body: string, toolCallId: string): string {
     );
   if (!result) throw new Error(`Missing tool result for ${toolCallId}`);
   const output = result.output as Record<string, unknown>;
-  if (output.type !== "text" || typeof output.value !== "string") {
+  if (output.type !== outputType || typeof output.value !== "string") {
     throw new Error(`Invalid tool result for ${toolCallId}`);
   }
   return output.value;
@@ -878,6 +889,95 @@ describe("MCP remote authentication lifecycle", () => {
     expect(loggedOut.stdout).toContain("Logged out of MCP server 'fixture'");
     expect(existsSync(credentialPath)).toBe(false);
     expect(auth.revocations).toBe(2);
+  }, 30_000);
+
+  test("rejected stored credentials report required auth without discovery fallback", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url, {
+      rejectDiscoveryWithoutChallenge: true,
+    });
+    const root = createRoot(auth);
+    const env = {
+      ...baseEnv(root),
+      AI_GATEWAY_API_KEY: undefined,
+    };
+
+    const authenticated = await runFx(["mcp", "auth", "fixture"], {
+      cwd: root.workspace,
+      env,
+      timeoutMs: 20_000,
+    });
+    expect(authenticated.code).toBe(0);
+    expect(authenticated.stdout).toContain("Authenticated MCP server 'fixture'");
+
+    const listed = await runFx(["mcp", "list", "--connect"], {
+      cwd: root.workspace,
+      env,
+      timeoutMs: 20_000,
+    });
+    expect(listed.code).toBe(0);
+    expect(listed.stdout).toMatch(/fixture[\s\S]{0,240}auth=required/);
+    expect(listed.stdout).not.toContain("auth=authenticated");
+    expect(listed.stdout).toContain("Authentication is required");
+    expect(listed.stdout).not.toContain("InvalidJsonResponse");
+    for (const secret of [ACCESS_INITIAL, REFRESH_INITIAL]) {
+      expect(listed.stdout).not.toContain(secret);
+      expect(listed.stderr).not.toContain(secret);
+      if (existsSync(root.trace)) {
+        expect(readFileSync(root.trace, "utf8")).not.toContain(secret);
+      }
+    }
+    expect(auth.requests.some((request) =>
+      request.body.includes('"method":"server/discover"')
+    )).toBe(true);
+    expect(auth.requests.some((request) =>
+      request.body.includes('"method":"tools/list"')
+    )).toBe(false);
+    expect(upstream.requests).toHaveLength(0);
+  }, 30_000);
+
+  test("OAuth-authenticated MongoDB-like discovery reaches legacy tools", async () => {
+    upstream = startModernMcpHttpFixture("legacy_session_required");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    const env = {
+      ...baseEnv(root),
+      AI_GATEWAY_API_KEY: undefined,
+    };
+
+    const authenticated = await runFx(["mcp", "auth", "fixture"], {
+      cwd: root.workspace,
+      env,
+      timeoutMs: 20_000,
+    });
+    expect(authenticated.code).toBe(0);
+    expect(authenticated.stdout).toContain("Authenticated MCP server 'fixture'");
+
+    const listed = await runFx(["mcp", "list", "--connect"], {
+      cwd: root.workspace,
+      env,
+      timeoutMs: 20_000,
+    });
+    expect(listed.code).toBe(0);
+    expect(listed.stderr).toBe("");
+    expect(listed.stdout).toMatch(
+      /fixture[\s\S]{0,240}state=ready auth=authenticated/,
+    );
+    expect(listed.stdout).toContain("protocol=2025-11-25");
+    expect(listed.stdout).toContain(
+      "negotiated_name=mongodb-managed-fixture negotiated_version=1.0.0",
+    );
+    expect(listed.stdout).toContain("tools=1");
+    for (const secret of [ACCESS_INITIAL, REFRESH_INITIAL]) {
+      expect(listed.stdout).not.toContain(secret);
+      expect(listed.stderr).not.toContain(secret);
+    }
+    expect(upstream.requests.map((entry) => entry.message.method)).toEqual([
+      "server/discover",
+      "initialize",
+      "notifications/initialized",
+      "tools/list",
+    ]);
   }, 30_000);
 
   test.skipIf(process.platform !== "darwin")(
@@ -1047,10 +1147,10 @@ describe("MCP remote authentication lifecycle", () => {
     );
     expect(result.code).toBe(0);
     const finalBody = gateway.requests.at(-1)!.body;
-    expect(toolResultText(finalBody, "template_auth_read")).toContain(
+    expect(toolResultText(finalBody, "template_auth_read", "error-text")).toContain(
       "McpAuthenticationRequired",
     );
-    expect(toolResultText(finalBody, "template_auth_read")).not.toContain(
+    expect(toolResultText(finalBody, "template_auth_read", "error-text")).not.toContain(
       "McpResourceNotFound",
     );
     expect(auth.requests.filter((request) =>
@@ -1239,7 +1339,7 @@ describe("MCP remote authentication lifecycle", () => {
     expect(toolResultText(finalBody, "private_read_a")).toContain(
       "HTTP_RESOURCE_TEXT",
     );
-    expect(toolResultText(finalBody, "private_rotate")).toContain(
+    expect(toolResultText(finalBody, "private_rotate", "error-text")).toContain(
       "tool_execution_failed",
     );
     for (const callId of [
@@ -1248,7 +1348,7 @@ describe("MCP remote authentication lifecycle", () => {
       "private_prompts_b",
       "private_read_b",
     ]) {
-      const output = toolResultText(finalBody, callId);
+      const output = toolResultText(finalBody, callId, "error-text");
       expect(output).not.toContain("custom://alpha");
       expect(output).not.toContain("custom://project/{path}");
       expect(output).not.toContain("review");
@@ -1437,7 +1537,11 @@ describe("MCP remote authentication lifecycle", () => {
       expect(toolResultText(finalBody, "ordered_read_a")).toContain(
         "HTTP_RESOURCE_TEXT",
       );
-      const second = toolResultText(finalBody, "ordered_read_b");
+      const second = toolResultText(
+        finalBody,
+        "ordered_read_b",
+        readCacheCase.publicCache ? "text" : "error-text",
+      );
       if (readCacheCase.publicCache) {
         expect(second).toContain("HTTP_RESOURCE_TEXT");
         expect(auth.refreshes).toBeGreaterThanOrEqual(1);

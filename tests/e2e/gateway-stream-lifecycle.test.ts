@@ -2245,7 +2245,7 @@ describe("gateway stream lifecycle", () => {
           toolCallId: MALFORMED_CALL_ID,
           toolName: MALFORMED_TOOL_NAME,
           output: expect.objectContaining({
-            type: "text",
+            type: "error-text",
             value: expect.stringContaining("tool_execution_failed"),
           }),
         }),
@@ -2855,6 +2855,14 @@ describe("gateway stream lifecycle", () => {
         expect.objectContaining({ input: { request: {} } }),
       );
       expect(historicalResults).toHaveLength(1);
+      expect(historicalResults[0]).toEqual(
+        expect.objectContaining({
+          output: expect.objectContaining({
+            type: "error-text",
+            value: expect.stringContaining("tool_execution_failed"),
+          }),
+        }),
+      );
       expect(gateway.requests[2].body).toContain("tool_execution_failed");
       expect(gateway.requests[2].body).not.toContain(malformedArguments);
       const resumeTrace = readFileSync(resumeTracePath, "utf8");

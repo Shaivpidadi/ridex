@@ -315,12 +315,13 @@ describe("cli: help", () => {
 Run one noninteractive request
 
 Usage:
-  fx ask [--auto|--yolo] [--image PATH] [--json] [--quiet] [--prompt-permissions] [--no-save] [--no-color] [--resume <last|id>|--resume-id <id>] [--continue-recovery] [--] <prompt>
+  fx ask [--auto|--yolo] [--image PATH] [--system TEXT] [--json] [--quiet] [--prompt-permissions] [--no-save] [--no-color] [--resume <last|id>|--resume-id <id>] [--continue-recovery] [--] <prompt>
 
 Options:
   --auto                Automatically review unresolved permission requests
   --yolo                Disable fx permission checks
   --image PATH          Attach an image file; repeat for multiple images
+  --system TEXT         Replace the built-in system prompt for this request
   --json                Emit machine-readable JSON instead of text
   --quiet               Suppress assistant output
   --prompt-permissions  Prompt for Y/N permission approval when stdin is a TTY
@@ -334,6 +335,7 @@ Options:
 The prompt may be passed as arguments or piped on stdin when no prompt args are given.
 TTY stdout uses the Minimal transcript presentation; redirected stdout emits raw assistant Markdown.
 Operational progress and diagnostics are written to stderr. JSON \`output\` keeps accumulated assistant Markdown; \`final_output\` contains only the completed final response, or an empty string when absent.
+--system replaces only the built-in base prompt for this request; tool, skill, project, and runtime context still apply.
 With --prompt-permissions, JSON and quiet requests may prompt on stderr only when stdin is a TTY.
 `;
 
@@ -5351,7 +5353,7 @@ describe("cli: error handling", () => {
             "fx ask: --no-save cannot be used with --resume or --resume-id",
           );
           expect(rejected.stderr).toContain(
-            "usage: fx ask [--auto|--yolo] [--image PATH] [--json] [--quiet] [--prompt-permissions] [--no-save]",
+            "usage: fx ask [--auto|--yolo] [--image PATH] [--system TEXT] [--json] [--quiet] [--prompt-permissions] [--no-save]",
           );
         }
         expect(gateway.requests).toHaveLength(0);
@@ -5804,8 +5806,7 @@ describe("cli: MCP profile add", () => {
         /workspace-only source=workspace scope=workspace/,
       );
       expect(before.stdout).not.toMatch(/shared source=workspace scope=workspace/);
-      expect(before.stdout).toContain(".mcp.json server 'broken'");
-      expect(before.stdout).toContain("MISSING_LIST_COMMAND");
+      expect(before.stdout).not.toContain("MISSING_LIST_COMMAND");
       expect(existsSync(profileMarker)).toBe(false);
       expect(existsSync(workspaceMarker)).toBe(false);
 
@@ -5853,6 +5854,8 @@ describe("cli: MCP profile add", () => {
         "fx mcp logout NAME",
         "fx mcp path",
         "fx mcp remove NAME",
+        "fx mcp trust approve|reject NAME",
+        "fx mcp trust approve-all|reset",
       ]) expect(help.stdout).toContain(command);
 
       const local = await runFx(
@@ -5917,20 +5920,19 @@ describe("cli: MCP profile add", () => {
       expect(Object.keys(canonical.mcp).sort()).toEqual(["new", "old"]);
       expect(canonical).not.toHaveProperty("mcpServers");
 
-      writeFileSync(
-        profilePath,
-        JSON.stringify({
-          "MCP-Servers": { blocked: { command: "blocked-server" } },
-        }),
-        { mode: 0o600 },
-      );
+      const ambiguous = JSON.stringify({
+        mcp: { canonical: { command: "canonical-server" } },
+        "MCP-Servers": { blocked: { command: "blocked-server" } },
+        metadata: { owner: "team" },
+      });
+      writeFileSync(profilePath, ambiguous, { mode: 0o600 });
       const refused = await runFx(
         ["mcp", "add", "unsafe", "must-not-save"],
         { env: { HOME: home, ...NO_GATEWAY_AUTH } },
       );
       expect(refused.code).not.toBe(0);
       expect(refused.stderr).toContain("McpConfigAmbiguousServerKey");
-      expect(readFileSync(profilePath, "utf8")).not.toContain("must-not-save");
+      expect(readFileSync(profilePath, "utf8")).toBe(ambiguous);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

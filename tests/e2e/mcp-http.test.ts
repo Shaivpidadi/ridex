@@ -136,7 +136,11 @@ function startToolGateway(finalText: string) {
   });
 }
 
-function toolResultText(body: string, toolCallId: string): string {
+function toolResultText(
+  body: string,
+  toolCallId: string,
+  outputType: "text" | "error-text" = "text",
+): string {
   const request = JSON.parse(body) as {
     prompt?: Array<{ content?: Array<Record<string, unknown>> }>;
   };
@@ -147,7 +151,7 @@ function toolResultText(body: string, toolCallId: string): string {
     );
   if (!result) throw new Error(`Missing tool result for ${toolCallId}`);
   const output = result.output as Record<string, unknown>;
-  if (output.type !== "text" || typeof output.value !== "string") {
+  if (output.type !== outputType || typeof output.value !== "string") {
     throw new Error(`Invalid tool result for ${toolCallId}`);
   }
   return output.value;
@@ -207,6 +211,42 @@ function assertModernWire(
 }
 
 describe("modern MCP Streamable HTTP", () => {
+  test("MongoDB-like session-required discovery falls back to legacy initialize", async () => {
+    fixture = startModernMcpHttpFixture("legacy_session_required");
+    const root = createRoot("mongodb-legacy-fallback", fixture);
+
+    const result = await runFx(
+      ["mcp", "list", "--connect"],
+      {
+        cwd: root.workspace,
+        env: {
+          HOME: root.home,
+          AI_GATEWAY_API_KEY: undefined,
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_AUTO_UPGRADE: "0",
+          FX_TRACE_LOG: root.traceLogPath,
+          FX_TRACE_SCOPES: "mcp",
+        },
+        timeoutMs: 20_000,
+      },
+    );
+
+    expect(result.code).toBe(0);
+    expect(result.stderr).toBe("");
+    expect(result.stdout).toMatch(/fixture[\s\S]{0,240}state=ready/);
+    expect(result.stdout).toContain("protocol=2025-11-25");
+    expect(result.stdout).toContain(
+      "negotiated_name=mongodb-managed-fixture negotiated_version=1.0.0",
+    );
+    expect(result.stdout).toContain("tools=1");
+    expect(fixture.requests.map((entry) => entry.message.method)).toEqual([
+      "server/discover",
+      "initialize",
+      "notifications/initialized",
+      "tools/list",
+    ]);
+  }, 25_000);
+
   test("top-level mcp add persists HTTP and a later ask calls it", async () => {
     fixture = startModernMcpHttpFixture("json");
     const root = createEmptyRoot("top-level-add");
@@ -741,6 +781,7 @@ describe("modern MCP Streamable HTTP", () => {
     const cancelled = toolResultText(
       gateway.requests.at(-1)!.body,
       "http_resource_stall",
+      "error-text",
     );
     expect(cancelled).toContain("tool_execution_failed");
     expect(cancelled).not.toContain("HTTP_RESOURCE_TEXT");
@@ -1412,15 +1453,21 @@ describe("modern MCP Streamable HTTP", () => {
       }),
     );
     gateway = startToolGateway("Workspace-expanded HTTP MCP complete.");
+    const env = {
+      ...fixtureEnv(root, gateway),
+      WORKSPACE_HTTP_TOKEN: "workspace-http-secret",
+    };
+    const trusted = await runFx(
+      ["mcp", "trust", "approve", "fixture"],
+      { cwd: root.workspace, env },
+    );
+    expect(trusted.code).toBe(0);
 
     const result = await runFx(
       ["ask", "--json", "--auto", "--no-save", "Call the workspace HTTP fixture."],
       {
         cwd: root.workspace,
-        env: {
-          ...fixtureEnv(root, gateway),
-          WORKSPACE_HTTP_TOKEN: "workspace-http-secret",
-        },
+        env,
         timeoutMs: 20_000,
       },
     );

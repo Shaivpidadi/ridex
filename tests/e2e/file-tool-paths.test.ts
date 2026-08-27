@@ -100,6 +100,23 @@ function toolResultOutput(body: string, callId: string): string {
   return contentText(result.output);
 }
 
+function toolResultReason(body: string, callId: string): string {
+  const request = JSON.parse(body) as {
+    prompt: Array<{ content: unknown }>;
+  };
+  const parts = request.prompt.flatMap((message) =>
+    Array.isArray(message.content) ? message.content : []
+  ) as Array<Record<string, unknown>>;
+  const result = parts.find((part) =>
+    part.type === "tool-result" && part.toolCallId === callId
+  );
+  if (!result) throw new Error(`Missing tool result for ${callId}`);
+  const output = result.output as Record<string, unknown>;
+  expect(output.type).toBe("execution-denied");
+  expect(typeof output.reason).toBe("string");
+  return output.reason as string;
+}
+
 function occurrenceCount(text: string, needle: string) {
   return text.split(needle).length - 1;
 }
@@ -979,7 +996,7 @@ describe("filesystem path handling", () => {
           content,
         }),
         (body) => {
-          const resultOutput = toolResultOutput(body, "write_large_review");
+          const resultOutput = toolResultReason(body, "write_large_review");
           expect(resultOutput).toContain('"reason":"review_caution"');
           expect(resultOutput).toContain("Action held after safety review");
           return finalText("large reviewed write blocked");

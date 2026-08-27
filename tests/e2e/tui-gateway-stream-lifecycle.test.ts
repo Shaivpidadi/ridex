@@ -3059,7 +3059,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(repairedResults).toEqual([
         expect.objectContaining({
           output: expect.objectContaining({
-            type: "text",
+            type: "error-text",
             value: expect.stringContaining("tool_execution_failed"),
           }),
         }),
