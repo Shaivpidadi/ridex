@@ -3495,7 +3495,7 @@ fn localEntryConfig() app_entry_runtime.Config {
         .background_process_provider = background_process.provider,
         .url_opener = url_opener.native_opener,
         .secret_store = native_host.secret_store,
-        .prompt_policy = .{ .system_prompt = "" },
+        .prompt_policy = builtin_context.prompt_policy,
         .skill_root_policy = builtin_skills.root_policy,
         .ignored_list_entries = &.{},
         .max_list_entries = 0,

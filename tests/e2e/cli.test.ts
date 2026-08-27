@@ -3743,6 +3743,60 @@ describe("cli: explicit launch config", () => {
     expect(rejected.stderr).toBe("usage: fx config schema --json\n");
   });
 
+  test("validate and resolve enforce the same built-in prompt budget as launch", async () => {
+    const root = mkdtempSync(join(tmpdir(), "fx-e2e-config-prompt-budget-"));
+    try {
+      const config = join(root, "prompt-budget.json");
+      const systemParts = [
+        ...Array.from({ length: 15 }, () => ({
+          type: "builtin",
+          id: "default",
+        })),
+        { type: "inline", text: "x".repeat(62_000) },
+      ];
+      const document = `${JSON.stringify({
+        schema_version: 1,
+        prompt: { system_parts: systemParts },
+      })}\n`;
+      expect(Buffer.byteLength(document)).toBeLessThanOrEqual(65_536);
+      writeFileSync(config, document);
+
+      const launch = await runFx(
+        [
+          `--config=${config}`,
+          "ask",
+          "--json",
+          "--no-save",
+          "Check prompt budget.",
+        ],
+        { env: NO_GATEWAY_AUTH },
+      );
+      const validate = await runFx([
+        "config",
+        "validate",
+        config,
+        "--json",
+      ]);
+      const resolve = await runFx([
+        `--config=${config}`,
+        "config",
+        "resolve",
+        "--json",
+      ]);
+
+      expect(JSON.parse(launch.stdout).error).toBe("SystemPromptTooLarge");
+      expect([launch.code, validate.code, resolve.code]).toEqual([1, 1, 1]);
+      for (const result of [validate, resolve]) {
+        expect(JSON.parse(result.stdout).diagnostics[0]).toMatchObject({
+          instance_location: "/prompt/system_parts",
+          code: "too_large",
+        });
+      }
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("validate is strict and stdin cannot declare prompt files", async () => {
     const root = mkdtempSync(join(tmpdir(), "fx-e2e-config-validate-"));
     try {
