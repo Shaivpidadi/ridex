@@ -6013,28 +6013,46 @@ fn save_record(
     entry.deinit(alloc);
 }
 
+inline fn failRecord(err: anytype) @TypeOf(err)!Record {
+    return @errorCast(failRecordDynamic(err));
+}
+
+noinline fn failRecordDynamic(err: anyerror) anyerror!Record {
+    return err;
+}
+
+test "terminal record failures preserve exact error types and identities" {
+    const missing = failRecord(error.TerminalRecordNotFound);
+    try std.testing.expect(
+        @TypeOf(missing) == error{TerminalRecordNotFound}!Record,
+    );
+    try std.testing.expectError(error.TerminalRecordNotFound, missing);
+    try std.testing.expectError(error.OutOfMemory, failRecord(error.OutOfMemory));
+}
+
 fn load_record(
     alloc: Allocator,
     capability: *session_child_store.SessionChildCapability,
     session_id: []const u8,
 ) !Record {
-    const name = try record_name(alloc, session_id);
+    const name = record_name(alloc, session_id) catch |err|
+        return failRecord(err);
     defer alloc.free(name);
     var file = capability.openFileReadOnly(
         alloc,
         .terminal_state,
         name,
     ) catch |err| switch (err) {
-        error.FileNotFound => return error.TerminalRecordNotFound,
-        else => return err,
+        error.FileNotFound => return failRecord(error.TerminalRecordNotFound),
+        else => return failRecord(err),
     };
     defer file.deinit();
     const bytes = file.readToEnd(alloc, max_record_bytes) catch |err| switch (err) {
-        error.StreamTooLong => return error.TerminalRecordTooLarge,
-        else => return err,
+        error.StreamTooLong => return failRecord(error.TerminalRecordTooLarge),
+        else => return failRecord(err),
     };
     defer alloc.free(bytes);
-    return parse_record(alloc, bytes);
+    return parse_record(alloc, bytes) catch |err| return failRecord(err);
 }
 
 fn write_owner_catalog_proof(
