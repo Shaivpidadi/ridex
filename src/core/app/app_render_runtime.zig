@@ -41,7 +41,6 @@ const ui_input = @import("../../ui/input/runtime.zig");
 const input_visual_layout = @import("../../ui/input/visual_layout.zig");
 const registered_entities = @import("../input/registered_entities.zig");
 const approval_screen = @import("../../ui/approval_screen.zig");
-const skills_screen = @import("../../ui/skills_screen.zig");
 const full_transcript_screen = @import("../../ui/full_transcript_screen.zig");
 const render_engine = @import("../../ui/render_engine.zig");
 const build_checkpoint = @import("../../ui/render_engine/build_checkpoint.zig");
@@ -1134,7 +1133,7 @@ pub fn Runtime(comptime App: type) type {
                 .question_requested,
                 .open_model_picker,
                 .turn_token_update,
-                .tool_payload_started,
+                .turn_phase_update,
                 .finish_prompt,
                 .session_grant,
                 => {},
@@ -1260,7 +1259,10 @@ pub fn Runtime(comptime App: type) type {
             ctx.file_completions = &.{};
             ctx.inline_completion_suffix = "";
             ctx.auth_picker.active = false;
-            ctx.skills_menu = .{};
+            ctx.skills_menu = if (comptime @hasField(App, "skills"))
+                render_input.skillsMenuProjection(&app.skills)
+            else
+                .{};
             ctx.help_menu = .{};
             ctx.settings_menu = .{};
             ctx.model_menu = if (comptime @hasField(App, "model_cache"))
@@ -1773,7 +1775,7 @@ pub fn Runtime(comptime App: type) type {
                 else
                     false;
                 if (surface_changed) {
-                    if (!modelMenuActive(app)) {
+                    if (!modelMenuActive(app) and !skillsMenuActive(app)) {
                         presentation_shell.invalidateTranscriptAnchor(
                             "subagent child surface activated",
                         );
@@ -1820,9 +1822,6 @@ pub fn Runtime(comptime App: type) type {
                 )
             else
                 main_footer_ctx;
-            if (child_view != null and skillsMenuActive(app)) {
-                return renderChildSkillsScreen(app, footer_ctx);
-            }
             const render_reconciliation = if (child_view != null)
                 InlineRenderReconciliation{ .alternate_screen_owns_rendering = true }
             else switch (try reconcileBeforeFrameRender(app, render_input.queuedBannerRows(footer_ctx))) {
@@ -2501,46 +2500,6 @@ pub fn Runtime(comptime App: type) type {
             if (screen.needs_full_file_projection) {
                 app.shell.render_requests.request(.modal);
             }
-            return .{
-                .shadow_state = .committed,
-                .animation_visible = false,
-            };
-        }
-
-        fn renderChildSkillsScreen(
-            app: *App,
-            ctx: render_input.RenderContext,
-        ) !FrameAttemptResult {
-            if (comptime !@hasField(App, "terminal") or !@hasField(App, "skills")) {
-                return error.MissingSkillsScreenRuntime;
-            }
-            if (app.shell.shadow_vt) |grid| {
-                if (grid.cols != app.shell.layout.cols or grid.rows != app.shell.layout.rows) {
-                    try grid.resize(app.shell.layout.cols, app.shell.layout.rows);
-                }
-            }
-
-            var screen = try skills_screen.paint(app.alloc, .{
-                .rows = app.shell.layout.rows,
-                .cols = app.shell.layout.cols,
-                .skills = render_input.skillsMenuProjection(&app.skills),
-                .composer = .{
-                    .input = ctx.input.edit_state.input.items,
-                    .cursor = ctx.input.edit_state.cursor,
-                    .images = &.{},
-                    .pasted_blocks = ctx.input.entities.pasted_blocks.items,
-                    .image_tokens = ctx.input.entities.image_tokens.items,
-                    .skill_tokens = ctx.input.entities.skill_tokens.items,
-                },
-                .ctrl_c_pending = ctx.ctrl_c_pending,
-                .clear_display = true,
-            });
-            defer screen.deinit(app.alloc);
-            try app_lifecycle.writeLifecycleTerminalBytes(
-                &app.shell,
-                &app.metrics,
-                screen.bytes,
-            );
             return .{
                 .shadow_state = .committed,
                 .animation_visible = false,

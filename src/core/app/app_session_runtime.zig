@@ -1838,7 +1838,7 @@ pub fn Runtime(comptime App: type) type {
             log_options: session_log.Options,
         ) !session_store.LoadedWritableSession {
             const store = app.session_persistence.store orelse
-                return error.SessionStoreUnavailable;
+                return session_log.failLoadedWritableSession(error.SessionStoreUnavailable);
             return subagent_resume_admission.resumeForExternalPrompt(
                 store,
                 app.alloc,

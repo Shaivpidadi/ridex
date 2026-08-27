@@ -85,7 +85,7 @@ export function analyzeRun(manifest: RenderLabManifest) {
     assertTuiObservabilityFrame(failures, frame, manifest);
 
     if (countLogoBlocks(frame.grid, logoRows) > 1) {
-      push(failures, "single-active-logo", frame, "more than one active Fx logo block is visible");
+      push(failures, "single-active-logo", frame, "more than one active fx logo block is visible");
     }
 
     if (footers.length > 1) {
@@ -93,7 +93,7 @@ export function analyzeRun(manifest: RenderLabManifest) {
     }
 
     if (expectsChrome && footers.length === 0 && !viewerFooterPresent) {
-      push(failures, "footer-missing", frame, "Fx-owned frame has no complete footer block");
+      push(failures, "footer-missing", frame, "fx-owned frame has no complete footer block");
     }
 
     if (input_rows.length > 1) {
@@ -101,7 +101,7 @@ export function analyzeRun(manifest: RenderLabManifest) {
     }
 
     if (expectsChrome && input_rows.length === 0 && !viewerFooterPresent) {
-      push(failures, "input-missing", frame, "Fx-owned frame has no footer input row");
+      push(failures, "input-missing", frame, "fx-owned frame has no footer input row");
     }
 
     assertActivitySpacing(failures, frame, footers[0]);
@@ -171,7 +171,7 @@ export function analyzeRun(manifest: RenderLabManifest) {
             failures,
             "shell-marker-in-fx-band",
             frame,
-            `shell marker ${marker} appears inside the Fx-owned viewport band`,
+            `shell marker ${marker} appears inside the fx-owned viewport band`,
           );
         }
       }

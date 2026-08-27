@@ -53,6 +53,7 @@ const runtime_interruption = @import("interruption.zig");
 const runtime_parallel_execution = @import("parallel_execution.zig");
 const runtime_tool_batch = @import("tool_batch.zig");
 const model_response_recovery = @import("model_response_recovery.zig");
+const tool_mcp_runtime = @import("../../tooling/tool_mcp_runtime.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -1713,7 +1714,7 @@ fn streamReplaySafe(
 const read_failure_tool_recovery_instruction =
     \\<network_recovery>
     \\The previous response stream ended because the network connection was interrupted.
-    \\Fx did not execute the incomplete tool call from that stream. Recreate the tool call if it is still needed.
+    \\fx did not execute the incomplete tool call from that stream. Recreate the tool call if it is still needed.
     \\</network_recovery>
 ;
 
@@ -2399,18 +2400,18 @@ fn pushAutoRetryStatus(
     return deadline;
 }
 
-const AutoRetryAdmission = struct {
+const ProviderAdmission = struct {
     deps: *const AgentRuntimeDeps,
+    stream: *runtime_assistant_stream.StreamChunkContext,
     pending_status: *?types.RouteRecoveryStatus,
-    published: bool = false,
 
     fn admit(raw: *anyopaque) !void {
         const self: *@This() = @ptrCast(@alignCast(raw));
-        if (self.published) return;
-        const status = self.pending_status.* orelse return;
-        try pushRouteRecoveryStatus(self.deps, status);
-        self.pending_status.* = null;
-        self.published = true;
+        runtime_assistant_stream.publishTurnPhase(self.stream, .thinking);
+        if (self.pending_status.*) |status| {
+            try pushRouteRecoveryStatus(self.deps, status);
+            self.pending_status.* = null;
+        }
     }
 };
 
@@ -2598,14 +2599,25 @@ pub fn processQueuedPrompt(
     if (effective_job.turn_id == 0) {
         effective_job.turn_id = debug_trace.nextTurnId();
     }
+    var effective_config = config;
+    if (effective_config.origin == .subagent and effective_config.subagent_id == 0) {
+        effective_config.subagent_id = debug_trace.nextSubagentId();
+    }
+    var effective_lifecycle = lifecycle;
+    if (effective_config.origin == .subagent and
+        effective_lifecycle.scope.kind == .subagent and
+        effective_lifecycle.scope.subagent_id == null)
+    {
+        effective_lifecycle.scope.subagent_id = effective_config.subagent_id;
+    }
     var finalization = TurnFinalizationGuard.init(
         deps,
         effective_job.turn_id,
-        lifecycle,
+        effective_lifecycle,
     );
     defer finalization.deinit();
 
-    processQueuedPromptInner(deps, semantic_presentation, lifecycle, config, effective_job, &finalization) catch |err| {
+    processQueuedPromptInner(deps, semantic_presentation, effective_lifecycle, effective_config, effective_job, &finalization) catch |err| {
         if (finalization.state == .open) {
             finalization.finish(.failed, null, null) catch |finalization_err| return finalization_err;
         }
@@ -3508,8 +3520,9 @@ fn processQueuedPromptLoop(
                 .stream = &stream_ctx,
                 .required_vision = vision_mode == .required,
             };
-            var auto_retry_admission = AutoRetryAdmission{
+            var provider_admission = ProviderAdmission{
                 .deps = deps,
+                .stream = &stream_ctx,
                 .pending_status = &pending_auto_retry_status,
             };
             var model_request = agent_stream_provider.ModelRequest{
@@ -3544,10 +3557,7 @@ fn processQueuedPromptLoop(
                 .delivery = &gateway_delivery,
                 .attempt_evidence = &gateway_attempt_evidence,
                 .events = .{ .context = &provider_events, .emit_fn = onProviderEvent },
-                .admission = if (pending_auto_retry_status != null)
-                    .{ .context = &auto_retry_admission, .admit_fn = AutoRetryAdmission.admit }
-                else
-                    .{},
+                .admission = .{ .context = &provider_admission, .admit_fn = ProviderAdmission.admit },
                 .cancel_flag = config.cancel_flag,
                 .provider_attempt_owner = .agent,
             };
@@ -7060,6 +7070,7 @@ fn processQueuedPromptLoop(
             }
             const execution_lifecycle_id = types.ToolLifecycleId{ .turn_id = turn_id, .call_id = execution_call.id };
             const execution_is_command = runtime_tool_presentation.activityKindForCall(arena, deps.tool_registry, tool_call) == .command;
+            var execution_error: ?anyerror = null;
             var execution = deps.execute_tool_call(deps.ctx, .{
                 .call_allocator = call_allocator,
                 .result_allocator = arena,
@@ -7092,8 +7103,7 @@ fn processQueuedPromptLoop(
                         .model_output = "command cancelled\n",
                     };
                 }
-                debug_trace.eventf("tool", "after_tool_execution", step_ctx, "call_id={s} name={s} result_kind=error err={s}", .{ tool_call.id, tool_call.name, @errorName(err) });
-                debug_trace.eventf("tool", "execution_result", step_ctx, "call_id={s} name={s} result_kind=error err={s}", .{ tool_call.id, tool_call.name, @errorName(err) });
+                execution_error = err;
                 break :blk ToolExecutionResult{ .status = .failure, .model_output = try deps.format_tool_execution_error(deps.ctx, arena, tool_call.name, err) };
             };
 
@@ -7402,8 +7412,13 @@ fn processQueuedPromptLoop(
                 return;
             }
 
-            debug_trace.eventf("tool", "after_tool_execution", step_ctx, "call_id={s} name={s} result_kind={s} model_output_bytes={d}", .{ tool_call.id, tool_call.name, runtime_telemetry.toolExecutionResultKind(execution), safe_tool_output.len });
-            debug_trace.eventf("tool", "execution_result", step_ctx, "call_id={s} name={s} result_kind={s} model_output_bytes={d}", .{ tool_call.id, tool_call.name, runtime_telemetry.toolExecutionResultKind(execution), safe_tool_output.len });
+            if (execution_error) |err| {
+                debug_trace.eventf("tool", "after_tool_execution", step_ctx, "call_id={s} name={s} result_kind={s} err={s} model_output_bytes={d}", .{ tool_call.id, tool_call.name, runtime_telemetry.toolExecutionResultKind(execution), @errorName(err), safe_tool_output.len });
+                debug_trace.eventf("tool", "execution_result", step_ctx, "call_id={s} name={s} result_kind={s} err={s} model_output_bytes={d}", .{ tool_call.id, tool_call.name, runtime_telemetry.toolExecutionResultKind(execution), @errorName(err), safe_tool_output.len });
+            } else {
+                debug_trace.eventf("tool", "after_tool_execution", step_ctx, "call_id={s} name={s} result_kind={s} model_output_bytes={d}", .{ tool_call.id, tool_call.name, runtime_telemetry.toolExecutionResultKind(execution), safe_tool_output.len });
+                debug_trace.eventf("tool", "execution_result", step_ctx, "call_id={s} name={s} result_kind={s} model_output_bytes={d}", .{ tool_call.id, tool_call.name, runtime_telemetry.toolExecutionResultKind(execution), safe_tool_output.len });
+            }
             try runtime_gateway_step.recordSelectedDynamicTool(arena, &selected_dynamic_tool_names, &selected_dynamic_tools, execution);
             try runtime_tool_batch.appendOrdinaryExecutedResult(
                 deps.tool_registry,

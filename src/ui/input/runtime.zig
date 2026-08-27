@@ -528,7 +528,7 @@ test "terminal input carries typed question decisions and focused edits" {
     );
 }
 
-test "Fx terminal reply ownership survives takeover transition" {
+test "fx terminal reply ownership survives takeover transition" {
     const alloc = std.testing.allocator;
     var monitor = theme_monitor.Monitor{};
     monitor.start();

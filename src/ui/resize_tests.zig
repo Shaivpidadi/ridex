@@ -9,6 +9,8 @@ const display_width = @import("../core/shared/display_width.zig");
 const diff_mod = @import("../core/output/diff.zig");
 const io_mod = @import("../core/shared/io.zig");
 const skill_runtime = @import("../core/skills/skill_runtime.zig");
+const usage_report = @import("../core/session/usage_report.zig");
+const workspace_access = @import("../core/workspace/workspace_access.zig");
 const types = @import("../core/shared/types.zig");
 const assistant_presentation = @import("../core/agent/assistant_presentation.zig");
 const builtin_commands = @import("../builtins/commands.zig");
@@ -993,6 +995,118 @@ fn expectGridContains(h: *Harness, needle: []const u8) !void {
         }
     }
     return error.TestExpectedGridText;
+}
+
+test "responsive compact menus stay inline across the VT width matrix" {
+    const alloc = std.testing.allocator;
+    var models: [25]usage_report.ModelUsage = undefined;
+    for (&models) |*model| {
+        model.* = .{
+            .model = @constCast("provider/model"),
+            .totals = .{
+                .total_tokens = 1,
+                .input_tokens = 1,
+                .output_tokens = 0,
+                .cache_read_tokens = 0,
+                .cache_write_tokens = 0,
+                .reasoning_tokens = null,
+                .request_count = 1,
+                .total_cost = 0.0001,
+            },
+        };
+    }
+    const usage_snapshot = usage_report.Snapshot{
+        .scope = .days_30,
+        .snapshot_time_ms = 100,
+        .window_start_ms = 0,
+        .coverage_started_at_ms = 0,
+        .coverage = .full,
+        .completeness = .complete,
+        .totals = .{
+            .total_tokens = 25,
+            .input_tokens = 25,
+            .output_tokens = 0,
+            .cache_read_tokens = 0,
+            .cache_write_tokens = 0,
+            .reasoning_tokens = null,
+            .request_count = 25,
+            .total_cost = 0.0025,
+        },
+        .models = &models,
+    };
+    var entries = [_]workspace_access.Entry{.{
+        .path = @constCast("/workspace/long-additional-directory"),
+        .saved = true,
+        .command_line = false,
+        .available = true,
+        .active = true,
+    }};
+
+    for ([_]u16{ 50, 80, 120, 180 }) |width| {
+        var h = try Harness.init(alloc, width, 36, 4);
+        defer h.deinit();
+        var input = InputRuntime{};
+        defer input.deinit(alloc);
+        var approval = approval_prompt.ApprovalPrompt{};
+        defer approval.deinit(alloc);
+        try h.shell.initViewport(&h.metrics, 1);
+        try h.shell.writeTranscript(
+            alloc,
+            &h.metrics,
+            "compact menu transcript remains visible\n",
+            true,
+        );
+
+        var ctx = defaultFooterContext(&input);
+        ctx.statusline_menu = .{
+            .active = true,
+            .selected_index = 2,
+            .snapshot = .{
+                .statusline_context = false,
+                .statusline_session = true,
+                .statusline_workspace = false,
+            },
+        };
+        try renderTestFooterWithContext(&h, &approval, &h.frame_redraw, ctx);
+        try h.flush();
+        try expectGridContains(&h, "compact menu transcript remains visible");
+        try expectGridContains(&h, "Status line");
+        try expectGridContains(&h, "Workspace");
+
+        ctx.statusline_menu = .{};
+        ctx.usage_menu = .{
+            .active = true,
+            .scope = .days_30,
+            .selected_model = models.len - 1,
+            .model_window_start = models.len - 1,
+            .snapshot = &usage_snapshot,
+        };
+        h.frame_redraw = true;
+        try renderTestFooterWithContext(&h, &approval, &h.frame_redraw, ctx);
+        try h.flush();
+        try expectGridContains(&h, "[30 days]");
+        try std.testing.expectEqual(
+            @as(usize, 20),
+            try countGridOccurrences(&h, "provider/model"),
+        );
+
+        ctx.usage_menu = .{};
+        ctx.workspace_menu = .{
+            .active = true,
+            .selected_row = 1,
+            .primary_directory = "/workspace",
+            .entries = &entries,
+        };
+        h.frame_redraw = true;
+        try renderTestFooterWithContext(&h, &approval, &h.frame_redraw, ctx);
+        try h.flush();
+        try expectGridContains(&h, "Workspace");
+        try expectGridContains(&h, "Additional directories");
+        try std.testing.expectEqual(
+            @as(usize, 0),
+            try countGridOccurrences(&h, "provider/model"),
+        );
+    }
 }
 
 fn expectGridNotContains(h: *Harness, needle: []const u8) !void {
@@ -2370,7 +2484,7 @@ test "thinking shimmer reserves assistant-gap rows and clears back to stable foo
     try std.testing.expectEqual(footer_idle, footer_after);
 }
 
-test "completed presentation tail keeps thinking slot until turn summary" {
+test "completed presentation tail keeps activity slot until turn summary" {
     var h = try Harness.init(std.testing.allocator, 80, 22, 4);
     defer h.deinit();
 
@@ -2405,11 +2519,9 @@ test "completed presentation tail keeps thinking slot until turn summary" {
     try h.flush();
 
     const assistant_row = try findRowContaining(&h, "assistant starts here");
-    const thinking_after_provider_finish = try findRowContaining(&h, "Thinking");
-    try std.testing.expect(thinking_after_provider_finish > thinking_row);
-    try expectExactlyOneBlankRowBetween(&h, assistant_row, thinking_after_provider_finish);
-    const footer_after_assistant = try findFirstDividerRowAfter(&h, thinking_after_provider_finish);
-    try expectExactlyOneBlankRowBetween(&h, thinking_after_provider_finish, footer_after_assistant);
+    try expectGridNotContains(&h, "Thinking");
+    const footer_after_assistant = try findFirstDividerRowAfter(&h, assistant_row);
+    try expectOnlyBlankRowsBetween(&h, assistant_row, footer_after_assistant);
 
     _ = try h.shell.appendTurnSummaryEntry(h.alloc, .{
         .thinking_duration_ms = 1_000,

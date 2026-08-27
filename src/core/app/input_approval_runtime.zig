@@ -11,6 +11,7 @@ const types = @import("../shared/types.zig");
 const input_interrupt_runtime = @import("input_interrupt_runtime.zig");
 const input_queue_runtime = @import("input_queue_runtime.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
+const app_commands = @import("app_commands.zig");
 const app_render_runtime = @import("app_render_runtime.zig");
 const approval_registry = @import("../subagent/approval_registry.zig");
 const communication = @import("../subagent/communication.zig");

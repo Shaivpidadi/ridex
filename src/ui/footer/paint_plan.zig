@@ -1011,16 +1011,7 @@ pub fn composeFooterFrame(
             shell.layout.cols,
         )
     else if (compact_command_menu) |menu|
-        switch (menu) {
-            .statusline => try input_presentation.composeHintRow(
-                alloc,
-                false,
-                input.active_label,
-                ctx,
-                shell.layout.cols,
-            ),
-            else => try input_presentation.composeCompactCommandMenuHintRow(alloc, shell.layout.cols, menu),
-        }
+        try input_presentation.composeCompactCommandMenuHintRow(alloc, shell.layout.cols, menu)
     else if (input.show_picker and input.picker_kind == .skills)
         try input_presentation.composeSkillsMenuHintRow(alloc, shell.layout.cols, ctx.ctrl_c_pending)
     else if (input.show_picker and input.picker_kind == .settings)

@@ -4527,7 +4527,7 @@ test "bounded deterministic corrupt checkpoint fuzz" {
     }
 }
 
-test "full snapshot painter owns the viewport without Fx chrome" {
+test "full snapshot painter owns the viewport without fx chrome" {
     const cells = [_]contracts.RenderCell{
         .{ .kind = .single, .text = "A", .style = .{
             .foreground = .{ .rgb = .{ .red = 1, .green = 2, .blue = 3 } },

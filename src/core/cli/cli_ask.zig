@@ -38,6 +38,7 @@ const mcp_elicitation = @import("../mcp/elicitation.zig");
 const mcp_access_policy = @import("../mcp/access_policy.zig");
 const mcp_model_catalog = @import("../mcp/model_catalog.zig");
 const mcp_runtime = @import("../mcp/mcp_runtime.zig");
+const mcp_contract = @import("../mcp/mcp_contract.zig");
 const mode_registry = @import("../modes/mode_registry.zig");
 const permission_auto_classifier = @import("../permissions/auto_classifier.zig");
 const prompt_policy = @import("../config/prompt_policy.zig");
@@ -1707,8 +1708,34 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     }
 
     try ctx.checkCancellation();
-    ctx.mcp = try options.deps.load_mcp_runtime(alloc, ctx.mcp_elicitation_capabilities);
-    if (ctx.mcp) |mcp| mcp.connectRequiredForAsk(ctx.toolRegistry());
+    ctx.mcp = try options.deps.load_mcp_runtime(
+        alloc,
+        startup.workspace_root,
+        ctx.mcp_elicitation_capabilities,
+    );
+    if (ctx.mcp) |mcp| {
+        var health_snapshot = try mcp.snapshotHealth(
+            alloc,
+            @intCast(@max(io_mod.milliTimestamp(), 0)),
+        );
+        defer health_snapshot.deinit(alloc);
+        for (health_snapshot.configuration_issues) |issue| {
+            try ctx.writeStderr("fx ask: ");
+            try ctx.writeStderr(issue.message);
+            try ctx.writeStderr("\n");
+        }
+        const project_names = try mcp.pendingWorkspaceNamesForPhase(alloc, .ask_startup);
+        defer mcp_contract.freeOwnedStrings(alloc, project_names);
+        if (project_names.len > 0) {
+            try ctx.writeStderr("fx ask: loaded project MCP servers: ");
+            for (project_names, 0..) |name, index| {
+                if (index > 0) try ctx.writeStderr(", ");
+                try ctx.writeStderr(name);
+            }
+            try ctx.writeStderr("\n");
+        }
+        mcp.connectRequiredForAsk(ctx.toolRegistry());
+    }
     try ctx.checkCancellation();
     if (ctx.mcp) |mcp| {
         if (try mcp.requiredStartupFailure(
@@ -4484,7 +4511,7 @@ fn testPresentKeyNoContextStartup(alloc: Allocator, transport: oauth_transport.P
     return state;
 }
 
-fn testNoMcpRuntime(_: Allocator, _: mcp_elicitation.Capabilities) !?*mcp_runtime.McpRuntime {
+fn testNoMcpRuntime(_: Allocator, _: []const u8, _: mcp_elicitation.Capabilities) !?*mcp_runtime.McpRuntime {
     return null;
 }
 
@@ -5624,7 +5651,7 @@ const test_startup_cancellation_context_registry = context_contract.Registry{ .d
     .append_transient_fn = testNoTransientContext,
 } };
 
-fn testLoadMcpRuntimeWithCancellation(_: Allocator, _: mcp_elicitation.Capabilities) !?*mcp_runtime.McpRuntime {
+fn testLoadMcpRuntimeWithCancellation(_: Allocator, _: []const u8, _: mcp_elicitation.Capabilities) !?*mcp_runtime.McpRuntime {
     test_startup_cancellation_mcp_calls += 1;
     if (test_startup_cancellation_stage == .during_mcp_load) {
         requestTestHeadlessInterrupt();

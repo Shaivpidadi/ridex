@@ -1259,7 +1259,7 @@ fn livePresentationEventBytes(event: worker_runtime.WorkerEvent) ?usize {
         .clear_route_recovery_status,
         .route_recovery_status,
         .turn_token_update,
-        .tool_payload_started,
+        .turn_phase_update,
         => 1,
         .semantic_notice, .error_text => |notice| notice.topic.len +| notice.body.len,
         .command_output => |chunk| chunk.text.len +|

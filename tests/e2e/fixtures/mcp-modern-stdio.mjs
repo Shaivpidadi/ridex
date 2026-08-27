@@ -168,6 +168,11 @@ function handle(message) {
       result: {
         resultType: "complete",
         supportedVersions: [protocolVersion],
+        _meta: {
+          "io.modelcontextprotocol/serverInfo": {
+            name: "modern-stdio-fixture",
+          },
+        },
         capabilities: {
           tools: mode === "subscription_cache" || mode === "crash_once_new_tool" || mode === "features"
             ? { listChanged: true }

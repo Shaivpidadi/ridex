@@ -534,7 +534,7 @@ function fxProcessId(session: TmuxSession): number {
   }).trim().split("\n");
   const pid = findFxProcessId(rows);
   if (pid !== undefined) return pid;
-  throw new Error(`Unable to find Fx on ${tty}. Processes:\n${rows.join("\n")}`);
+  throw new Error(`Unable to find fx on ${tty}. Processes:\n${rows.join("\n")}`);
 }
 
 function findFxProcessId(rows: readonly string[]): number | undefined {
@@ -549,7 +549,7 @@ function findFxProcessId(rows: readonly string[]): number | undefined {
   return undefined;
 }
 
-test("Fx process discovery accepts basename and path process names", () => {
+test("fx process discovery accepts basename and path process names", () => {
   expect(findFxProcessId(["11361 fx"])).toBe(11361);
   expect(findFxProcessId(["11362 /workspace/zig-out/bin/fx"])).toBe(11362);
 });

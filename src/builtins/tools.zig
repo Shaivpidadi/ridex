@@ -310,7 +310,7 @@ const terminal_start_action_model_tool_schemas = [_]model_tool_schema.ObjectSche
 const terminal_read_branch_properties = terminal_action_gateway_properties(.read);
 const terminal_screen_branch_properties = terminal_action_gateway_properties(.screen);
 const terminal_atomic_write_description =
-    "Input for this session. Supply exactly one of text, keys, controls, or paste. Fx acquires and releases agent control around the write.";
+    "Input for this session. Supply exactly one of text, keys, controls, or paste. fx acquires and releases agent control around the write.";
 const terminal_model_text_input_properties = [_]model_tool_schema.Property{
     .{ .name = "text", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = terminal_contracts.max_write_bytes }, .description = "Literal text written to the session." },
 };
@@ -1742,7 +1742,7 @@ test "terminal tool schema derives closed action branches and exact write states
         schemaProperty(read_schema, "session_id").?.description,
     );
     try std.testing.expectEqualStrings(
-        "Input for this session. Supply exactly one of text, keys, controls, or paste. Fx acquires and releases agent control around the write.",
+        "Input for this session. Supply exactly one of text, keys, controls, or paste. fx acquires and releases agent control around the write.",
         schemaProperty(write_schema, "input").?.description,
     );
     try std.testing.expectEqualStrings(

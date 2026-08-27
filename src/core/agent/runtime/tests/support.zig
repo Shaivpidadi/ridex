@@ -488,6 +488,7 @@ pub const FakeAgentRuntimeDeps = struct {
     context_registry: ?context_contract.Registry = null,
     context_enabled: bool = false,
     root_permission_mode: ?PermissionMode = null,
+    current_mcp_generation: ?u64 = null,
     execute_mutex: std.Io.Mutex = .init,
     log: std.ArrayList([]u8) = .empty,
     texts: std.ArrayList([]u8) = .empty,
@@ -740,6 +741,10 @@ pub const FakeAgentRuntimeDeps = struct {
             .context_enabled = self.context_enabled,
             .snapshot_root_permission_mode = if (self.root_permission_mode != null)
                 snapshotRootPermissionMode
+            else
+                null,
+            .current_mcp_generation = if (self.current_mcp_generation != null)
+                snapshotCurrentMcpGeneration
             else
                 null,
             .finalize_turn = finalizeTurn,
@@ -1151,6 +1156,11 @@ pub const FakeAgentRuntimeDeps = struct {
             .feedback = if (feedback.len == 0) null else try arena.dupe(u8, feedback),
             .auto_review_result = auto_review_result,
         };
+    }
+
+    fn snapshotCurrentMcpGeneration(raw: *anyopaque) ?u64 {
+        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        return self.current_mcp_generation;
     }
 
     fn testVisionPathAuthority(

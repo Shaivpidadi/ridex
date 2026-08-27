@@ -580,9 +580,9 @@ pub fn composeCompactCommandMenuHintRow(
             "←→ Esc",
         },
         .usage => [_][]const u8{
-            "←→ Scope     ↑↓ Model     Enter Expand     R Refresh     Esc Close",
-            "←→ Scope  ↑↓ Model  Enter Expand  R Refresh  Esc",
-            "←→ ↑↓  Enter  R  Esc",
+            "Tab Scope     ↑↓ Model     Enter Expand     R Refresh     Esc Close",
+            "Tab Scope  ↑↓ Model  Enter Expand  R Refresh  Esc",
+            "Tab ↑↓  Enter  R  Esc",
         },
         .workspace => [_][]const u8{
             "↑↓ Navigate     Enter Use     Esc Close",

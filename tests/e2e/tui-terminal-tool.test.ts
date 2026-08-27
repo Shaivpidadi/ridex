@@ -1061,7 +1061,7 @@ test.skipIf(!tmuxAvailable())(
 
 for (const backend of ["native", "tmux"] as const) {
   test.skipIf(!tmuxAvailable())(
-    `abrupt Fx death leaves a live ${backend} takeover discoverable and reclaimable on exact task resume`,
+    `abrupt fx death leaves a live ${backend} takeover discoverable and reclaimable on exact task resume`,
     async () => {
       const fixture = createFixture(`fx-tui-terminal-reclaim-${backend}-`);
       const scriptPath = writeTakeoverFixture(fixture);

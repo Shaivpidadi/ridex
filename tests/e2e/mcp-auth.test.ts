@@ -132,6 +132,21 @@ async function waitForFile(path: string, timeoutMs: number): Promise<boolean> {
   return existsSync(path);
 }
 
+async function waitForFileText(
+  path: string,
+  expected: string,
+  timeoutMs: number,
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (existsSync(path) && readFileSync(path, "utf8").includes(expected)) {
+      return true;
+    }
+    await Bun.sleep(10);
+  }
+  return existsSync(path) && readFileSync(path, "utf8").includes(expected);
+}
+
 afterEach(async () => {
   const activeTui = tui;
   const activeGateway = gateway;
@@ -547,6 +562,7 @@ function createRoot(
   const bin = join(root, "bin");
   const trace = join(root, "trace.log");
   const openLog = join(root, "open.log");
+  const callbackLog = join(root, "callback.html");
   const stderr = join(root, "stderr.log");
   mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
   mkdirSync(workspace, { recursive: true });
@@ -577,7 +593,7 @@ function createRoot(
     }),
   );
   const follow = followAuthorization
-    ? "nohup curl --location --silent --show-error \"$1\" >/dev/null 2>&1 &\n"
+    ? `nohup curl --location --silent --show-error "$1" > '${callbackLog}' 2>/dev/null &\n`
     : "";
   const opener =
     `#!/bin/sh\nprintf '%s\\n' "$1" > '${openLog}'\n${follow}exit 0\n`;
@@ -586,7 +602,17 @@ function createRoot(
     writeFileSync(path, opener);
     chmodSync(path, 0o700);
   }
-  return { root, home, workspace, bin, trace, openLog, stderr };
+  return { root, home, workspace, bin, trace, openLog, callbackLog, stderr };
+}
+
+function moveAuthFixtureToWorkspace(root: ReturnType<typeof createRoot>): void {
+  const profilePath = join(root.home, ".fx", "mcp.json");
+  const profile = JSON.parse(readFileSync(profilePath, "utf8"));
+  writeFileSync(
+    join(root.workspace, ".mcp.json"),
+    JSON.stringify({ mcpServers: { fixture: profile.mcp.fixture } }),
+  );
+  writeFileSync(profilePath, JSON.stringify({ mcp: {} }));
 }
 
 function baseEnv(root: ReturnType<typeof createRoot>) {
@@ -784,6 +810,118 @@ async function preserveAuthTuiFailure(
 }
 
 describe("MCP remote authentication lifecycle", () => {
+  test("top-level MCP auth and logout complete without TUI or Gateway", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    const env = {
+      ...baseEnv(root),
+      AI_GATEWAY_API_KEY: undefined,
+    };
+
+    const authenticated = await runFx(["mcp", "auth", "fixture"], {
+      cwd: root.workspace,
+      env,
+      timeoutMs: 20_000,
+    });
+    if (authenticated.code !== 0) {
+      throw new Error(JSON.stringify({
+        authenticated,
+        authorizationRequests: auth.authorizationRequests,
+        tokenExchanges: auth.tokenExchanges,
+        authRequests: auth.requests,
+        trace: existsSync(root.trace) ? readFileSync(root.trace, "utf8") : "",
+      }, null, 2));
+    }
+    expect(authenticated.code).toBe(0);
+    expect(authenticated.stderr).toBe("");
+    expect(authenticated.stdout).toContain("Authenticated MCP server 'fixture'");
+    expect(auth.authorizationRequests).toBe(1);
+    expect(auth.tokenExchanges).toBe(1);
+    expect(existsSync(root.openLog)).toBe(true);
+    expect(
+      await waitForFileText(root.callbackLog, "Authorization complete", 5_000),
+    ).toBe(true);
+    const callbackPage = readFileSync(root.callbackLog, "utf8");
+    expect(callbackPage).toContain("<h1>Authorization complete</h1>");
+    expect(callbackPage).toContain("prefers-color-scheme:dark");
+    const credentialPath = join(
+      root.home,
+      ".fx",
+      "mcp-credentials",
+      "credentials.json",
+    );
+    expect(existsSync(credentialPath)).toBe(true);
+    const profilePath = join(root.home, ".fx", "mcp.json");
+    const profile = JSON.parse(readFileSync(profilePath, "utf8"));
+    delete profile.mcp.fixture.oauth;
+    writeFileSync(profilePath, JSON.stringify(profile));
+
+    const requestCountBeforeList = auth.requests.length;
+    const listed = await runFx(["mcp", "list"], {
+      cwd: root.workspace,
+      env,
+      timeoutMs: 20_000,
+    });
+    expect(listed.code).toBe(0);
+    expect(listed.stderr).toBe("");
+    expect(listed.stdout).toMatch(/fixture[\s\S]{0,240}auth=authenticated/);
+    expect(auth.requests).toHaveLength(requestCountBeforeList);
+
+    const loggedOut = await runFx(["mcp", "logout", "fixture"], {
+      cwd: root.workspace,
+      env,
+      timeoutMs: 20_000,
+    });
+    expect(loggedOut.code).toBe(0);
+    expect(loggedOut.stderr).toBe("");
+    expect(loggedOut.stdout).toContain("Logged out of MCP server 'fixture'");
+    expect(existsSync(credentialPath)).toBe(false);
+    expect(auth.revocations).toBe(2);
+  }, 30_000);
+
+  test.skipIf(process.platform !== "darwin")(
+    "MCP auth falls back to the private profile store when HOME has no Keychain",
+    async () => {
+      upstream = startModernMcpHttpFixture("json");
+      auth = startAuthFixture(upstream.url);
+      const root = createRoot(auth);
+      const env = {
+        ...baseEnv(root),
+        AI_GATEWAY_API_KEY: undefined,
+        FX_DISABLE_KEYCHAIN: undefined,
+      };
+
+      const authenticated = await runFx(["mcp", "auth", "fixture"], {
+        cwd: root.workspace,
+        env,
+        timeoutMs: 20_000,
+      });
+      expect(authenticated.code).toBe(0);
+      expect(authenticated.stderr).toBe("");
+      expect(auth.authorizationRequests).toBe(1);
+      expect(auth.tokenExchanges).toBe(1);
+      const credentialPath = join(
+        root.home,
+        ".fx",
+        "mcp-credentials",
+        "credentials.json",
+      );
+      expect(existsSync(credentialPath)).toBe(true);
+      expect(statSync(credentialPath).mode & 0o777).toBe(0o600);
+
+      const loggedOut = await runFx(["mcp", "logout", "fixture"], {
+        cwd: root.workspace,
+        env,
+        timeoutMs: 20_000,
+      });
+      expect(loggedOut.code).toBe(0);
+      expect(loggedOut.stderr).toBe("");
+      expect(existsSync(credentialPath)).toBe(false);
+    },
+    30_000,
+  );
+
   test.skipIf(!tmuxAvailable())(
     "no-scope OAuth credentials survive reload and preserve an unrelated server",
     async () => {
@@ -1670,7 +1808,7 @@ describe("MCP remote authentication lifecycle", () => {
       ).toHaveLength(1);
       expect(gateway.requests[1]?.body).toContain("authentication_required");
       expect(gateway.requests[1]?.body).toContain(
-        "Run /mcp auth for this server in an interactive Fx session.",
+        "Run /mcp auth for this server in an interactive fx session.",
       );
       expect(
         existsSync(join(root.home, ".fx", "mcp-credentials")),
@@ -1740,6 +1878,21 @@ describe("MCP remote authentication lifecycle", () => {
         const persisted = JSON.parse(storedValue);
         expect(persisted.credentials[0].access_token).toBe(ACCESS_INITIAL);
         expect(persisted.credentials[0].refresh_token).toBe(REFRESH_INITIAL);
+
+        const profilePath = join(root.home, ".fx", "mcp.json");
+        const profile = JSON.parse(readFileSync(profilePath, "utf8"));
+        delete profile.mcp.fixture.oauth;
+        writeFileSync(profilePath, JSON.stringify(profile));
+        const requestCountBeforeList = auth.requests.length;
+        const listed = await runFx(["mcp", "list"], {
+          cwd: root.workspace,
+          env: keychainEnv,
+          timeoutMs: 20_000,
+        });
+        expect(listed.code).toBe(0);
+        expect(listed.stderr).toBe("");
+        expect(listed.stdout).toMatch(/fixture[\s\S]{0,240}auth=authenticated/);
+        expect(auth.requests).toHaveLength(requestCountBeforeList);
 
         gateway.stop();
         gateway = startFakeGateway([
@@ -1862,6 +2015,101 @@ describe("MCP remote authentication lifecycle", () => {
     },
     30_000,
   );
+
+  test.skipIf(!tmuxAvailable())(
+    "pending workspace authentication is blocked and logout deletes local credentials only",
+    async () => {
+      upstream = startModernMcpHttpFixture("json");
+      auth = startAuthFixture(upstream.url);
+      const root = createRoot(auth, true, "http", auth.url, false);
+      moveAuthFixtureToWorkspace(root);
+      const credentialPath = seedExpiredCredentials(
+        root,
+        auth,
+        Date.now() + 3_600_000,
+      );
+      gateway = startFakeGateway([], {
+        models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+      });
+      tui = await TmuxSession.create({
+        isolated: true,
+        cwd: root.workspace,
+        env: {
+          ...baseEnv(root),
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+        },
+        width: 120,
+        height: 34,
+        stderrPath: root.stderr,
+      });
+      await tui.waitForComposer(15_000);
+      await tui.waitForText(
+        "Project MCP server 'fixture' is defined in .mcp.json",
+        10_000,
+      );
+      await tui.sendKeys("Escape");
+      await tui.waitForText(
+        "Project MCP approval prompts dismissed for this process",
+        10_000,
+      );
+
+      await tui.sendText("/mcp auth fixture --open");
+      await tui.waitForText("McpWorkspaceApprovalRequired", 10_000);
+      expect(existsSync(root.openLog)).toBe(false);
+      expect(auth.authorizationRequests).toBe(0);
+      expect(existsSync(credentialPath)).toBe(true);
+      await Bun.sleep(250);
+      const requestsBeforeLogout = auth.requests.length;
+
+      await tui.sendText("/mcp logout fixture");
+      await tui.waitForText("Logged out of MCP server 'fixture'", 10_000);
+      await Bun.sleep(250);
+      expect(existsSync(credentialPath)).toBe(false);
+      expect(auth.revocations).toBe(0);
+      expect(auth.requests).toHaveLength(requestsBeforeLogout);
+    },
+    35_000,
+  );
+
+  test("top-level pending workspace auth is blocked and logout stays local", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth, true, "http", auth.url, false);
+    moveAuthFixtureToWorkspace(root);
+    const credentialPath = seedExpiredCredentials(
+      root,
+      auth,
+      Date.now() + 3_600_000,
+    );
+    const env = {
+      ...baseEnv(root),
+      AI_GATEWAY_API_KEY: undefined,
+    };
+
+    const authentication = await runFx(["mcp", "auth", "fixture"], {
+      cwd: root.workspace,
+      env,
+      timeoutMs: 20_000,
+    });
+    expect(authentication.code).not.toBe(0);
+    expect(authentication.stderr).toContain("McpWorkspaceApprovalRequired");
+    expect(existsSync(root.openLog)).toBe(false);
+    expect(auth.authorizationRequests).toBe(0);
+    expect(existsSync(credentialPath)).toBe(true);
+    const requestsBeforeLogout = auth.requests.length;
+
+    const logout = await runFx(["mcp", "logout", "fixture"], {
+      cwd: root.workspace,
+      env,
+      timeoutMs: 20_000,
+    });
+    expect(logout.code).toBe(0);
+    expect(logout.stdout).toContain("Logged out of MCP server 'fixture' locally");
+    expect(existsSync(credentialPath)).toBe(false);
+    expect(auth.revocations).toBe(0);
+    expect(auth.requests).toHaveLength(requestsBeforeLogout);
+  }, 30_000);
 
   test.skipIf(!tmuxAvailable())(
     "fresh TUI login persists, ask refreshes after restart, and logout revokes",

@@ -5,6 +5,7 @@ const app_permission_runtime = @import("app_permission_runtime.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
 const app_workspace_runtime = @import("app_workspace_runtime.zig");
 const app_commands = @import("app_commands.zig");
+const project_config = @import("../mcp/project_config.zig");
 const app_worker_runtime = @import("app_worker_runtime.zig");
 const app_render_runtime = @import("app_render_runtime.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
@@ -23,6 +24,7 @@ const paste_framing = @import("../input/paste_framing.zig");
 const text_scalar = @import("../input/text_scalar.zig");
 const io_mod = @import("../shared/io.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
+const text_utils = @import("../shared/text_utils.zig");
 const image_attachments = @import("../images/image_attachments.zig");
 const image_commands = @import("../images/image_commands.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
@@ -49,6 +51,8 @@ const approval_ui = @import("../../ui/footer/approval_ui.zig");
 const interaction_state = @import("../../ui/footer/interaction_state.zig");
 const approval_prompt = @import("../permissions/approval_prompt.zig");
 const picker_presentation = @import("../../ui/footer/picker_presentation.zig");
+const compact_command_menu_presentation = @import("../../ui/footer/compact_command_menu_presentation.zig");
+const render_input = @import("../../ui/footer/render_input.zig");
 const paste_blocks = @import("../input/pasted_blocks.zig");
 const registered_entities = @import("../input/registered_entities.zig");
 const prompt_history_runtime = @import("prompt_history_runtime.zig");
@@ -99,6 +103,24 @@ const ExplicitModelSelectionParse = union(enum) {
     invalid,
     selection: ExplicitModelSelection,
 };
+
+const ProjectMcpPromptInputState = struct {
+    active: bool,
+    question_active: bool,
+    approval_active: bool,
+    subagent_active: bool,
+    menu_active: bool,
+    authentication_active: bool,
+};
+
+fn projectMcpPromptMayOwnInput(state: ProjectMcpPromptInputState) bool {
+    return state.active and
+        !state.question_active and
+        !state.approval_active and
+        !state.subagent_active and
+        !state.menu_active and
+        !state.authentication_active;
+}
 
 fn shortcutMayMutateQueuedDraft(action: input_action.ShortcutAction) bool {
     return switch (action) {
@@ -608,6 +630,11 @@ pub fn Runtime(comptime App: type) type {
             }
 
             var replay_byte = ingress.replay_byte_after_routing;
+            if (replay_byte) |byte| {
+                if (byte != 0x1b and try routeProjectMcpPromptByte(app, byte)) {
+                    replay_byte = null;
+                }
+            }
             if (ingress.event) |event| {
                 switch (event) {
                     .paste_byte => |byte| {
@@ -848,6 +875,89 @@ pub fn Runtime(comptime App: type) type {
             return false;
         }
 
+        fn projectMcpPromptOwnsInput(app: *App) bool {
+            if (comptime !@hasDecl(App, "projectMcpPromptActive")) return false;
+            var subagent_active = false;
+            if (comptime runtime_profile.allows(App, .subagents)) {
+                subagent_active = app.subagents.isViewActive();
+            }
+            const menu_active = activeCompactCommandMenu(app) != null or
+                settingsMenuActive(app) or
+                skillsMenuActive(app) or
+                modelMenuActive(app) or
+                sessionMenuActive(app) or
+                helpMenuActive(app);
+            var authentication_active = false;
+            if (comptime runtime_profile.allows(App, .native_auth)) {
+                authentication_active = app.auth.apiKeyEntryActive();
+            }
+            return projectMcpPromptMayOwnInput(.{
+                .active = app.projectMcpPromptActive(),
+                .question_active = app.question_prompt.isActive(),
+                .approval_active = app.approval_prompt.isActive(),
+                .subagent_active = subagent_active,
+                .menu_active = menu_active,
+                .authentication_active = authentication_active,
+            });
+        }
+
+        fn routeProjectMcpPromptByte(app: *App, byte: u8) !bool {
+            if (comptime !@hasDecl(App, "projectMcpPromptName")) return false;
+            const owns_input = projectMcpPromptOwnsInput(app);
+            debug_trace.logf(
+                "mcp",
+                "project prompt input byte={d} owns_input={s}",
+                .{ byte, if (owns_input) "true" else "false" },
+            );
+            if (!owns_input) return false;
+            const action: project_config.ProjectMcpAction = switch (byte) {
+                '1' => {
+                    const name = (try app.projectMcpPromptName(app.alloc)) orelse return true;
+                    defer app.alloc.free(name);
+                    const display = try text_utils.encodeTerminalSafe(app.alloc, name, 256);
+                    defer app.alloc.free(display.bytes);
+                    const body = try std.fmt.allocPrint(
+                        app.alloc,
+                        "Approving project MCP server '{s}'.",
+                        .{display.bytes},
+                    );
+                    defer app.alloc.free(body);
+                    try app_commands.Handlers(App).applyProjectMcpAction(
+                        app,
+                        .{ .approve = name },
+                        body,
+                    );
+                    return true;
+                },
+                '2' => .approve_all,
+                '3' => {
+                    const name = (try app.projectMcpPromptName(app.alloc)) orelse return true;
+                    defer app.alloc.free(name);
+                    const display = try text_utils.encodeTerminalSafe(app.alloc, name, 256);
+                    defer app.alloc.free(display.bytes);
+                    const body = try std.fmt.allocPrint(
+                        app.alloc,
+                        "Rejecting project MCP server '{s}'.",
+                        .{display.bytes},
+                    );
+                    defer app.alloc.free(body);
+                    try app_commands.Handlers(App).applyProjectMcpAction(
+                        app,
+                        .{ .reject = name },
+                        body,
+                    );
+                    return true;
+                },
+                else => return true,
+            };
+            try app_commands.Handlers(App).applyProjectMcpAction(
+                app,
+                action,
+                "Approving all project MCP servers for this workspace.",
+            );
+            return true;
+        }
+
         fn handleRawTerminalInputWithLimits(
             app: *App,
             raw: input_action.RawTerminalInput,
@@ -880,7 +990,7 @@ pub fn Runtime(comptime App: type) type {
                 if (try app_auth_runtime.Runtime(App).routeAuthPickerByte(app, byte)) return;
             }
             if (try full_transcript_rt.routeByte(app, byte)) return;
-
+            if (try routeProjectMcpPromptByte(app, byte)) return;
             if (try routeActiveModalInput(app, raw, input_limits.decision_bytes)) return;
             if (byte >= 0x80) {
                 try handleTextByte(app, .composer, byte, max_input_len);
@@ -929,6 +1039,17 @@ pub fn Runtime(comptime App: type) type {
 
             if (resolved == .escape) {
                 if (try full_transcript_rt.routeAction(app, resolved)) return .done;
+                if (comptime @hasDecl(App, "suppressProjectMcpPrompts")) {
+                    if (projectMcpPromptOwnsInput(app)) {
+                        app.suppressProjectMcpPrompts();
+                        try app.writeDomainNotice(.{
+                            .topic = "mcp",
+                            .tone = .neutral,
+                            .body = "Project MCP approval prompts dismissed for this process.",
+                        }, true);
+                        return .done;
+                    }
+                }
                 const now = io_mod.milliTimestamp();
                 expireEscClearArm(app, now);
                 try resolveEscape(app, was_cancel_pending, now);
@@ -1237,10 +1358,13 @@ pub fn Runtime(comptime App: type) type {
                     return true;
                 }
                 switch (byte) {
+                    '\t' => if (menu == .usage) {
+                        try cycleUsageMenuScope(app, 1);
+                    },
                     '\r' => try submitCompactCommandMenuSelection(app, menu, max_input_len),
                     'r', 'R' => if (menu == .usage) {
                         if (comptime runtime_profile.allows(App, .profile_usage)) {
-                            try refreshUsageMenu(
+                            try reloadUsageMenu(
                                 app,
                                 app.input_runtime.usage_menu.navigationScope(),
                             );
@@ -1938,7 +2062,7 @@ pub fn Runtime(comptime App: type) type {
             }
             if (menu == .usage) {
                 _ = app.input_runtime.usage_menu.toggleExpanded(
-                    app.shell.layout.rows,
+                    usageMenuVisibleModelItems(app),
                 );
                 app.shell.render_requests.request(.footer);
                 return;
@@ -1990,7 +2114,7 @@ pub fn Runtime(comptime App: type) type {
                 .statusline => app.input_runtime.statusline_menu.move(delta),
                 .usage => app.input_runtime.usage_menu.moveModel(
                     delta,
-                    app.shell.layout.rows,
+                    usageMenuVisibleModelItems(app),
                 ),
                 .workspace => if (comptime @hasDecl(App, "workspaceAccess"))
                     app.input_runtime.workspace_menu.move(
@@ -2000,6 +2124,27 @@ pub fn Runtime(comptime App: type) type {
                 else
                     false,
             };
+        }
+
+        fn usageMenuVisibleModelItems(app: *App) u16 {
+            const projection = render_input.usageMenuProjection(
+                &app.input_runtime.usage_menu,
+            );
+            const menu: render_input.CompactCommandMenuProjection = .{
+                .usage = projection,
+            };
+            const visible_rows = @min(
+                compact_command_menu_presentation.desiredRowCount(
+                    menu,
+                    app.shell.layout.cols,
+                ),
+                app.shell.layout.rows -| 3,
+            );
+            return compact_command_menu_presentation.usageVisibleModelItems(
+                projection,
+                visible_rows,
+                app.shell.layout.cols,
+            );
         }
 
         fn routeCompactCommandMenuEscapeAction(
@@ -2018,6 +2163,10 @@ pub fn Runtime(comptime App: type) type {
                 if (next != current) {
                     try refreshUsageMenu(app, next);
                 }
+                return;
+            }
+            if (menu == .usage and resolved == .toggle_permission_mode) {
+                try cycleUsageMenuScope(app, -1);
                 return;
             }
             if (menu == .statusline and
@@ -2050,6 +2199,35 @@ pub fn Runtime(comptime App: type) type {
             } else {
                 try app_commands.Handlers(App).refreshUsageMenu(app, scope);
             }
+        }
+
+        fn reloadUsageMenu(app: *App, scope: usage_report.Scope) !void {
+            if (comptime !runtime_profile.allows(App, .profile_usage)) return;
+            if (comptime @hasDecl(App, "reloadUsageMenu")) {
+                try app.reloadUsageMenu(scope);
+            } else if (comptime @hasDecl(App, "refreshUsageMenu")) {
+                try app.refreshUsageMenu(scope);
+            } else {
+                try app_commands.Handlers(App).reloadUsageMenu(app, scope);
+            }
+        }
+
+        fn cycleUsageMenuScope(app: *App, delta: i32) !void {
+            const current = app.input_runtime.usage_menu.navigationScope();
+            const next: usage_report.Scope = if (delta < 0)
+                switch (current) {
+                    .days_30 => .session,
+                    .days_7 => .days_30,
+                    .hours_24 => .days_7,
+                    .session => .hours_24,
+                }
+            else switch (current) {
+                .days_30 => .days_7,
+                .days_7 => .hours_24,
+                .hours_24 => .session,
+                .session => .days_30,
+            };
+            try refreshUsageMenu(app, next);
         }
 
         fn submitHelpMenuSelection(app: *App, max_input_len: usize, max_prompt_history: usize) !bool {
@@ -3085,6 +3263,36 @@ test "all destructive composer shortcuts can delete an empty queued draft" {
     try std.testing.expect(!shortcutDeletesQueuedDraft(.cut_selection));
     try std.testing.expect(!shortcutDeletesQueuedDraft(.{ .move = .{ .kind = .character_left } }));
     try std.testing.expect(!shortcutDeletesQueuedDraft(.insert_newline));
+}
+
+test "project MCP prompt waits for every existing modal owner" {
+    const base = ProjectMcpPromptInputState{
+        .active = true,
+        .question_active = false,
+        .approval_active = false,
+        .subagent_active = false,
+        .menu_active = false,
+        .authentication_active = false,
+    };
+    try std.testing.expect(projectMcpPromptMayOwnInput(base));
+    var blocked = base;
+    blocked.question_active = true;
+    try std.testing.expect(!projectMcpPromptMayOwnInput(blocked));
+    blocked = base;
+    blocked.approval_active = true;
+    try std.testing.expect(!projectMcpPromptMayOwnInput(blocked));
+    blocked = base;
+    blocked.subagent_active = true;
+    try std.testing.expect(!projectMcpPromptMayOwnInput(blocked));
+    blocked = base;
+    blocked.menu_active = true;
+    try std.testing.expect(!projectMcpPromptMayOwnInput(blocked));
+    blocked = base;
+    blocked.authentication_active = true;
+    try std.testing.expect(!projectMcpPromptMayOwnInput(blocked));
+    var inactive = base;
+    inactive.active = false;
+    try std.testing.expect(!projectMcpPromptMayOwnInput(inactive));
 }
 
 const RoutingFakeApp = struct {
@@ -4483,6 +4691,23 @@ test "app_input_runtime Tab advances help categories before autocomplete" {
     try std.testing.expect(app.input_runtime.help_menu.category == null);
     try std.testing.expectEqual(@as(usize, 0), app.input_runtime.help_menu.selected_index);
     try std.testing.expectEqual(@as(usize, 0), app.input_runtime.help_menu.window_start);
+}
+
+test "app_input_runtime Tab cycles usage scopes in both directions" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    try app.input_runtime.usage_menu.openError(
+        alloc,
+        .days_30,
+        "usage is unavailable",
+    );
+
+    try Runtime(RoutingFakeApp).handleByte(&app, '\t', 4096, 100);
+    try std.testing.expectEqual(usage_report.Scope.days_7, app.input_runtime.usage_menu.navigationScope());
+
+    try feedRoutingBytes(&app, "\x1b[Z");
+    try std.testing.expectEqual(usage_report.Scope.days_30, app.input_runtime.usage_menu.navigationScope());
 }
 
 test "app_input_runtime Tab toggles session picker scope before autocomplete" {

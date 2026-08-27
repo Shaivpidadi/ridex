@@ -2926,6 +2926,87 @@ describe("gateway stream lifecycle", () => {
     }
   });
 
+  test("suffixless stored result handle remains readable", async () => {
+    const root = createFixtureRoot("suffixless-tool-result-handle");
+    const tracePath = join(root.root, "trace.log");
+    const readFileCallId = "suffixless_handle_read_file_1";
+    const readResultCallId = "suffixless_handle_read_result_1";
+    const needle = "E2E_SUFFIX_NEEDLE";
+    const lines = Array.from(
+      { length: 500 },
+      (_, index) => `fixture line ${index.toString().padStart(3, "0")}: ${"x".repeat(72)}`,
+    );
+    lines[300] = needle;
+    writeFileSync(join(root.workspace, "large-result.txt"), `${lines.join("\n")}\n`);
+
+    let step = 0;
+    let canonicalHandle = "";
+    let suffixlessHandle = "";
+    const gateway = startGateway((body) => {
+      switch (step++) {
+        case 0:
+          return fakeGatewayToolCall(readFileCallId, "read_file", {
+            path: "large-result.txt",
+          });
+        case 1: {
+          const output = toolResultOutput(body, readFileCallId);
+          const match = output.match(
+            /<tool_result_handle>([^<]+)<\/tool_result_handle>/,
+          );
+          canonicalHandle = match?.[1] ?? "";
+          expect(canonicalHandle.endsWith(".txt")).toBe(true);
+          suffixlessHandle = canonicalHandle.slice(0, -4);
+          return fakeGatewayToolCall(readResultCallId, "read_tool_result", {
+            handle: suffixlessHandle,
+            query: needle,
+          });
+        }
+        case 2: {
+          const output = toolResultOutput(body, readResultCallId);
+          expect(output).toContain(needle);
+          expect(output).toContain(
+            `<tool_result_query handle="${canonicalHandle}">`,
+          );
+          return fakeGatewayFinalText("Suffixless result handle inspected.");
+        }
+        default:
+          return new Response("unexpected request", { status: 500 });
+      }
+    });
+
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--yolo", "Inspect the retained large result."],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 15_000,
+        },
+      );
+      const json = parseAskJson(result.stdout);
+      const sessionRoot = join(root.home, ".fx", "sessions", json.session_id);
+
+      expect(result.code).toBe(0);
+      expect(json.error).toBeUndefined();
+      expect(json.output).toContain("Suffixless result handle inspected.");
+      expect(gateway.requestCount()).toBe(3);
+      expect(json.tool_calls).toContainEqual({ name: "read_file", status: "success" });
+      expect(json.tool_calls).toContainEqual({
+        name: "read_tool_result",
+        status: "success",
+      });
+      expect(existsSync(join(sessionRoot, "tool-results", canonicalHandle))).toBe(true);
+      const sessionEvents = readFileSync(join(sessionRoot, "events.jsonl"), "utf8");
+      expect(sessionEvents).toContain(suffixlessHandle);
+      expect(sessionEvents).toContain(canonicalHandle);
+      expect(sessionEvents).toContain(needle);
+      expect(result.stderr).not.toContain("ResultHandleNotFound");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
   test("no-save terminal timeout returns a readable process-scoped replay handle", async () => {
     const root = createFixtureRoot("terminal-timeout-replay");
     const tracePath = join(root.root, "trace.log");
