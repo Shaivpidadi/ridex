@@ -14,7 +14,8 @@ FX CLI binary.
 Harbor custom agents run in credential-proxy mode. The ACP wrapper consumes
 Harbor's injected `HOSTED_INFERENCE_URL` and `HOSTED_INFERENCE_TOKEN`, then
 streams FX's normal AI Gateway request through a loopback-only compatibility
-proxy. The hosted provider credential is never exposed to the FX process.
+proxy. The proxy retains FX's provider endpoint suffix beneath Harbor's injected
+base path. The hosted provider credential is never exposed to the FX process.
 
 The efficiency and compaction variants are selected independently with
 `FX_EXPERIMENT_X6_EFFICIENCY` and `FX_EXPERIMENT_X6_COMPACTION` in the hosted

@@ -74,7 +74,7 @@ class HostedInferenceProxy:
             raw_head = await client_reader.readuntil(b"\r\n\r\n")
             if len(raw_head) > _MAX_REQUEST_HEAD_BYTES:
                 raise ValueError("FX gateway request headers are too large")
-            method, headers = _parse_request_head(raw_head)
+            method, request_target, headers = _parse_request_head(raw_head)
             content_length = _content_length(headers)
             upstream_reader, upstream_writer = await asyncio.wait_for(
                 self._open_upstream(),
@@ -83,6 +83,7 @@ class HostedInferenceProxy:
             upstream_writer.write(
                 _upstream_request_head(
                     method=method,
+                    request_target=request_target,
                     upstream=self._upstream,
                     token=self._token,
                     headers=headers,
@@ -153,16 +154,21 @@ def _is_loopback(host: str) -> bool:
         return False
 
 
-def _parse_request_head(raw_head: bytes) -> tuple[str, list[tuple[str, str]]]:
+def _parse_request_head(
+    raw_head: bytes,
+) -> tuple[str, str, list[tuple[str, str]]]:
     try:
         lines = raw_head.decode("iso-8859-1").split("\r\n")
-        method, _target, version = lines[0].split(" ", 2)
+        method, target, version = lines[0].split(" ", 2)
     except (UnicodeDecodeError, ValueError) as exc:
         raise ValueError("invalid FX gateway HTTP request") from exc
     if version != "HTTP/1.1":
         raise ValueError("FX gateway request must use HTTP/1.1")
     if method not in {"POST", "GET"}:
         raise ValueError("unsupported FX gateway HTTP method")
+    parsed_target = urlsplit(target)
+    if parsed_target.scheme or parsed_target.netloc or not parsed_target.path.startswith("/"):
+        raise ValueError("FX gateway request must use an origin-form target")
 
     headers: list[tuple[str, str]] = []
     for line in lines[1:]:
@@ -175,7 +181,7 @@ def _parse_request_head(raw_head: bytes) -> tuple[str, list[tuple[str, str]]]:
         if not name:
             raise ValueError("invalid FX gateway HTTP header name")
         headers.append((name, value.strip()))
-    return method, headers
+    return method, target, headers
 
 
 def _content_length(headers: Iterable[tuple[str, str]]) -> int:
@@ -196,14 +202,13 @@ def _content_length(headers: Iterable[tuple[str, str]]) -> int:
 def _upstream_request_head(
     *,
     method: str,
+    request_target: str,
     upstream: SplitResult,
     token: str,
     headers: Iterable[tuple[str, str]],
     content_length: int,
 ) -> bytes:
-    target = upstream.path or "/"
-    if upstream.query:
-        target = f"{target}?{upstream.query}"
+    target = _join_upstream_target(upstream, request_target)
     default_port = 443 if upstream.scheme == "https" else 80
     port = upstream.port or default_port
     host = upstream.hostname or ""
@@ -230,6 +235,17 @@ def _upstream_request_head(
         ]
     )
     return "\r\n".join(output).encode("iso-8859-1")
+
+
+def _join_upstream_target(upstream: SplitResult, request_target: str) -> str:
+    incoming = urlsplit(request_target)
+    base_path = upstream.path.rstrip("/")
+    suffix = incoming.path.lstrip("/")
+    path = f"{base_path}/{suffix}" if suffix else (base_path or "/")
+    queries = [value for value in (upstream.query, incoming.query) if value]
+    if queries:
+        return f"{path}?{'&'.join(queries)}"
+    return path
 
 
 async def _relay_exactly(

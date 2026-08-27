@@ -53,7 +53,7 @@ class HostedInferenceProxyTests(unittest.IsolatedAsyncioTestCase):
                 reader, writer = await asyncio.open_connection("127.0.0.1", proxy_port)
                 body = b'{"messages":[{"role":"user","content":"hello"}]}'
                 writer.write(
-                    b"POST /v3/ai/language-model HTTP/1.1\r\n"
+                    b"POST /v3/ai/language-model?stream=true HTTP/1.1\r\n"
                     b"Host: 127.0.0.1\r\n"
                     b"Authorization: Bearer provider-key-must-not-pass\r\n"
                     b"Content-Type: application/json\r\n"
@@ -70,7 +70,10 @@ class HostedInferenceProxyTests(unittest.IsolatedAsyncioTestCase):
             upstream_server.close()
             await upstream_server.wait_closed()
 
-        self.assertEqual(captured["request_line"], "POST /targets?trial=one HTTP/1.1")
+        self.assertEqual(
+            captured["request_line"],
+            "POST /targets/v3/ai/language-model?trial=one&stream=true HTTP/1.1",
+        )
         headers = captured["headers"]
         assert isinstance(headers, dict)
         self.assertEqual(headers["authorization"], "Bearer hosted-token")
