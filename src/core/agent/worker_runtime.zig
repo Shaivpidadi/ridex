@@ -70,6 +70,9 @@ pub const QueuedPrompt = struct {
     account_id: ?[]u8 = null,
     permission_mode: types.PermissionMode,
     history: []types.HistoryTurn,
+    /// Non-zero only after explicit durable `/compact`; model projection uses
+    /// it as a manual trigger while canonical history remains complete.
+    context_history_start: usize = 0,
     root_user_intent_context: []u8 = &.{},
     grants: []types.PermissionGrant,
     skill_bindings: []SkillBinding = &.{},
@@ -2156,12 +2159,8 @@ fn appendHistoryTurnProjection(
     defer alloc.free(combined);
     std.mem.copyForwards(types.HistoryTurn, combined[0..current.len], current);
     combined[current.len] = turn;
-    return session_runtime.snapshotOwnedContextHistory(
-        alloc,
-        combined,
-        0,
-        max_history_turns,
-    );
+    _ = max_history_turns;
+    return session_runtime.snapshotOwnedCanonicalContextHistory(alloc, combined);
 }
 
 pub fn freeQueuedPrompt(alloc: std.mem.Allocator, prompt: QueuedPrompt) void {
@@ -3454,9 +3453,11 @@ test "queue, event, snapshot, sync, history, and grant behavior" {
     } };
     defer types.freeHistoryTurn(alloc, turn);
     try runtime.propagateHistoryTurn(alloc, turn, 1);
-    try std.testing.expectEqual(@as(usize, 1), runtime.queued_prompts.items[0].history.len);
+    try std.testing.expectEqual(@as(usize, 2), runtime.queued_prompts.items[0].history.len);
     try std.testing.expect(runtime.queued_prompts.items[0].history[0] == .compacted_summary);
-    try std.testing.expectEqualStrings("summary", runtime.queued_prompts.items[0].history[0].compacted_summary.summary);
+    try std.testing.expectEqualStrings("old", runtime.queued_prompts.items[0].history[0].compacted_summary.summary);
+    try std.testing.expect(runtime.queued_prompts.items[0].history[1] == .compacted_summary);
+    try std.testing.expectEqualStrings("summary", runtime.queued_prompts.items[0].history[1].compacted_summary.summary);
 
     try runtime.propagateGrant(alloc, "read_file", "/tmp/a");
     try std.testing.expectEqual(@as(usize, 1), runtime.queued_prompts.items[0].grants.len);

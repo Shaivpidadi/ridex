@@ -558,7 +558,7 @@ pub fn handlePrompt(
     if (explicit_skills.diagnostic_notice) |notice| try pushContextNotice(@ptrCast(&ctx), notice);
 
     session.session_rt.setConversationLanguageFromUserMessage(owned_prompt);
-    const context_history = try session.session_rt.snapshotContextHistory(alloc);
+    const context_history = try session.session_rt.snapshotCanonicalContextHistory(alloc);
     defer types.freeHistoryTurnSlice(alloc, context_history);
     var context_snapshot = try state.context_snapshot.dupe(alloc);
     defer context_snapshot.deinit(alloc);
@@ -586,6 +586,7 @@ pub fn handlePrompt(
         .gateway_team = state.gateway_team,
         .permission_mode = captured_permission_mode,
         .history = context_history,
+        .context_history_start = session.session_rt.contextHistoryStart(),
         .root_user_intent_context = root_user_intent_context,
         .grants = session.session_grants,
         .context_snapshot = context_snapshot,

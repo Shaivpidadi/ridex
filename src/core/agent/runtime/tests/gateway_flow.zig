@@ -2778,6 +2778,136 @@ test "processQueuedPrompt projects bounded output limits into gateway requests" 
     }
 }
 
+test "processQueuedPrompt compacts an older active tool result before the next provider request" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const result_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(result_dir);
+
+    const first_calls = [_]ToolCall{toolCall(
+        "compact_active_1",
+        "read_file",
+        "{\"path\":\"first.txt\"}",
+    )};
+    const second_calls = [_]ToolCall{toolCall(
+        "compact_active_2",
+        "read_file",
+        "{\"path\":\"second.txt\"}",
+    )};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &first_calls },
+        .{ .tool_calls = &second_calls },
+        .{ .content = "Compaction complete." },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.permission_decisions = &.{ .once, .once };
+    hooks.exec_plans = &.{
+        .{ .result = .{ .model_output = "OLD_ACTIVE_RESULT_SENTINEL" } },
+        .{ .result = .{ .model_output = "RECENT_ACTIVE_RESULT_SENTINEL" } },
+    };
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.tool_result_dir = result_dir;
+    var job = fixture.job();
+    job.context_history_start = 1;
+
+    try runFakePrompt(&gateway, &hooks, config, job);
+
+    try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
+    try expectBodyNotContains(&gateway, 2, "OLD_ACTIVE_RESULT_SENTINEL");
+    try expectBodyContains(&gateway, 2, "RECENT_ACTIVE_RESULT_SENTINEL");
+    try expectBodyContains(&gateway, 2, "tool_result_compacted");
+    try expectBodyContains(&gateway, 2, "result-read_file-");
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        hooks.successful_effect_count.load(.seq_cst),
+    );
+}
+
+test "processQueuedPrompt automatically compacts an older active result under provider pressure" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const result_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(result_dir);
+
+    const first_calls = [_]ToolCall{toolCall(
+        "auto_compact_1",
+        "read_file",
+        "{\"path\":\"first.txt\"}",
+    )};
+    const second_calls = [_]ToolCall{toolCall(
+        "auto_compact_2",
+        "read_file",
+        "{\"path\":\"second.txt\"}",
+    )};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &first_calls },
+        .{ .tool_calls = &second_calls },
+        .{ .content = "Automatic compaction complete." },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    const available_overrides = [_]ModelCapabilityOverride{.{
+        .model = "anthropic/claude-opus-4.6",
+        .capabilities = .{ .context_window = 45_000 },
+    }};
+    const runtime_contexts = [_][]const u8{
+        "automatic compaction phase one",
+        "automatic compaction phase two",
+        "AUTOMATIC_PRESSURE_PADDING\n" ++ ("p" ** 130_000),
+    };
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    hooks.available_capability_overrides = &available_overrides;
+    hooks.runtime_context_texts = &runtime_contexts;
+    defer hooks.deinit();
+    hooks.permission_decisions = &.{ .once, .once };
+    hooks.exec_plans = &.{
+        .{ .result = .{ .model_output = "AUTO_OLD_RESULT_SENTINEL\n" ++ ("a" ** 15_000) } },
+        .{ .result = .{ .model_output = "AUTO_RECENT_RESULT_SENTINEL\n" ++ ("b" ** 15_000) } },
+    };
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.tool_result_dir = result_dir;
+
+    try runFakePrompt(&gateway, &hooks, config, fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
+    try expectBodyNotContains(&gateway, 2, "AUTO_OLD_RESULT_SENTINEL");
+    try expectBodyContains(&gateway, 2, "AUTO_RECENT_RESULT_SENTINEL");
+    try expectBodyContains(&gateway, 2, "tool_result_compacted");
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        hooks.successful_effect_count.load(.seq_cst),
+    );
+}
+
+test "processQueuedPrompt fails before provider delivery when exact context cannot fit" {
+    const alloc = std.testing.allocator;
+    const available_overrides = [_]ModelCapabilityOverride{.{
+        .model = "anthropic/claude-opus-4.6",
+        .capabilities = .{ .context_window = 1 },
+    }};
+    const completions = [_]FakeCompletion{.{ .content = "must not run" }};
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    hooks.available_capability_overrides = &available_overrides;
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+
+    try std.testing.expectError(
+        error.ContextCapacityExceeded,
+        runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job()),
+    );
+    try std.testing.expectEqual(@as(usize, 0), gateway.request_bodies.items.len);
+    try std.testing.expectEqual(@as(usize, 0), hooks.successful_effect_count.load(.seq_cst));
+}
+
 test "processQueuedPrompt resolves catalog capabilities for opaque effort" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

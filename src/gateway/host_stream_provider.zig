@@ -54,6 +54,7 @@ pub fn provider(context: *ProviderContext) stream_provider.Provider {
     return .{
         .context = context,
         .stream_fn = stream,
+        .build_request_fn = buildRequest,
     };
 }
 
@@ -68,8 +69,9 @@ pub fn initContext(
 fn stream(raw: ?*anyopaque, alloc: Allocator, request: stream_provider.ModelRequest) anyerror!stream_provider.Result {
     const context: *ProviderContext = @ptrCast(@alignCast(raw.?));
     const transport = context.transport;
-    const payload = try context.build_fn(alloc, request.data());
-    defer alloc.free(payload);
+    const payload = request.prepared_request_body orelse
+        try context.build_fn(alloc, request.data());
+    defer if (request.prepared_request_body == null) alloc.free(payload);
     const auth = try std.fmt.allocPrint(alloc, "Bearer {s}", .{request.credential.secret});
     defer alloc.free(auth);
 
@@ -141,6 +143,15 @@ fn stream(raw: ?*anyopaque, alloc: Allocator, request: stream_provider.ModelRequ
         .usage = gatewayUsageOutcome(request, completion),
         .ownership = .owned,
     } };
+}
+
+fn buildRequest(
+    raw: ?*anyopaque,
+    alloc: Allocator,
+    request: stream_provider.RequestData,
+) anyerror![]u8 {
+    const context: *ProviderContext = @ptrCast(@alignCast(raw.?));
+    return context.build_fn(alloc, request);
 }
 
 fn gatewayUsageOutcome(

@@ -215,12 +215,12 @@ describe.skipIf(SKIP)("tui: slash commands", () => {
   );
 
   test(
-    "/compact shows compaction message",
+    "/compact reports when there is no eligible context",
     async () => {
       session = await launchAndWait();
       await session.sendText("/compact");
-      const pane = await session.waitForText(/compact/i, 5_000);
-      expect(pane.toLowerCase()).toContain("compact");
+      const pane = await session.waitForText("No context to compact.", 5_000);
+      expect(pane).toContain("No context to compact.");
     },
     TIMEOUT,
   );

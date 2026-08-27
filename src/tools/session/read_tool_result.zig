@@ -98,6 +98,12 @@ pub fn validate(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.ToolIn
         ctx.allocator.free(input.handle);
         input.handle = owned;
     }
+    if (input.query) |query| {
+        if (std.mem.trim(u8, query, " \t\r\n").len == 0) {
+            ctx.allocator.free(query);
+            input.query = null;
+        }
+    }
     return null;
 }
 
@@ -240,6 +246,24 @@ test "read_tool_result admission restores only omitted stored-result suffixes" {
         }
         try std.testing.expectEqualStrings(case.expected_handle, input.as(Input).handle);
     }
+}
+
+test "read_tool_result admission treats an empty query as a range read" {
+    const alloc = std.testing.allocator;
+    const decoded = try decode(
+        .{ .allocator = alloc },
+        "{\"handle\":\"result-read_file-1705079ba6e278c4-553514ccf082aeb9.txt\",\"start_byte\":2,\"byte_count\":9,\"query\":\"\"}",
+    );
+    const input = switch (decoded) {
+        .input => |value| value,
+        .failure => return error.TestUnexpectedDecodeFailure,
+    };
+    defer input.deinit(alloc);
+    try std.testing.expect((try validate(.{ .allocator = alloc }, input)) == null);
+    const typed = input.as(Input);
+    try std.testing.expect(typed.query == null);
+    try std.testing.expectEqual(@as(usize, 2), typed.start_byte);
+    try std.testing.expectEqual(@as(usize, 9), typed.byte_count);
 }
 
 test "unknown read_tool_result handle returns failure for legacy and managed stores" {

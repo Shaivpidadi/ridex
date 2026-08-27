@@ -132,6 +132,7 @@ pub const generation_usage_provider = gateway_generation_usage.provider;
 
 pub const agent_stream_provider = agent_stream_provider_contract.Provider{
     .stream_fn = streamAgentCompletion,
+    .build_request_fn = buildAgentRequestForProvider,
 };
 
 pub const provider_bundle = provider_set.Bundle{
@@ -232,6 +233,14 @@ pub fn buildAgentRequest(
     }
 
     unreachable;
+}
+
+fn buildAgentRequestForProvider(
+    _: ?*anyopaque,
+    alloc: Allocator,
+    request: agent_stream_provider_contract.RequestData,
+) anyerror![]u8 {
+    return buildAgentRequest(alloc, request);
 }
 
 fn resolveGatewayProviderOptions(
@@ -506,8 +515,9 @@ fn streamAgentCompletion(
             error.SubscriptionCredentialCannotAuthorizeGateway,
         );
     }
-    const payload = try buildAgentRequest(alloc, request.data());
-    defer alloc.free(payload);
+    const payload = request.prepared_request_body orelse
+        try buildAgentRequest(alloc, request.data());
+    defer if (request.prepared_request_body == null) alloc.free(payload);
     var events = request.events;
     const result = gateway_client.streamGatewayCompletion(
         alloc,

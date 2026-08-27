@@ -8,6 +8,7 @@ const worker_runtime = @import("../worker_runtime.zig");
 const agent_stream_provider = @import("../stream_provider.zig");
 const session_runtime = @import("../../session/session.zig");
 const session_codec = @import("../../session/session_codec.zig");
+const result_store = @import("../../session/result_store.zig");
 const debug_trace = @import("../../shared/debug_trace.zig");
 const gateway_error_format = @import("../../shared/gateway_error_format.zig");
 const mem_utils = @import("../../shared/mem_utils.zig");
@@ -3513,6 +3514,96 @@ fn processQueuedPromptLoop(
                     ));
                 }
             }
+            const request_data = agent_stream_provider.RequestData{
+                .model = gateway_model,
+                .messages = request_messages,
+                .tools = .{
+                    .registry = deps.tool_registry,
+                    .advertised_names = config.advertised_tool_names,
+                    .advertised_functions = config.advertised_functions,
+                    .selected_dynamic = selected_dynamic_tools.items,
+                },
+                .tool_choice = tool_choice,
+                .vision_mode = vision_mode,
+                .provider_options = provider_opts,
+                .max_output_tokens = request_max_output_tokens(request_capabilities),
+                .budget = .{ .cancel_flag = config.cancel_flag },
+                .verified_images = if (verified_images.items.len > 0)
+                    verified_images.items
+                else
+                    null,
+            };
+            var prepared_request_body: ?[]const u8 = null;
+            if (try deps.agent_stream_provider.buildRequest(
+                overlay_arena,
+                request_data,
+            )) |request_body| {
+                prepared_request_body = request_body;
+                const request_cost = runtime_prompt_context.measureProviderRequest(request_body);
+                var projection_plan = try runtime_prompt_context.planHybridProjection(
+                    overlay_arena,
+                    .{
+                        .trigger = if (job.context_history_start > 0)
+                            .manual
+                        else
+                            .automatic,
+                        .capabilities = request_capabilities,
+                        .cost = request_cost,
+                        .durable_history = history_messages.items,
+                        .request_local = within_turn_suffix.items,
+                        .request_local_provenance = if (job.recovery_checkpoint == null)
+                            .fresh
+                        else
+                            .unversioned_history,
+                    },
+                );
+                defer projection_plan.deinit(overlay_arena);
+                debug_trace.eventf(
+                    "context_compaction",
+                    "decision",
+                    step_ctx,
+                    "decision={s} request_bytes={d} estimated_tokens={d} usable_tokens={any} high_water_tokens={any} target_tokens={any} candidates={d}",
+                    .{
+                        @tagName(projection_plan.decision),
+                        request_cost.serialized_bytes,
+                        request_cost.estimated_input_tokens,
+                        projection_plan.usable_input_tokens,
+                        projection_plan.high_water_tokens,
+                        projection_plan.target_tokens,
+                        projection_plan.candidates.len,
+                    },
+                );
+                switch (projection_plan.decision) {
+                    .no_op => {},
+                    .capacity_failure => return error.ContextCapacityExceeded,
+                    .project => {
+                        const applied = try applyHybridProjectionPlan(
+                            arena,
+                            config,
+                            projection_plan,
+                            history_messages.items,
+                            within_turn_suffix.items,
+                            step_ctx,
+                        );
+                        if (applied > 0) {
+                            debug_trace.eventf(
+                                "context_compaction",
+                                "projected",
+                                step_ctx,
+                                "applied={d} request_bytes_before={d} estimated_tokens_before={d}",
+                                .{ applied, request_cost.serialized_bytes, request_cost.estimated_input_tokens },
+                            );
+                            skip_next_preflight_refresh = true;
+                            continue;
+                        }
+                        if (projection_plan.usable_input_tokens) |usable_tokens| {
+                            if (request_cost.estimated_input_tokens > usable_tokens) {
+                                return error.ContextCapacityExceeded;
+                            }
+                        }
+                    },
+                }
+            }
             summary_accumulator.prepareTokenRequest();
             runtime_assistant_stream.pushTokenProgressUpdate(&stream_ctx, .changed) catch |progress_err| {
                 debug_trace.logf("agent", "token progress publication failed source=gateway_prepare err={s}", .{@errorName(progress_err)});
@@ -3563,22 +3654,15 @@ fn processQueuedPromptLoop(
                 .session_id = lifecycle.scope.session_id,
                 .model = gateway_model,
                 .retry_count = config.gateway_retry_count,
-                .messages = request_messages,
-                .tools = .{
-                    .registry = deps.tool_registry,
-                    .advertised_names = config.advertised_tool_names,
-                    .advertised_functions = config.advertised_functions,
-                    .selected_dynamic = selected_dynamic_tools.items,
-                },
-                .tool_choice = tool_choice,
-                .vision_mode = vision_mode,
-                .provider_options = provider_opts,
-                .max_output_tokens = request_max_output_tokens(request_capabilities),
-                .budget = .{ .cancel_flag = config.cancel_flag },
-                .verified_images = if (verified_images.items.len > 0)
-                    verified_images.items
-                else
-                    null,
+                .messages = request_data.messages,
+                .tools = request_data.tools,
+                .tool_choice = request_data.tool_choice,
+                .vision_mode = request_data.vision_mode,
+                .provider_options = request_data.provider_options,
+                .max_output_tokens = request_data.max_output_tokens,
+                .budget = request_data.budget,
+                .verified_images = request_data.verified_images,
+                .prepared_request_body = prepared_request_body,
                 .trace_ctx = step_ctx,
                 .content_capture_limit = null,
                 .cooperative_pulse = deps.cooperative_transport_pulse,
@@ -7704,6 +7788,66 @@ fn processQueuedPromptLoop(
         config.step_limit_notice,
         "step_limit",
     );
+}
+
+fn applyHybridProjectionPlan(
+    alloc: Allocator,
+    config: Config,
+    plan: runtime_prompt_context.ProjectionPlan,
+    durable_history: []ChatMessage,
+    request_local: []ChatMessage,
+    trace_ctx: TraceContext,
+) !usize {
+    var applied: usize = 0;
+    for (plan.candidates) |candidate| {
+        const messages = switch (candidate.lane) {
+            .durable_history => durable_history,
+            .request_local => request_local,
+        };
+        if (candidate.message_index >= messages.len) continue;
+        const source = messages[candidate.message_index];
+        const handle = switch (candidate.kind) {
+            .existing_handle => candidate.output_handle orelse continue,
+            .promote_inline => blk: {
+                const promoted = if (config.session_child_capability) |capability|
+                    result_store.storeLargeResultManaged(
+                        alloc,
+                        capability,
+                        candidate.tool_call_id,
+                        candidate.tool_name,
+                        candidate.content,
+                    )
+                else if (config.tool_result_dir) |dir|
+                    result_store.storeLargeResult(
+                        alloc,
+                        dir,
+                        candidate.tool_call_id,
+                        candidate.tool_name,
+                        candidate.content,
+                    )
+                else
+                    break :blk null;
+                break :blk promoted catch |err| {
+                    debug_trace.eventf(
+                        "context_compaction",
+                        "promotion_failed",
+                        trace_ctx,
+                        "call_id={s} tool={s} err={s}",
+                        .{ candidate.tool_call_id, candidate.tool_name, @errorName(err) },
+                    );
+                    break :blk null;
+                };
+            },
+        } orelse continue;
+        messages[candidate.message_index] = try runtime_prompt_context.projectToolResultMessage(
+            alloc,
+            source,
+            handle,
+            candidate.stored_output_bytes,
+        );
+        applied += 1;
+    }
+    return applied;
 }
 
 fn finishFailedTurnWithNotice(

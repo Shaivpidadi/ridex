@@ -1719,7 +1719,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     if (explicit_skills.diagnostic_notice) |notice| try pushContextNotice(@ptrCast(&ctx), notice);
     ctx.subagent_skills_prompt = try alloc.dupe(u8, skills_section);
     ctx.subagent_explicit_skills_prompt = try alloc.dupe(u8, explicit_skills.text);
-    const context_history = try ctx.session.snapshotContextHistory(alloc);
+    const context_history = try ctx.session.snapshotCanonicalContextHistory(alloc);
     defer types.freeHistoryTurnSlice(alloc, context_history);
     const root_user_intent_context = try auto_classifier_context.buildCanonicalRootUserContext(
         alloc,
@@ -1745,6 +1745,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         .provider = ctx.provider,
         .permission_mode = ctx.permission_mode,
         .history = context_history,
+        .context_history_start = ctx.session.contextHistoryStart(),
         .root_user_intent_context = root_user_intent_context,
         .grants = &.{},
         // process_queued_prompt is synchronous here; AskContext keeps the

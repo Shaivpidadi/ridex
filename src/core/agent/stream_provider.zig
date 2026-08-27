@@ -186,6 +186,9 @@ pub const ModelRequest = struct {
     budget: ?BuildBudget = null,
     verified_images: ?[]const image_attachments.VerifiedSnapshot = null,
     response_format: ?StructuredResponseFormat = null,
+    /// Exact provider body already built for capacity measurement. Borrowed
+    /// for this call and valid until `stream` returns.
+    prepared_request_body: ?[]const u8 = null,
     trace_ctx: debug_trace.TraceContext,
     content_capture_limit: ?usize,
     /// Optional absolute provider deadline. Transports that support bounded
@@ -319,13 +322,32 @@ pub const StreamFn = *const fn (
     request: ModelRequest,
 ) anyerror!Result;
 
+pub const BuildRequestFn = *const fn (
+    context: ?*anyopaque,
+    alloc: Allocator,
+    request: RequestData,
+) anyerror![]u8;
+
 pub const Provider = struct {
     /// When set, context must remain valid until every in-flight `stream` returns.
     context: ?*anyopaque = null,
     stream_fn: StreamFn,
+    /// Optional exact provider serializer used for request-capacity decisions.
+    build_request_fn: ?BuildRequestFn = null,
 
     pub fn stream(self: Provider, alloc: Allocator, request: ModelRequest) !Result {
         return self.stream_fn(self.context, alloc, request);
+    }
+
+    /// Returns an owned provider request body when this provider exposes its
+    /// serializer. The caller owns the returned allocation.
+    pub fn buildRequest(
+        self: Provider,
+        alloc: Allocator,
+        request: RequestData,
+    ) !?[]u8 {
+        const build = self.build_request_fn orelse return null;
+        return try build(self.context, alloc, request);
     }
 };
 
@@ -417,4 +439,55 @@ test "stream provider accepts one typed request and emits ordered neutral events
     try std.testing.expectEqualStrings("firstsecond", capture.chunks.items);
     try std.testing.expectEqualStrings("done", result.completed.completion.content.?);
     try std.testing.expect(std.meta.activeTag(result.completed.usage) == .exact);
+}
+
+test "stream provider exposes its exact request serializer without streaming" {
+    const Builder = struct {
+        calls: usize = 0,
+
+        fn build(
+            raw: ?*anyopaque,
+            alloc: Allocator,
+            request: RequestData,
+        ) anyerror![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            return std.fmt.allocPrint(
+                alloc,
+                "model={s};messages={d};tools={d}",
+                .{ request.model, request.messages.len, request.tools.advertised_names.len },
+            );
+        }
+
+        fn stream(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: ModelRequest,
+        ) anyerror!Result {
+            return error.TestUnexpectedStream;
+        }
+    };
+
+    var builder: Builder = .{};
+    const provider = Provider{
+        .context = &builder,
+        .stream_fn = Builder.stream,
+        .build_request_fn = Builder.build,
+    };
+    const messages = [_]types.ChatMessage{.{ .role = .user, .content = "hello" }};
+    const names = [_][]const u8{"terminal"};
+    const body = (try provider.buildRequest(std.testing.allocator, .{
+        .model = "test/model",
+        .messages = &messages,
+        .tools = .{ .advertised_names = &names },
+        .tool_choice = .auto,
+        .provider_options = .{},
+    })).?;
+    defer std.testing.allocator.free(body);
+
+    try std.testing.expectEqual(@as(usize, 1), builder.calls);
+    try std.testing.expectEqualStrings(
+        "model=test/model;messages=1;tools=1",
+        body,
+    );
 }

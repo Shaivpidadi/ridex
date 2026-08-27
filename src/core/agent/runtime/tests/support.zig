@@ -264,8 +264,9 @@ pub const FakeGateway = struct {
         alloc: Allocator,
         request: agent_stream_provider.ModelRequest,
     ) !agent_stream_provider.Result {
-        const payload = try builtin_gateway.buildAgentRequest(alloc, request.data());
-        defer alloc.free(payload);
+        const payload = request.prepared_request_body orelse
+            try builtin_gateway.buildAgentRequest(alloc, request.data());
+        defer if (request.prepared_request_body == null) alloc.free(payload);
         try self.request_bodies.append(self.alloc, try self.alloc.dupe(u8, payload));
         try self.request_models.append(self.alloc, try self.alloc.dupe(u8, request.model));
         try self.request_api_keys.append(self.alloc, try self.alloc.dupe(u8, request.credential.secret));

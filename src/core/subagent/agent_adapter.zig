@@ -212,6 +212,7 @@ pub fn run(
             null,
         .permission_mode = admission.permission_mode,
         .history = history,
+        .context_history_start = turn.sessionRuntime().contextHistoryStart(),
         .root_user_intent_context = if (message.root_user_intent_context.len > 0)
             arena.dupe(u8, message.root_user_intent_context) catch return error.OutOfMemory
         else

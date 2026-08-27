@@ -2756,10 +2756,11 @@ pub fn Runtime(comptime App: type) type {
             return .committed;
         }
 
-        pub fn compactHistory(app: *App) !void {
+        pub fn compactHistory(app: *App) !bool {
+            if (!app.session.hasHybridCompactionCandidate()) return false;
             const previous_start = app.session.contextHistoryStart();
             app.session.forceCompaction();
-            if (app.session.contextHistoryStart() == previous_start) return;
+            if (app.session.contextHistoryStart() == previous_start) return false;
 
             commitJsHostSnapshot(app, "compaction");
 
@@ -2768,9 +2769,10 @@ pub fn Runtime(comptime App: type) type {
             const loaded = if (app.session_persistence.writable) |*value|
                 value
             else
-                return;
+                return true;
             try convergeDegraded(app, loaded, .{});
             try commitCurrentStateReplacement(app, loaded, .compaction, .{}, false);
+            return true;
         }
 
         pub fn commitRuntimePreferences(

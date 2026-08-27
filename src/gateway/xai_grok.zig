@@ -27,6 +27,7 @@ const connect_timeout_ms: i64 = 30_000;
 
 pub const agent_stream_provider = stream_provider.Provider{
     .stream_fn = streamCompletion,
+    .build_request_fn = buildRequestForProvider,
 };
 
 fn validateModel(model: []const u8) !void {
@@ -95,6 +96,14 @@ pub fn buildRequest(
     return out.toOwnedSlice();
 }
 
+fn buildRequestForProvider(
+    _: ?*anyopaque,
+    alloc: Allocator,
+    request: stream_provider.RequestData,
+) anyerror![]u8 {
+    return buildRequest(alloc, request);
+}
+
 fn writeResponsesInput(
     writer: *std.Io.Writer,
     alloc: Allocator,
@@ -130,8 +139,9 @@ fn streamCompletion(
         return stream_provider.failResult(error.InvalidGrokSubscriptionAccount);
     }
     try validateModel(request.model);
-    const payload = try buildRequest(alloc, request.data());
-    defer alloc.free(payload);
+    const payload = request.prepared_request_body orelse
+        try buildRequest(alloc, request.data());
+    defer if (request.prepared_request_body == null) alloc.free(payload);
     var result = streamPrepared(alloc, request, payload) catch |err| {
         if (request.cancel_flag.load(.seq_cst)) return stream_provider.failResult(error.Cancelled);
         if (requestDeadlineExpired(request)) return stream_provider.failResult(error.Timeout);

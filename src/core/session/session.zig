@@ -1912,6 +1912,13 @@ pub const SessionRuntime = struct {
         );
     }
 
+    pub fn snapshotCanonicalContextHistory(
+        self: *const SessionRuntime,
+        alloc: Allocator,
+    ) ![]HistoryTurn {
+        return snapshotOwnedCanonicalContextHistory(alloc, self.history.items);
+    }
+
     pub fn appendHistoryEntry(self: *SessionRuntime, alloc: Allocator, turn: HistoryTurn) !void {
         const copy = try dupeHistoryTurn(alloc, turn);
         var owns_copy = true;
@@ -2020,6 +2027,24 @@ pub const SessionRuntime = struct {
         self.context_history_start = self.history.items.len - 1;
     }
 
+    pub fn hasHybridCompactionCandidate(self: *const SessionRuntime) bool {
+        if (self.history.items.len <= 1) return false;
+        for (self.history.items[0 .. self.history.items.len - 1]) |turn| {
+            const execution = switch (turn) {
+                .assistant => |entry| entry.execution,
+                .background_command => |entry| entry.execution,
+                .interrupted => |entry| entry.execution,
+                .compacted_summary => continue,
+            };
+            for (execution.tool_steps) |step| {
+                for (step.tool_results) |result| {
+                    if (result.output_handle != null) return true;
+                }
+            }
+        }
+        return false;
+    }
+
     fn setConversationLanguage(self: *SessionRuntime, language: ConversationLanguage) void {
         self.language_lock.lockUncancelable(io_mod.getIo());
         defer self.language_lock.unlock(io_mod.getIo());
@@ -2062,6 +2087,21 @@ pub fn snapshotOwnedContextHistory(
     );
     try appendHistoryCopies(alloc, &copy, canonical_history[start..]);
     _ = try compactHistory(&copy, alloc, max_history_turns);
+    return copy.toOwnedSlice(alloc);
+}
+
+/// Copies complete typed history for provider-capacity projection. Unlike the
+/// legacy UI/resume snapshot, this path applies no count-based compaction.
+pub fn snapshotOwnedCanonicalContextHistory(
+    alloc: Allocator,
+    canonical_history: []const HistoryTurn,
+) ![]HistoryTurn {
+    var copy: std.ArrayList(HistoryTurn) = .empty;
+    errdefer {
+        for (copy.items) |turn| freeHistoryTurn(alloc, turn);
+        copy.deinit(alloc);
+    }
+    try appendHistoryCopies(alloc, &copy, canonical_history);
     return copy.toOwnedSlice(alloc);
 }
 
@@ -2759,6 +2799,7 @@ pub fn appendExecutionMemoryChatMessages(
                 .tool_call_id = result.tool_call_id,
                 .tool_name = result.tool_name,
                 .tool_result_status = result.status,
+                .tool_result_memory = toolResultMemory(result),
             });
         }
         for (step.tool_results) |result| {
@@ -2772,6 +2813,20 @@ pub fn appendExecutionMemoryChatMessages(
         errdefer alloc.free(text);
         try messages.append(alloc, .{ .role = .user, .content = text });
     }
+}
+
+fn toolResultMemory(result: core_types.PersistedToolResult) core_types.ToolResultMemory {
+    return .{
+        .output_handle = result.output_handle,
+        .preview = result.preview,
+        .output_bytes = result.output_bytes,
+        .stored_output_bytes = result.stored_output_bytes,
+        .truncated = result.truncated,
+        .committed_file_presentation = result.committed_file_presentation,
+        .command_output_replay = result.command_output_replay,
+        .command_process_presentation = result.command_process_presentation,
+        .terminal_action_presentation = result.terminal_action_presentation,
+    };
 }
 
 fn appendHistoryChatMessagesImpl(

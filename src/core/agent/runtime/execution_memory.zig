@@ -254,10 +254,9 @@ pub fn prepareCapturedToolModelOutput(
     else
         false;
     if (!required_command_replay and
-        (config.session_child_capability != null or config.tool_result_dir != null) and
-        raw_output.len > result_store.large_result_threshold_bytes)
+        (config.session_child_capability != null or config.tool_result_dir != null))
     {
-        const redacted_output = try execution_memory_helpers.redactText(
+        const redacted_output = try tool_result_limits.prepareRedactedOutput(
             arena,
             raw_output,
         );
@@ -286,18 +285,18 @@ pub fn prepareCapturedToolModelOutput(
         config.max_tool_result_bytes -| command_replay_store.model_handle_notice_reserve_bytes
     else
         config.max_tool_result_bytes;
-    const safe_output = try tool_result_limits.prepareModelOutput(
+    const prepared = try tool_result_limits.prepareModelOutputWithTruncation(
         arena,
         tool_call.name,
         raw_output,
         model_output_budget,
     );
     return .{
-        .model_output = safe_output,
+        .model_output = prepared.model_output,
         .memory = .{
             .output_bytes = raw_output.len,
-            .stored_output_bytes = safe_output.len,
-            .truncated = safe_output.len < raw_output.len,
+            .stored_output_bytes = prepared.model_output.len,
+            .truncated = prepared.truncated,
         },
     };
 }
@@ -880,6 +879,112 @@ test "required terminal exec stores large output only as replay" {
     var tool_results = try capability.iterate(alloc, .tool_results);
     defer tool_results.deinit();
     try std.testing.expectEqual(@as(usize, 0), tool_results.names.len);
+}
+
+test "saved preparation stores complete redacted output on sub-threshold cap loss" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const result_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(result_dir);
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var cancel = std.atomic.Value(bool).init(false);
+    const raw = "CUSTOM_API_KEY=abc123\n" ** 46;
+    try std.testing.expectEqual(@as(usize, 1012), raw.len);
+
+    const prepared = try prepareToolModelOutput(
+        arena,
+        .{
+            .system_prompt = "",
+            .gateway_retry_count = 0,
+            .gateway_chat_url = "",
+            .agent_step_limit = 1,
+            .max_tool_result_bytes = tool_result_limits.min_configured_tool_result_bytes,
+            .cancel_flag = &cancel,
+            .tool_result_dir = result_dir,
+        },
+        toolCall("call_expanded_secret", "read_file", "{}"),
+        raw,
+    );
+
+    const handle = prepared.memory.output_handle orelse
+        return error.TestExpectedStoredResult;
+    try std.testing.expect(prepared.memory.truncated);
+    const stored = try result_store.readByRange(
+        alloc,
+        result_dir,
+        handle,
+        1,
+        result_store.read_max_bytes,
+    );
+    defer alloc.free(stored);
+    try std.testing.expect(std.mem.find(u8, stored, "CUSTOM_API_KEY=[redacted]") != null);
+    try std.testing.expect(std.mem.find(u8, stored, "abc123") == null);
+}
+
+test "no-save preparation preserves capped success without a result handle" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var cancel = std.atomic.Value(bool).init(false);
+    const raw = "CUSTOM_API_KEY=abc123\n" ** 46;
+
+    const prepared = try prepareToolModelOutput(
+        arena,
+        .{
+            .system_prompt = "",
+            .gateway_retry_count = 0,
+            .gateway_chat_url = "",
+            .agent_step_limit = 1,
+            .max_tool_result_bytes = tool_result_limits.min_configured_tool_result_bytes,
+            .cancel_flag = &cancel,
+        },
+        toolCall("call_no_save_secret", "read_file", "{}"),
+        raw,
+    );
+
+    try std.testing.expect(prepared.memory.output_handle == null);
+    try std.testing.expect(prepared.memory.truncated);
+    try std.testing.expect(std.mem.find(u8, prepared.model_output, "tool result truncated") != null);
+    try std.testing.expect(std.mem.find(u8, prepared.model_output, "abc123") == null);
+}
+
+test "saved preparation keeps redaction shrink complete and inline" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const result_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(result_dir);
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var cancel = std.atomic.Value(bool).init(false);
+    const raw = "AI_GATEWAY_API_KEY=abcdefghijklmnop end";
+
+    const prepared = try prepareToolModelOutput(
+        arena,
+        .{
+            .system_prompt = "",
+            .gateway_retry_count = 0,
+            .gateway_chat_url = "",
+            .agent_step_limit = 1,
+            .max_tool_result_bytes = tool_result_limits.default_max_tool_result_bytes,
+            .cancel_flag = &cancel,
+            .tool_result_dir = result_dir,
+        },
+        toolCall("call_redaction_shrink", "read_file", "{}"),
+        raw,
+    );
+
+    try std.testing.expect(prepared.memory.output_handle == null);
+    try std.testing.expect(!prepared.memory.truncated);
+    try std.testing.expectEqualStrings(
+        "AI_GATEWAY_API_KEY=[redacted] end",
+        prepared.model_output,
+    );
 }
 
 test "common execution memory does not mark stored read previews as full" {

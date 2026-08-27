@@ -1856,11 +1856,14 @@ pub fn Handlers(comptime App: type) type {
 
         fn commandCompactHistory(ctx: *anyopaque) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
-            try app_session_runtime.Runtime(App).compactHistory(app);
+            const compacted = try app_session_runtime.Runtime(App).compactHistory(app);
             try app.writeDomainNotice(.{
                 .topic = "context",
                 .tone = .neutral,
-                .body = "Context compacted.",
+                .body = if (compacted)
+                    "Context compacted."
+                else
+                    "No context to compact.",
             }, true);
         }
 

@@ -4098,7 +4098,20 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       const root = createFixtureRoot("manual-compaction-restart");
       const tracePath = join(root.root, "trace.log");
       const stderrPath = join(root.root, "stderr.log");
+      const callId = "manual_compaction_large_result";
+      const bodySentinel = "MANUAL_COMPACTION_BODY_SENTINEL";
+      writeFileSync(
+        join(root.workspace, "manual-compaction-large.txt"),
+        `${bodySentinel}\n${"x".repeat(20 * 1024)}\n`,
+      );
+      writeFileSync(
+        join(root.workspace, ".fx.json"),
+        JSON.stringify({ max_tool_result_bytes: 1024 }),
+      );
       const responses = [
+        fakeGatewayToolCall(callId, "read_file", {
+          path: "manual-compaction-large.txt",
+        }),
         fakeGatewayFinalText("FIRST_REPLY_COMPACTION_SENTINEL"),
         fakeGatewayFinalText("SECOND_REPLY_COMPACTION_SENTINEL"),
         fakeGatewayFinalText("compaction restart complete"),
@@ -4174,25 +4187,29 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         );
         expect(resumed.code).toBe(0);
         expect(resumed.stderr).toBe("");
-        expect(gateway.requests).toHaveLength(3);
+        expect(gateway.requests).toHaveLength(4);
 
-        const request = JSON.parse(gateway.requests[2].body) as {
+        const request = JSON.parse(gateway.requests[3].body) as {
           prompt: Array<{ role: string; content: unknown }>;
         };
         const userTexts = request.prompt
           .filter((message) => message.role === "user")
           .map((message) => contentText(message.content));
-        expect(userTexts).toEqual([
+        expect(
+          userTexts.filter((text) =>
+            text.includes("PROMPT_COMPACTION_SENTINEL") ||
+            text === "compaction restart probe"
+          ),
+        ).toEqual([
+          "FIRST_PROMPT_COMPACTION_SENTINEL",
           "SECOND_PROMPT_COMPACTION_SENTINEL",
           "compaction restart probe",
         ]);
-        const systemText = request.prompt
-          .filter((message) => message.role === "system")
-          .map((message) => contentText(message.content))
-          .join("\n");
-        expect(systemText).toContain("Conversation summary:");
-        expect(systemText).toContain("FIRST_PROMPT_COMPACTION_SENTINEL");
-        expect(systemText).toContain("FIRST_REPLY_COMPACTION_SENTINEL");
+        expect(userTexts.join("\n")).toContain("manual-compaction-large.txt");
+        const requestText = JSON.stringify(request);
+        expect(requestText).toContain("tool_result_compacted");
+        expect(requestText).toContain("result-read_file-");
+        expect(requestText).not.toContain(bodySentinel);
         expect(readFileSync(stderrPath, "utf8")).toBe("");
 
         const afterResume = await runFx(
@@ -4223,7 +4240,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
   );
 
   test.skipIf(!tmuxAvailable())(
-    "explicit skill reads remain repeatable after manual compaction",
+    "explicit skill reads remain repeatable after ineligible compaction no-op",
     async () => {
       const root = createFixtureRoot("skill-manual-compaction");
       const tracePath = join(root.root, "trace.log");
@@ -4234,7 +4251,11 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       mkdirSync(skillDirectory, { recursive: true });
       writeFileSync(
         join(skillDirectory, "SKILL.md"),
-        `---\nname: ${skillName}\ndescription: compaction explicit fixture\n---\n\n${bodySentinel}\n`,
+        `---\nname: ${skillName}\ndescription: compaction explicit fixture\n---\n\n${bodySentinel}\n${"x".repeat(20 * 1024)}\n`,
+      );
+      writeFileSync(
+        join(root.workspace, ".fx.json"),
+        JSON.stringify({ max_tool_result_bytes: 1024 }),
       );
 
       const beforeCallId = "skill_before_compaction";
@@ -4275,7 +4296,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           20_000,
         );
         await tui.sendText("/compact");
-        await tui.waitForText("Context compacted.", 15_000);
+        await tui.waitForText("No context to compact.", 15_000);
         await tui.sendText("Read the explicit skill after compaction.");
         await tui.waitForPane(
           (pane) =>
@@ -4289,15 +4310,15 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
 
         expect(gateway.requests).toHaveLength(5);
         const before = toolResultOutput(gateway.requests[1]!.body, beforeCallId);
-        const postCompactionRequest = promptText(gateway.requests[3]!.body);
+        const postCompactionRequest = gateway.requests[3]!.body;
         const after = toolResultOutput(gateway.requests[4]!.body, afterCallId);
 
         expect(before).toContain(bodySentinel);
-        expect(after).toBe(before);
-        expect(postCompactionRequest).toContain("Conversation summary:");
-        expect(postCompactionRequest).toContain("skill success");
-        expect(postCompactionRequest).not.toContain(bodySentinel);
-        expect(postCompactionRequest).not.toContain("<loaded_skill_context>");
+        expect(after).toContain(bodySentinel);
+        expect(before).not.toContain("tool_result_handle");
+        expect(after).not.toContain("tool_result_handle");
+        expect(postCompactionRequest).toContain(bodySentinel);
+        expect(postCompactionRequest).toContain("<skill_content");
         expect(readFileSync(stderrPath, "utf8")).toBe("");
       } finally {
         if (tui) await tui.kill();
@@ -5777,6 +5798,51 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(trace).toContain("event=provider_tool_recovery_materialized");
       expect(trace).toContain("event=provider_tool_recovery_duplicate_suppressed");
       expect(trace).not.toContain("event=before_tool_execution");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
+  test("no-save capped tool result succeeds without publishing a phantom handle", async () => {
+    const root = createFixtureRoot("no-save-capped-result");
+    const tracePath = join(root.root, "trace.log");
+    const callId = "no_save_capped_read";
+    writeFileSync(
+      join(root.workspace, "no-save-large.txt"),
+      `NO_SAVE_RESULT_SENTINEL\n${"x".repeat(8 * 1024)}\n`,
+    );
+    writeFileSync(
+      join(root.workspace, ".fx.json"),
+      JSON.stringify({ max_tool_result_bytes: 1024 }),
+    );
+    const responses = [
+      fakeGatewayToolCall(callId, "read_file", { path: "no-save-large.txt" }),
+      fakeGatewayFinalText("No-save capped result completed."),
+    ];
+    const gateway = startGateway(() =>
+      responses.shift() ?? new Response("unexpected request", { status: 500 })
+    );
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Read the large fixture once."],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 15_000,
+        },
+      );
+      const json = parseAskJson(result.stdout);
+      const output = toolResultOutput(gateway.requests[1]!.body, callId);
+
+      expect(result.code).toBe(0);
+      expect(json.output).toBe("No-save capped result completed.");
+      expect(gateway.requestCount()).toBe(2);
+      expect(output).toContain("NO_SAVE_RESULT_SENTINEL");
+      expect(output).toContain("tool result truncated");
+      expect(output).not.toContain("tool_result_handle");
+      expect(result.stderr).not.toContain("Tool execution failed");
+      expect(result.stderr).not.toContain("ContextCapacityExceeded");
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });
