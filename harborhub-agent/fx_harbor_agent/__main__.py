@@ -38,7 +38,7 @@ from acp.schema import (
     TextContentBlock,
 )
 
-from .hosted_inference import HostedInferenceProxy
+from .hosted_inference import HostedInferenceProxy, probe_hosted_inference
 
 
 REQUESTED_MODEL = "vercel_ai_gateway/openai/gpt-5.6-sol"
@@ -46,6 +46,7 @@ FX_BINARY = Path(__file__).resolve().parent.parent / "bin" / "fx"
 FX_BINARY_SHA256 = "a02d34b3c34783ef0af9610bded4ac2610a695fed3ba4305cc419f39122f3b2c"
 FX_LOG = Path("/logs/agent/fx.json")
 FX_STDERR_LOG = Path("/logs/agent/fx-stderr.log")
+HARBOR_GATEWAY_PROBE_LOG = Path("/logs/agent/harbor-gateway-probe.json")
 
 
 class FxAskAgent(Agent):
@@ -90,7 +91,7 @@ class FxAskAgent(Agent):
             agent_info=Implementation(
                 name="fx-x6-ask",
                 title="FX X6 ask wrapper",
-                version="0.0.6-x6.dd87df1-hg2",
+                version="0.0.6-x6.dd87df1-hg3",
             ),
         )
 
@@ -246,6 +247,22 @@ class FxAskAgent(Agent):
                 "Harbor must provide HOSTED_INFERENCE_URL and "
                 "HOSTED_INFERENCE_TOKEN in gateway credential mode"
             )
+        if os.environ.get("FX_HARBOR_GATEWAY_DIAGNOSTIC") == "1":
+            probe = await probe_hosted_inference(
+                hosted_inference_url,
+                hosted_inference_token,
+            )
+            HARBOR_GATEWAY_PROBE_LOG.write_text(
+                json.dumps(probe, indent=2, sort_keys=True),
+                encoding="utf-8",
+            )
+            await self._conn.session_update(
+                session_id=session_id,
+                update=update_agent_message(
+                    text_block("Harbor gateway contract probe completed.")
+                ),
+            )
+            return PromptResponse(stop_reason="end_turn")
         env = dict(os.environ)
         env.update(
             {

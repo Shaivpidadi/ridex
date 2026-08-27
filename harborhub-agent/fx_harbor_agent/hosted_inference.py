@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import http.client
 import ipaddress
+import json
 import ssl
 from collections.abc import Iterable
 from urllib.parse import SplitResult, urlsplit
@@ -126,6 +128,96 @@ class HostedInferenceProxy:
                 server_hostname=host,
             )
         return await asyncio.open_connection(host, self._upstream.port or 80)
+
+
+async def probe_hosted_inference(upstream_url: str, token: str) -> dict[str, object]:
+    """Inspect Harbor's public gateway contract without issuing inference."""
+
+    if not token:
+        raise ValueError("HOSTED_INFERENCE_TOKEN is empty")
+    upstream = _validated_upstream(upstream_url)
+    return await asyncio.to_thread(_probe_hosted_inference_sync, upstream, token)
+
+
+def _probe_hosted_inference_sync(
+    upstream: SplitResult,
+    token: str,
+) -> dict[str, object]:
+    base_path = upstream.path or "/"
+    probes = [
+        ("GET", base_path),
+        ("OPTIONS", base_path),
+        ("GET", f"{base_path.rstrip('/')}/"),
+        ("GET", "/openapi.json"),
+        ("GET", f"{base_path.rstrip('/')}/openapi.json"),
+    ]
+    results: list[dict[str, object]] = []
+    for method, path in probes:
+        results.append(_probe_request(upstream, token, method, path))
+    return {
+        "host": upstream.hostname,
+        "base_path": base_path,
+        "probes": results,
+    }
+
+
+def _probe_request(
+    upstream: SplitResult,
+    token: str,
+    method: str,
+    path: str,
+) -> dict[str, object]:
+    host = upstream.hostname
+    if host is None:
+        raise ValueError("HOSTED_INFERENCE_URL has no hostname")
+    port = upstream.port or (443 if upstream.scheme == "https" else 80)
+    connection_class = (
+        http.client.HTTPSConnection
+        if upstream.scheme == "https"
+        else http.client.HTTPConnection
+    )
+    connection = connection_class(host, port, timeout=10)
+    result: dict[str, object] = {"method": method, "path": path}
+    try:
+        connection.request(
+            method,
+            path,
+            headers={
+                "Accept": "application/json",
+                "Authorization": f"Bearer {token}",
+                "User-Agent": "fx-harbor-contract-probe/1",
+            },
+        )
+        response = connection.getresponse()
+        body = response.read(4096)
+        result["status"] = response.status
+        selected_headers = {
+            name.lower(): value
+            for name, value in response.getheaders()
+            if name.lower()
+            in {
+                "allow",
+                "content-type",
+                "server",
+                "via",
+                "x-powered-by",
+            }
+        }
+        result["headers"] = selected_headers
+        text = body.decode("utf-8", "replace").replace(token, "[REDACTED]")
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, dict) and isinstance(parsed.get("paths"), dict):
+            result["openapi_paths"] = sorted(parsed["paths"])
+        elif text:
+            result["body_preview"] = text[:1000]
+    except (OSError, http.client.HTTPException) as exc:
+        result["error"] = type(exc).__name__
+    finally:
+        connection.close()
+    return result
 
 
 def _validated_upstream(value: str) -> SplitResult:

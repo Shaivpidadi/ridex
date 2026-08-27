@@ -3,7 +3,10 @@ from __future__ import annotations
 import asyncio
 import unittest
 
-from fx_harbor_agent.hosted_inference import HostedInferenceProxy
+from fx_harbor_agent.hosted_inference import (
+    HostedInferenceProxy,
+    probe_hosted_inference,
+)
 
 
 class HostedInferenceProxyTests(unittest.IsolatedAsyncioTestCase):
@@ -89,6 +92,55 @@ class HostedInferenceProxyTests(unittest.IsolatedAsyncioTestCase):
     async def test_rejects_empty_hosted_token(self) -> None:
         with self.assertRaisesRegex(ValueError, "TOKEN is empty"):
             HostedInferenceProxy("https://example.com/targets", "")
+
+    async def test_contract_probe_extracts_paths_without_recording_token(self) -> None:
+        async def upstream(
+            reader: asyncio.StreamReader,
+            writer: asyncio.StreamWriter,
+        ) -> None:
+            head = await reader.readuntil(b"\r\n\r\n")
+            request_line = head.decode("iso-8859-1").split("\r\n", 1)[0]
+            _method, path, _version = request_line.split(" ", 2)
+            if path == "/openapi.json":
+                body = b'{"paths":{"/targets/{target_path}":{},"/health":{}}}'
+                status = b"200 OK"
+            else:
+                body = b'{"detail":"Not Found"}'
+                status = b"404 Not Found"
+            writer.write(
+                b"HTTP/1.1 "
+                + status
+                + b"\r\nContent-Type: application/json\r\n"
+                + f"Content-Length: {len(body)}\r\n".encode("ascii")
+                + b"Connection: close\r\n\r\n"
+                + body
+            )
+            await writer.drain()
+            writer.close()
+            await writer.wait_closed()
+
+        upstream_server = await asyncio.start_server(upstream, "127.0.0.1", 0)
+        upstream_port = upstream_server.sockets[0].getsockname()[1]
+        try:
+            report = await probe_hosted_inference(
+                f"http://127.0.0.1:{upstream_port}/targets",
+                "short-lived-secret-token",
+            )
+        finally:
+            upstream_server.close()
+            await upstream_server.wait_closed()
+
+        serialized = str(report)
+        self.assertNotIn("short-lived-secret-token", serialized)
+        openapi_probe = next(
+            probe
+            for probe in report["probes"]
+            if probe["path"] == "/openapi.json"
+        )
+        self.assertEqual(
+            openapi_probe["openapi_paths"],
+            ["/health", "/targets/{target_path}"],
+        )
 
 
 if __name__ == "__main__":
