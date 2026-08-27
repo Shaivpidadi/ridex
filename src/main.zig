@@ -642,10 +642,13 @@ const App = struct {
             alloc,
             builtin_context.prompt_policy.system_prompt,
         );
-        try app.session_persistence.launch_policy.resolveEnabledTools(
-            alloc,
-            app.baseToolSet(),
-        );
+        if (comptime !host_target.is_wasm) {
+            app.session_persistence.narrowed_tools = try tool_set_contract.narrow(
+                alloc,
+                app.baseToolSet(),
+                app.session_persistence.launch_policy.enabled_tools,
+            );
+        }
         if (comptime host_profile.durable_sessions or host_profile.js_host_sessions) {
             if (app.requested_resume != null) {
                 if (launch.upgrade_relaunch) {
@@ -1546,7 +1549,8 @@ const App = struct {
     }
 
     fn effectiveToolSet(self: *const App) tool_set_contract.ToolSet {
-        return self.session_persistence.launch_policy.toolSetOr(self.baseToolSet());
+        if (self.session_persistence.narrowed_tools) |*tools| return tools.view();
+        return self.baseToolSet();
     }
 
     pub fn toolRegistry(self: *const App) tool_dispatch.Registry {

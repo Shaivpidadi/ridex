@@ -23,6 +23,7 @@ const model_catalog = @import("../core/gateway/model_catalog.zig");
 const hooks = @import("../core/hooks/hooks.zig");
 const mcp_runtime = @import("../core/mcp/mcp_runtime.zig");
 const mode_registry = @import("../core/modes/mode_registry.zig");
+const tool_set_contract = @import("../core/tooling/tool_set.zig");
 const skill_runtime = @import("../core/skills/skill_runtime.zig");
 const session_codec = @import("../core/session/session_codec.zig");
 const session_log = @import("../core/session/session_log.zig");
@@ -255,6 +256,7 @@ pub const ServerState = struct {
     legacy_url_mutex: std.Io.Mutex = .init,
     pending_legacy_urls: std.ArrayListUnmanaged(PendingLegacyUrl) = .empty,
     launch_policy: config_runtime.launch_config.OwnedLaunchPolicy = .{},
+    narrowed_tools: ?tool_set_contract.Narrowed = null,
 
     pub fn deinit(self: *ServerState) void {
         reapActivePrompt(self, true);
@@ -290,6 +292,15 @@ pub const ServerState = struct {
         clearPendingLegacyUrls(self);
         self.pending_legacy_urls.deinit(self.alloc);
         self.launch_policy.deinit(self.alloc);
+        if (self.narrowed_tools) |*tools| tools.deinit(self.alloc);
+    }
+
+    pub fn launchToolSet(
+        self: *const ServerState,
+        available: tool_set_contract.ToolSet,
+    ) tool_set_contract.ToolSet {
+        if (self.narrowed_tools) |*tools| return tools.view();
+        return available;
     }
 };
 
@@ -551,7 +562,7 @@ fn resolveSubagentAuthority(
             root_id,
             root_id,
             active.permission_rules,
-            state.cfg.mode_registry.toolAllowed(state.launch_policy.toolSetOr(builtin_tools.advertisement_set), active.mode, "mcp_features") and
+            state.cfg.mode_registry.toolAllowed(state.launchToolSet(builtin_tools.advertisement_set), active.mode, "mcp_features") and
                 !permissions.rulesDenyAllTargetsForTool(active.permission_rules, "mcp_features"),
         )
     else
@@ -565,7 +576,7 @@ fn resolveSubagentAuthority(
     return subagent_tool_host.captureHostAuthorityWithMcpView(
         alloc,
         .{
-            .tool_set = state.launch_policy.toolSetOr(builtin_tools.advertisement_set),
+            .tool_set = state.launchToolSet(builtin_tools.advertisement_set),
             .mode = .{
                 .active = .{
                     .registry = state.cfg.mode_registry,
@@ -1338,7 +1349,14 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     state.launch_policy.deinit(alloc);
     state.launch_policy = startup.takeLaunchPolicy();
     try state.launch_policy.composeSystemPrompt(alloc, state.cfg.prompt_policy.system_prompt);
-    try state.launch_policy.resolveEnabledTools(alloc, builtin_tools.advertisement_set);
+    if (comptime !host_target.is_wasm) {
+        if (state.narrowed_tools) |*tools| tools.deinit(alloc);
+        state.narrowed_tools = try tool_set_contract.narrow(
+            alloc,
+            builtin_tools.advertisement_set,
+            state.launch_policy.enabled_tools,
+        );
+    }
     if (state.launch_policy.system_prompt) |system_prompt| {
         state.cfg.prompt_policy.system_prompt = system_prompt;
     }

@@ -3160,10 +3160,21 @@ fn runConfigCommand(
     modifiers: LaunchModifiers,
     deps: RunDeps,
 ) !RunResult {
-    if (comptime !hostSupportsNativeConfig(builtin.os.tag)) {
+    if (comptime hostSupportsNativeConfig(builtin.os.tag)) {
+        return runConfigCommandNative(alloc, args, cfg, modifiers, deps);
+    } else {
         try writeStderr(deps, "fx config is unavailable on this host\n");
         return .handled_failure;
     }
+}
+
+fn runConfigCommandNative(
+    alloc: Allocator,
+    args: []const [:0]const u8,
+    cfg: Config,
+    modifiers: LaunchModifiers,
+    deps: RunDeps,
+) !RunResult {
     if (args.len == 0) {
         try writeStderr(deps, "usage: fx config <schema|capabilities|validate|resolve> [--json]\n");
         return .handled_failure;
@@ -3352,10 +3363,15 @@ fn resolveLaunchConfig(
     };
     defer startup.deinit(alloc);
     try startup.launch_policy.composeSystemPrompt(alloc, cfg.prompt_policy.system_prompt);
-    try startup.launch_policy.resolveEnabledTools(alloc, cfg.tool_set);
+    var narrowed_tools = try tool_set_contract.narrow(
+        alloc,
+        cfg.tool_set,
+        startup.launch_policy.enabled_tools,
+    );
+    defer if (narrowed_tools) |*tools| tools.deinit(alloc);
     const active_directories = try startup.workspace_access.activeDirectoriesAlloc(alloc);
     defer freeOwnedStrings(alloc, active_directories);
-    const effective_tools = startup.launch_policy.toolSetOr(cfg.tool_set);
+    const effective_tools = if (narrowed_tools) |*tools| tools.view() else cfg.tool_set;
     const report = try (output_contracts.ResolvedConfigSnapshot{
         .provider = startup.provider,
         .configured_model = startup.configured_model,

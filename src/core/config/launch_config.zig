@@ -4,9 +4,7 @@ const io_mod = @import("../shared/io.zig");
 const model_provider = @import("model_provider.zig");
 const settings_store = @import("settings_store.zig");
 const types = @import("../shared/types.zig");
-const tool_dispatch = @import("../tooling/tool_dispatch.zig");
 const tool_result_limits = @import("../tooling/tool_result_limits.zig");
-const tool_set_contract = @import("../tooling/tool_set.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
 
 const Allocator = std.mem.Allocator;
@@ -231,9 +229,6 @@ pub const OwnedLaunchPolicy = struct {
     system_parts: ?[]SystemPart = null,
     system_prompt: ?[]u8 = null,
     enabled_tools: ?[][]u8 = null,
-    enabled_tool_order: ?[]const []const u8 = null,
-    enabled_read_only_tools: ?[]const []const u8 = null,
-    enabled_registry_tools: ?[]tool_dispatch.Tool = null,
 
     pub fn deinit(self: *OwnedLaunchPolicy, alloc: Allocator) void {
         for (&self.sources) |*item| item.deinit(alloc);
@@ -243,9 +238,6 @@ pub const OwnedLaunchPolicy = struct {
         }
         if (self.system_prompt) |text| alloc.free(text);
         if (self.enabled_tools) |names| freeStrings(alloc, names);
-        if (self.enabled_tool_order) |order| alloc.free(order);
-        if (self.enabled_read_only_tools) |names| alloc.free(names);
-        if (self.enabled_registry_tools) |tools| alloc.free(tools);
         self.* = .{};
     }
 
@@ -297,59 +289,6 @@ pub const OwnedLaunchPolicy = struct {
         const composed = try output.toOwnedSlice();
         if (self.system_prompt) |old| alloc.free(old);
         self.system_prompt = composed;
-    }
-
-    pub fn resolveEnabledTools(
-        self: *OwnedLaunchPolicy,
-        alloc: Allocator,
-        available: tool_set_contract.ToolSet,
-    ) !void {
-        const selected = self.enabled_tools orelse return;
-        for (selected) |name| {
-            if (!containsName(available.order, name)) return error.ToolCapabilityUnavailable;
-        }
-
-        var order: std.ArrayList([]const u8) = .empty;
-        defer order.deinit(alloc);
-        for (available.order) |name| {
-            if (containsName(selected, name)) try order.append(alloc, name);
-        }
-        var read_only: std.ArrayList([]const u8) = .empty;
-        defer read_only.deinit(alloc);
-        for (available.read_only_tool_names) |name| {
-            if (containsName(selected, name)) try read_only.append(alloc, name);
-        }
-        var registry_tools: std.ArrayList(tool_dispatch.Tool) = .empty;
-        defer registry_tools.deinit(alloc);
-        for (available.registry.tools) |tool| {
-            if (containsName(selected, tool.name)) try registry_tools.append(alloc, tool);
-        }
-
-        const owned_order = try order.toOwnedSlice(alloc);
-        errdefer alloc.free(owned_order);
-        const owned_read_only = try read_only.toOwnedSlice(alloc);
-        errdefer alloc.free(owned_read_only);
-        const owned_registry_tools = try registry_tools.toOwnedSlice(alloc);
-        if (self.enabled_tool_order) |old| alloc.free(old);
-        if (self.enabled_read_only_tools) |old| alloc.free(old);
-        if (self.enabled_registry_tools) |old| alloc.free(old);
-        self.enabled_tool_order = owned_order;
-        self.enabled_read_only_tools = owned_read_only;
-        self.enabled_registry_tools = owned_registry_tools;
-    }
-
-    pub fn toolSetOr(
-        self: *const OwnedLaunchPolicy,
-        available: tool_set_contract.ToolSet,
-    ) tool_set_contract.ToolSet {
-        return .{
-            .registry = if (self.enabled_registry_tools) |tools|
-                .{ .tools = tools }
-            else
-                available.registry,
-            .order = self.enabled_tool_order orelse available.order,
-            .read_only_tool_names = self.enabled_read_only_tools orelse available.read_only_tool_names,
-        };
     }
 };
 
@@ -809,31 +748,6 @@ test "typed overrides share strict document parsing" {
     );
 }
 
-test "enabled tools narrow while preserving canonical order" {
-    const alloc = std.testing.allocator;
-    var policy = OwnedLaunchPolicy{};
-    defer policy.deinit(alloc);
-    policy.enabled_tools = try dupeStrings(alloc, &.{ "read_file", "list_files" });
-    const available = tool_set_contract.ToolSet{
-        .registry = .{},
-        .order = &.{ "list_files", "grep_files", "read_file" },
-        .read_only_tool_names = &.{ "list_files", "grep_files", "read_file" },
-    };
-    try policy.resolveEnabledTools(alloc, available);
-    const narrowed = policy.toolSetOr(available);
-    try std.testing.expectEqual(@as(usize, 2), narrowed.order.len);
-    try std.testing.expectEqualStrings("list_files", narrowed.order[0]);
-    try std.testing.expectEqualStrings("read_file", narrowed.order[1]);
-
-    var unavailable = OwnedLaunchPolicy{};
-    defer unavailable.deinit(alloc);
-    unavailable.enabled_tools = try dupeStrings(alloc, &.{"missing"});
-    try std.testing.expectError(
-        error.ToolCapabilityUnavailable,
-        unavailable.resolveEnabledTools(alloc, available),
-    );
-}
-
 test "strict document ownership cleans every allocation failure" {
     const Case = struct {
         fn run(alloc: Allocator) !void {
@@ -865,11 +779,6 @@ test "owned launch policy projections clean every allocation failure" {
             text_owned = false;
             parts_owned = false;
             try policy.composeSystemPrompt(alloc, "builtin");
-            try policy.resolveEnabledTools(alloc, .{
-                .registry = .{},
-                .order = &.{"read_file"},
-                .read_only_tool_names = &.{"read_file"},
-            });
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});

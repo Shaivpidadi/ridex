@@ -321,7 +321,7 @@ const AcpContext = struct {
 fn activeToolSet(state: *const server.ServerState) tool_set_contract.ToolSet {
     if (comptime host_target.is_wasm) return tool_set_contract.empty;
     const available = if (state.cfg.allow_native_tools) builtin_tools.advertisement_set else tool_set_contract.empty;
-    return state.launch_policy.toolSetOr(available);
+    return state.launchToolSet(available);
 }
 
 const AcpElicitationResponderContext = struct {

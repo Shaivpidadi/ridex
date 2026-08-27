@@ -1091,6 +1091,7 @@ pub const Persistence = struct {
     resume_handoff_intent: ResumeHandoffIntent = .none,
     pending_live_session_policy: ?BackgroundSessionPolicy = null,
     launch_policy: config_runtime.launch_config.OwnedLaunchPolicy = .{},
+    narrowed_tools: ?tool_set_contract.Narrowed = null,
 
     pub fn deinit(self: *Persistence, alloc: Allocator) void {
         if (self.pending_live_session_policy) |policy| {
@@ -1114,6 +1115,7 @@ pub const Persistence = struct {
         if (self.js_host_session) |*owner| owner.deinit(alloc);
         if (self.process_model_override) |model| alloc.free(model);
         self.launch_policy.deinit(alloc);
+        if (self.narrowed_tools) |*tools| tools.deinit(alloc);
         self.session_picker.deinit(alloc);
         self.session_picker_load.deinit();
         self.session_picker_current_cache.deinit();

@@ -578,6 +578,7 @@ const AskContext = struct {
     prompt_snapshot_committed: bool = false,
     last_recovery_status: ?types.RouteRecoveryStatus = null,
     launch_policy: config_runtime.launch_config.OwnedLaunchPolicy = .{},
+    narrowed_tools: ?tool_set_contract.Narrowed = null,
 
     fn init(alloc: Allocator, cfg: Config, deps: RunDeps, workspace_root: []const u8) AskContext {
         const lifecycle_runtime = hooks.Runtime.init(alloc);
@@ -744,6 +745,7 @@ const AskContext = struct {
         if (self.subagent_skills_prompt.len > 0) self.alloc.free(self.subagent_skills_prompt);
         if (self.subagent_explicit_skills_prompt.len > 0) self.alloc.free(self.subagent_explicit_skills_prompt);
         self.launch_policy.deinit(self.alloc);
+        if (self.narrowed_tools) |*tools| tools.deinit(self.alloc);
     }
 
     fn lifecycleContext(self: *AskContext) agent_runtime.LifecycleContext {
@@ -1514,11 +1516,17 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     defer ctx.deinit();
     ctx.launch_policy = startup.takeLaunchPolicy();
     try ctx.launch_policy.composeSystemPrompt(alloc, ctx.cfg.prompt_policy.system_prompt);
-    try ctx.launch_policy.resolveEnabledTools(alloc, ctx.deps.tool_set);
+    if (comptime std_builtin.os.tag != .wasi) {
+        ctx.narrowed_tools = try tool_set_contract.narrow(
+            alloc,
+            ctx.deps.tool_set,
+            ctx.launch_policy.enabled_tools,
+        );
+    }
     if (ctx.launch_policy.system_prompt) |system_prompt| {
         ctx.cfg.prompt_policy.system_prompt = system_prompt;
     }
-    ctx.deps.tool_set = ctx.launch_policy.toolSetOr(ctx.deps.tool_set);
+    if (ctx.narrowed_tools) |*tools| ctx.deps.tool_set = tools.view();
     if (options.save_session) {
         _ = try ctx.session.initializeProfileUsage(alloc, io_mod.getenv("HOME"));
         ctx.session.attachProfileUsagePublisher(alloc);
