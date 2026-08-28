@@ -38,6 +38,7 @@ const mcp_elicitation = @import("../mcp/elicitation.zig");
 const mcp_access_policy = @import("../mcp/access_policy.zig");
 const mcp_model_catalog = @import("../mcp/model_catalog.zig");
 const mcp_runtime = @import("../mcp/mcp_runtime.zig");
+const mcp_contract = @import("../mcp/mcp_contract.zig");
 const mode_registry = @import("../modes/mode_registry.zig");
 const permission_auto_classifier = @import("../permissions/auto_classifier.zig");
 const prompt_policy = @import("../config/prompt_policy.zig");
@@ -287,6 +288,7 @@ fn runAskChild(
 pub const PromptRunResult = struct {
     exit_code: u8,
     assistant_output: []u8,
+    final_output: []u8 = &.{},
     interrupted: bool = false,
     model: []u8 = &.{},
     session_id: []u8 = &.{},
@@ -299,6 +301,7 @@ pub const PromptRunResult = struct {
 
     pub fn deinit(self: PromptRunResult, alloc: Allocator) void {
         alloc.free(self.assistant_output);
+        if (self.final_output.len > 0) alloc.free(self.final_output);
         if (self.model.len > 0) alloc.free(self.model);
         if (self.session_id.len > 0) alloc.free(self.session_id);
         freeToolCallRecords(alloc, self.tool_calls);
@@ -559,6 +562,7 @@ const AskContext = struct {
     raw_has_output: bool = false,
     command_output_line_open: bool = false,
     assistant_output: std.ArrayList(u8) = .empty,
+    final_output: std.ArrayList(u8) = .empty,
     tool_call_records: std.ArrayList(ToolCallRecord) = .empty,
     tool_call_records_mutex: std.Io.Mutex = .init,
     web_search_progress_mutex: std.Io.Mutex = .init,
@@ -727,6 +731,7 @@ const AskContext = struct {
             self.alloc.free(path);
         }
         self.assistant_output.deinit(self.alloc);
+        self.final_output.deinit(self.alloc);
         for (self.pending_tool_progress.items) |progress| progress.deinit(self.alloc);
         self.pending_tool_progress.deinit(self.alloc);
         for (self.deferred_tool_progress.items) |progress| self.alloc.free(progress);
@@ -1626,8 +1631,34 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     }
 
     try ctx.checkCancellation();
-    ctx.mcp = try options.deps.load_mcp_runtime(alloc, ctx.mcp_elicitation_capabilities);
-    if (ctx.mcp) |mcp| mcp.connectRequiredForAsk(ctx.toolRegistry());
+    ctx.mcp = try options.deps.load_mcp_runtime(
+        alloc,
+        startup.workspace_root,
+        ctx.mcp_elicitation_capabilities,
+    );
+    if (ctx.mcp) |mcp| {
+        var health_snapshot = try mcp.snapshotHealth(
+            alloc,
+            @intCast(@max(io_mod.milliTimestamp(), 0)),
+        );
+        defer health_snapshot.deinit(alloc);
+        for (health_snapshot.configuration_issues) |issue| {
+            try ctx.writeStderr("fx ask: ");
+            try ctx.writeStderr(issue.message);
+            try ctx.writeStderr("\n");
+        }
+        const project_names = try mcp.pendingWorkspaceNames(alloc);
+        defer mcp_contract.freeOwnedStrings(alloc, project_names);
+        if (project_names.len > 0) {
+            try ctx.writeStderr("fx ask: skipped unapproved project MCP servers: ");
+            for (project_names, 0..) |name, index| {
+                if (index > 0) try ctx.writeStderr(", ");
+                try ctx.writeStderr(name);
+            }
+            try ctx.writeStderr(". Approve with fx mcp trust approve <name> before retrying.\n");
+        }
+        mcp.connectRequiredForAsk(ctx.toolRegistry());
+    }
     try ctx.checkCancellation();
     if (ctx.mcp) |mcp| {
         if (try mcp.requiredStartupFailure(
@@ -1784,6 +1815,11 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
 fn takePromptRunResult(ctx: *AskContext, alloc: Allocator) !PromptRunResult {
     const assistant_output = try alloc.dupe(u8, ctx.assistant_output.items);
     errdefer alloc.free(assistant_output);
+    const final_output: []u8 = if (ctx.final_output.items.len > 0)
+        try alloc.dupe(u8, ctx.final_output.items)
+    else
+        @constCast(&.{});
+    errdefer if (final_output.len > 0) alloc.free(final_output);
     const model = try alloc.dupe(u8, ctx.model);
     errdefer alloc.free(model);
     const session_id = if (ctx.writable) |writable|
@@ -1797,6 +1833,7 @@ fn takePromptRunResult(ctx: *AskContext, alloc: Allocator) !PromptRunResult {
     return .{
         .exit_code = if (ctx.failed) 1 else 0,
         .assistant_output = assistant_output,
+        .final_output = final_output,
         .interrupted = ctx.processInterruptRequested(),
         .model = model,
         .session_id = session_id,
@@ -1886,6 +1923,7 @@ fn agentRuntimeDeps(ctx: *AskContext) agent_runtime.AgentRuntimeDeps {
         .context_registry = ctx.deps.context_registry,
         .context_enabled = ctx.context_enabled,
         .finalize_turn = finalizeTurn,
+        .release_agent_terminal_lease = releaseAgentTerminalLease,
         .prepare_parent_turn_context = prepareParentTurnContext,
         .acknowledge_parent_turn_context = acknowledgeParentTurnContext,
         .append_runtime_context = appendRuntimeContext,
@@ -1927,6 +1965,11 @@ fn agentRuntimeDeps(ctx: *AskContext) agent_runtime.AgentRuntimeDeps {
         .usage = &ctx.session.usage,
         .usage_allocator = ctx.alloc,
     };
+}
+
+fn releaseAgentTerminalLease(raw_ctx: *anyopaque, session_id: []const u8) !void {
+    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    return tool_runtime.release_agent_terminal_lease(ctx.toolContext(), session_id);
 }
 
 fn refreshGatewayCredential(
@@ -2697,11 +2740,21 @@ fn propagateGrant(_: *anyopaque, _: []const u8, _: []const u8) !void {}
 
 fn pushEvent(raw_ctx: *anyopaque, event: WorkerEvent) !void {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    defer worker_runtime.freeWorkerEvent(std.heap.c_allocator, event);
     switch (event) {
         .clear_route_recovery_status => ctx.last_recovery_status = null,
+        .finish_prompt => |finished| {
+            ctx.final_output.clearRetainingCapacity();
+            if (finished.terminal_outcome == .completed) switch (finished.turn) {
+                .assistant => |turn| try ctx.final_output.appendSlice(
+                    ctx.alloc,
+                    turn.assistant,
+                ),
+                .compacted_summary, .background_command, .interrupted => {},
+            };
+        },
         else => {},
     }
-    worker_runtime.freeWorkerEvent(std.heap.c_allocator, event);
 }
 
 fn pushText(raw_ctx: *anyopaque, emission: agent_runtime.TextEmission) !void {
@@ -3509,6 +3562,8 @@ fn renderFinalJsonResult(alloc: Allocator, result: PromptRunResult) ![]u8 {
 
     try out.writer.writeAll("{\"output\":");
     try std.json.Stringify.value(result.assistant_output, .{}, &out.writer);
+    try out.writer.writeAll(",\"final_output\":");
+    try std.json.Stringify.value(result.final_output, .{}, &out.writer);
     try out.writer.print(",\"exit_code\":{d}", .{result.exit_code});
     try out.writer.writeAll(",\"model\":");
     try std.json.Stringify.value(result.model, .{}, &out.writer);
@@ -3594,7 +3649,7 @@ fn renderErrorJsonResult(alloc: Allocator, err_name: []const u8) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
 
-    try out.writer.writeAll("{\"output\":\"\",\"exit_code\":1,\"model\":\"\",\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"error\":");
+    try out.writer.writeAll("{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"error\":");
     try std.json.Stringify.value(err_name, .{}, &out.writer);
     try out.writer.writeAll("}\n");
     return try out.toOwnedSlice();
@@ -3902,6 +3957,23 @@ fn testProcessQueuedPromptRecoveryLifecycle(deps: *const agent_runtime.AgentRunt
     });
     try deps.push_event(deps.ctx, .clear_route_recovery_status);
     try testPushAssistantText(deps, "assistant text");
+}
+
+fn testProcessQueuedPromptRetryAdmissionFailure(deps: *const agent_runtime.AgentRuntimeDeps, semantic_presentation: ?agent_runtime.SemanticPresentationSink, _: agent_runtime.LifecycleContext, _: agent_runtime.Config, _: worker_runtime.QueuedPrompt) !void {
+    try std.testing.expect(semantic_presentation == null);
+    try deps.push_route_recovery_status(deps.ctx, .{
+        .kind = .auto_retry,
+        .failed_attempt = 1,
+        .attempt_limit = 2,
+        .delay_seconds = 4,
+    });
+    try deps.push_route_recovery_status(deps.ctx, .{
+        .kind = .terminal_provider_error,
+        .failed_attempt = 1,
+        .attempt_limit = 2,
+        .diagnostic = types.ModelFailureDiagnostic.init("TestProviderSerializationFailed"),
+    });
+    return error.TestProviderSerializationFailed;
 }
 
 fn testProcessQueuedPromptPartialThenReadFailed(deps: *const agent_runtime.AgentRuntimeDeps, semantic_presentation: ?agent_runtime.SemanticPresentationSink, _: agent_runtime.LifecycleContext, _: agent_runtime.Config, _: worker_runtime.QueuedPrompt) !void {
@@ -4360,7 +4432,7 @@ fn testPresentKeyNoContextStartup(alloc: Allocator, transport: oauth_transport.P
     return state;
 }
 
-fn testNoMcpRuntime(_: Allocator, _: mcp_elicitation.Capabilities) !?*mcp_runtime.McpRuntime {
+fn testNoMcpRuntime(_: Allocator, _: []const u8, _: mcp_elicitation.Capabilities) !?*mcp_runtime.McpRuntime {
     return null;
 }
 
@@ -5186,14 +5258,14 @@ test "stdin prompt errors keep exact structured names" {
     const overflow = try renderErrorJsonResult(alloc, "PromptResourceLimitExceeded");
     defer alloc.free(overflow);
     try std.testing.expectEqualStrings(
-        "{\"output\":\"\",\"exit_code\":1,\"model\":\"\",\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"error\":\"PromptResourceLimitExceeded\"}\n",
+        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"error\":\"PromptResourceLimitExceeded\"}\n",
         overflow,
     );
 
     const read_failure = try renderErrorJsonResult(alloc, "PromptInputReadFailed");
     defer alloc.free(read_failure);
     try std.testing.expectEqualStrings(
-        "{\"output\":\"\",\"exit_code\":1,\"model\":\"\",\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"error\":\"PromptInputReadFailed\"}\n",
+        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"error\":\"PromptInputReadFailed\"}\n",
         read_failure,
     );
 }
@@ -5210,7 +5282,7 @@ test "image preparation failure has stable text and JSON contracts" {
     const json = try renderErrorJsonResult(alloc, @errorName(error.ImagePreparationFailed));
     defer alloc.free(json);
     try std.testing.expectEqualStrings(
-        "{\"output\":\"\",\"exit_code\":1,\"model\":\"\",\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"error\":\"ImagePreparationFailed\"}\n",
+        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"error\":\"ImagePreparationFailed\"}\n",
         json,
     );
 }
@@ -5241,7 +5313,7 @@ test "stdin read failure has distinct text and JSON output contracts" {
         try runWithDeps(alloc, &.{"--json"}, testConfig(), deps),
     );
     try std.testing.expectEqualStrings(
-        "{\"output\":\"\",\"exit_code\":1,\"model\":\"\",\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"error\":\"PromptInputReadFailed\"}\n",
+        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"error\":\"PromptInputReadFailed\"}\n",
         stdout_capture.bytes.items,
     );
     try std.testing.expectEqualStrings("", stderr_capture.bytes.items);
@@ -5498,7 +5570,7 @@ const test_startup_cancellation_context_registry = context_contract.Registry{ .d
     .append_transient_fn = testNoTransientContext,
 } };
 
-fn testLoadMcpRuntimeWithCancellation(_: Allocator, _: mcp_elicitation.Capabilities) !?*mcp_runtime.McpRuntime {
+fn testLoadMcpRuntimeWithCancellation(_: Allocator, _: []const u8, _: mcp_elicitation.Capabilities) !?*mcp_runtime.McpRuntime {
     test_startup_cancellation_mcp_calls += 1;
     if (test_startup_cancellation_stage == .during_mcp_load) {
         requestTestHeadlessInterrupt();
@@ -7922,7 +7994,7 @@ test "render final JSON preserves shape escaping order and newline" {
     defer alloc.free(json);
 
     try std.testing.expectEqualStrings(
-        "{\"output\":\"hello \\\"zig\\\"\\n\",\"exit_code\":0,\"model\":\"model-x\",\"session_id\":\"123\",\"steps\":2,\"tool_calls\":[{\"name\":\"read_file\",\"status\":\"success\"}]}\n",
+        "{\"output\":\"hello \\\"zig\\\"\\n\",\"final_output\":\"\",\"exit_code\":0,\"model\":\"model-x\",\"session_id\":\"123\",\"steps\":2,\"tool_calls\":[{\"name\":\"read_file\",\"status\":\"success\"}]}\n",
         json,
     );
 }
@@ -7939,7 +8011,7 @@ test "render final JSON emits empty tool call array" {
     defer alloc.free(json);
 
     try std.testing.expectEqualStrings(
-        "{\"output\":\"\",\"exit_code\":1,\"model\":\"\",\"session_id\":\"\",\"steps\":0,\"tool_calls\":[]}\n",
+        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"session_id\":\"\",\"steps\":0,\"tool_calls\":[]}\n",
         json,
     );
 }
@@ -8666,7 +8738,7 @@ test "json run with missing API key prints diagnostic then final object" {
     try std.testing.expectEqual(@as(u8, 1), exit_code);
     try std.testing.expectEqualStrings("fx ask: " ++ credentials.missing_credential_message ++ "\n", stderr_capture.bytes.items);
     try std.testing.expectEqualStrings(
-        "{\"output\":\"\",\"exit_code\":1,\"model\":\"\",\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"error\":\"MissingCredentials\"}\n",
+        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"error\":\"MissingCredentials\"}\n",
         stdout_capture.bytes.items,
     );
 }
@@ -8874,8 +8946,8 @@ test "default fx ask preserves project context gathering error mappings" {
         json: ?[]const u8,
     }{
         .{ .err = error.OutOfMemory, .json = null },
-        .{ .err = error.NoSpaceLeft, .json = "{\"output\":\"\",\"exit_code\":1,\"model\":\"\",\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"error\":\"NoSpaceLeft\"}\n" },
-        .{ .err = error.WriteFailed, .json = "{\"output\":\"\",\"exit_code\":1,\"model\":\"\",\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"error\":\"WriteFailed\"}\n" },
+        .{ .err = error.NoSpaceLeft, .json = "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"error\":\"NoSpaceLeft\"}\n" },
+        .{ .err = error.WriteFailed, .json = "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"error\":\"WriteFailed\"}\n" },
     };
 
     for (cases) |case| {
@@ -8928,7 +9000,7 @@ test "quiet suppresses streaming while quiet json captures final output" {
 
     const json_exit = try runWithDeps(alloc, &.{ "--quiet", "--json", "hello" }, testConfig(), testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeyStartup));
     try std.testing.expectEqual(@as(u8, 0), json_exit);
-    try std.testing.expect(std.mem.startsWith(u8, stdout_capture.bytes.items, "{\"output\":\"assistant text\",\"exit_code\":0,\"model\":\"model\",\"session_id\":\""));
+    try std.testing.expect(std.mem.startsWith(u8, stdout_capture.bytes.items, "{\"output\":\"assistant text\",\"final_output\":\"\",\"exit_code\":0,\"model\":\"model\",\"session_id\":\""));
     try std.testing.expect(std.mem.endsWith(u8, stdout_capture.bytes.items, "\",\"steps\":0,\"tool_calls\":[]}\n"));
     try std.testing.expectEqualStrings("", stderr_capture.bytes.items);
 }
@@ -8955,6 +9027,34 @@ test "fx ask JSON recovery keeps stdout structured and reports progress on stder
         "[notice] ⚠ Network interrupted · waiting for connection · attempt 1/10\n",
         stderr_capture.bytes.items,
     );
+}
+
+test "fx ask JSON reports the consumed attempt after retry admission failure" {
+    const alloc = std.testing.allocator;
+    var stdout_capture: TestCapture = .{};
+    defer stdout_capture.deinit(alloc);
+    var stderr_capture: TestCapture = .{};
+    defer stderr_capture.deinit(alloc);
+    const deps = testPromptRunDepsWithProcess(
+        &stdout_capture,
+        &stderr_capture,
+        testProcessQueuedPromptRetryAdmissionFailure,
+    );
+
+    const exit_code = try runWithDeps(alloc, &.{ "--json", "hello" }, testConfig(), deps);
+    try std.testing.expectEqual(@as(u8, 1), exit_code);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, stdout_capture.bytes.items, .{});
+    defer parsed.deinit();
+    const recovery = parsed.value.object.get("recovery").?.object;
+    try std.testing.expectEqualStrings("paused", recovery.get("state").?.string);
+    try std.testing.expectEqual(@as(i64, 1), recovery.get("attempt").?.integer);
+    try std.testing.expectEqual(@as(i64, 0), recovery.get("delay_seconds").?.integer);
+    try std.testing.expectEqualStrings(
+        "TestProviderSerializationFailed",
+        parsed.value.object.get("error").?.string,
+    );
+    try std.testing.expect(std.mem.find(u8, stderr_capture.bytes.items, "retrying request in 4s · attempt 1/2") != null);
+    try std.testing.expect(std.mem.find(u8, stderr_capture.bytes.items, "recovery paused after 1/2 attempts") != null);
 }
 
 test "fx ask JSON preserves partial output on prompt failure" {
@@ -9087,8 +9187,17 @@ test "CLI tagged stream routes source output rendering and diagnostics by mode" 
     try json_deps.push_text(json_deps.ctx, .{ .assistant_rendered = rendered_span });
     for (source_spans) |span| try json_deps.push_text(json_deps.ctx, .{ .assistant_source = span });
     try json_deps.push_text(json_deps.ctx, .{ .operational = "diagnostic\n" });
+    const finished = try types.dupeFinishedPrompt(std.heap.c_allocator, .{
+        .turn = .{ .assistant = .{
+            .user = .{ .text = @constCast("prompt") },
+            .assistant = @constCast("final answer"),
+        } },
+        .terminal_outcome = .completed,
+    });
+    try json_deps.push_event(json_deps.ctx, .{ .finish_prompt = finished });
 
     try std.testing.expectEqualStrings(source_output, json_ctx.assistant_output.items);
+    try std.testing.expectEqualStrings("final answer", json_ctx.final_output.items);
     try std.testing.expectEqualStrings("", json_stdout_capture.bytes.items);
     try std.testing.expectEqualStrings("diagnostic\n", json_stderr_capture.bytes.items);
 
@@ -9099,6 +9208,69 @@ test "CLI tagged stream routes source output rendering and diagnostics by mode" 
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, rendered, .{});
     defer parsed.deinit();
     try std.testing.expectEqualStrings(source_output, parsed.value.object.get("output").?.string);
+    try std.testing.expectEqualStrings("final answer", parsed.value.object.get("final_output").?.string);
+}
+
+test "CLI final output admits only completed assistant finish prompts" {
+    const alloc = std.testing.allocator;
+    var stdout_capture: TestCapture = .{};
+    defer stdout_capture.deinit(alloc);
+    var stderr_capture: TestCapture = .{};
+    defer stderr_capture.deinit(alloc);
+    var ctx = AskContext.init(
+        alloc,
+        testConfig(),
+        testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeyStartup),
+        "/tmp/workspace",
+    );
+    defer ctx.deinit();
+    ctx.output_mode = .json;
+    const deps = agentRuntimeDeps(&ctx);
+
+    const cases = [_]types.FinishedPrompt{
+        .{
+            .turn = .{ .assistant = .{
+                .user = .{ .text = @constCast("prompt") },
+                .assistant = @constCast("failed partial"),
+            } },
+            .terminal_outcome = .failed,
+        },
+        .{
+            .turn = .{ .assistant = .{
+                .user = .{ .text = @constCast("prompt") },
+                .assistant = @constCast("paused partial"),
+            } },
+            .terminal_outcome = .paused,
+        },
+        .{
+            .turn = .{ .interrupted = .{
+                .user = .{ .text = @constCast("prompt") },
+                .assistant = @constCast("interrupted partial"),
+            } },
+            .terminal_outcome = .interrupted,
+        },
+        .{
+            .turn = .{ .background_command = .{
+                .user = .{ .text = @constCast("prompt") },
+                .assistant = @constCast("background partial"),
+                .log_path = @constCast("/tmp/background.log"),
+                .expect_url = false,
+            } },
+            .terminal_outcome = .completed,
+        },
+        .{
+            .turn = .{ .assistant = .{
+                .user = .{ .text = @constCast("prompt") },
+                .assistant = @constCast("unqualified partial"),
+            } },
+        },
+    };
+
+    for (cases) |source| {
+        const owned = try types.dupeFinishedPrompt(std.heap.c_allocator, source);
+        try deps.push_event(deps.ctx, .{ .finish_prompt = owned });
+        try std.testing.expectEqual(@as(usize, 0), ctx.final_output.items.len);
+    }
 }
 
 test "CLI command output completion terminates only an open display line" {

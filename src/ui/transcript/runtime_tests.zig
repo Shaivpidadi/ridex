@@ -7684,8 +7684,8 @@ test "attempt source projections leave transcript runtime and commit state uncha
 
 fn checkPrepareTranscriptSourceAllocationFailures(alloc: Allocator) !void {
     const welcome =
-        "Fx welcome banner line one\n" ++
-        "Fx welcome banner line two\n";
+        "fx welcome banner line one\n" ++
+        "fx welcome banner line two\n";
     const summary = "● 2 command lines folded\n";
     var runtime = TranscriptRuntime{
         .layout = transcriptTestLayout(24, 10, 6),

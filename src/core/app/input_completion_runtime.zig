@@ -33,7 +33,6 @@ const help_menu_presentation = @import("../../ui/footer/help_menu_presentation.z
 const settings_menu_presentation = @import("../../ui/footer/settings_menu_presentation.zig");
 const surface_frame = @import("../../ui/footer/surface_frame.zig");
 const footer_paint_plan = @import("../../ui/footer/paint_plan.zig");
-const catalog_screen_layout = @import("../../ui/catalog_screen_layout.zig");
 
 const ModelPickerStage = picker_state.ModelPickerStage;
 
@@ -365,13 +364,13 @@ pub fn CompletionRuntime(comptime App: type) type {
         }
 
         fn routeNonSlashPickerMove(app: *App, delta: i32) !bool {
-            if (routeSettingsMenuMove(app, delta)) return true;
-            if (routeHelpMenuMove(app, delta)) return true;
-            if (routeModelMenuMove(app, delta)) return true;
+            if (try routeSettingsMenuMove(app, delta)) return true;
+            if (try routeHelpMenuMove(app, delta)) return true;
+            if (try routeModelMenuMove(app, delta)) return true;
             if (routeAuthPickerMove(app, delta)) return true;
             if (try routeSkillsMenuMove(app, delta)) return true;
             if (comptime runtime_profile.allows(App, .durable_sessions)) {
-                if (routeSessionPickerMove(app, delta)) return true;
+                if (try routeSessionPickerMove(app, delta)) return true;
             }
             const stream_suppresses_file_picker = app.stream.active and !queueReviewOwnsComposer(app);
             if (!stream_suppresses_file_picker and hasFileQuery(app)) {
@@ -387,62 +386,51 @@ pub fn CompletionRuntime(comptime App: type) type {
             return false;
         }
 
-        fn routeSettingsMenuMove(app: *App, delta: i32) bool {
+        fn routeSettingsMenuMove(app: *App, delta: i32) !bool {
             const menu = &app.input_runtime.settings_menu;
             if (!menu.active) return false;
-            if (comptime @hasField(App, "model_cache")) {
-                if (app.model_cache.menu.active) {
-                    _ = app.model_cache.menu.moveVisibleItems(delta, 6);
-                    return true;
-                }
-            }
             const snapshot = app_commands.settingsCatalogSnapshot(app);
-            const projection = render_input.settingsMenuProjection(
+            var projection = render_input.settingsMenuProjection(
                 menu,
                 snapshot,
                 app.input_runtime.edit_state.input.items,
             );
-            const scan = ui_input.scanInputCursorVertical(
-                &app.input_runtime,
-                .down,
-                app.shell.layout.cols,
-                app.pending_images.items,
-            );
-            const layout = catalog_screen_layout.screenLayout(
-                app.shell.layout.rows,
-                scan.total_rows,
-                scan.cursor_row,
-            );
+            if (comptime @hasField(App, "model_cache")) {
+                if (app.model_cache.menu.active) {
+                    projection.models = render_input.modelMenuProjection(&app.model_cache);
+                    _ = app.model_cache.menu.moveVisibleItems(
+                        delta,
+                        @max(
+                            settings_menu_presentation.visibleModelItemsForBudget(
+                                projection,
+                                app.shell.layout.cols,
+                                try inlineMenuRowBudget(app, settings_menu_presentation.max_inline_rows),
+                            ),
+                            1,
+                        ),
+                    );
+                    return true;
+                }
+            }
             const visible_items = settings_menu_presentation.visibleNavigationItemsForBudget(
                 projection,
                 app.shell.layout.cols,
-                layout.menu_row_budget,
+                try inlineMenuRowBudget(app, settings_menu_presentation.max_inline_rows),
             );
             return menu.move(&snapshot, app.input_runtime.edit_state.input.items, delta, visible_items);
         }
 
-        fn routeHelpMenuMove(app: *App, delta: i32) bool {
+        fn routeHelpMenuMove(app: *App, delta: i32) !bool {
             if (!app.input_runtime.help_menu.active) return false;
             const projection = render_input.helpMenuProjection(
                 &app.input_runtime.help_menu,
                 app.slashRegistry(),
                 app.input_runtime.edit_state.input.items,
             );
-            const scan = ui_input.scanInputCursorVertical(
-                &app.input_runtime,
-                .down,
-                app.shell.layout.cols,
-                app.pending_images.items,
-            );
-            const layout = catalog_screen_layout.screenLayout(
-                app.shell.layout.rows,
-                scan.total_rows,
-                scan.cursor_row,
-            );
             const visible_items = help_menu_presentation.visibleNavigationItemsForBudget(
                 projection,
                 app.shell.layout.cols,
-                layout.menu_row_budget,
+                try inlineMenuRowBudget(app, help_menu_presentation.max_inline_rows),
             );
             return app.input_runtime.help_menu.move(
                 app.slashRegistry(),
@@ -452,36 +440,24 @@ pub fn CompletionRuntime(comptime App: type) type {
             );
         }
 
-        fn routeModelMenuMove(app: *App, delta: i32) bool {
+        fn routeModelMenuMove(app: *App, delta: i32) !bool {
             if (comptime !@hasField(App, "model_cache")) return false;
             if (!app.model_cache.menu.active) return false;
-            _ = app.model_cache.menu.moveVisibleItems(delta, modelMenuVisibleItems(app));
+            _ = app.model_cache.menu.moveVisibleItems(
+                delta,
+                model_menu_presentation.visibleNavigationItemsForBudget(
+                    render_input.modelMenuProjection(&app.model_cache),
+                    try inlineMenuRowBudget(app, model_menu_presentation.max_inline_rows),
+                ),
+            );
             return true;
         }
 
-        fn modelMenuVisibleItems(app: *App) u16 {
-            const scan = ui_input.scanInputCursorVertical(
-                &app.input_runtime,
-                .down,
-                app.shell.layout.cols,
-                app.pending_images.items,
-            );
-            const layout = catalog_screen_layout.screenLayout(
-                app.shell.layout.rows,
-                scan.total_rows,
-                scan.cursor_row,
-            );
-            return model_menu_presentation.visibleNavigationItemsForBudget(
-                render_input.modelMenuProjection(&app.model_cache),
-                layout.menu_row_budget,
-            );
-        }
-
-        fn routeSessionPickerMove(app: *App, delta: i32) bool {
+        fn routeSessionPickerMove(app: *App, delta: i32) !bool {
             if (comptime !@hasField(App, "session_persistence")) return false;
             if (app.stream.active) return false;
             if (!app.session_persistence.session_picker.active) return false;
-            _ = app_session_runtime.Runtime(App).moveSessionPicker(app, delta, sessionPickerVisibleItems(app));
+            _ = app_session_runtime.Runtime(App).moveSessionPicker(app, delta, try sessionPickerVisibleItems(app));
             return true;
         }
 
@@ -498,14 +474,19 @@ pub fn CompletionRuntime(comptime App: type) type {
 
         fn skillsMenuVisibleRows(app: *App) !u16 {
             const projection = render_input.skillsMenuProjection(&app.skills);
-            const budget = try footerRowBudget(app);
             return skills_menu_presentation.inlineVisibleNavigationRowsForBudget(
                 projection,
-                picker_presentation.inlinePickerRowBudget(
-                    app.shell.layout.rows,
-                    budget.input_extra,
-                    budget.banner_rows,
-                ),
+                try inlineMenuRowBudget(app, input_presentation.max_model_picker_rows + 2),
+            );
+        }
+
+        fn inlineMenuRowBudget(app: *App, max_picker_rows: u16) !u16 {
+            const budget = try footerRowBudget(app);
+            return picker_presentation.inlinePickerRowBudgetCapped(
+                app.shell.layout.rows,
+                budget.input_extra,
+                budget.banner_rows,
+                max_picker_rows,
             );
         }
 
@@ -568,7 +549,7 @@ pub fn CompletionRuntime(comptime App: type) type {
             };
         }
 
-        pub fn syncSessionPickerWindowStart(app: *App) void {
+        pub fn syncSessionPickerWindowStart(app: *App) !void {
             if (comptime !@hasField(App, "session_persistence")) return;
             const picker = &app.session_persistence.session_picker;
             const item_count = picker.navigationItemCount();
@@ -576,22 +557,11 @@ pub fn CompletionRuntime(comptime App: type) type {
                 picker.window_start = 0;
                 return;
             }
-            picker.syncWindowStart(sessionPickerVisibleItems(app));
+            picker.syncWindowStart(try sessionPickerVisibleItems(app));
         }
 
-        fn sessionPickerVisibleItems(app: *App) u16 {
+        fn sessionPickerVisibleItems(app: *App) !u16 {
             const picker = &app.session_persistence.session_picker;
-            const scan = ui_input.scanInputCursorVertical(
-                &app.input_runtime,
-                .down,
-                app.shell.layout.cols,
-                app.pending_images.items,
-            );
-            const layout = catalog_screen_layout.screenLayout(
-                app.shell.layout.rows,
-                scan.total_rows,
-                scan.cursor_row,
-            );
             const projection: render_input.SessionMenuProjection = .{
                 .active = picker.active,
                 .load_state = picker.load_state,
@@ -606,7 +576,7 @@ pub fn CompletionRuntime(comptime App: type) type {
             };
             return resume_menu_presentation.visibleNavigationItemsForBudget(
                 projection,
-                layout.menu_row_budget,
+                try inlineMenuRowBudget(app, resume_menu_presentation.max_inline_rows),
             );
         }
 
@@ -1405,11 +1375,6 @@ const inline_completion_test_slash_specs = [_]command_specs.SlashSpec{
         .kind = .help,
         .command = "/help",
         .help_entry = "/help",
-    },
-    .{
-        .kind = .models,
-        .command = "/models",
-        .help_entry = "/models",
     },
     .{
         .kind = .resume_session,

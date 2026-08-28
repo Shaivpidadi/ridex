@@ -5288,6 +5288,8 @@ pub const TranscriptRuntime = struct {
                 .deferred
             else if (deferred or permission_denied)
                 .denied
+            else if (result.terminal_action_presentation) |presentation|
+                presentation.outcomeKind()
             else if (result.status == .success or
                 (activity_kind == .command and
                     result.command_process_presentation != null))
@@ -5303,6 +5305,7 @@ pub const TranscriptRuntime = struct {
                 .truncated = result.truncated,
                 .command_output_replay = result.command_output_replay,
                 .command_process_presentation = result.command_process_presentation,
+                .terminal_action_presentation = result.terminal_action_presentation,
             },
             command_artifact_handle,
             if (deferred or permission_denied) null else command_output_entry_id,

@@ -3,6 +3,7 @@ const display_width = @import("../../core/shared/display_width.zig");
 const skill_runtime = @import("../../core/skills/skill_runtime.zig");
 const list_window = @import("../../core/shared/list_window.zig");
 const ui_render = @import("../render.zig");
+const picker_presentation = @import("picker_presentation.zig");
 const render_input = @import("render_input.zig");
 const row_text = @import("row_text.zig");
 
@@ -12,7 +13,6 @@ const SkillsMenuProjection = render_input.SkillsMenuProjection;
 const header_rows: u16 = 1;
 const roomy_top_gap_rows: u16 = 1;
 const title_rows: u16 = 1;
-const inline_scope_gap_width: usize = 4;
 // Each skill is a single line now, so there is no separate description row
 // or gap.
 const description_rows: u16 = 0;
@@ -381,7 +381,7 @@ fn composeSkillTitleRow(
     const prefix_width = display_width.visibleWidthIgnoringAnsi(row.items);
     const content_width: usize = @as(usize, width) -| 1;
     const show_scope = if (inline_name_width) |name_col|
-        scope_width > 0 and content_width >= prefix_width + name_col + inline_scope_gap_width + scope_width
+        scope_width > 0 and content_width >= prefix_width + name_col + picker_presentation.inline_picker_column_gap_width + scope_width
     else
         scope_width > 0 and content_width >= prefix_width + 8 + 2 + scope_width;
     const name_budget = if (!show_scope)
@@ -399,7 +399,7 @@ fn composeSkillTitleRow(
 
     if (show_scope) {
         const scope_start = if (inline_name_width) |name_col|
-            prefix_width + name_col + inline_scope_gap_width
+            prefix_width + name_col + picker_presentation.inline_picker_column_gap_width
         else
             content_width - scope_width;
         try row_text.appendSpacesToColumn(alloc, &row, scope_start);
@@ -437,9 +437,9 @@ fn composeEmptyRow(
 
 fn skillSourceScopeLabel(source: skill_runtime.SkillSource) []const u8 {
     return switch (source) {
-        .global_fx => "Fx · Global",
+        .global_fx => "fx · Global",
         .workspace_fx => "fx · Workspace",
-        .workspace_shared => "Fx · Workspace",
+        .workspace_shared => "fx · Workspace",
         .workspace_opencode => "OpenCode · Workspace",
         .global_opencode => "OpenCode · Global",
         .workspace_codex => "Codex · Workspace",

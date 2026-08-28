@@ -495,6 +495,34 @@ pub fn Runtime(comptime App: type) type {
             );
         }
 
+        pub fn releaseAgentTerminalLease(
+            app: *App,
+            session_id: []const u8,
+            ignored_list_entries: []const []const u8,
+            max_list_entries: usize,
+            max_read_file_bytes: usize,
+            max_read_file_lines: usize,
+            max_read_file_line_len: usize,
+            max_command_output_bytes: usize,
+            gateway_retry_count: usize,
+            gateway_chat_url: []const u8,
+        ) !void {
+            return tool_runtime.release_agent_terminal_lease(
+                toolContext(
+                    app,
+                    ignored_list_entries,
+                    max_list_entries,
+                    max_read_file_bytes,
+                    max_read_file_lines,
+                    max_read_file_line_len,
+                    max_command_output_bytes,
+                    gateway_retry_count,
+                    gateway_chat_url,
+                ),
+                session_id,
+            );
+        }
+
         pub fn describeToolAction(
             app: *App,
             arena: Allocator,

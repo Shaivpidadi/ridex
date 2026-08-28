@@ -2085,7 +2085,7 @@ test "auth runtime exposes one current Gateway credential for prompt admission" 
     try std.testing.expectEqual(credentials.Source.fx_login, gateway_credential.source);
 }
 
-test "auth runtime withholds an Fx credential across its expiry boundary" {
+test "auth runtime withholds an fx credential across its expiry boundary" {
     const alloc = std.testing.allocator;
     var runtime: Runtime = .{};
     defer runtime.deinit(alloc);

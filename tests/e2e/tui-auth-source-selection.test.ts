@@ -1221,7 +1221,8 @@ tmuxTest(
       "model_source=Codex subscription",
       TIMEOUT,
     );
-    await session.sendText("/model");
+    await session.sendLiteralText("/model");
+    await session.sendKeys("Tab");
     const picker = await session.waitForPane(
       (pane) =>
         pane.includes("gpt-5.6-sol") &&
@@ -1265,8 +1266,8 @@ tmuxTest(
         `Bearer ${chatgptOauth.accessToken}`,
       );
     }
-    await session.sendText("/models");
-    await session.waitForPane(
+    await session.sendText("/model");
+    const codexCatalog = await session.waitForPane(
       (pane) =>
         pane.includes("Models") &&
         pane.includes("gpt-5.6-sol") &&
@@ -1274,6 +1275,10 @@ tmuxTest(
         !pane.includes("openai/gpt-5.6-sol"),
       TIMEOUT,
     );
+    expect(codexCatalog).toContain("[All]");
+    for (const vendor of ["Anthropic", "OpenAI", "xAI", "Z.AI", "Others"]) {
+      expect(codexCatalog).not.toContain(vendor);
+    }
     await session.sendKeys("Escape");
     await session.waitForPane((pane) => !pane.includes("Esc Close"), TIMEOUT);
     await session.waitForComposer(TIMEOUT);
@@ -2044,7 +2049,7 @@ tmuxTest(
     await session.waitForText("Signed in to Vercel", TIMEOUT);
     await waitForModelRequestCount(gateway, 3);
 
-    await session.sendText("/models");
+    await session.sendText("/model");
     await session.waitForPane(
       (pane) =>
         pane.includes("private/blue-hornbill") &&
@@ -2572,6 +2577,17 @@ tmuxTest(
       await session.sendKeys("Down");
       await session.sendKeys("Enter");
       await session.waitForText("Switched to Grok subscription with grok-4.20.", TIMEOUT);
+      await session.sendText("/model");
+      const grokCatalog = await session.waitForPane(
+        (pane) => pane.includes("Models") && pane.includes("grok-4.20"),
+        TIMEOUT,
+      );
+      expect(grokCatalog).toContain("[All]");
+      for (const vendor of ["Anthropic", "OpenAI", "xAI", "Z.AI", "Others"]) {
+        expect(grokCatalog).not.toContain(vendor);
+      }
+      await session.sendKeys("Escape");
+      await session.waitForComposer(TIMEOUT);
       const settingsPath = join(home, ".fx", "settings.json");
       const persistenceDeadline = Date.now() + TIMEOUT;
       let saved: { provider: string; models: { grok: string } } | undefined;
@@ -3422,7 +3438,7 @@ tmuxTest(
     await session.sendText(" preserve this exact prompt");
     const blocked = await session.waitForPane(
       (pane) =>
-        pane.includes("Fx needs access to Vercel AI Gateway") &&
+        pane.includes("fx needs access to Vercel AI Gateway") &&
         pane.includes("preserve this exact prompt") &&
         pane.includes("Image 1"),
       TIMEOUT,
@@ -3835,7 +3851,7 @@ tmuxTest(
     expect(gateway.requests[0].headers.get("authorization")).toBe(`Bearer ${ACQUIRED_LOGIN_TOKEN}`);
     expect(gateway.requests[0].headers.get("x-vercel-ai-gateway-team")).toBe("team_123");
 
-    await session.sendText("/models");
+    await session.sendText("/model");
     await session.waitForPane(
       (pane) =>
         pane.includes("private/blue-hornbill") &&
@@ -3896,7 +3912,7 @@ tmuxTest(
     expect(gateway.modelRequests[0].headers.get("authorization")).toBeNull();
     expect(gateway.modelRequests[0].headers.get("x-vercel-ai-gateway-team")).toBeNull();
 
-    await session.sendText("/models");
+    await session.sendText("/model");
     await session.waitForPane(
       (pane) =>
         pane.includes(FAKE_GATEWAY_MODEL) &&
@@ -3914,7 +3930,7 @@ tmuxTest(
 );
 
 tmuxTest(
-  "ready team catalog downgrades after Fx login expiry and refresh failure",
+  "ready team catalog downgrades after fx login expiry and refresh failure",
   async () => {
     home = mkdtempSync(join(tmpdir(), "fx-tui-auth-ready-catalog-expiry-"));
     stderrPath = join(home, "stderr.log");
@@ -3955,7 +3971,7 @@ tmuxTest(
     expect(new URL(gateway.modelRequests[0].url).searchParams.get("teamId")).toBe("team_123");
 
     await Bun.sleep(6_000);
-    await session.sendText("/models");
+    await session.sendText("/model");
     await waitForModelRequestCount(gateway, 2);
     const expiredPane = await session.waitForPane(
       (pane) =>
@@ -3991,7 +4007,7 @@ tmuxTest(
       TIMEOUT,
     );
     await session.sendKeys("C-u");
-    await session.sendText("/models");
+    await session.sendText("/model");
     const failedPane = await session.waitForPane(
       (pane) =>
         pane.includes(FAKE_GATEWAY_MODEL) &&
@@ -4069,7 +4085,7 @@ tmuxTest(
       TIMEOUT,
     );
     await session.sendKeys("C-u");
-    await session.sendText("/models");
+    await session.sendText("/model");
     await session.waitForPane(
       (pane) =>
         pane.includes("Vercel sign-in refresh failed; using the public model catalog.") &&
@@ -4243,7 +4259,7 @@ tmuxTest(
     await session.waitForComposer(TIMEOUT);
     await waitForModelRequestCount(gateway, 1);
 
-    await session.sendText("/models");
+    await session.sendText("/model");
     const pane = await session.waitForPane(
       (text) =>
         text.includes(FAKE_GATEWAY_MODEL) &&
@@ -4282,7 +4298,7 @@ tmuxTest(
     await session.waitForComposer(TIMEOUT);
     await waitForModelRequestCount(gateway, 2);
 
-    await session.sendText("/models");
+    await session.sendText("/model");
     const pane = await session.waitForPane(
       (text) =>
         text.includes(FAKE_GATEWAY_MODEL) &&
@@ -4339,7 +4355,7 @@ for (const scenario of [
       await session.waitForComposer(TIMEOUT);
       await waitForModelRequestCount(gateway, scenario.authenticated ? 2 : 1);
 
-      await session.sendText("/models");
+      await session.sendText("/model");
       const pane = await session.waitForPane(
         (text) => text.includes("No models available.") && text.includes(scenario.status),
         TIMEOUT,

@@ -61,6 +61,7 @@ const tool_mcp_registry = @import("tool_mcp_registry.zig");
 const tool_mcp_runtime = @import("tool_mcp_runtime.zig");
 const tool_mcp_feature_dispatch = @import("tool_mcp_feature_dispatch.zig");
 const tool_presentation = @import("tool_presentation.zig");
+const terminal_impl = @import("../../tools/terminal/terminal.zig");
 const web_fetch_runtime = @import("web_fetch_runtime.zig");
 const web_search_contract = @import("web_search_contract.zig");
 const web_fetch_artifacts = @import("../session/web_fetch_artifacts.zig");
@@ -200,6 +201,7 @@ pub const Context = struct {
     mcp_call_tool: ?tool_mcp_runtime.CallToolFn = null,
     mcp_search_tools: ?tool_mcp_runtime.SearchToolsFn = null,
     mcp_tool_schema: ?tool_mcp_runtime.ToolSchemaFn = null,
+    expected_mcp_runtime_generation: ?u64 = null,
     mcp_call_feature: ?tool_mcp_runtime.FeatureCallFn = null,
     mcp_access: tool_mcp_runtime.Access = .unrestricted,
     mcp_input_responder: ?tool_mcp_runtime.InputResponder = null,
@@ -320,16 +322,16 @@ pub fn validateToolCall(ctx: Context, arena: Allocator, call: ToolCall) !tool_co
             .advertised_dynamic_tool_names = ctx.advertised_dynamic_tool_names,
             .runtime = mcpRuntimeCapabilities(ctx),
         }, arena, call.name, call.arguments_json)) {
-            .valid => .valid,
+            .valid => |generation| .{ .valid = .{ .mcp_runtime_generation = generation } },
             .invalid => |reason| .{ .failure = reason },
             .not_available => .not_registered,
         };
     };
     switch (spec.executor_kind) {
         // Preserve execution-time argument failures for MCP control tool calls.
-        .mcp_search_tools, .mcp_select_tool, .mcp_features => return .valid,
+        .mcp_search_tools, .mcp_select_tool, .mcp_features => return .{ .valid = .{} },
         // File mutation arguments are decoded once by shared permission preflight.
-        .write_file, .edit_file => return .valid,
+        .write_file, .edit_file => return .{ .valid = .{} },
         else => {},
     }
 
@@ -337,7 +339,7 @@ pub fn validateToolCall(ctx: Context, arena: Allocator, call: ToolCall) !tool_co
     dispatch_ctx.captured_command_host = spec.captured_command_host;
     return switch (try tool_dispatch.validateRegisteredToolCall(dispatch_ctx, ctx.tool_registry, call)) {
         .not_registered => .not_registered,
-        .valid => .valid,
+        .valid => .{ .valid = .{} },
         .failure => |reason| .{ .failure = reason },
     };
 }
@@ -386,6 +388,7 @@ pub fn executeToolCallAuthorized(
             request.advertised_dynamic_tool_names;
     }
     execution_ctx.max_tool_result_bytes = request.max_tool_result_bytes;
+    execution_ctx.expected_mcp_runtime_generation = request.expected_mcp_runtime_generation;
     execution_ctx.current_turn_messages = request.current_turn_messages;
     execution_ctx.output_chunk_lifecycle_id = request.lifecycle_id;
     execution_ctx.command_timeout_started_ms = request.command_timeout_started_ms;
@@ -675,6 +678,7 @@ fn executeRegisteredTool(
     var dispatch_ctx = typedDispatchContextForCall(ctx, arena, call);
     dispatch_ctx.execution_authority = authority;
     dispatch_ctx.mcp_call_options = .{
+        .expected_runtime_generation = ctx.expected_mcp_runtime_generation,
         .cancel_flag = dispatch_ctx.cancel_flag,
         .progress = .{
             .context = @ptrCast(&mcp_progress_bridge),
@@ -914,6 +918,24 @@ fn typedDispatchContext(ctx: Context, arena: Allocator) tool_dispatch.DispatchCo
         else
             ctx.permission_rules,
     };
+}
+
+fn terminal_lease_cleanup_dispatch_context(
+    ctx: Context,
+    arena: Allocator,
+) tool_dispatch.DispatchContext {
+    var dispatch = typedDispatchContext(ctx, arena);
+    dispatch.cancel_flag = null;
+    return dispatch;
+}
+
+pub fn release_agent_terminal_lease(ctx: Context, session_id: []const u8) !void {
+    var arena_state = std.heap.ArenaAllocator.init(ctx.session_allocator);
+    defer arena_state.deinit();
+    return terminal_impl.release_agent_write_lease(
+        terminal_lease_cleanup_dispatch_context(ctx, arena_state.allocator()),
+        session_id,
+    );
 }
 
 fn requestQuestionBatchWithWorker(
@@ -1658,6 +1680,7 @@ fn commandProcessPresentation(
         .foreground => |value| value,
         .background => return null,
     };
+    if (foreground.timed_out) return .timed_out;
     if (foreground.signal) |signal| return .{ .signal = signal };
     if (foreground.exit_code) |exit_code| {
         if (exit_code != 0) return .{ .exit_code = exit_code };
@@ -3752,6 +3775,20 @@ test "tool runtime explicit cancellation source overrides worker fallback" {
     try std.testing.expect(typedDispatchContext(rt.context(), arena_state.allocator()).cancel_flag.? == &cancel_flag);
 }
 
+test "agent terminal lease cleanup ignores preexisting turn cancellation" {
+    var cancel_flag = std.atomic.Value(bool).init(true);
+    var rt = TestRuntime{ .cancel_flag = &cancel_flag };
+    defer rt.deinit(std.testing.allocator);
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    const cleanup = terminal_lease_cleanup_dispatch_context(
+        rt.context(),
+        arena_state.allocator(),
+    );
+    try std.testing.expect(cleanup.cancel_flag == null);
+}
+
 test "read-only local runtime tools are registered in built-in registry" {
     const cases = [_]struct {
         name: []const u8,
@@ -3802,10 +3839,7 @@ test "tool runtime validates and executes only tools from supplied registry" {
     const list_only_registry = tool_dispatch.Registry{ .tools = &.{test_builtin_tools.list_files} };
     var list_rt = TestRuntime{ .tool_registry = list_only_registry };
     defer list_rt.deinit(alloc);
-    try std.testing.expectEqual(
-        tool_contracts.ToolCallValidationResult.valid,
-        try validateToolCall(list_rt.context(), arena, call),
-    );
+    try std.testing.expect((try validateToolCall(list_rt.context(), arena, call)) == .valid);
 }
 
 fn registryOwnedWebFetchCall(
@@ -4468,14 +4502,11 @@ test "validateToolCall preserves the registered captured command host" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
 
-    try std.testing.expectEqual(
-        tool_contracts.ToolCallValidationResult.valid,
-        try validateToolCall(rt.context(), arena_state.allocator(), .{
-            .id = "workspace-terminal",
-            .name = "terminal",
-            .arguments_json = "{\"action\":\"exec\",\"command\":\"printf ok\"}",
-        }),
-    );
+    try std.testing.expect((try validateToolCall(rt.context(), arena_state.allocator(), .{
+        .id = "workspace-terminal",
+        .name = "terminal",
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"printf ok\"}",
+    })) == .valid);
 }
 
 test "validateToolCall rejects selected MCP arguments through runtime capability" {
@@ -4498,6 +4529,19 @@ test "validateToolCall rejects selected MCP arguments through runtime capability
     });
     try std.testing.expect(invalid == .failure);
     try std.testing.expectEqualStrings("path must be a string", invalid.failure);
+
+    const valid = try validateToolCall(rt.context(), arena_state.allocator(), .{
+        .id = "mcp-valid",
+        .name = "mcp_fs_read",
+        .arguments_json = "{\"path\":\"README.md\"}",
+    });
+    switch (valid) {
+        .valid => |witness| try std.testing.expectEqual(
+            @as(?u64, 41),
+            witness.mcp_runtime_generation,
+        ),
+        .not_registered, .failure => return error.TestUnexpectedResult,
+    }
 }
 
 test "checkToolAvailability rejects missing web_search runtime without catalog or network work" {
@@ -6308,6 +6352,65 @@ test "saved noninteractive terminal exec captures replay by capability" {
     );
 }
 
+test "registered read_tool_result restores an omitted stored-result suffix" {
+    const result_store = @import("../session/result_store.zig");
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(
+        io_mod.getIo(),
+        "session",
+        std.Io.File.Permissions.fromMode(0o700),
+    );
+    var session_dir = try tmp.dir.openDir(io_mod.getIo(), "session", .{
+        .iterate = true,
+        .follow_symlinks = false,
+    });
+    defer session_dir.close(io_mod.getIo());
+    const session_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "session");
+    defer alloc.free(session_path);
+    var capability = try session_child_store.SessionChildCapability.initForTesting(
+        alloc,
+        session_dir,
+        session_path,
+        .writable,
+        .{},
+    );
+    defer capability.deinit();
+
+    const handle = try result_store.storeLargeResultManaged(
+        alloc,
+        &capability,
+        "integration-call",
+        "web_fetch",
+        "integration suffix needle",
+    );
+    defer alloc.free(handle);
+    try std.testing.expect(std.mem.endsWith(u8, handle, ".txt"));
+    const suffixless_handle = handle[0 .. handle.len - ".txt".len];
+
+    var rt = TestRuntime{ .session_child_capability = &capability };
+    defer rt.deinit(alloc);
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const arguments_json = try std.fmt.allocPrint(
+        arena,
+        "{{\"handle\":\"{s}\",\"query\":\"suffix needle\"}}",
+        .{suffixless_handle},
+    );
+
+    const result = try executeToolCall(rt.context(), arena, .{
+        .id = "suffixless-result-read",
+        .name = "read_tool_result",
+        .arguments_json = arguments_json,
+    });
+
+    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.success, result.status);
+    try expectContains(result.model_output, "integration suffix needle");
+    try expectContains(result.model_output, handle);
+}
+
 test "no-save terminal exec publishes one readable ephemeral replay" {
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
 
@@ -6479,7 +6582,13 @@ test "run_command timeout returns model-visible failure" {
     try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, result.status);
     try expectContains(result.model_output, "timeout=true\n");
     try expectContains(result.model_output, "timeout_ms=1000\n");
-    try expectContains(result.model_output, "command timed out and was terminated\n");
+    try expectContains(
+        result.model_output,
+        "cleanup_scope=process_group_and_tracked_descendants\n",
+    );
+    try expectContains(result.model_output, "cleanup_guarantee=best_effort\n");
+    try expectContains(result.model_output, "fully detached descendants may remain\n");
+    try expectNotContains(result.model_output, "command timed out and was terminated");
     try expectNotContains(result.model_output, "PRE-TIMEOUT-OUT");
     try expectNotContains(result.model_output, "PRE-TIMEOUT-ERR");
     const structured = result.command_result_json orelse return error.TestExpectedEqual;
@@ -7386,6 +7495,7 @@ test "configured ask rule prompts the worker" {
 const McpFixture = struct {
     const CountingContext = struct {
         calls: usize = 0,
+        runtime_generation: u64 = 41,
     };
 
     const PermissionContext = struct {
@@ -7397,6 +7507,7 @@ const McpFixture = struct {
         calls: usize = 0,
         admission_generation: u64 = 0,
         action_generation: u64 = 0,
+        expected_runtime_generation: ?u64 = null,
     };
 
     fn hasTrue(_: *anyopaque, _: []const u8, _: tool_mcp_runtime.Access) bool {
@@ -7407,11 +7518,12 @@ const McpFixture = struct {
         return false;
     }
 
-    fn validateArguments(_: *anyopaque, arena: Allocator, _: []const u8, arguments_json: []const u8, _: tool_mcp_runtime.Access) anyerror!tool_mcp_runtime.ValidationResult {
+    fn validateArguments(raw_ctx: *anyopaque, arena: Allocator, _: []const u8, arguments_json: []const u8, _: tool_mcp_runtime.Access) anyerror!tool_mcp_runtime.ValidationResult {
         if (std.mem.eql(u8, arguments_json, "{\"path\":7}")) {
             return .{ .invalid = try arena.dupe(u8, "path must be a string") };
         }
-        return .valid;
+        const ctx: *CountingContext = @ptrCast(@alignCast(raw_ctx));
+        return .{ .valid = ctx.runtime_generation };
     }
 
     fn callOk(_: *anyopaque, arena: Allocator, _: []const u8, _: []const u8, _: usize, _: tool_mcp_runtime.CallOptions) anyerror!?tool_mcp_runtime.CallResult {
@@ -7433,6 +7545,7 @@ const McpFixture = struct {
         ctx.calls += 1;
         ctx.admission_generation = scope.admission_authority_generation;
         ctx.action_generation = scope.action_authority_generation;
+        ctx.expected_runtime_generation = options.expected_runtime_generation;
         return .{ .model_output = try arena.dupe(u8, "mcp ok") };
     }
 
@@ -7666,6 +7779,7 @@ test "MCP execution binds the last live action generation before transport" {
         },
         .advertised_dynamic_tool_names = &integrations,
         .max_tool_result_bytes = rt.max_tool_result_bytes,
+        .expected_mcp_runtime_generation = 73,
     });
     defer alloc.free(result.model_output);
 
@@ -7674,6 +7788,7 @@ test "MCP execution binds the last live action generation before transport" {
     try std.testing.expectEqual(@as(usize, 1), authority.calls);
     try std.testing.expectEqual(@as(u64, 17), authority.admission_generation);
     try std.testing.expectEqual(@as(u64, 41), authority.action_generation);
+    try std.testing.expectEqual(@as(?u64, 73), authority.expected_runtime_generation);
     const original_scope = switch (tool_ctx.mcp_access) {
         .scoped => |scope| scope,
         else => return error.McpScopedAccessExpected,

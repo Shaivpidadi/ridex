@@ -9,6 +9,8 @@ const display_width = @import("../core/shared/display_width.zig");
 const diff_mod = @import("../core/output/diff.zig");
 const io_mod = @import("../core/shared/io.zig");
 const skill_runtime = @import("../core/skills/skill_runtime.zig");
+const usage_report = @import("../core/session/usage_report.zig");
+const workspace_access = @import("../core/workspace/workspace_access.zig");
 const types = @import("../core/shared/types.zig");
 const assistant_presentation = @import("../core/agent/assistant_presentation.zig");
 const builtin_commands = @import("../builtins/commands.zig");
@@ -993,6 +995,118 @@ fn expectGridContains(h: *Harness, needle: []const u8) !void {
         }
     }
     return error.TestExpectedGridText;
+}
+
+test "responsive compact menus stay inline across the VT width matrix" {
+    const alloc = std.testing.allocator;
+    var models: [25]usage_report.ModelUsage = undefined;
+    for (&models) |*model| {
+        model.* = .{
+            .model = @constCast("provider/model"),
+            .totals = .{
+                .total_tokens = 1,
+                .input_tokens = 1,
+                .output_tokens = 0,
+                .cache_read_tokens = 0,
+                .cache_write_tokens = 0,
+                .reasoning_tokens = null,
+                .request_count = 1,
+                .total_cost = 0.0001,
+            },
+        };
+    }
+    const usage_snapshot = usage_report.Snapshot{
+        .scope = .days_30,
+        .snapshot_time_ms = 100,
+        .window_start_ms = 0,
+        .coverage_started_at_ms = 0,
+        .coverage = .full,
+        .completeness = .complete,
+        .totals = .{
+            .total_tokens = 25,
+            .input_tokens = 25,
+            .output_tokens = 0,
+            .cache_read_tokens = 0,
+            .cache_write_tokens = 0,
+            .reasoning_tokens = null,
+            .request_count = 25,
+            .total_cost = 0.0025,
+        },
+        .models = &models,
+    };
+    var entries = [_]workspace_access.Entry{.{
+        .path = @constCast("/workspace/long-additional-directory"),
+        .saved = true,
+        .command_line = false,
+        .available = true,
+        .active = true,
+    }};
+
+    for ([_]u16{ 50, 80, 120, 180 }) |width| {
+        var h = try Harness.init(alloc, width, 36, 4);
+        defer h.deinit();
+        var input = InputRuntime{};
+        defer input.deinit(alloc);
+        var approval = approval_prompt.ApprovalPrompt{};
+        defer approval.deinit(alloc);
+        try h.shell.initViewport(&h.metrics, 1);
+        try h.shell.writeTranscript(
+            alloc,
+            &h.metrics,
+            "compact menu transcript remains visible\n",
+            true,
+        );
+
+        var ctx = defaultFooterContext(&input);
+        ctx.statusline_menu = .{
+            .active = true,
+            .selected_index = 2,
+            .snapshot = .{
+                .statusline_context = false,
+                .statusline_session = true,
+                .statusline_workspace = false,
+            },
+        };
+        try renderTestFooterWithContext(&h, &approval, &h.frame_redraw, ctx);
+        try h.flush();
+        try expectGridContains(&h, "compact menu transcript remains visible");
+        try expectGridContains(&h, "Status line");
+        try expectGridContains(&h, "Workspace");
+
+        ctx.statusline_menu = .{};
+        ctx.usage_menu = .{
+            .active = true,
+            .scope = .days_30,
+            .selected_model = models.len - 1,
+            .model_window_start = models.len - 1,
+            .snapshot = &usage_snapshot,
+        };
+        h.frame_redraw = true;
+        try renderTestFooterWithContext(&h, &approval, &h.frame_redraw, ctx);
+        try h.flush();
+        try expectGridContains(&h, "[30 days]");
+        try std.testing.expectEqual(
+            @as(usize, 20),
+            try countGridOccurrences(&h, "provider/model"),
+        );
+
+        ctx.usage_menu = .{};
+        ctx.workspace_menu = .{
+            .active = true,
+            .selected_row = 1,
+            .primary_directory = "/workspace",
+            .entries = &entries,
+        };
+        h.frame_redraw = true;
+        try renderTestFooterWithContext(&h, &approval, &h.frame_redraw, ctx);
+        try h.flush();
+        try expectGridContains(&h, "Workspace");
+        try expectGridContains(&h, "Additional directories");
+        try std.testing.expectEqual(
+            @as(usize, 0),
+            try countGridOccurrences(&h, "provider/model"),
+        );
+    }
 }
 
 fn expectGridNotContains(h: *Harness, needle: []const u8) !void {
@@ -2370,7 +2484,7 @@ test "thinking shimmer reserves assistant-gap rows and clears back to stable foo
     try std.testing.expectEqual(footer_idle, footer_after);
 }
 
-test "completed presentation tail keeps thinking slot until turn summary" {
+test "completed presentation tail keeps activity slot until turn summary" {
     var h = try Harness.init(std.testing.allocator, 80, 22, 4);
     defer h.deinit();
 
@@ -2405,11 +2519,9 @@ test "completed presentation tail keeps thinking slot until turn summary" {
     try h.flush();
 
     const assistant_row = try findRowContaining(&h, "assistant starts here");
-    const thinking_after_provider_finish = try findRowContaining(&h, "Thinking");
-    try std.testing.expect(thinking_after_provider_finish > thinking_row);
-    try expectExactlyOneBlankRowBetween(&h, assistant_row, thinking_after_provider_finish);
-    const footer_after_assistant = try findFirstDividerRowAfter(&h, thinking_after_provider_finish);
-    try expectExactlyOneBlankRowBetween(&h, thinking_after_provider_finish, footer_after_assistant);
+    try expectGridNotContains(&h, "Thinking");
+    const footer_after_assistant = try findFirstDividerRowAfter(&h, assistant_row);
+    try expectOnlyBlankRowsBetween(&h, assistant_row, footer_after_assistant);
 
     _ = try h.shell.appendTurnSummaryEntry(h.alloc, .{
         .thinking_duration_ms = 1_000,
@@ -3436,6 +3548,92 @@ test "closed tool group finality flows through fixed point resolution and sealin
     try std.testing.expect(released.history_visual_offset > held.history_visual_offset);
     try std.testing.expect(released.visual_offset >= released.history_visual_offset);
     try expectGridContains(&h, "SECOND_GROUP_INTRO");
+}
+
+test "completed tool group lets streamed assistant hard lines enter history" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc, 80, 14, 3);
+    defer h.deinit();
+
+    var input = InputRuntime{};
+    defer input.deinit(alloc);
+    var approval = approval_prompt.ApprovalPrompt{};
+    defer approval.deinit(alloc);
+
+    try h.shell.initViewport(&h.metrics, 8);
+    for (0..4) |index| {
+        var line: [32]u8 = undefined;
+        const text = try std.fmt.bufPrint(&line, "startup row {d}\n", .{index});
+        _ = try h.shell.appendRawTranscriptEntry(alloc, text);
+    }
+    try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
+    try h.flush();
+
+    const group = types.ToolPresentationGroupId{ .turn_id = 93, .anchor_step_id = 1 };
+    var call_ids: [18][20]u8 = undefined;
+    for (0..call_ids.len - 1) |index| {
+        const call_id = try std.fmt.bufPrint(
+            &call_ids[index],
+            "answer-a-{d:0>2}",
+            .{index},
+        );
+        try applyCompletedReadForGroupFinalityResizeTest(&h, 93, call_id, group);
+    }
+    const active_call_id = try std.fmt.bufPrint(
+        &call_ids[call_ids.len - 1],
+        "answer-a-{d:0>2}",
+        .{call_ids.len - 1},
+    );
+    const active_id = types.ToolLifecycleId{ .turn_id = 93, .call_id = active_call_id };
+    _ = try h.shell.applyToolLifecycle(alloc, .{ .authoritative_started = .{
+        .id = active_id,
+        .presentation_group_id = group,
+        .reconciles_provisional_call_id = null,
+        .tool_name = "read_file",
+        .activity_kind = .read,
+    } });
+    h.frame_redraw = true;
+    try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
+    try h.flush();
+
+    var held_source = try h.shell.prepareTranscriptSource(alloc, null);
+    defer held_source.deinit(alloc);
+    const held = h.shell.stableTranscriptProjectionForFlow(held_source.bytes) orelse
+        return error.TestExpectedStableTranscript;
+    try std.testing.expect(held.visual_offset > held.history_visual_offset);
+
+    _ = try h.shell.streamAssistantChunk(
+        alloc,
+        &h.metrics,
+        "FINAL_LINE_01\nFINAL_LINE_02\nFINAL_LINE_03\npartial tail",
+    );
+    h.frame_redraw = true;
+    try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
+    try h.flush();
+
+    try std.testing.expectEqual(@as(u16, 0), h.last_frame.planned_scroll_rows);
+    try std.testing.expectEqual(@as(u16, 0), h.last_frame.committed_scroll_rows);
+
+    _ = try h.shell.applyToolLifecycle(alloc, .{ .terminal = .{
+        .id = active_id,
+        .outcome = .{ .kind = .completed, .summary = "Read fixed-point fixture" },
+    } });
+    h.frame_redraw = true;
+    try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
+    try h.flush();
+
+    try std.testing.expect(h.last_frame.planned_scroll_rows > 0);
+    try std.testing.expect(h.last_frame.committed_scroll_rows > 0);
+    try std.testing.expect(h.last_frame.document_append_bytes > 0);
+    try std.testing.expect(h.last_frame.transcript_history_floor_respected);
+    try std.testing.expectEqual(@as(u16, 0), h.last_frame.unplanned_scroll_rows);
+
+    var released_source = try h.shell.prepareTranscriptSource(alloc, null);
+    defer released_source.deinit(alloc);
+    const released = h.shell.stableTranscriptProjectionForFlow(released_source.bytes) orelse
+        return error.TestExpectedStableTranscript;
+    try std.testing.expect(released.history_visual_offset > held.visual_offset);
+    try expectGridContains(&h, "partial tail");
 }
 
 test "hidden auto approval lifecycle reposition adds no compact scroll rows" {
@@ -5686,7 +5884,7 @@ test "slash main page renders header categories selection range and contextual c
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
 
-    try expectGridContains(&h, "Commands 37 · Type to filter");
+    try expectGridContains(&h, "Commands 36 · Type to filter");
     try expectGridContains(&h, "1–6");
     try expectGridContains(&h, "/help");
     try expectGridContains(&h, "General");
@@ -5707,7 +5905,7 @@ test "slash main page renders header categories selection range and contextual c
 
     try expectGridContains(&h, "ask");
     try expectGridContains(&h, "test-model");
-    try expectGridNotContains(&h, "Commands 37");
+    try expectGridNotContains(&h, "Commands 36");
     try expectGridNotContains(&h, "↑↓ Navigate");
 }
 
@@ -5728,7 +5926,7 @@ test "slash main page drops categories and ellipsizes descriptions when narrow" 
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
 
-    try expectGridContains(&h, "Commands 2");
+    try expectGridContains(&h, "Commands 1");
     try expectGridContains(&h, "/model");
     try expectGridContains(&h, "…");
     try expectGridNotContains(&h, "Model");

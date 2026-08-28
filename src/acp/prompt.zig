@@ -982,6 +982,7 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
         .context_registry = ctx.state.cfg.context_registry,
         .context_enabled = ctx.state.context_enabled,
         .finalize_turn = finalizeTurn,
+        .release_agent_terminal_lease = releaseAgentTerminalLease,
         .prepare_parent_turn_context = prepareParentTurnContext,
         .acknowledge_parent_turn_context = acknowledgeParentTurnContext,
         .append_runtime_context = appendRuntimeContext,
@@ -1023,6 +1024,11 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
         .usage = &session.session_rt.usage,
         .usage_allocator = ctx.state.alloc,
     };
+}
+
+fn releaseAgentTerminalLease(raw_ctx: *anyopaque, session_id: []const u8) !void {
+    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    return tool_runtime.release_agent_terminal_lease(ctx.toolContext(), session_id);
 }
 
 fn refreshGatewayCredential(
@@ -1897,8 +1903,8 @@ fn pushRouteRecoveryStatus(
 fn pushText(raw_ctx: *anyopaque, emission: agent_runtime.TextEmission) !void {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     const text = switch (emission) {
-        .assistant_source => return,
-        .assistant_rendered => |text| text,
+        .assistant_source => |text| text,
+        .assistant_rendered => return,
         .operational => |text| text,
     };
     if (text.len == 0) return;
@@ -2198,12 +2204,12 @@ fn formatAcpElicitationMessage(
     return switch (request.mode) {
         .form => std.fmt.allocPrint(
             alloc,
-            "Fx received a form request from MCP server {s}. {s}",
+            "fx received a form request from MCP server {s}. {s}",
             .{ server_name, request.message },
         ),
         .url => std.fmt.allocPrint(
             alloc,
-            "Fx received a URL request from MCP server {s} for host {s}. {s}",
+            "fx received a URL request from MCP server {s} for host {s}. {s}",
             .{ server_name, request.url_host orelse "unknown", request.message },
         ),
         .unknown => error.McpInputRequired,
@@ -3073,20 +3079,29 @@ test "ACP tool notifications preserve UTF-8 for clipped and unsafe output" {
     }
 }
 
-test "ACP stream adapter strips ANSI from agent chunks and suppresses writer failure" {
+test "ACP stream adapter forwards raw Markdown and suppresses rendered duplicates and writer failure" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const alloc = arena_state.allocator();
-    const spans = [_][]const u8{
-        "\x1b[1mbold\x1b[22m and \x1b[3mitalic\x1b[23m\n",
-        "\x1b]8;id=fx-1;https://example.com\x1b\\docs\x1b]8;;\x1b\\\n",
-        "\x1b[2m\xe2\x94\x82 \x1b[22mconst x = **literal**;\n",
+    const source_spans = [_][]const u8{
+        "# Heading\n\n- **bold** item\n",
+        "| A | B |\n| - | - |\n| 1 | 2 |\n",
+        "```zig\nconst x = 1;\n```\n",
+    };
+    const rendered_spans = [_][]const u8{
+        "Heading\n\nbold item\n",
+        "A  B\n1  2\n",
+        "\xe2\x94\x82 const x = 1;\n",
     };
     const expected_spans = [_][]const u8{
-        "bold and italic\n",
-        "[docs](https://example.com)\n",
-        "\xe2\x94\x82 const x = **literal**;\n",
+        source_spans[0],
+        source_spans[1],
+        source_spans[2],
+        "status\n[docs](https://example.com)\n",
     };
+    const operational_span =
+        "\x1b[1mstatus\x1b[22m\n" ++
+        "\x1b]8;id=fx-1;https://example.com\x1b\\docs\x1b]8;;\x1b\\\n";
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -3107,8 +3122,12 @@ test "ACP stream adapter strips ANSI from agent chunks and suppresses writer fai
         };
         const deps = agentRuntimeDeps(&ctx);
 
-        for (spans) |span| try deps.push_text(deps.ctx, .{ .assistant_rendered = span });
-        try deps.push_text(deps.ctx, .{ .assistant_rendered = "" });
+        for (source_spans, rendered_spans) |source, rendered| {
+            try deps.push_text(deps.ctx, .{ .assistant_source = source });
+            try deps.push_text(deps.ctx, .{ .assistant_rendered = rendered });
+        }
+        try deps.push_text(deps.ctx, .{ .assistant_source = "" });
+        try deps.push_text(deps.ctx, .{ .operational = operational_span });
         try capture.sync(io_mod.getIo());
     }
 
@@ -3137,7 +3156,7 @@ test "ACP stream adapter strips ANSI from agent chunks and suppresses writer fai
 
         notification_count += 1;
     }
-    try std.testing.expectEqual(spans.len, notification_count);
+    try std.testing.expectEqual(expected_spans.len, notification_count);
 
     var failed_output = try tmp.dir.createFile(io_mod.getIo(), "acp-stream-failure.jsonl", .{});
     failed_output.close(io_mod.getIo());
@@ -3157,7 +3176,7 @@ test "ACP stream adapter strips ANSI from agent chunks and suppresses writer fai
     try std.testing.expect(writer_failed);
 
     const failed_deps = agentRuntimeDeps(&failed_ctx);
-    try failed_deps.push_text(failed_deps.ctx, .{ .assistant_rendered = "writer failure remains suppressed" });
+    try failed_deps.push_text(failed_deps.ctx, .{ .assistant_source = "writer failure remains suppressed" });
 }
 
 test "ACP auth failure emits a valid detail-free JSON-RPC notification" {

@@ -966,11 +966,15 @@ pub const Runtime = struct {
         return self.main_approval_presented;
     }
 
-    pub fn mainApprovalBinding(self: *const Runtime, prompt_id: u64) ?MainApprovalBinding {
-        if (!self.main_approval_presented) return null;
+    pub fn mainApprovalCardBinding(self: *const Runtime, prompt_id: u64) ?MainApprovalBinding {
         const card = self.main_approval_card orelse return null;
         if (card.prompt_id != prompt_id) return null;
         return .{ .child_id = card.child_id, .approval_id = card.approval_id };
+    }
+
+    pub fn mainApprovalBinding(self: *const Runtime, prompt_id: u64) ?MainApprovalBinding {
+        if (!self.main_approval_presented) return null;
+        return self.mainApprovalCardBinding(prompt_id);
     }
 
     pub fn dismissMainApproval(self: *Runtime) void {
@@ -4997,7 +5001,7 @@ fn paintActions(
     try writeLine(alloc, writer, cols, row, limit, "R Retry queued external work or resume interrupted work");
     switch (projection.cancellationCapability(node.state, node.external_busy)) {
         .available => try writeLine(alloc, writer, cols, row, limit, "C Cancel active/queued work; preserve persistent chat and return idle"),
-        .external_owner => try writeLine(alloc, writer, cols, row, limit, "Cancel unavailable: another Fx process owns this child."),
+        .external_owner => try writeLine(alloc, writer, cols, row, limit, "Cancel unavailable: another fx process owns this child."),
         .inactive => try writeLine(alloc, writer, cols, row, limit, "Cancel unavailable: this child has no active or queued work."),
     }
     try writeLine(alloc, writer, cols, row, limit, "X Close and archive chat (separate from navigation)");
@@ -7004,7 +7008,7 @@ test "external owner makes manager cancellation unavailable" {
     );
     defer alloc.free(rendered);
     try std.testing.expect(std.mem.find(u8, rendered, "Current state: external busy") != null);
-    try std.testing.expect(std.mem.find(u8, rendered, "another Fx process owns this child") != null);
+    try std.testing.expect(std.mem.find(u8, rendered, "another fx process owns this child") != null);
     try std.testing.expect(std.mem.find(u8, rendered, "C cancel") == null);
     try std.testing.expectEqual(Command.none, try runtime.handleByte(alloc, 'c', null));
     try std.testing.expect(runtime.lifecycle_action == null);

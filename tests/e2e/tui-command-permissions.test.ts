@@ -4626,7 +4626,7 @@ describe("effect-aware command permissions", () => {
   );
 
   test.skipIf(!tmuxAvailable())(
-    "interactive Fx advertises and executes the canonical subagent tool",
+    "interactive fx advertises and executes the canonical subagent tool",
     async () => {
       const root = createIsolatedRoot();
       const stderrPath = join(root.root, "interactive-subagent-stderr.log");
@@ -4952,7 +4952,7 @@ describe("effect-aware command permissions", () => {
   );
 
   test.skipIf(!tmuxAvailable())(
-    "interactive Fx delivers periodic child notifications at the next available parent step",
+    "interactive fx delivers periodic child notifications at the next available parent step",
     async () => {
       const root = createIsolatedRoot();
       const stderrPath = join(root.root, "interactive-parent-delivery-stderr.log");
@@ -5105,7 +5105,7 @@ describe("effect-aware command permissions", () => {
   );
 
   test.skipIf(!tmuxAvailable())(
-    "interactive Fx delivers a 64 KiB child message in five bounded projections",
+    "interactive fx delivers a 64 KiB child message in five bounded projections",
     async () => {
       const root = createIsolatedRoot();
       const stderrPath = join(root.root, "interactive-64k-delivery-stderr.log");

@@ -741,7 +741,7 @@ describe("gateway stream lifecycle", () => {
       expect(request.prompt[1]?.role).toBe("system");
       expect(contentText(request.prompt[1]?.content)).toBe(WEB_SEARCH_GUIDANCE);
       expect(toolByName(oracleRequest, "terminal")?.description).toBe(
-        "Run one captured command with a required finite timeout_ms and return its result.",
+        "Run one captured command with a required finite timeout_ms and return its result. Timeout cleanup covers the process group and tracked descendants; fully detached descendant cleanup is best effort on macOS.",
       );
       expect(toolByName(oracleRequest, "skill")?.description).toContain(
         "the task clearly matches one",
@@ -2245,7 +2245,7 @@ describe("gateway stream lifecycle", () => {
           toolCallId: MALFORMED_CALL_ID,
           toolName: MALFORMED_TOOL_NAME,
           output: expect.objectContaining({
-            type: "text",
+            type: "error-text",
             value: expect.stringContaining("tool_execution_failed"),
           }),
         }),
@@ -2855,6 +2855,14 @@ describe("gateway stream lifecycle", () => {
         expect.objectContaining({ input: { request: {} } }),
       );
       expect(historicalResults).toHaveLength(1);
+      expect(historicalResults[0]).toEqual(
+        expect.objectContaining({
+          output: expect.objectContaining({
+            type: "error-text",
+            value: expect.stringContaining("tool_execution_failed"),
+          }),
+        }),
+      );
       expect(gateway.requests[2].body).toContain("tool_execution_failed");
       expect(gateway.requests[2].body).not.toContain(malformedArguments);
       const resumeTrace = readFileSync(resumeTracePath, "utf8");
@@ -2920,6 +2928,157 @@ describe("gateway stream lifecycle", () => {
       );
       expect(result.stderr).not.toContain("SIGKILL");
       expect(readFileSync(outputPath, "utf8")).toBe(`${payload}\n`);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
+  test("indeterminate terminal termination reports one truthful result without replaying effects", async () => {
+    const root = createFixtureRoot("terminal-indeterminate-outcome");
+    const tracePath = join(root.root, "trace.log");
+    const effectPath = join(root.workspace, "command-effect.txt");
+    const callId = "terminal_indeterminate_1";
+    let observedFailure = "";
+    let step = 0;
+    const gateway = startGateway((body) => {
+      switch (step++) {
+        case 0:
+          return fakeGatewayToolCall(callId, "terminal", {
+            action: "exec",
+            command: "printf 'effect\\n' >> command-effect.txt",
+            timeout_ms: 30_000,
+          });
+        case 1:
+          observedFailure = toolResultOutput(body, callId);
+          return fakeGatewayFinalText("Indeterminate command outcome acknowledged without retry.");
+        default:
+          return new Response("unexpected request", { status: 500 });
+      }
+    });
+
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--yolo", "--no-save", "Run the mutation exactly once."],
+        {
+          cwd: root.workspace,
+          env: {
+            ...fixtureEnv(root, gateway, tracePath),
+            FX_COMMAND_TEST_INDETERMINATE_AFTER_EXIT: "1",
+          },
+          timeoutMs: 15_000,
+        },
+      );
+      const json = JSON.parse(result.stdout) as {
+        exit_code: number;
+        output: string;
+        tool_calls: Array<{
+          name: string;
+          status: string;
+          command_result?: { termination_indeterminate?: boolean };
+        }>;
+      };
+
+      expect(result.code).toBe(0);
+      expect(json.exit_code).toBe(0);
+      expect(json.output).toContain("acknowledged without retry");
+      expect(gateway.requestCount()).toBe(2);
+      expect(readFileSync(effectPath, "utf8")).toBe("effect\n");
+      expect(observedFailure).toContain("could not be confirmed");
+      expect(observedFailure).toContain("Do not retry");
+      expect(observedFailure).not.toContain("Unexpected");
+      expect(json.tool_calls).toHaveLength(1);
+      expect(json.tool_calls[0]).toMatchObject({
+        name: "terminal",
+        status: "error",
+        command_result: { termination_indeterminate: true },
+      });
+      expect(readFileSync(tracePath, "utf8")).toContain(
+        "command termination became indeterminate",
+      );
+      expect(result.stderr).not.toContain("Unexpected");
+      expect(result.stderr).not.toContain("error.Unexpected");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
+  test("suffixless stored result handle remains readable", async () => {
+    const root = createFixtureRoot("suffixless-tool-result-handle");
+    const tracePath = join(root.root, "trace.log");
+    const readFileCallId = "suffixless_handle_read_file_1";
+    const readResultCallId = "suffixless_handle_read_result_1";
+    const needle = "E2E_SUFFIX_NEEDLE";
+    const lines = Array.from(
+      { length: 500 },
+      (_, index) => `fixture line ${index.toString().padStart(3, "0")}: ${"x".repeat(72)}`,
+    );
+    lines[300] = needle;
+    writeFileSync(join(root.workspace, "large-result.txt"), `${lines.join("\n")}\n`);
+
+    let step = 0;
+    let canonicalHandle = "";
+    let suffixlessHandle = "";
+    const gateway = startGateway((body) => {
+      switch (step++) {
+        case 0:
+          return fakeGatewayToolCall(readFileCallId, "read_file", {
+            path: "large-result.txt",
+          });
+        case 1: {
+          const output = toolResultOutput(body, readFileCallId);
+          const match = output.match(
+            /<tool_result_handle>([^<]+)<\/tool_result_handle>/,
+          );
+          canonicalHandle = match?.[1] ?? "";
+          expect(canonicalHandle.endsWith(".txt")).toBe(true);
+          suffixlessHandle = canonicalHandle.slice(0, -4);
+          return fakeGatewayToolCall(readResultCallId, "read_tool_result", {
+            handle: suffixlessHandle,
+            query: needle,
+          });
+        }
+        case 2: {
+          const output = toolResultOutput(body, readResultCallId);
+          expect(output).toContain(needle);
+          expect(output).toContain(
+            `<tool_result_query handle="${canonicalHandle}">`,
+          );
+          return fakeGatewayFinalText("Suffixless result handle inspected.");
+        }
+        default:
+          return new Response("unexpected request", { status: 500 });
+      }
+    });
+
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--yolo", "Inspect the retained large result."],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 15_000,
+        },
+      );
+      const json = parseAskJson(result.stdout);
+      const sessionRoot = join(root.home, ".fx", "sessions", json.session_id);
+
+      expect(result.code).toBe(0);
+      expect(json.error).toBeUndefined();
+      expect(json.output).toContain("Suffixless result handle inspected.");
+      expect(gateway.requestCount()).toBe(3);
+      expect(json.tool_calls).toContainEqual({ name: "read_file", status: "success" });
+      expect(json.tool_calls).toContainEqual({
+        name: "read_tool_result",
+        status: "success",
+      });
+      expect(existsSync(join(sessionRoot, "tool-results", canonicalHandle))).toBe(true);
+      const sessionEvents = readFileSync(join(sessionRoot, "events.jsonl"), "utf8");
+      expect(sessionEvents).toContain(suffixlessHandle);
+      expect(sessionEvents).toContain(canonicalHandle);
+      expect(sessionEvents).toContain(needle);
+      expect(result.stderr).not.toContain("ResultHandleNotFound");
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });
@@ -3033,6 +3192,299 @@ describe("gateway stream lifecycle", () => {
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("terminal timeout prevents the default user shell from evaluating trailing statements", async () => {
+    const root = createFixtureRoot("terminal-timeout-stops-trailing-statements");
+    const tracePath = join(root.root, "trace.log");
+    const effectPath = join(root.workspace, "post-timeout-effect.txt");
+    const timeoutCallId = "terminal_timeout_stops_trailing_1";
+    const readCallId = "terminal_timeout_stops_trailing_read_1";
+    const trailingMarker = "POST-TIMEOUT-SHOULD-NOT-RUN";
+    let step = 0;
+    let replayHandle = "";
+    const gateway = startGateway((body) => {
+      switch (step++) {
+        case 0:
+          return fakeGatewayToolCall(timeoutCallId, "terminal", {
+            action: "exec",
+            command: `printf 'PRE-TIMEOUT\n'; sleep 2; printf '${trailingMarker}\n'; printf '${trailingMarker}' > ${JSON.stringify(effectPath)}`,
+            timeout_ms: 500,
+          });
+        case 1: {
+          const timedOut = toolResultOutput(body, timeoutCallId);
+          expect(timedOut).toContain("timeout=true");
+          expect(existsSync(effectPath)).toBe(false);
+          const match = timedOut.match(
+            /<command_output_handle>([^<]+)<\/command_output_handle>/,
+          );
+          replayHandle = match?.[1] ?? "";
+          expect(replayHandle).not.toBe("");
+          return fakeGatewayToolCall(readCallId, "read_tool_result", {
+            handle: replayHandle,
+            query: trailingMarker,
+          });
+        }
+        case 2: {
+          const replay = toolResultOutput(body, readCallId);
+          expect(replay).toContain("(no matches)");
+          expect(replay).not.toContain(`[stdout]\n${trailingMarker}`);
+          return fakeGatewayFinalText("Post-timeout statements were blocked.");
+        }
+        default:
+          return new Response("unexpected request", { status: 500 });
+      }
+    });
+
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--yolo", "--no-save", "Run the strict timeout fixture."],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 15_000,
+        },
+      );
+      const json = parseAskJson(result.stdout);
+
+      expect(result.code).toBe(0);
+      expect(json.output).toContain("Post-timeout statements were blocked.");
+      expect(gateway.requestCount()).toBe(3);
+      expect(existsSync(effectPath)).toBe(false);
+      expect(readFileSync(tracePath, "utf8")).toContain(
+        "command termination requested source=timeout",
+      );
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("terminal timeout reaps a descendant that escapes with setsid", async () => {
+    const root = createFixtureRoot("terminal-timeout-reaps-setsid");
+    const tracePath = join(root.root, "trace.log");
+    const pidPath = join(root.workspace, "escaped-timeout.pid");
+    const timeoutCallId = "terminal_timeout_reaps_setsid_1";
+    const command = [
+      "python3 -c 'import os,time",
+      "pid=os.fork()",
+      "if pid == 0:",
+      " os.setsid()",
+      " null=os.open(\"/dev/null\",os.O_RDWR)",
+      " os.dup2(null,0); os.dup2(null,1); os.dup2(null,2)",
+      ` open(${JSON.stringify(pidPath)},\"w\").write(str(os.getpid()))`,
+      " time.sleep(30)",
+      "else:",
+      " while True: time.sleep(1)'",
+    ].join("\n");
+    let step = 0;
+    let escapedPid: number | null = null;
+    const gateway = startGateway((body) => {
+      switch (step++) {
+        case 0:
+          return fakeGatewayToolCall(timeoutCallId, "terminal", {
+            action: "exec",
+            command,
+            timeout_ms: 2_000,
+          });
+        case 1: {
+          const timedOut = toolResultOutput(body, timeoutCallId);
+          expect(timedOut).toContain("timeout=true");
+          expect(existsSync(pidPath)).toBe(true);
+          escapedPid = Number.parseInt(readFileSync(pidPath, "utf8"), 10);
+          expect(Number.isSafeInteger(escapedPid) && escapedPid > 0).toBe(true);
+          expect(isProcessAlive(escapedPid)).toBe(false);
+          return fakeGatewayFinalText("Escaped descendant was reaped.");
+        }
+        default:
+          return new Response("unexpected request", { status: 500 });
+      }
+    });
+
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--yolo", "--no-save", "Run the setsid timeout fixture."],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 15_000,
+        },
+      );
+      const json = parseAskJson(result.stdout);
+
+      expect(result.code).toBe(0);
+      expect(json.output).toContain("Escaped descendant was reaped.");
+      expect(gateway.requestCount()).toBe(2);
+    } finally {
+      if (escapedPid !== null && isProcessAlive(escapedPid)) {
+        try {
+          process.kill(escapedPid, "SIGKILL");
+        } catch {}
+      }
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("terminal timeout reaps env-cleared Bash double-fork descendants", async () => {
+    const root = createFixtureRoot("terminal-timeout-reaps-env-bash-descendants");
+    const tracePath = join(root.root, "trace.log");
+    const pidPath = join(root.workspace, "escaped-timeout.pids");
+    const effectPath = join(root.workspace, "post-timeout-effect.txt");
+    const scriptPath = join(root.workspace, "spawn-descendants.sh");
+    const timeoutCallId = "terminal_timeout_reaps_env_bash_1";
+    const trailingMarker = "POST_TIMEOUT_BASH_STATEMENT_MUST_NOT_RUN";
+    const descendantCount = 8;
+    const readEscapedPids = (): number[] => {
+      if (!existsSync(pidPath)) return [];
+      return readFileSync(pidPath, "utf8")
+        .trim()
+        .split(/\s+/)
+        .filter(Boolean)
+        .map(Number);
+    };
+    const python = [
+      "import os,sys,time",
+      "pid_path=sys.argv[1]",
+      `count=${descendantCount}`,
+      "for _ in range(count):",
+      " pid=os.fork()",
+      " if pid == 0:",
+      "  os.setsid()",
+      "  grandchild=os.fork()",
+      "  if grandchild > 0: os._exit(0)",
+      "  with open(pid_path, 'a') as output:",
+      "   output.write(str(os.getpid())+'\\n')",
+      "   output.flush()",
+      "  null=os.open('/dev/null',os.O_RDWR)",
+      "  os.dup2(null,0); os.dup2(null,1); os.dup2(null,2)",
+      "  time.sleep(30)",
+      "  os._exit(0)",
+      "while True: time.sleep(1)",
+    ].join("\n");
+    writeFileSync(
+      scriptPath,
+      `#!/bin/bash
+/usr/bin/python3 - ${JSON.stringify(pidPath)} <<'PY'
+${python}
+PY
+printf '%s\\n' ${JSON.stringify(trailingMarker)}
+printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
+`,
+    );
+    chmodSync(scriptPath, 0o700);
+    const command =
+      `/usr/bin/env -i PATH=/usr/bin:/bin /bin/bash ${JSON.stringify(scriptPath)}`;
+    let step = 0;
+    let escapedPids: number[] = [];
+    let timeoutOutput = "";
+    let aliveAtResult: number[] = [];
+    let effectExistedAtResult = false;
+    let gatewayObservationError: unknown;
+    const gateway = startGateway((body) => {
+      switch (step++) {
+        case 0:
+          return fakeGatewayToolCall(timeoutCallId, "terminal", {
+            action: "exec",
+            command,
+            timeout_ms: 2_000,
+          });
+        case 1: {
+          try {
+            timeoutOutput = toolResultOutput(body, timeoutCallId);
+            escapedPids = readEscapedPids();
+            aliveAtResult = escapedPids.filter(isProcessAlive);
+            effectExistedAtResult = existsSync(effectPath);
+          } catch (error) {
+            gatewayObservationError = error;
+          }
+          return fakeGatewayFinalText("Combined timeout cleanup complete.");
+        }
+        default:
+          return new Response("unexpected request", { status: 500 });
+      }
+    });
+
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--yolo", "--no-save", "Run the combined timeout fixture."],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 20_000,
+        },
+      );
+      if (result.code !== 0) {
+        const trace = existsSync(tracePath)
+          ? readFileSync(tracePath, "utf8").slice(-4_000)
+          : "(trace missing)";
+        throw new Error(
+          `fx ask exited ${result.code}; signal=${result.signal}; timed_out=${result.timedOut}; kill_sent=${result.killSent}; elapsed_ms=${result.elapsedMs}; pid=${result.pid}\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}\nprocess_at_timeout:\n${result.processStateAtTimeout}\nprocess_after_close:\n${result.processStateAfterClose}\ntrace:\n${trace}`,
+        );
+      }
+      const json = parseAskJson(result.stdout);
+
+      expect(json.output).toContain("Combined timeout cleanup complete.");
+      expect(gateway.requestCount()).toBe(2);
+      if (gatewayObservationError) throw gatewayObservationError;
+      expect(timeoutOutput).toContain("timeout=true");
+      expect(timeoutOutput).toContain(
+        "cleanup_scope=process_group_and_tracked_descendants",
+      );
+      expect(timeoutOutput).toContain("cleanup_guarantee=best_effort");
+      expect(escapedPids).toHaveLength(descendantCount);
+      expect(new Set(escapedPids).size).toBe(descendantCount);
+      for (const pid of escapedPids) {
+        expect(Number.isSafeInteger(pid) && pid > 0).toBe(true);
+      }
+      expect(aliveAtResult).toEqual([]);
+      expect(effectExistedAtResult).toBe(false);
+      expect(existsSync(effectPath)).toBe(false);
+      expect(timeoutOutput).not.toContain(trailingMarker);
+      expect(readFileSync(tracePath, "utf8")).toContain(
+        "command termination requested source=timeout",
+      );
+
+      const later = await runFx(["help"], {
+        cwd: root.workspace,
+        env: {
+          HOME: root.home,
+          AI_GATEWAY_API_KEY: undefined,
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_E2E_DISABLE_DOTENV: "1",
+        },
+      });
+      expect(later.code).toBe(0);
+      expect(later.stdout).not.toBe("");
+      expect(later.stderr).toBe("");
+    } finally {
+      try {
+        const cleanupPids = [...new Set([...escapedPids, ...readEscapedPids()])]
+          .filter((pid) => Number.isSafeInteger(pid) && pid > 0);
+        for (const pid of cleanupPids) {
+          if (!isProcessAlive(pid)) continue;
+          try {
+            process.kill(pid, "SIGKILL");
+          } catch {}
+        }
+        const cleanupDeadline = Date.now() + 5_000;
+        while (
+          cleanupPids.some(isProcessAlive) &&
+          Date.now() < cleanupDeadline
+        ) {
+          await Bun.sleep(25);
+        }
+        const cleanupSurvivors = cleanupPids.filter(isProcessAlive);
+        if (cleanupSurvivors.length > 0) {
+          throw new Error(
+            `timeout test cleanup left live descendants: ${cleanupSurvivors.join(",")}`,
+          );
+        }
+      } finally {
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
     }
   }, 30_000);
 

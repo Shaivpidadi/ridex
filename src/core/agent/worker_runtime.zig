@@ -520,9 +520,7 @@ pub const WorkerEvent = union(enum) {
     command_output_complete: ?types.ToolLifecycleId,
     tool_lifecycle: types.ToolLifecycleEvent,
     turn_token_update: types.TurnTokenProgress,
-    /// A tool call that publishes no status row of its own began streaming its
-    /// arguments. The turn is working, with nothing to print until it lands.
-    tool_payload_started,
+    turn_phase_update: types.TurnPhaseUpdate,
     diff_block: diff_mod.DiffEntryPayload,
     finish_prompt: types.FinishedPrompt,
     session_grant: types.PermissionGrant,
@@ -2748,7 +2746,7 @@ pub fn dupeWorkerEvent(alloc: std.mem.Allocator, event: WorkerEvent) !WorkerEven
             .tool_lifecycle = try dupeToolLifecycleEvent(alloc, lifecycle),
         },
         .turn_token_update => |update| .{ .turn_token_update = update },
-        .tool_payload_started => .tool_payload_started,
+        .turn_phase_update => |update| .{ .turn_phase_update = update },
         .diff_block => |payload| blk: {
             const preview = try alloc.dupe(u8, payload.preview);
             errdefer alloc.free(preview);
@@ -2970,6 +2968,7 @@ fn dupeToolResultMemory(
         .model_view_covers_full_file = memory.model_view_covers_full_file,
         .command_output_replay = command_output_replay,
         .command_process_presentation = memory.command_process_presentation,
+        .terminal_action_presentation = memory.terminal_action_presentation,
     };
 }
 

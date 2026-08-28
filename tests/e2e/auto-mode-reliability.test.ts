@@ -104,7 +104,11 @@ function cleanCommandCall(command: string, id: string) {
   });
 }
 
-function toolResultText(body: string, toolCallId: string): string {
+function toolResultText(
+  body: string,
+  toolCallId: string,
+  outputType: "text" | "execution-denied" = "text",
+): string {
   const request = JSON.parse(body) as {
     prompt?: Array<{ content?: Array<Record<string, unknown>> }>;
   };
@@ -113,9 +117,10 @@ function toolResultText(body: string, toolCallId: string): string {
     .find((part) => part.type === "tool-result" && part.toolCallId === toolCallId);
   expect(result).toBeDefined();
   const output = result!.output as Record<string, unknown>;
-  expect(output.type).toBe("text");
-  expect(typeof output.value).toBe("string");
-  return output.value as string;
+  expect(output.type).toBe(outputType);
+  const content = outputType === "execution-denied" ? output.reason : output.value;
+  expect(typeof content).toBe("string");
+  return content as string;
 }
 
 function installRecorder(root: IsolatedRoot, name: string, marker: string) {
@@ -353,7 +358,7 @@ describe("lean auto mode reliability", () => {
           (body) => {
             expect(toolResultText(body, "clean_direct_pwd")).toContain("exit_code=0");
             expect(toolResultText(body, "clean_direct_git_status")).toContain("exit_code=0");
-            expect(toolResultText(body, "clean_blocked_reset")).toContain("review_caution");
+            expect(toolResultText(body, "clean_blocked_reset", "execution-denied")).toContain("review_caution");
             return fakeGatewayFinalText("Clean command group complete.");
           },
         ],
@@ -986,7 +991,7 @@ describe("lean auto mode reliability", () => {
             return userCommandCall(rebuildCommand, "injected_rebuild");
           },
           (body) => {
-            expect(toolResultText(body, "injected_rebuild")).toContain("review_caution");
+            expect(toolResultText(body, "injected_rebuild", "execution-denied")).toContain("review_caution");
             expect(body).not.toContain("approval_request_id");
             return commandCall("pwd", "safe_after_injection");
           },

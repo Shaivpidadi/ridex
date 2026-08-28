@@ -187,6 +187,9 @@ const test_tool_registry = tool_dispatch.Registry{ .tools = test_tools[0..] };
 
 fn testExecutionAuthority(call: ToolCall) command_admission.ToolExecutionAuthority {
     if (!std.mem.eql(u8, call.name, "terminal")) return .ordinary;
+    if (std.mem.find(u8, call.arguments_json, "\"action\":\"exec\"") == null) {
+        return .ordinary;
+    }
     return .{ .run_command = .{ .shell_allowed = .{
         .fingerprint = .{
             .command = call.arguments_json,
@@ -204,6 +207,7 @@ pub const FakeCompletion = struct {
     failure_schema: ?[]const u8 = null,
     failure_request_shape: ?[]const u8 = null,
     retry_after_seconds: ?u64 = null,
+    pre_admission_error: ?anyerror = null,
     pre_send_error: ?anyerror = null,
     stream_error: ?anyerror = null,
     stream_error_after_chunks: ?anyerror = null,
@@ -236,6 +240,7 @@ pub const FakeGateway = struct {
     request_models: std.ArrayList([]u8) = .empty,
     request_api_keys: std.ArrayList([]u8) = .empty,
     request_session_ids: std.ArrayList(?[]u8) = .empty,
+    admitted_requests: usize = 0,
     recovery_pause_flag: ?*std.atomic.Value(bool) = null,
 
     pub fn init(alloc: Allocator, completions: []const FakeCompletion) FakeGateway {
@@ -278,7 +283,9 @@ pub const FakeGateway = struct {
         if (self.index >= self.completions.len) return error.TestUnexpectedGatewayRequest;
         const completion = self.completions[self.index];
         self.index += 1;
+        if (completion.pre_admission_error) |err| return err;
         try request.admission.admit();
+        self.admitted_requests += 1;
 
         if (completion.pre_send_error) |err| {
             recordNetworkFailureEvidence(request, err);
@@ -481,6 +488,8 @@ pub const FakeAgentRuntimeDeps = struct {
     context_registry: ?context_contract.Registry = null,
     context_enabled: bool = false,
     root_permission_mode: ?PermissionMode = null,
+    validation_mcp_runtime_generation: ?u64 = null,
+    validation_mcp_tool_name: ?[]const u8 = null,
     execute_mutex: std.Io.Mutex = .init,
     log: std.ArrayList([]u8) = .empty,
     texts: std.ArrayList([]u8) = .empty,
@@ -505,6 +514,7 @@ pub const FakeAgentRuntimeDeps = struct {
     validated_names: std.ArrayList([]u8) = .empty,
     availability_checked_names: std.ArrayList([]u8) = .empty,
     execution_classification_complete: std.ArrayList(bool) = .empty,
+    execution_mcp_runtime_generations: std.ArrayList(?u64) = .empty,
     last_validated_arguments: ?[]u8 = null,
     last_permission_arguments: ?[]u8 = null,
     last_executed_arguments: ?[]u8 = null,
@@ -575,6 +585,9 @@ pub const FakeAgentRuntimeDeps = struct {
     finalized_outcome: ?types.TurnPresentationOutcome = null,
     finalized_disposition: ?types.ProviderCompletionDisposition = null,
     finalization_error: ?anyerror = null,
+    terminal_lease_cleanup_ids: std.ArrayList([]u8) = .empty,
+    terminal_lease_cleanup_errors: []const ?anyerror = &.{},
+    terminal_lease_cleanup_index: usize = 0,
     finish_assistant_text: ?[]u8 = null,
     finish_summary: ?types.TurnSummary = null,
     finish_projection: ?types.FinishedPromptProjection = null,
@@ -651,9 +664,12 @@ pub const FakeAgentRuntimeDeps = struct {
     enable_recovery_checkpoint: bool = false,
     recovery_checkpoints: std.ArrayList(session_codec.RecoveryCheckpoint) = .empty,
     recovery_checkpoint_error: ?anyerror = null,
+    recovery_checkpoint_error_at: ?usize = null,
+    recovery_checkpoint_calls: usize = 0,
     cancel_on_recovery_reservation: ?*std.atomic.Value(bool) = null,
     pause_on_auto_retry_status: bool = false,
     recovery_pause_flag: ?*std.atomic.Value(bool) = null,
+    route_recovery_status_error_attempt: ?usize = null,
 
     pub fn init(alloc: Allocator) FakeAgentRuntimeDeps {
         return .{ .alloc = alloc };
@@ -684,6 +700,7 @@ pub const FakeAgentRuntimeDeps = struct {
         freeStringList(self.alloc, &self.validated_names);
         freeStringList(self.alloc, &self.availability_checked_names);
         self.execution_classification_complete.deinit(self.alloc);
+        self.execution_mcp_runtime_generations.deinit(self.alloc);
         if (self.last_validated_arguments) |value| self.alloc.free(value);
         if (self.last_permission_arguments) |value| self.alloc.free(value);
         if (self.last_executed_arguments) |value| self.alloc.free(value);
@@ -695,6 +712,7 @@ pub const FakeAgentRuntimeDeps = struct {
         freeGrantList(self.alloc, &self.last_frozen_file_grants);
         self.execute_timeout_started_ms.deinit(self.alloc);
         if (self.finish_assistant_text) |value| self.alloc.free(value);
+        freeStringList(self.alloc, &self.terminal_lease_cleanup_ids);
         if (self.history_assistant_text) |value| self.alloc.free(value);
         if (self.background_history_log_path) |value| self.alloc.free(value);
         if (self.background_event_log_path) |value| self.alloc.free(value);
@@ -729,6 +747,7 @@ pub const FakeAgentRuntimeDeps = struct {
             else
                 null,
             .finalize_turn = finalizeTurn,
+            .release_agent_terminal_lease = releaseAgentTerminalLease,
             .prepare_parent_turn_context = prepareParentTurnContext,
             .acknowledge_parent_turn_context = acknowledgeParentTurnContext,
             .append_runtime_context = appendRuntimeContext,
@@ -775,7 +794,14 @@ pub const FakeAgentRuntimeDeps = struct {
         checkpoint: session_codec.RecoveryCheckpoint,
     ) !void {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
-        if (self.recovery_checkpoint_error) |err| return err;
+        self.recovery_checkpoint_calls += 1;
+        if (self.recovery_checkpoint_error) |err| {
+            if (self.recovery_checkpoint_error_at == null or
+                self.recovery_checkpoint_error_at.? == self.recovery_checkpoint_calls)
+            {
+                return err;
+            }
+        }
         try self.recovery_checkpoints.append(
             self.alloc,
             try checkpoint.dupe(self.alloc),
@@ -854,6 +880,19 @@ pub const FakeAgentRuntimeDeps = struct {
         self.finalized_disposition = disposition;
         try self.record("event:turn_finished", .{});
         if (self.finalization_error) |err| return err;
+    }
+
+    fn releaseAgentTerminalLease(raw: *anyopaque, session_id: []const u8) !void {
+        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        try self.terminal_lease_cleanup_ids.append(
+            self.alloc,
+            try self.alloc.dupe(u8, session_id),
+        );
+        const index = self.terminal_lease_cleanup_index;
+        self.terminal_lease_cleanup_index += 1;
+        if (index < self.terminal_lease_cleanup_errors.len) {
+            if (self.terminal_lease_cleanup_errors[index]) |err| return err;
+        }
     }
 
     fn appendStaticContext(raw: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) !void {
@@ -948,7 +987,16 @@ pub const FakeAgentRuntimeDeps = struct {
                 return .{ .failure = try std.fmt.allocPrint(arena, "{s} arguments failed registered-tool validation", .{call.name}) };
             }
         }
-        return .valid;
+        const mcp_runtime_generation = if (self.validation_mcp_tool_name) |name|
+            if (std.mem.eql(u8, name, call.name))
+                self.validation_mcp_runtime_generation
+            else
+                null
+        else
+            null;
+        return .{ .valid = .{
+            .mcp_runtime_generation = mcp_runtime_generation,
+        } };
     }
 
     fn checkToolAvailability(raw: *anyopaque, arena: Allocator, call: ToolCall) !?[]const u8 {
@@ -1305,6 +1353,10 @@ pub const FakeAgentRuntimeDeps = struct {
                 self.alloc,
                 request.classification_complete,
             );
+            try self.execution_mcp_runtime_generations.append(
+                self.alloc,
+                request.expected_mcp_runtime_generation,
+            );
             try self.execute_timeout_started_ms.append(
                 self.alloc,
                 request.command_timeout_started_ms,
@@ -1633,8 +1685,14 @@ pub const FakeAgentRuntimeDeps = struct {
 
     fn routeRecoveryStatus(raw: *anyopaque, status: types.RouteRecoveryStatus) !void {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        if (status.kind == .auto_retry and
+            status.retry_deadline == null and
+            self.route_recovery_status_error_attempt == status.failed_attempt)
+        {
+            return error.TestRouteRecoveryPublicationFailed;
+        }
         try self.route_recovery_statuses.append(self.alloc, status);
-        if (status.kind == .auto_retry) {
+        if (status.kind == .auto_retry and status.retry_deadline != null) {
             if (self.cancel_on_auto_retry_status) |flag| {
                 if (self.cancel_on_auto_retry_attempt == null or
                     self.cancel_on_auto_retry_attempt.? == status.failed_attempt)
@@ -1643,7 +1701,10 @@ pub const FakeAgentRuntimeDeps = struct {
                 }
             }
         }
-        if (self.pause_on_auto_retry_status and status.kind == .auto_retry) {
+        if (self.pause_on_auto_retry_status and
+            status.kind == .auto_retry and
+            status.retry_deadline != null)
+        {
             if (self.recovery_pause_flag) |flag| flag.store(true, .seq_cst);
         }
         var label_buf: [types.RouteRecoveryStatus.label_max_bytes]u8 = undefined;
