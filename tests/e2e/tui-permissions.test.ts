@@ -1679,6 +1679,9 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
       const expectedHash = createHash("sha256").update(content).digest("hex");
       const gateway = startFakeGateway([
         chunkedWriteToolCall("maximum_write", "maximum.txt", content),
+        finalText(
+          "# Objective\nFinish the maximum-size write workflow.\n\n# Completed effects\nmaximum.txt was written once.\n\n# Next action\nReport completion.",
+        ),
         finalText("maximum write complete"),
       ]);
       const { session, stderrPath } = await launch(root, gateway);
@@ -1697,6 +1700,7 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
 
       expect(statSync(target).size).toBe(content.length);
       expect(fileHash(target)).toBe(expectedHash);
+      expect(gateway.requests).toHaveLength(3);
       expectCleanStderr(stderrPath);
     },
     MAXIMUM_WRITE_TIMEOUT + 30_000,
@@ -1710,6 +1714,9 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
       const content = "x".repeat(4 * 1024 * 1024 + 1);
       const gateway = startFakeGateway([
         chunkedWriteToolCall("oversized_write", "oversized.txt", content),
+        finalText(
+          "# Objective\nReport the rejected oversized write.\n\n# Failures\nwrite_file rejected content above the 4 MiB limit.\n\n# Next action\nReport completion without retrying.",
+        ),
         finalText("oversized write complete"),
       ]);
       const { session, stderrPath } = await launch(root, gateway);
@@ -1722,7 +1729,7 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
 
       expect(settled).not.toContain(APPLY_QUESTION);
       expect(existsSync(target)).toBe(false);
-      expect(gateway.requests).toHaveLength(2);
+      expect(gateway.requests).toHaveLength(3);
       expect(gateway.requests[1]!.body).toContain(
         "write_file failed: content exceeds the 4 MiB preparation limit",
       );
