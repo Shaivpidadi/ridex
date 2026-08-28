@@ -263,7 +263,6 @@ const Parser = struct {
         errdefer old_out.deinit();
         var new_out: std.Io.Writer.Allocating = .init(self.alloc);
         errdefer new_out.deinit();
-        var saw_change = false;
         var previous: ?HunkLineKind = null;
 
         while (self.index < self.lines.len) {
@@ -304,12 +303,10 @@ const Parser = struct {
                 },
                 '-' => {
                     try appendPatchLine(&old_out, body);
-                    saw_change = true;
                     previous = .removed;
                 },
                 '+' => {
                     try appendPatchLine(&new_out, body);
-                    saw_change = true;
                     previous = .added;
                 },
                 else => return self.invalid("apply_patch hunk lines require a space, +, or - prefix"),
@@ -317,7 +314,6 @@ const Parser = struct {
             self.index += 1;
         }
 
-        if (!saw_change) return self.invalid("apply_patch hunk must add or remove text");
         const old_text = try old_out.toOwnedSlice();
         errdefer self.alloc.free(old_text);
         if (old_text.len == 0) {
@@ -458,17 +454,11 @@ pub fn call(
                     .content => |content| content,
                     .failure => |reason| return .{ .failure = try std.fmt.allocPrint(
                         ctx.allocator,
-                        "{s} in {s}; re-read it, or use edit_file for one exact replacement",
+                        "{s}; file={s}",
                         .{ reason, update.path },
                     ) },
                 };
-                if (std.mem.eql(u8, before, patched)) {
-                    return .{ .failure = try std.fmt.allocPrint(
-                        ctx.allocator,
-                        "apply_patch failed: {s} would not change",
-                        .{update.path},
-                    ) };
-                }
+                if (std.mem.eql(u8, before, patched) and update.move_to == null) continue;
 
                 if (update.move_to) |move_to| {
                     const destination = resolvePatchPath(arena, ctx.workspace_root, move_to, .create) catch |err| {
@@ -557,6 +547,13 @@ pub fn call(
         }
     }
 
+    if (prepared.items.len == 0) {
+        return .{ .failure = try ctx.allocator.dupe(
+            u8,
+            "PATCH_NO_CHANGE: no effective additions or removals; inspect current files before retrying",
+        ) };
+    }
+
     verifyPreparedState(arena, prepared.items) catch |err| {
         return .{ .failure = try std.fmt.allocPrint(
             ctx.allocator,
@@ -637,6 +634,7 @@ fn applyHunks(
     for (hunks, 0..) |hunk, hunk_index| {
         const old_text = try patchTextForLineEndings(alloc, hunk.old_text, use_crlf);
         const new_text = try patchTextForLineEndings(alloc, hunk.new_text, use_crlf);
+        if (std.mem.eql(u8, old_text, new_text)) continue;
         var matched_old_len = old_text.len;
         var replacement_text = new_text;
         const match_start = if (std.mem.find(u8, current[search_start..], old_text)) |relative|
@@ -648,7 +646,7 @@ fn applyHunks(
         } else {
             return .{ .failure = try std.fmt.allocPrint(
                 alloc,
-                "apply_patch failed: hunk {d} context not found",
+                "PATCH_CONTEXT_MISSING hunk={d}: re-read before another mutation",
                 .{hunk_index + 1},
             ) };
         };
@@ -657,7 +655,7 @@ fn applyHunks(
         {
             return .{ .failure = try std.fmt.allocPrint(
                 alloc,
-                "apply_patch failed: hunk {d} is not at end of file",
+                "PATCH_CONTEXT_MISSING hunk={d}: expected end of file; re-read before another mutation",
                 .{hunk_index + 1},
             ) };
         }
@@ -667,7 +665,7 @@ fn applyHunks(
         {
             return .{ .failure = try std.fmt.allocPrint(
                 alloc,
-                "apply_patch failed: hunk {d} context is not unique; include more unchanged lines",
+                "PATCH_CONTEXT_AMBIGUOUS hunk={d}: retry once with more unchanged surrounding lines",
                 .{hunk_index + 1},
             ) };
         }
@@ -1002,7 +1000,7 @@ test "apply_patch v3 validates every hunk before writing any file" {
     try std.testing.expect(std.mem.find(
         u8,
         result.failure,
-        "hunk 1 context not found in b.txt; re-read it, or use edit_file",
+        "PATCH_CONTEXT_MISSING hunk=1: re-read before another mutation; file=b.txt",
     ) != null);
     const a = try readTestFile(std.testing.allocator, tmp.dir, "a.txt");
     defer std.testing.allocator.free(a);
@@ -1070,6 +1068,52 @@ test "apply_patch v3 preserves a CRLF file" {
     const actual = try readTestFile(std.testing.allocator, tmp.dir, "a.txt");
     defer std.testing.allocator.free(actual);
     try std.testing.expectEqualStrings("one\r\nTWO\r\n", actual);
+}
+
+test "apply_patch v3 ignores context-only hunks when applying real changes" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestFile(tmp.dir, "a.txt", "one\ntwo\n");
+    const root = try workspaceRoot(std.testing.allocator, tmp);
+    defer std.testing.allocator.free(root);
+    const input = try decodeInput(
+        \\{"patch":"*** Begin Patch\n*** Update File: a.txt\n@@\n one\n@@\n-two\n+TWO\n*** End Patch"}
+    );
+    defer input.deinit(std.testing.allocator);
+    const result = try call(.{
+        .allocator = std.testing.allocator,
+        .workspace_root = root,
+    }, input);
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(std.meta.activeTag(result) == .success);
+    const actual = try readTestFile(std.testing.allocator, tmp.dir, "a.txt");
+    defer std.testing.allocator.free(actual);
+    try std.testing.expectEqualStrings("one\nTWO\n", actual);
+}
+
+test "apply_patch v3 reports an entirely context-only patch as no change" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestFile(tmp.dir, "a.txt", "one\n");
+    const root = try workspaceRoot(std.testing.allocator, tmp);
+    defer std.testing.allocator.free(root);
+    const input = try decodeInput(
+        \\{"patch":"*** Begin Patch\n*** Update File: a.txt\n@@\n one\n*** End Patch"}
+    );
+    defer input.deinit(std.testing.allocator);
+    const result = try call(.{
+        .allocator = std.testing.allocator,
+        .workspace_root = root,
+    }, input);
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(std.meta.activeTag(result) == .failure);
+    try std.testing.expectEqualStrings(
+        "PATCH_NO_CHANGE: no effective additions or removals; inspect current files before retrying",
+        result.failure,
+    );
+    const actual = try readTestFile(std.testing.allocator, tmp.dir, "a.txt");
+    defer std.testing.allocator.free(actual);
+    try std.testing.expectEqualStrings("one\n", actual);
 }
 
 test "apply_patch v3 safely matches an unterminated final line" {

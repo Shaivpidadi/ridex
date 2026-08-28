@@ -1230,6 +1230,7 @@ fn appendNotExecutedToolResult(
     completed_tool_names: *std.ArrayList([]u8),
     batch: *runtime_tool_batch.StepBatchState,
     result_kind: []const u8,
+    model_output: []const u8,
 ) !void {
     _ = try provisional_statuses.settleAdmittedCall(
         deps,
@@ -1237,7 +1238,7 @@ fn appendNotExecutedToolResult(
         arena,
         turn_id,
         call,
-        types.deferred_tool_result_output,
+        model_output,
         advertised_dynamic_tool_names,
     );
     debug_trace.eventf(
@@ -1245,7 +1246,7 @@ fn appendNotExecutedToolResult(
         "execution_result",
         step_ctx,
         "call_id={s} name={s} result_kind={s} model_output_bytes={d}",
-        .{ call.id, call.name, result_kind, types.deferred_tool_result_output.len },
+        .{ call.id, call.name, result_kind, model_output.len },
     );
     try runtime_tool_batch.appendToolResultContent(
         arena,
@@ -1253,13 +1254,22 @@ fn appendNotExecutedToolResult(
         completed_tool_names,
         batch,
         call,
-        types.deferred_tool_result_output,
+        model_output,
         null,
         .{
             .increment_total = false,
             .status = .failure,
         },
     );
+}
+
+const mutation_after_failure_output =
+    "Not executed: a prior mutation in this batch failed; inspect current files before retrying";
+
+fn isGuardedFileMutation(tool_name: []const u8) bool {
+    return std.mem.eql(u8, tool_name, "apply_patch") or
+        std.mem.eql(u8, tool_name, "edit_file") or
+        std.mem.eql(u8, tool_name, "write_file");
 }
 
 fn appendContextDeferredToolResult(
@@ -5389,6 +5399,7 @@ fn processQueuedPromptLoop(
         }
 
         var step_batch = runtime_tool_batch.StepBatchState{};
+        var mutation_batch_failed = false;
         terminal_validation_retry.beginBatch();
         malformed_arguments_retry.beginBatch();
         for (effective_tool_calls) |tool_call| {
@@ -5400,6 +5411,24 @@ fn processQueuedPromptLoop(
         for (prepared_tool_calls, 0..) |prepared_tool_call, tool_call_index| {
             if (tool_call_index < parallel_skip_until) continue;
             const tool_call = prepared_tool_call.call();
+            if (mutation_batch_failed and isGuardedFileMutation(tool_call.name)) {
+                try appendNotExecutedToolResult(
+                    deps,
+                    &stream_ctx.provisional_statuses,
+                    stream_ctx.alloc,
+                    arena,
+                    turn_id,
+                    tool_call,
+                    advertised_dynamic_tool_names,
+                    step_ctx,
+                    &within_turn_suffix,
+                    &completed_tool_names,
+                    &step_batch,
+                    "prior_mutation_failed",
+                    mutation_after_failure_output,
+                );
+                continue;
+            }
             const root_live_permission_mode = snapshotRootPermissionMode(deps);
             const root_action_permission_mode = permissionModeForAction(
                 job.permission_mode,
@@ -5899,6 +5928,9 @@ fn processQueuedPromptLoop(
                         prepared.memory,
                         .{ .increment_error = true },
                     );
+                    if (isGuardedFileMutation(tool_call.name)) {
+                        mutation_batch_failed = true;
+                    }
                     continue;
                 },
                 .provider_executed, .ready => {},
@@ -5963,6 +5995,9 @@ fn processQueuedPromptLoop(
                 switch (preparation) {
                     .candidate => {},
                     .terminal => |terminal| {
+                        if (terminal.status == .failure and isGuardedFileMutation(tool_call.name)) {
+                            mutation_batch_failed = true;
+                        }
                         const model_output = try preparedTerminalModelOutput(
                             arena,
                             tool_call,
@@ -6294,6 +6329,9 @@ fn processQueuedPromptLoop(
                         prepared.memory,
                         .{ .increment_error = true },
                     );
+                    if (isGuardedFileMutation(tool_call.name)) {
+                        mutation_batch_failed = true;
+                    }
                     continue;
                 }
                 if (try runtime_tool_admission.toolAvailabilityFailure(deps, arena, tool_call)) |execution| {
@@ -6331,6 +6369,9 @@ fn processQueuedPromptLoop(
                         prepared.memory,
                         .{ .increment_error = true },
                     );
+                    if (isGuardedFileMutation(tool_call.name)) {
+                        mutation_batch_failed = true;
+                    }
                     continue;
                 }
             }
@@ -6407,7 +6448,11 @@ fn processQueuedPromptLoop(
                     &completed_tool_names,
                     &step_batch,
                     "applicable_targets_changed",
+                    types.deferred_tool_result_output,
                 );
+                if (isGuardedFileMutation(tool_call.name)) {
+                    mutation_batch_failed = true;
+                }
                 continue;
             }
             const external_file_action_identity = if (prepared_file_mutation) |prepared|
@@ -6466,6 +6511,7 @@ fn processQueuedPromptLoop(
                             "live_authority_denied"
                         else
                             "live_authority_unavailable",
+                        types.deferred_tool_result_output,
                     );
                     continue;
                 }
@@ -6801,6 +6847,9 @@ fn processQueuedPromptLoop(
                     prepared_failure.model_output,
                     null,
                 );
+                if (isGuardedFileMutation(tool_call.name)) {
+                    mutation_batch_failed = true;
+                }
                 debug_trace.eventf(
                     "tool",
                     "execution_result",
@@ -7183,6 +7232,10 @@ fn processQueuedPromptLoop(
                 replay_handed_off = true;
                 finish_trace.finish("interrupted");
                 return;
+            }
+
+            if (execution.status == .failure and isGuardedFileMutation(tool_call.name)) {
+                mutation_batch_failed = true;
             }
 
             if (execution.status == .success) {
