@@ -12,6 +12,56 @@ const Allocator = std.mem.Allocator;
 const ToolExecutionResult = tool_contracts.ToolExecutionResult;
 
 pub const Foreground = struct {
+    pub fn outputIncompleteFailure(
+        arena: Allocator,
+        result: command_contract.RunCommandResult,
+    ) !?ToolExecutionResult {
+        const command_result = result.command_result orelse return null;
+        const foreground = switch (command_result) {
+            .foreground => |value| value,
+            .background => return null,
+        };
+        if (!foreground.output_incomplete) return null;
+
+        var details: [7]tool_result_errors.Detail = undefined;
+        var count: usize = 0;
+        details[count] = .{ .name = "command", .value = .{ .string = foreground.command } };
+        count += 1;
+        details[count] = .{ .name = "cwd", .value = .{ .string = foreground.cwd } };
+        count += 1;
+        details[count] = .{ .name = "output_incomplete", .value = .{ .boolean = true } };
+        count += 1;
+        if (foreground.exit_code) |code| {
+            details[count] = .{ .name = "exit_code", .value = .{ .integer = code } };
+            count += 1;
+        }
+        if (foreground.signal) |signal| {
+            details[count] = .{ .name = "signal", .value = .{ .unsigned = signal } };
+            count += 1;
+        }
+        if (foreground.termination_indeterminate) {
+            details[count] = .{ .name = "termination_indeterminate", .value = .{ .boolean = true } };
+            count += 1;
+        }
+        if (result.output.len > 0) {
+            details[count] = .{ .name = "partial_output", .value = .{ .string = result.output } };
+            count += 1;
+        }
+
+        const model_output = try tool_result_errors.toolExecutionFailureJson(arena, .{
+            .tool_name = "terminal",
+            .message = "Command started, but its output could not be read completely",
+            .details = details[0..count],
+            .suggestion = "Do not retry the command unchanged because side effects may already exist. Inspect the resulting state and available output first.",
+        });
+        errdefer arena.free(model_output);
+        return .{
+            .status = .failure,
+            .model_output = model_output,
+            .command_result_json = try command_result.toJson(arena),
+        };
+    }
+
     pub fn cancelledFailure(
         arena: Allocator,
         result: command_contract.RunCommandResult,
@@ -372,6 +422,37 @@ fn freeBackgroundCommand(alloc: Allocator, background: command_contract.Backgrou
     alloc.free(background.cwd);
     alloc.free(background.log_path);
     if (background.url) |url| alloc.free(url);
+}
+
+test "command result mapping reports incomplete output with preserved status" {
+    const alloc = std.testing.allocator;
+    const command_result = try command_contract.formatForegroundCommandResult(alloc, .{
+        .command = "printf effect > marker",
+        .cwd = "/tmp/workspace",
+        .status = .{ .exit_code = 0 },
+        .stdout_display = "partial output",
+        .stderr_display = "",
+        .stdout_bytes = 14,
+        .stderr_bytes = 0,
+        .output_incomplete = true,
+    });
+    defer alloc.free(command_result.output);
+
+    const result = try Foreground.outputIncompleteFailure(
+        alloc,
+        command_result,
+    ) orelse return error.TestExpectedEqual;
+    defer alloc.free(result.model_output);
+    defer alloc.free(result.command_result_json.?);
+
+    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, result.status);
+    try expectContains(result.model_output, "Command started, but its output could not be read completely");
+    try expectContains(result.model_output, "\"output_incomplete\":true");
+    try expectContains(result.model_output, "\"exit_code\":0");
+    try expectContains(result.model_output, "\"partial_output\":");
+    try expectContains(result.model_output, "Do not retry");
+    try expectContains(result.command_result_json.?, "\"exit_code\":0");
+    try expectContains(result.command_result_json.?, "\"output_incomplete\":true");
 }
 
 test "command result mapping preserves non-zero stderr envelope and JSON" {

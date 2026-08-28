@@ -24,6 +24,7 @@ pub const ForegroundCommandResult = struct {
     signal: ?u32 = null,
     timed_out: bool = false,
     termination_indeterminate: bool = false,
+    output_incomplete: bool = false,
     duration_ms: ?u64 = null,
     stdout_bytes: usize = 0,
     stderr_bytes: usize = 0,
@@ -84,6 +85,7 @@ pub const ForegroundCommandResultSnapshot = struct {
     stderr_display: []const u8,
     stdout_bytes: usize,
     stderr_bytes: usize,
+    output_incomplete: bool = false,
     duration_ms: ?u64 = null,
 };
 
@@ -104,6 +106,7 @@ pub fn formatForegroundCommandResult(
     defer out.deinit();
 
     try writeForegroundStatusLine(&out.writer, snapshot.status);
+    try writeForegroundOutputCompleteness(&out.writer, snapshot.output_incomplete);
     try writeForegroundOutputEnvelopes(&out.writer, stdout_text, stderr_text);
     const status = projectForegroundStatus(snapshot.status);
 
@@ -115,6 +118,7 @@ pub fn formatForegroundCommandResult(
             .exit_code = status.exit_code,
             .signal = status.signal,
             .termination_indeterminate = status.termination_indeterminate,
+            .output_incomplete = snapshot.output_incomplete,
             .duration_ms = snapshot.duration_ms,
             .stdout_bytes = snapshot.stdout_bytes,
             .stderr_bytes = snapshot.stderr_bytes,
@@ -132,6 +136,14 @@ pub fn writeForegroundStatusLine(writer: *std.Io.Writer, status: ForegroundComma
                 "message=the command was started, but fx could not confirm its final process status; do not retry unchanged because side effects may already exist\n",
         ),
     }
+}
+
+pub fn writeForegroundOutputCompleteness(writer: *std.Io.Writer, output_incomplete: bool) !void {
+    if (!output_incomplete) return;
+    try writer.writeAll(
+        "output_incomplete=true\n" ++
+            "message=the command was started, but fx could not read all of its output; do not retry unchanged because side effects may already exist\n",
+    );
 }
 
 fn writeForegroundOutputEnvelopes(writer: *std.Io.Writer, stdout_text: []const u8, stderr_text: []const u8) !void {
@@ -186,6 +198,9 @@ fn writeForegroundJson(result: ForegroundCommandResult, writer: *std.Io.Writer) 
     try writeBoolField(writer, "timed_out", result.timed_out);
     if (result.termination_indeterminate) {
         try writeBoolField(writer, "termination_indeterminate", true);
+    }
+    if (result.output_incomplete) {
+        try writeBoolField(writer, "output_incomplete", true);
     }
     try writeOptionalIntField(writer, "duration_ms", result.duration_ms);
     try writeIntField(writer, "stdout_bytes", result.stdout_bytes);
@@ -318,5 +333,36 @@ test "foreground result represents indeterminate termination without implying no
         u8,
         json,
         "\"termination_indeterminate\":true",
+    ) != null);
+}
+
+test "foreground result preserves incomplete output with process status" {
+    const result = try formatForegroundCommandResult(std.testing.allocator, .{
+        .command = "printf effect > marker",
+        .cwd = "/tmp",
+        .status = .{ .exit_code = 0 },
+        .stdout_display = "partial output",
+        .stderr_display = "",
+        .stdout_bytes = 14,
+        .stderr_bytes = 0,
+        .output_incomplete = true,
+    });
+    defer std.testing.allocator.free(result.output);
+
+    try std.testing.expect(std.mem.find(
+        u8,
+        result.output,
+        "output_incomplete=true",
+    ) != null);
+    try std.testing.expect(std.mem.find(u8, result.output, "do not retry unchanged") != null);
+    const foreground = result.command_result.?.foreground;
+    try std.testing.expect(foreground.output_incomplete);
+    try std.testing.expectEqual(@as(?i64, 0), foreground.exit_code);
+    const json = try result.command_result.?.toJson(std.testing.allocator);
+    defer std.testing.allocator.free(json);
+    try std.testing.expect(std.mem.find(
+        u8,
+        json,
+        "\"output_incomplete\":true",
     ) != null);
 }

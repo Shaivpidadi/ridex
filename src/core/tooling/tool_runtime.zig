@@ -118,7 +118,7 @@ const terminal_client_runtime = @import("../terminal/client.zig");
 
 test {
     _ = tool_admission;
-    _ = command_result_mapping;
+    _ = @import("command_result_mapping.zig");
     _ = @import("../session/command_replay_store.zig");
     _ = file_mutation_execution;
     _ = tool_presentation;
@@ -1458,6 +1458,18 @@ fn toolRunCommand(
         );
     }
 
+    if (try command_result_mapping.Foreground.outputIncompleteFailure(arena, result)) |incomplete| {
+        return finishCommandToolResult(
+            arena,
+            replay_capture,
+            replay_init.unavailable and
+                (ctx.command_replay_unavailable or replay_callback.had_accepted_output),
+            &replay_transferred,
+            result,
+            incomplete,
+        );
+    }
+
     if (try command_result_mapping.Foreground.nonZeroFailure(arena, result)) |failure| {
         return finishCommandToolResult(
             arena,
@@ -1531,6 +1543,16 @@ fn executeWorkspaceRunCommand(
             &replay_transferred,
             result,
             cancelled,
+        );
+    }
+    if (try command_result_mapping.Foreground.outputIncompleteFailure(arena, result)) |incomplete| {
+        return finishCommandToolResult(
+            arena,
+            null,
+            false,
+            &replay_transferred,
+            result,
+            incomplete,
         );
     }
     if (try command_result_mapping.Foreground.nonZeroFailure(arena, result)) |failure| {
@@ -3621,6 +3643,15 @@ fn expectToolErrorDetailInt(json: []const u8, field: []const u8, expected: i64) 
     const value = details.get(field) orelse return error.TestExpectedEqual;
     try std.testing.expect(value == .integer);
     try std.testing.expectEqual(expected, value.integer);
+}
+
+fn expectToolErrorDetailBool(json: []const u8, field: []const u8, expected: bool) !void {
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+    defer parsed.deinit();
+    const details = parsed.value.object.get("error").?.object.get("details").?.object;
+    const value = details.get(field) orelse return error.TestExpectedEqual;
+    try std.testing.expect(value == .bool);
+    try std.testing.expectEqual(expected, value.bool);
 }
 
 fn writeTestFile(dir: std.Io.Dir, path: []const u8, content: []const u8) !void {
@@ -6560,6 +6591,24 @@ fn fakeWorkspaceTruncated(
     return result;
 }
 
+fn fakeWorkspaceIncomplete(
+    alloc: Allocator,
+    command: []const u8,
+    cwd: []const u8,
+    _: u32,
+) js_host_workspace.ExecuteError!command_contract.RunCommandResult {
+    return command_contract.formatForegroundCommandResult(alloc, .{
+        .command = command,
+        .cwd = cwd,
+        .status = .{ .exit_code = 0 },
+        .stdout_display = "partial",
+        .stderr_display = "",
+        .stdout_bytes = 7,
+        .stderr_bytes = 0,
+        .output_incomplete = true,
+    });
+}
+
 fn fakeWorkspaceCancelled(
     _: Allocator,
     command: []const u8,
@@ -6623,6 +6672,30 @@ test "browser run_command uses only the admitted host executor for nonzero and t
     try expectCommandResultNull(truncated_json, "output_file");
 }
 
+test "browser run_command reports incomplete output with preserved status" {
+    var rt = TestRuntime{
+        .workspace_root = "/virtual/workspace",
+        .tool_registry = test_browser_workspace_tools.registry,
+        .workspace_executor = .{ .execute_fn = fakeWorkspaceIncomplete },
+    };
+    defer rt.deinit(std.testing.allocator);
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    const result = try executeTestRunCommand(rt.context(), arena_state.allocator(), .{
+        .id = "browser-incomplete",
+        .name = "terminal",
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"write effect\"}",
+    });
+    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, result.status);
+    try expectToolErrorDetailBool(result.model_output, "output_incomplete", true);
+    try expectToolErrorDetailInt(result.model_output, "exit_code", 0);
+    try expectContains(result.model_output, "Do not retry");
+    const json = result.command_result_json orelse return error.TestExpectedEqual;
+    try expectCommandResultInt(json, "exit_code", 0);
+    try expectCommandResultBool(json, "output_incomplete", true);
+}
+
 test "browser run_command maps host cancellation and deadline without signal or fallback" {
     var rt = TestRuntime{
         .workspace_root = "/virtual/workspace",
@@ -6659,12 +6732,16 @@ test "browser run_command maps host cancellation and deadline without signal or 
     try expectCommandResultNull(timeout_json, "signal");
 }
 
-test "run_command propagates output callback failure" {
+test "run_command preserves result when presentation callback fails" {
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
 
     const FailOutput = struct {
-        fn write(_: *anyopaque, _: ?types.ToolLifecycleId, _: command_contract.CommandOutputStream, _: []const u8) error{OutOfMemory}!void {
-            return error.OutOfMemory;
+        calls: usize = 0,
+
+        fn write(raw_ctx: *anyopaque, _: ?types.ToolLifecycleId, _: command_contract.CommandOutputStream, _: []const u8) error{Unexpected}!void {
+            const self: *@This() = @ptrCast(@alignCast(raw_ctx));
+            self.calls += 1;
+            return error.Unexpected;
         }
     };
 
@@ -6676,17 +6753,20 @@ test "run_command propagates output callback failure" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
 
+    var presentation = FailOutput{};
     var ctx = rt.context();
-    ctx.output_chunk_ctx = @ptrCast(&rt);
+    ctx.output_chunk_ctx = @ptrCast(&presentation);
     ctx.on_output_chunk = FailOutput.write;
-    try std.testing.expectError(
-        error.OutOfMemory,
-        executeTestRunCommand(ctx, arena_state.allocator(), .{
-            .id = "cmd",
-            .name = "terminal",
-            .arguments_json = "{\"action\":\"exec\",\"command\":\"printf 'handoff\\\\n'\",\"timeout_ms\":600000}",
-        }),
-    );
+    const result = try executeTestRunCommand(ctx, arena_state.allocator(), .{
+        .id = "cmd",
+        .name = "terminal",
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"printf 'handoff\\\\nsecond\\\\n'\",\"timeout_ms\":600000}",
+    });
+    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.success, result.status);
+    try std.testing.expectEqual(@as(usize, 1), presentation.calls);
+    try expectContains(result.model_output, "handoff\nsecond");
+    const structured = result.command_result_json orelse return error.TestExpectedEqual;
+    try expectCommandResultInt(structured, "exit_code", 0);
 }
 
 test "run_command returns model output and structured metadata" {
