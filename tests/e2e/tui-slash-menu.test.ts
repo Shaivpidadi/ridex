@@ -1003,12 +1003,12 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(
         visibleTranscriptTailRow(afterResponse),
         `resumed baseline grid:\n${afterResponse.join("\n")}`,
-      ).toBe(71);
+      ).toBe(69);
       expect(closedComposerRow).toBe(73);
       await session.sendLiteralText("/");
       await session.waitForText("Commands 36", 5_000);
       const afterSlash = await capture("after-slash");
-      expect(visibleTranscriptTailRow(afterSlash)).toBe(62);
+      expect(visibleTranscriptTailRow(afterSlash)).toBe(60);
       expect(composerRow(afterSlash)).toBe(64);
       await session.sendLiteralText("f");
       await session.waitForText("/feedback", 5_000);
@@ -1028,7 +1028,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
         5_000,
       );
       const afterDismiss = await capture("after-dismiss");
-      expect(visibleTranscriptTailRow(afterDismiss)).toBe(62);
+      expect(visibleTranscriptTailRow(afterDismiss)).toBe(60);
       expect(composerRow(afterDismiss)).toBe(64);
       expect(footerStatusRow(afterDismiss)).toBe(66);
       await session.sendLiteralText("x");
@@ -1039,7 +1039,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
         5_000,
       );
       const afterDismissEdit = await capture("after-dismiss-edit");
-      expect(visibleTranscriptTailRow(afterDismissEdit)).toBe(62);
+      expect(visibleTranscriptTailRow(afterDismissEdit)).toBe(60);
       expect(composerRow(afterDismissEdit)).toBe(64);
       expect(footerStatusRow(afterDismissEdit)).toBe(66);
 

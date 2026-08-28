@@ -85,25 +85,6 @@ fn streamedResetRoute(
     return if (source_available) .sequential else .preserve_reflow;
 }
 
-test "streamed reset routing changes only a requested main surface with a safe source" {
-    try std.testing.expectEqual(
-        StreamedResetRoute.none,
-        streamedResetRoute(false, true, true),
-    );
-    try std.testing.expectEqual(
-        StreamedResetRoute.none,
-        streamedResetRoute(true, false, true),
-    );
-    try std.testing.expectEqual(
-        StreamedResetRoute.preserve_reflow,
-        streamedResetRoute(true, true, false),
-    );
-    try std.testing.expectEqual(
-        StreamedResetRoute.sequential,
-        streamedResetRoute(true, true, true),
-    );
-}
-
 pub const VisualEpochResetTrigger = enum {
     native_clear_probe,
     ctrl_l,
@@ -7028,4 +7009,23 @@ test "child approval arrival closes review and full transcript depths before ren
         trace,
         "depth_transition from=full to=inline route=child trigger=approval_handoff",
     ) != null);
+}
+
+test "streamed reset routing changes only a requested main surface with a safe source" {
+    try std.testing.expectEqual(
+        StreamedResetRoute.none,
+        streamedResetRoute(false, true, true),
+    );
+    try std.testing.expectEqual(
+        StreamedResetRoute.none,
+        streamedResetRoute(true, false, true),
+    );
+    try std.testing.expectEqual(
+        StreamedResetRoute.preserve_reflow,
+        streamedResetRoute(true, true, false),
+    );
+    try std.testing.expectEqual(
+        StreamedResetRoute.sequential,
+        streamedResetRoute(true, true, true),
+    );
 }
