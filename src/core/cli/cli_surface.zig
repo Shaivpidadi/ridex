@@ -3851,6 +3851,7 @@ fn resolveLaunchConfig(
     request.available_tool_names = cfg.tool_set.order;
     request.builtin_system_prompt = cfg.prompt_policy.system_prompt;
     var failure: ?config_runtime.LaunchFailure = null;
+    defer if (failure) |*value| value.deinit(alloc);
     request.failure_out = &failure;
     var validation: ?config_runtime.launch_config.ValidationDiagnostics = null;
     defer if (validation) |*diagnostics| diagnostics.deinit(alloc);

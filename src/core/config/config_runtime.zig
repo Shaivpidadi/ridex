@@ -246,6 +246,7 @@ pub const LaunchResolutionRequest = struct {
     saved_directories_suppressed: bool = false,
     context_limit_argument_index: ?usize = null,
     additional_directories_argument_index: ?usize = null,
+    /// The caller owns a non-null result and deinitializes it with the request allocator.
     failure_out: ?*?LaunchFailure = null,
     /// The caller owns a non-null result and deinitializes it with the request allocator.
     validation_diagnostics_out: ?*?launch_config.ValidationDiagnostics = null,
@@ -253,6 +254,11 @@ pub const LaunchResolutionRequest = struct {
 
 pub const LaunchFailure = struct {
     source: launch_config.Source,
+
+    pub fn deinit(self: *LaunchFailure, alloc: Allocator) void {
+        self.source.deinit(alloc);
+        self.* = undefined;
+    }
 };
 
 pub const LaunchOverride = struct {
@@ -403,26 +409,26 @@ fn loadMergedSettingsDetailedForLaunchWithOptionalHome(
     for (request.explicit_files, 0..) |path, layer| {
         const source: launch_config.Source = .{ .explicit_file = .{ .path = path, .layer = layer } };
         const bytes = readRequiredExplicitConfig(alloc, path) catch |err| {
-            recordLaunchFailure(request.failure_out, source);
+            try recordLaunchFailure(alloc, request.failure_out, source);
             return err;
         };
         defer alloc.free(bytes);
         if (request.validation_diagnostics_out) |diagnostics_out| {
             var validation = launch_config.collectValidationDiagnostics(alloc, bytes) catch |err| {
-                recordLaunchFailure(request.failure_out, source);
+                try recordLaunchFailure(alloc, request.failure_out, source);
                 return err;
             };
             if (validation.items.len > 0) {
                 if (diagnostics_out.*) |*previous| previous.deinit(alloc);
                 diagnostics_out.* = validation;
                 validation = .{};
-                recordLaunchFailure(request.failure_out, source);
+                try recordLaunchFailure(alloc, request.failure_out, source);
                 return error.InvalidLaunchConfiguration;
             }
             validation.deinit(alloc);
         }
         var parsed = launch_config.parseDocument(alloc, bytes, .{ .regular_file = path }) catch |err| {
-            recordLaunchFailure(request.failure_out, source);
+            try recordLaunchFailure(alloc, request.failure_out, source);
             return err;
         };
         defer parsed.deinit(alloc);
@@ -435,7 +441,7 @@ fn loadMergedSettingsDetailedForLaunchWithOptionalHome(
             source,
             request.available_tool_names,
         ) catch |err| {
-            recordLaunchFailure(request.failure_out, source);
+            try recordLaunchFailure(alloc, request.failure_out, source);
             return err;
         };
     }
@@ -460,7 +466,7 @@ fn loadMergedSettingsDetailedForLaunchWithOptionalHome(
             override.value,
             request.validation_diagnostics_out,
         ) catch |err| {
-            recordLaunchFailure(request.failure_out, source);
+            try recordLaunchFailure(alloc, request.failure_out, source);
             return err;
         };
         defer parsed.deinit(alloc);
@@ -473,7 +479,7 @@ fn loadMergedSettingsDetailedForLaunchWithOptionalHome(
             source,
             request.available_tool_names,
         ) catch |err| {
-            recordLaunchFailure(request.failure_out, source);
+            try recordLaunchFailure(alloc, request.failure_out, source);
             return err;
         };
     }
@@ -503,7 +509,7 @@ fn loadMergedSettingsDetailedForLaunchWithOptionalHome(
             const source: launch_config.Source = .{ .command = .{
                 .argument_index = request.context_limit_argument_index orelse 0,
             } };
-            recordLaunchFailure(request.failure_out, source);
+            try recordLaunchFailure(alloc, request.failure_out, source);
             return err;
         };
     }
@@ -519,13 +525,17 @@ fn loadMergedSettingsDetailedForLaunchWithOptionalHome(
             const source: launch_config.Source = .{ .command = .{
                 .argument_index = request.additional_directories_argument_index orelse 0,
             } };
-            recordLaunchFailure(request.failure_out, source);
+            try recordLaunchFailure(alloc, request.failure_out, source);
             return err;
         };
     }
     if (request.builtin_system_prompt) |builtin_prompt| {
         detailed.launch_policy.composeSystemPrompt(alloc, builtin_prompt) catch |err| {
-            recordLaunchFailure(request.failure_out, detailed.launch_policy.source(.system_parts));
+            try recordLaunchFailure(
+                alloc,
+                request.failure_out,
+                detailed.launch_policy.source(.system_parts),
+            );
             return err;
         };
     }
@@ -544,10 +554,14 @@ fn loadMergedSettingsDetailedForLaunchWithOptionalHome(
 }
 
 fn recordLaunchFailure(
+    alloc: Allocator,
     output: ?*?LaunchFailure,
     source: launch_config.Source,
-) void {
-    if (output) |value| value.* = .{ .source = source };
+) !void {
+    const value = output orelse return;
+    const owned_source = try source.clone(alloc);
+    if (value.*) |*previous| previous.deinit(alloc);
+    value.* = .{ .source = owned_source };
 }
 
 fn loadProfileAuthSelectionWithOptionalHome(
@@ -607,7 +621,7 @@ fn applyRetainedEnvironmentAliases(
             value,
             validation_diagnostics_out,
         ) catch |err| {
-            recordLaunchFailure(failure_out, source);
+            try recordLaunchFailure(alloc, failure_out, source);
             return err;
         };
         defer parsed.deinit(alloc);
@@ -620,7 +634,7 @@ fn applyRetainedEnvironmentAliases(
             source,
             available_tool_names,
         ) catch |err| {
-            recordLaunchFailure(failure_out, source);
+            try recordLaunchFailure(alloc, failure_out, source);
             return err;
         };
     }
@@ -2590,6 +2604,51 @@ test "explicit launch files replace retained implicit settings in order" {
         @as(usize, 5),
         detailed.launch_policy.source(.max_steps).command.argument_index,
     );
+}
+
+test "launch failure owns explicit source after resolution cleanup" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "home/.fx");
+    try tmp.dir.createDirPath(std.testing.io, "workspace");
+    try writeFixtureFile(
+        tmp.dir,
+        "launch.json",
+        "{\"schema_version\":1,\"prompt\":{\"system_parts\":[{\"type\":\"builtin\",\"id\":\"default\"}]}}",
+    );
+
+    const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace_root);
+    const config_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "launch.json");
+    defer alloc.free(config_path);
+    const files = [_][]const u8{config_path};
+    const builtin_prompt = try alloc.alloc(u8, launch_config.max_system_prompt_total_bytes + 1);
+    defer alloc.free(builtin_prompt);
+    @memset(builtin_prompt, 'x');
+    var failure: ?LaunchFailure = null;
+    defer if (failure) |*value| value.deinit(alloc);
+
+    try std.testing.expectError(
+        error.SystemPromptTooLarge,
+        loadMergedSettingsDetailedForLaunchFromHome(
+            alloc,
+            home_root,
+            workspace_root,
+            .{
+                .explicit_files = &files,
+                .builtin_system_prompt = builtin_prompt,
+                .failure_out = &failure,
+            },
+        ),
+    );
+    try std.testing.expect(failure != null);
+    const source = failure.?.source.explicit_file;
+    try std.testing.expectEqualStrings(config_path, source.path);
+    try std.testing.expectEqual(@as(usize, 0), source.layer);
 }
 
 test "explicit launch model survives a later provider-only layer" {

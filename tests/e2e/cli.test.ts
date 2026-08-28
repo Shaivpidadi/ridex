@@ -3790,6 +3790,11 @@ describe("cli: explicit launch config", () => {
       expect([launch.code, validate.code, resolve.code]).toEqual([1, 1, 1]);
       for (const result of [validate, resolve]) {
         expect(JSON.parse(result.stdout).diagnostics[0]).toMatchObject({
+          source: {
+            kind: "explicit_file",
+            path: config,
+            layer: 0,
+          },
           instance_location: "/prompt/system_parts",
           code: "too_large",
         });
