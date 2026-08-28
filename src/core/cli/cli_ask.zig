@@ -1745,7 +1745,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         .provider = ctx.provider,
         .permission_mode = ctx.permission_mode,
         .history = context_history,
-        .context_history_start = ctx.session.contextHistoryStart(),
+        .unversioned_history_count = ctx.session.contextUnversionedHistoryCount(),
         .root_user_intent_context = root_user_intent_context,
         .grants = &.{},
         // process_queued_prompt is synchronous here; AskContext keeps the

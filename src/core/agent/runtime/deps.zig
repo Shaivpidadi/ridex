@@ -34,6 +34,13 @@ pub const RecoveryCheckpointEffect = struct {
     set: *const fn (ctx: *anyopaque, checkpoint: session_codec.RecoveryCheckpoint) anyerror!void,
 };
 
+pub const ContextCompactionCommitEffect = struct {
+    commit: *const fn (
+        ctx: *anyopaque,
+        summary: types.CompactedSummaryHistoryTurn,
+    ) anyerror!void,
+};
+
 pub const LiveToolAuthorityDecision = enum {
     allow,
     ask,
@@ -199,6 +206,7 @@ pub const AgentRuntimeDeps = struct {
     publish_committed_file_handoff: *const fn (ctx: *anyopaque, handoff: file_mutation.CommittedFileHandoff) tool_contracts.SecondaryPublicationReport,
     publish_deferred_tool_completion: ?*const fn (ctx: *anyopaque, completion: DeferredToolCompletion) TransportPublicationOutcome = null,
     propagate_history_turn: *const fn (ctx: *anyopaque, turn: HistoryTurn) anyerror!void,
+    commit_context_compaction: ?ContextCompactionCommitEffect = null,
     recovery_checkpoint: ?RecoveryCheckpointEffect = null,
     propagate_grant: *const fn (ctx: *anyopaque, tool_name: []const u8, target_path: []const u8) anyerror!void,
     push_event: *const fn (ctx: *anyopaque, event: WorkerEvent) anyerror!void,

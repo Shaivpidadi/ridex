@@ -1139,6 +1139,7 @@ pub fn Runtime(comptime App: type) type {
                 .open_model_picker,
                 .turn_token_update,
                 .turn_phase_update,
+                .context_compaction,
                 .finish_prompt,
                 .session_grant,
                 => {},

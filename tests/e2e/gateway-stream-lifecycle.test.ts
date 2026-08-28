@@ -4121,6 +4121,9 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         }),
         fakeGatewayFinalText("FIRST_REPLY_COMPACTION_SENTINEL"),
         fakeGatewayFinalText("SECOND_REPLY_COMPACTION_SENTINEL"),
+        fakeGatewayFinalText(
+          "# Objective\nContinue the compacted session.\n\n# User constraints\nPreserve FIRST_PROMPT_COMPACTION_SENTINEL and SECOND_PROMPT_COMPACTION_SENTINEL.\n\n# Completed effects\nRead manual-compaction-large.txt once.\n\n# Next action\nAnswer the next user prompt.",
+        ),
         fakeGatewayFinalText("compaction restart complete"),
       ];
       const gateway = startGateway(() =>
@@ -4169,13 +4172,33 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         expect(beforeResume.code).toBe(0);
         const canonical = JSON.parse(beforeResume.stdout) as {
           history_len: number;
-          history: Array<{ user: { text: string } }>;
+          history: Array<{
+            kind: string;
+            user?: { text: string };
+            summary?: string;
+          }>;
         };
-        expect(canonical.history_len).toBe(2);
-        expect(canonical.history.map((turn) => turn.user.text)).toEqual([
+        expect(canonical.history_len).toBe(3);
+        expect(canonical.history.filter((turn) => turn.user).map((turn) => turn.user!.text)).toEqual([
           "FIRST_PROMPT_COMPACTION_SENTINEL",
           "SECOND_PROMPT_COMPACTION_SENTINEL",
         ]);
+        expect(canonical.history.at(-1)).toEqual(
+          expect.objectContaining({
+            kind: "compacted_summary",
+          }),
+        );
+        expect(canonical.history.at(-1)?.summary).toContain(
+          "Continue the compacted session.",
+        );
+
+        expect(gateway.requests).toHaveLength(4);
+        const compactRequest = JSON.parse(gateway.requests[3].body) as {
+          tools?: unknown[];
+          toolChoice?: { type?: string };
+        };
+        expect(compactRequest.tools).toEqual([]);
+        expect(compactRequest.toolChoice).toEqual({ type: "none" });
 
         const resumed = await runFx(
           [
@@ -4194,28 +4217,21 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         );
         expect(resumed.code).toBe(0);
         expect(resumed.stderr).toBe("");
-        expect(gateway.requests).toHaveLength(4);
+        expect(gateway.requests).toHaveLength(5);
 
-        const request = JSON.parse(gateway.requests[3].body) as {
+        const request = JSON.parse(gateway.requests[4].body) as {
           prompt: Array<{ role: string; content: unknown }>;
         };
         const userTexts = request.prompt
           .filter((message) => message.role === "user")
           .map((message) => contentText(message.content));
-        expect(
-          userTexts.filter((text) =>
-            text.includes("PROMPT_COMPACTION_SENTINEL") ||
-            text === "compaction restart probe"
-          ),
-        ).toEqual([
-          "FIRST_PROMPT_COMPACTION_SENTINEL",
-          "SECOND_PROMPT_COMPACTION_SENTINEL",
-          "compaction restart probe",
-        ]);
-        expect(userTexts.join("\n")).toContain("manual-compaction-large.txt");
+        expect(userTexts.at(-1)).toBe("compaction restart probe");
+        expect(userTexts.some((text) => text.includes("context_handoff"))).toBe(
+          true,
+        );
         const requestText = JSON.stringify(request);
-        expect(requestText).toContain("tool_result_compacted");
-        expect(requestText).toContain("result-read_file-");
+        expect(requestText).toContain("context_handoff");
+        expect(requestText).toContain("manual-compaction-large.txt");
         expect(requestText).not.toContain(bodySentinel);
         expect(readFileSync(stderrPath, "utf8")).toBe("");
 
@@ -4229,10 +4245,12 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         expect(afterResume.code).toBe(0);
         const resumedCanonical = JSON.parse(afterResume.stdout) as {
           history_len: number;
-          history: Array<{ user: { text: string } }>;
+          history: Array<{ kind: string; user?: { text: string } }>;
         };
-        expect(resumedCanonical.history_len).toBe(3);
-        expect(resumedCanonical.history.map((turn) => turn.user.text)).toEqual([
+        expect(resumedCanonical.history_len).toBe(4);
+        expect(
+          resumedCanonical.history.filter((turn) => turn.user).map((turn) => turn.user!.text),
+        ).toEqual([
           "FIRST_PROMPT_COMPACTION_SENTINEL",
           "SECOND_PROMPT_COMPACTION_SENTINEL",
           "compaction restart probe",
@@ -4247,7 +4265,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
   );
 
   test.skipIf(!tmuxAvailable())(
-    "explicit skill reads remain repeatable after ineligible compaction no-op",
+    "explicit skill reads remain repeatable after semantic compaction",
     async () => {
       const root = createFixtureRoot("skill-manual-compaction");
       const tracePath = join(root.root, "trace.log");
@@ -4271,6 +4289,9 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         fakeGatewayToolCall(beforeCallId, "skill", { name: skillName }),
         fakeGatewayFinalText("SKILL_BEFORE_COMPACTION_COMPLETE"),
         fakeGatewayFinalText("SECOND_COMPACTION_TURN_COMPLETE"),
+        fakeGatewayFinalText(
+          "# Objective\nContinue after compacting the skill workflow.\n\n# Completed effects\nThe explicit skill was read once.\n\n# Next action\nRead the skill again when asked.",
+        ),
         fakeGatewayToolCall(afterCallId, "skill", { name: skillName }),
         fakeGatewayFinalText("SKILL_AFTER_COMPACTION_COMPLETE"),
       ];
@@ -4303,7 +4324,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           20_000,
         );
         await tui.sendText("/compact");
-        await tui.waitForText("No context to compact.", 15_000);
+        await tui.waitForText("Context compacted.", 15_000);
         await tui.sendText("Read the explicit skill after compaction.");
         await tui.waitForPane(
           (pane) =>
@@ -4315,17 +4336,21 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         await tui.waitForSessionEnd(15_000);
         tui = null;
 
-        expect(gateway.requests).toHaveLength(5);
+        expect(gateway.requests).toHaveLength(6);
         const before = toolResultOutput(gateway.requests[1]!.body, beforeCallId);
-        const postCompactionRequest = gateway.requests[3]!.body;
-        const after = toolResultOutput(gateway.requests[4]!.body, afterCallId);
+        const compactionRequest = gateway.requests[3]!.body;
+        const postCompactionRequest = gateway.requests[4]!.body;
+        const after = toolResultOutput(gateway.requests[5]!.body, afterCallId);
 
         expect(before).toContain(bodySentinel);
         expect(after).toContain(bodySentinel);
         expect(before).not.toContain("tool_result_handle");
         expect(after).not.toContain("tool_result_handle");
-        expect(postCompactionRequest).toContain(bodySentinel);
-        expect(postCompactionRequest).toContain("<skill_content");
+        expect(compactionRequest).toContain(bodySentinel);
+        expect(compactionRequest).toContain("<skill_content");
+        expect(compactionRequest).toContain("tool_result_handle");
+        expect(postCompactionRequest).toContain("context_handoff");
+        expect(postCompactionRequest).not.toContain(bodySentinel);
         expect(readFileSync(stderrPath, "utf8")).toBe("");
       } finally {
         if (tui) await tui.kill();

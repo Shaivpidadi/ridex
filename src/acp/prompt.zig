@@ -586,7 +586,7 @@ pub fn handlePrompt(
         .gateway_team = state.gateway_team,
         .permission_mode = captured_permission_mode,
         .history = context_history,
-        .context_history_start = session.session_rt.contextHistoryStart(),
+        .unversioned_history_count = session.session_rt.contextUnversionedHistoryCount(),
         .root_user_intent_context = root_user_intent_context,
         .grants = session.session_grants,
         .context_snapshot = context_snapshot,

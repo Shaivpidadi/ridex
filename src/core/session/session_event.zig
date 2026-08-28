@@ -995,6 +995,9 @@ fn applyDelta(
                 current.history = try alloc.realloc(current.history, current.history.len + 1);
             }
             current.history[current.history.len - 1] = turn;
+            if (payload.turn == .compacted_summary) {
+                current.context_history_start = current.history.len - 1;
+            }
             current.conversation_language = payload.conversation_language;
             current.total_input_tokens = payload.total_input_tokens;
             current.total_output_tokens = payload.total_output_tokens;
@@ -2119,6 +2122,51 @@ test "single event application updates caller-owned state without replaying its 
     try std.testing.expectEqual(@as(u64, 100), state.total_input_tokens);
     try std.testing.expectEqual(@as(u64, 50), state.total_output_tokens);
     try std.testing.expectEqual(@as(i64, 30), state.updated_at_ms);
+}
+
+test "compacted summary event advances the durable replacement boundary" {
+    const alloc = std.testing.allocator;
+    var state: ?session_codec.DurableSessionState = try singleEventTestState(
+        "session-compaction-checkpoint",
+    ).dupe(alloc);
+    defer if (state) |*current| current.deinit(alloc);
+
+    const generation = identifier(0xb0);
+    try applyDelta(alloc, &state, .{
+        .log_generation = generation,
+        .seq = 1,
+        .event_id = identifier(0xb1),
+        .timestamp_ms = 30,
+        .event = .{ .history_turn_committed = .{
+            .conversation_language = session.ConversationLanguage.literal("en"),
+            .total_input_tokens = 10,
+            .total_output_tokens = 5,
+            .turn = .{ .assistant = .{
+                .user = .{ .text = @constCast("exact prompt") },
+                .assistant = @constCast("exact reply"),
+            } },
+        } },
+    });
+    try applyDelta(alloc, &state, .{
+        .log_generation = generation,
+        .seq = 2,
+        .event_id = identifier(0xb2),
+        .timestamp_ms = 40,
+        .event = .{ .history_turn_committed = .{
+            .conversation_language = session.ConversationLanguage.literal("en"),
+            .total_input_tokens = 20,
+            .total_output_tokens = 10,
+            .turn = .{ .compacted_summary = .{
+                .summary = @constCast("<context_handoff>\nsummary\n</context_handoff>"),
+                .removed_turn_count = 1,
+                .compaction_count = 1,
+            } },
+        } },
+    });
+
+    try std.testing.expectEqual(@as(usize, 2), state.?.history.len);
+    try std.testing.expectEqual(@as(usize, 1), state.?.context_history_start);
+    try std.testing.expectEqualStrings("exact prompt", state.?.history[0].assistant.user.text);
 }
 
 test "single event application preserves caller-owned state on allocation failure" {

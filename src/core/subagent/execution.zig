@@ -1283,6 +1283,7 @@ fn livePresentationEventBytes(event: worker_runtime.WorkerEvent) ?usize {
         .begin_prompt,
         .begin_prompt_with_skill_bindings,
         .begin_presented_prompt,
+        .context_compaction,
         .finish_prompt,
         .notification,
         .question_requested,

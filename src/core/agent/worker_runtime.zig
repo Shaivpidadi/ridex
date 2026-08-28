@@ -47,6 +47,11 @@ pub const BeginPromptWithSkillBindings = struct {
     skill_display_spans: []SkillDisplaySpan = &.{},
 };
 
+pub const WorkKind = enum {
+    prompt,
+    compact_context,
+};
+
 pub const QueueReviewDraft = struct {
     input: []u8,
     pasted_blocks: []paste_blocks.PastedBlock = &.{},
@@ -55,6 +60,7 @@ pub const QueueReviewDraft = struct {
 };
 
 pub const QueuedPrompt = struct {
+    kind: WorkKind = .prompt,
     turn_id: u64 = 0,
     /// The active turn that may consume this prompt as steering. When that turn
     /// finishes, the target is cleared in place so admission order is retained.
@@ -70,9 +76,10 @@ pub const QueuedPrompt = struct {
     account_id: ?[]u8 = null,
     permission_mode: types.PermissionMode,
     history: []types.HistoryTurn,
-    /// Non-zero only after explicit durable `/compact`; model projection uses
-    /// it as a manual trigger while canonical history remains complete.
-    context_history_start: usize = 0,
+    /// Count of leading projected turns loaded without corrected result
+    /// provenance. The conservative default protects callers that do not own a
+    /// SessionRuntime snapshot.
+    unversioned_history_count: usize = std.math.maxInt(usize),
     root_user_intent_context: []u8 = &.{},
     grants: []types.PermissionGrant,
     skill_bindings: []SkillBinding = &.{},
@@ -533,6 +540,7 @@ pub const WorkerEvent = union(enum) {
     turn_token_update: types.TurnTokenProgress,
     turn_phase_update: types.TurnPhaseUpdate,
     diff_block: diff_mod.DiffEntryPayload,
+    context_compaction: types.HistoryTurn,
     finish_prompt: types.FinishedPrompt,
     session_grant: types.PermissionGrant,
     error_text: types.SemanticNotice,
@@ -1499,6 +1507,7 @@ pub const WorkerRuntime = struct {
         for (self.queued_prompts.items, prepared) |*prompt, next| {
             types.freeHistoryTurnSlice(alloc, prompt.history);
             prompt.history = next.history;
+            if (turn == .compacted_summary) prompt.unversioned_history_count = 0;
             if (prompt.root_user_intent_context.len > 0) alloc.free(prompt.root_user_intent_context);
             prompt.root_user_intent_context = next.root_user_intent_context;
             types.freeImageAttachmentSlice(alloc, prompt.authorized_image_catalog);
@@ -2295,6 +2304,22 @@ test "session transfer preserves active and finished prompt snapshots" {
     }
 }
 
+test "manual compaction is a typed worker item and not a prompt" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+
+    var work = try makePrompt(alloc, "", "provider/model");
+    work.kind = .compact_context;
+    try runtime.enqueuePrompt(alloc, work);
+
+    const taken = (try runtime.tryTakeNextPrompt(alloc)) orelse
+        return error.TestExpectedQueuedPrompt;
+    defer freeQueuedPrompt(alloc, taken);
+    try std.testing.expectEqual(WorkKind.compact_context, taken.kind);
+    try std.testing.expectEqual(@as(usize, 0), taken.prompt.len);
+}
+
 test "session transfer discards mismatched active prompt snapshots" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -2878,6 +2903,9 @@ pub fn dupeWorkerEvent(alloc: std.mem.Allocator, event: WorkerEvent) !WorkerEven
                 .full = full,
             } };
         },
+        .context_compaction => |turn| .{
+            .context_compaction = try types.dupeHistoryTurn(alloc, turn),
+        },
         .finish_prompt => |finished| .{ .finish_prompt = try types.dupeFinishedPrompt(alloc, finished) },
         .session_grant => |grant| blk: {
             const tool_name = try alloc.dupe(u8, grant.tool_name);
@@ -2921,6 +2949,7 @@ pub fn freeWorkerEvent(alloc: std.mem.Allocator, event: WorkerEvent) void {
         },
         .tool_lifecycle => |lifecycle| freeToolLifecycleEvent(alloc, lifecycle),
         .diff_block => |payload| diff_mod.freeDiffEntryPayload(alloc, payload),
+        .context_compaction => |turn| types.freeHistoryTurn(alloc, turn),
         .finish_prompt => |finished| types.freeFinishedPrompt(alloc, finished),
         .session_grant => |grant| {
             alloc.free(grant.tool_name);
@@ -3453,11 +3482,10 @@ test "queue, event, snapshot, sync, history, and grant behavior" {
     } };
     defer types.freeHistoryTurn(alloc, turn);
     try runtime.propagateHistoryTurn(alloc, turn, 1);
-    try std.testing.expectEqual(@as(usize, 2), runtime.queued_prompts.items[0].history.len);
+    try std.testing.expectEqual(@as(usize, 1), runtime.queued_prompts.items[0].history.len);
     try std.testing.expect(runtime.queued_prompts.items[0].history[0] == .compacted_summary);
-    try std.testing.expectEqualStrings("old", runtime.queued_prompts.items[0].history[0].compacted_summary.summary);
-    try std.testing.expect(runtime.queued_prompts.items[0].history[1] == .compacted_summary);
-    try std.testing.expectEqualStrings("summary", runtime.queued_prompts.items[0].history[1].compacted_summary.summary);
+    try std.testing.expectEqualStrings("summary", runtime.queued_prompts.items[0].history[0].compacted_summary.summary);
+    try std.testing.expectEqual(@as(usize, 0), runtime.queued_prompts.items[0].unversioned_history_count);
 
     try runtime.propagateGrant(alloc, "read_file", "/tmp/a");
     try std.testing.expectEqual(@as(usize, 1), runtime.queued_prompts.items[0].grants.len);

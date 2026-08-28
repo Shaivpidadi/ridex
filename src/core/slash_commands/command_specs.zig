@@ -2106,7 +2106,7 @@ test "slash completion descriptions follow completion matches" {
     try std.testing.expectEqualStrings("undo the latest tracked file operation", nthSlashCompletionDescription(testSlashRegistry(), "/un", 0).?);
     try std.testing.expectEqualStrings("open the fx feedback form", nthSlashCompletionDescription(testSlashRegistry(), "/fee", 0).?);
     try std.testing.expectEqualStrings("copy a private diagnostic trace", nthSlashCompletionDescription(testSlashRegistry(), "/tr", 0).?);
-    try std.testing.expectEqualStrings("compact older conversation turns", nthSlashCompletionDescription(testSlashRegistry(), "/comp", 0).?);
+    try std.testing.expectEqualStrings("summarize context into a fresh window", nthSlashCompletionDescription(testSlashRegistry(), "/comp", 0).?);
     try std.testing.expectEqualStrings("show alias availability", nthSlashCompletionDescription(testSlashRegistry(), "/ali", 0).?);
     try std.testing.expectEqualStrings("toggle Fast mode when supported", nthSlashCompletionDescription(testSlashRegistry(), "/fa", 0).?);
 }

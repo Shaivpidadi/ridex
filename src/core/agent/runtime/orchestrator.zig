@@ -39,6 +39,7 @@ const runtime_finalization = @import("finalization.zig");
 const runtime_deps = @import("deps.zig");
 const runtime_lifecycle = @import("lifecycle.zig");
 const runtime_prompt_context = @import("prompt_context.zig");
+const runtime_context_compaction = @import("context_compaction.zig");
 const runtime_telemetry = @import("telemetry.zig");
 const runtime_tool_contracts = @import("tool_contracts.zig");
 const runtime_gateway_step = @import("gateway_step.zig");
@@ -2837,11 +2838,10 @@ fn processQueuedPromptInner(
         "history_turns={d} gateway_messages_before={d} interrupted_turns={d} history_turn_kinds={s}",
         .{ job.history.len, history_messages_before, interrupted_turns, history_turn_kinds },
     );
-    try session_runtime.appendHistoryChatMessagesBudgeted(
+    try session_runtime.appendHistoryChatMessages(
         arena,
         &history_messages,
         job.history,
-        .{ .max_tokens = runtime_prompt_context.historyContextBudgetTokensForCapabilities(request_capabilities) },
     );
     const projected_roles = try runtime_telemetry.formatMessageRoles(arena, history_messages.items);
     debug_trace.eventf(
@@ -3069,6 +3069,75 @@ fn visionFallbackMode(
     return .optional;
 }
 
+fn buildGatewayMessagesForCompactionWindow(
+    alloc: Allocator,
+    stable_prefix: []const ChatMessage,
+    ephemeral_overlay: []const ChatMessage,
+    durable_history: []const ChatMessage,
+    current_user_message: ChatMessage,
+    within_turn_suffix: []const ChatMessage,
+    handoff: ?[]const u8,
+    compacted_suffix_len: usize,
+) !std.ArrayList(ChatMessage) {
+    if (handoff == null) return runtime_prompt_context.buildGatewayMessages(
+        alloc,
+        stable_prefix,
+        ephemeral_overlay,
+        durable_history,
+        current_user_message,
+        within_turn_suffix,
+    );
+    var compacted_suffix: std.ArrayList(ChatMessage) = .empty;
+    try compacted_suffix.append(alloc, .{
+        .role = .user,
+        .content = handoff.?,
+        .cache_policy = .no_cache,
+    });
+    try compacted_suffix.appendSlice(
+        alloc,
+        within_turn_suffix[@min(compacted_suffix_len, within_turn_suffix.len)..],
+    );
+    return runtime_prompt_context.buildGatewayMessages(
+        alloc,
+        stable_prefix,
+        ephemeral_overlay,
+        &.{},
+        current_user_message,
+        compacted_suffix.items,
+    );
+}
+
+fn latestCompactionCount(history: []const HistoryTurn) usize {
+    var count: usize = 0;
+    for (history) |turn| {
+        if (turn == .compacted_summary) {
+            count = @max(count, turn.compacted_summary.compaction_count);
+        }
+    }
+    return count;
+}
+
+fn compactedHistoryTurnCount(history: []const HistoryTurn) usize {
+    var removed: usize = 0;
+    for (history) |turn| switch (turn) {
+        .compacted_summary => |summary| {
+            removed = @max(removed, summary.removed_turn_count);
+        },
+        else => removed += 1,
+    };
+    return removed;
+}
+
+fn commitContextCompaction(
+    deps: *const AgentRuntimeDeps,
+    summary: types.CompactedSummaryHistoryTurn,
+) !void {
+    if (deps.commit_context_compaction) |effect| {
+        return effect.commit(deps.ctx, summary);
+    }
+    return deps.propagate_history_turn(deps.ctx, .{ .compacted_summary = summary });
+}
+
 test "vision fallback follows the selected provider capability" {
     try std.testing.expectEqual(
         runtime_gateway_step.VisionToolMode.optional,
@@ -3121,6 +3190,10 @@ fn processQueuedPromptLoop(
     var terminal_validation_retry: runtime_tool_admission.TerminalValidationRetryState = .{};
     defer terminal_validation_retry.deinit(arena);
     var malformed_arguments_retry: runtime_tool_admission.MalformedArgumentsRetryState = .{};
+    var active_compaction_handoff: ?[]const u8 = null;
+    var compacted_suffix_len: usize = 0;
+    var compaction_count = latestCompactionCount(job.history);
+    const compacted_history_turn_count = compactedHistoryTurnCount(job.history);
     var completed_tool_names = completed_tool_names_ptr.*;
     defer completed_tool_names_ptr.* = completed_tool_names;
     var context_delivery_state: context_contract.DeliveryState = if (deps.context_enabled)
@@ -3266,10 +3339,22 @@ fn processQueuedPromptLoop(
             overlay_arena,
             &ephemeral_overlay,
         );
-        var gateway_messages = try runtime_prompt_context.buildGatewayMessages(overlay_arena, stable_prefix.items, ephemeral_overlay.items, history_messages.items, current_user_effective, within_turn_suffix.items);
+        var gateway_messages = try buildGatewayMessagesForCompactionWindow(
+            overlay_arena,
+            stable_prefix.items,
+            ephemeral_overlay.items,
+            history_messages.items,
+            current_user_effective,
+            within_turn_suffix.items,
+            active_compaction_handoff,
+            compacted_suffix_len,
+        );
         last_gateway_message_count = gateway_messages.items.len;
         const history_start_index = stable_prefix.items.len + ephemeral_overlay.items.len;
-        const current_user_message_index = history_start_index + history_messages.items.len;
+        const current_user_message_index = history_start_index + if (active_compaction_handoff == null)
+            history_messages.items.len
+        else
+            0;
 
         debug_trace.logf("agent", "step start step={d} limit={d} messages={d}", .{ current_step_index, config.agent_step_limit, gateway_messages.items.len });
         debug_trace.eventf("agent", "step_begin", step_ctx, "step_index={d} step_limit={d} gateway_messages={d}", .{ current_step_index, config.agent_step_limit, gateway_messages.items.len });
@@ -3432,13 +3517,15 @@ fn processQueuedPromptLoop(
                     step_ctx,
                 );
             }
-            gateway_messages = try runtime_prompt_context.buildGatewayMessages(
+            gateway_messages = try buildGatewayMessagesForCompactionWindow(
                 overlay_arena,
                 stable_prefix.items,
                 ephemeral_overlay.items,
                 history_messages.items,
                 current_user_effective,
                 within_turn_suffix.items,
+                active_compaction_handoff,
+                compacted_suffix_len,
             );
             debug_trace.eventf("agent", "before_provider_preflight", step_ctx, "model={s} messages={d}", .{ gateway_model, gateway_messages.items.len });
             var vision_route: runtime_vision_contracts.VisionRoute = .native_images;
@@ -3540,67 +3627,124 @@ fn processQueuedPromptLoop(
             )) |request_body| {
                 prepared_request_body = request_body;
                 const request_cost = runtime_prompt_context.measureProviderRequest(request_body);
-                var projection_plan = try runtime_prompt_context.planHybridProjection(
-                    overlay_arena,
-                    .{
-                        .trigger = if (job.context_history_start > 0)
-                            .manual
-                        else
-                            .automatic,
-                        .capabilities = request_capabilities,
-                        .cost = request_cost,
-                        .durable_history = history_messages.items,
-                        .request_local = within_turn_suffix.items,
-                        .request_local_provenance = if (job.recovery_checkpoint == null)
-                            .fresh
-                        else
-                            .unversioned_history,
-                    },
-                );
-                defer projection_plan.deinit(overlay_arena);
+                const has_new_compactable_context = active_compaction_handoff == null or
+                    compacted_suffix_len < within_turn_suffix.items.len;
+                const projection_plan = runtime_prompt_context.planCompaction(.{
+                    .trigger = .automatic,
+                    .capabilities = request_capabilities,
+                    .request_tokens = request_cost.estimated_input_tokens,
+                    .source_tokens = if (has_new_compactable_context)
+                        request_cost.estimated_input_tokens
+                    else
+                        0,
+                    .protected_tokens = runtime_prompt_context.estimateCompactionSourceTokens(
+                        &.{current_user_effective},
+                    ),
+                });
                 debug_trace.eventf(
                     "context_compaction",
                     "decision",
                     step_ctx,
-                    "decision={s} request_bytes={d} estimated_tokens={d} usable_tokens={any} high_water_tokens={any} target_tokens={any} candidates={d}",
+                    "decision={s} request_bytes={d} estimated_tokens={d} usable_tokens={any} high_water_tokens={any} target_tokens={any} accepted_tokens={any} generation_tokens={any}",
                     .{
                         @tagName(projection_plan.decision),
                         request_cost.serialized_bytes,
                         request_cost.estimated_input_tokens,
                         projection_plan.usable_input_tokens,
                         projection_plan.high_water_tokens,
-                        projection_plan.target_tokens,
-                        projection_plan.candidates.len,
+                        projection_plan.session_target_tokens,
+                        projection_plan.accepted_handoff_tokens,
+                        projection_plan.generation_tokens,
                     },
                 );
                 switch (projection_plan.decision) {
-                    .no_op => {},
-                    .capacity_failure => return error.ContextCapacityExceeded,
-                    .project => {
-                        const applied = try applyHybridProjectionPlan(
-                            arena,
-                            config,
-                            projection_plan,
-                            history_messages.items,
-                            within_turn_suffix.items,
-                            step_ctx,
-                        );
-                        if (applied > 0) {
-                            debug_trace.eventf(
-                                "context_compaction",
-                                "projected",
-                                step_ctx,
-                                "applied={d} request_bytes_before={d} estimated_tokens_before={d}",
-                                .{ applied, request_cost.serialized_bytes, request_cost.estimated_input_tokens },
-                            );
-                            skip_next_preflight_refresh = true;
-                            continue;
-                        }
+                    .no_op => if (!has_new_compactable_context) {
                         if (projection_plan.usable_input_tokens) |usable_tokens| {
                             if (request_cost.estimated_input_tokens > usable_tokens) {
                                 return error.ContextCapacityExceeded;
                             }
                         }
+                    },
+                    .capacity_failure => return error.ContextCapacityExceeded,
+                    .compact => {
+                        std.debug.assert(projection_plan.next_action == .continue_turn);
+                        const accepted_tokens = projection_plan.accepted_handoff_tokens orelse
+                            return error.ContextCapacityExceeded;
+                        const generation_tokens = projection_plan.generation_tokens orelse
+                            return error.ContextCapacityExceeded;
+                        try runtime_context_compaction.validateUnversionedHistoryResults(
+                            job.history,
+                            job.unversioned_history_count,
+                        );
+                        try promoteRequestLocalResultsForCompaction(
+                            arena,
+                            config,
+                            within_turn_suffix.items,
+                            @constCast(request_messages),
+                        );
+                        const result_storage: runtime_context_compaction.ResultStorage =
+                            if (config.session_child_capability) |capability|
+                                .{ .managed = capability }
+                            else if (config.tool_result_dir) |dir|
+                                .{ .legacy_dir = dir }
+                            else
+                                .unavailable;
+                        try runtime_context_compaction.promoteMessageResults(
+                            arena,
+                            @constCast(request_messages),
+                            result_storage,
+                        );
+                        if (deps.push_interactive_notice) |push_notice| {
+                            try push_notice(deps.ctx, .{
+                                .topic = "context",
+                                .tone = .neutral,
+                                .body = "Compacting context…",
+                            });
+                        }
+                        const compacted = try runtime_context_compaction.compact(
+                            arena,
+                            request_messages,
+                            .{
+                                .stream_provider = deps.agent_stream_provider,
+                                .api_key = active_api_key,
+                                .credential_source = job.credential_source,
+                                .gateway_team = job.gateway_team,
+                                .session_id = lifecycle.scope.session_id,
+                                .model = gateway_model,
+                                .retry_count = config.gateway_retry_count,
+                                .cancel_flag = config.cancel_flag,
+                                .accepted_tokens = accepted_tokens,
+                                .generation_tokens = generation_tokens,
+                                .provider_options = provider_opts,
+                                .usage = deps.usage,
+                                .usage_allocator = deps.usage_allocator,
+                                .trace_ctx = step_ctx,
+                            },
+                        );
+                        active_compaction_handoff = compacted.handoff;
+                        compacted_suffix_len = within_turn_suffix.items.len;
+                        compaction_count += 1;
+                        try commitContextCompaction(deps, .{
+                            .summary = @constCast(active_compaction_handoff.?),
+                            .removed_turn_count = compacted_history_turn_count,
+                            .compaction_count = compaction_count,
+                        });
+                        debug_trace.eventf(
+                            "context_compaction",
+                            "installed",
+                            step_ctx,
+                            "request_bytes_before={d} estimated_tokens_before={d} handoff_bytes={d} accepted_tokens={d}",
+                            .{ request_cost.serialized_bytes, request_cost.estimated_input_tokens, active_compaction_handoff.?.len, accepted_tokens },
+                        );
+                        if (deps.push_interactive_notice) |push_notice| {
+                            try push_notice(deps.ctx, .{
+                                .topic = "context",
+                                .tone = .neutral,
+                                .body = "Context compacted.",
+                            });
+                        }
+                        skip_next_preflight_refresh = true;
+                        continue;
                     },
                 }
             }
@@ -7790,64 +7934,57 @@ fn processQueuedPromptLoop(
     );
 }
 
-fn applyHybridProjectionPlan(
+fn promoteRequestLocalResultsForCompaction(
     alloc: Allocator,
     config: Config,
-    plan: runtime_prompt_context.ProjectionPlan,
-    durable_history: []ChatMessage,
-    request_local: []ChatMessage,
-    trace_ctx: TraceContext,
-) !usize {
-    var applied: usize = 0;
-    for (plan.candidates) |candidate| {
-        const messages = switch (candidate.lane) {
-            .durable_history => durable_history,
-            .request_local => request_local,
-        };
-        if (candidate.message_index >= messages.len) continue;
-        const source = messages[candidate.message_index];
-        const handle = switch (candidate.kind) {
-            .existing_handle => candidate.output_handle orelse continue,
-            .promote_inline => blk: {
-                const promoted = if (config.session_child_capability) |capability|
-                    result_store.storeLargeResultManaged(
-                        alloc,
-                        capability,
-                        candidate.tool_call_id,
-                        candidate.tool_name,
-                        candidate.content,
-                    )
-                else if (config.tool_result_dir) |dir|
-                    result_store.storeLargeResult(
-                        alloc,
-                        dir,
-                        candidate.tool_call_id,
-                        candidate.tool_name,
-                        candidate.content,
-                    )
-                else
-                    break :blk null;
-                break :blk promoted catch |err| {
-                    debug_trace.eventf(
-                        "context_compaction",
-                        "promotion_failed",
-                        trace_ctx,
-                        "call_id={s} tool={s} err={s}",
-                        .{ candidate.tool_call_id, candidate.tool_name, @errorName(err) },
-                    );
-                    break :blk null;
-                };
-            },
-        } orelse continue;
-        messages[candidate.message_index] = try runtime_prompt_context.projectToolResultMessage(
-            alloc,
-            source,
-            handle,
-            candidate.stored_output_bytes,
-        );
-        applied += 1;
+    canonical_messages: []ChatMessage,
+    request_messages: []ChatMessage,
+) !void {
+    for (canonical_messages) |*message| {
+        if (message.role != .tool) continue;
+        const content = message.content orelse continue;
+        var memory = message.tool_result_memory orelse
+            return error.ContextCapacityExceeded;
+        if (memory.output_handle != null) continue;
+        if (memory.truncated) return error.ContextCapacityExceeded;
+        const call_id = message.tool_call_id orelse return error.ContextCapacityExceeded;
+        const tool_name = message.tool_name orelse return error.ContextCapacityExceeded;
+        const handle = if (config.session_child_capability) |capability|
+            try result_store.storeLargeResultManaged(
+                alloc,
+                capability,
+                call_id,
+                tool_name,
+                content,
+            )
+        else if (config.tool_result_dir) |dir|
+            try result_store.storeLargeResult(
+                alloc,
+                dir,
+                call_id,
+                tool_name,
+                content,
+            )
+        else
+            return error.ContextCapacityExceeded;
+        memory.output_handle = handle;
+        memory.stored_output_bytes = content.len;
+        message.tool_result_memory = memory;
+
+        for (request_messages) |*request_message| {
+            if (request_message.role != .tool) continue;
+            const request_call_id = request_message.tool_call_id orelse continue;
+            if (!std.mem.eql(u8, request_call_id, call_id)) continue;
+            const request_content = request_message.content orelse "";
+            request_message.content = try std.fmt.allocPrint(
+                alloc,
+                "{s}\n<tool_result_handle>{s}</tool_result_handle>",
+                .{ request_content, handle },
+            );
+            request_message.tool_result_memory = memory;
+            break;
+        }
     }
-    return applied;
 }
 
 fn finishFailedTurnWithNotice(

@@ -56,6 +56,7 @@ fn discardCodeBlock(_: *anyopaque, block: assistant_presentation.CodeBlockPayloa
 }
 
 fn discardThematicRule(_: *anyopaque) !void {}
+fn discardContextCompaction(_: *anyopaque, _: types.HistoryTurn) !void {}
 
 pub const WorkerEventHandlers = struct {
     ctx: *anyopaque,
@@ -72,6 +73,7 @@ pub const WorkerEventHandlers = struct {
     command_output: *const fn (*anyopaque, ?types.ToolLifecycleId, command_output_content.Stream, []const u8) anyerror!void,
     command_output_complete: *const fn (*anyopaque, ?types.ToolLifecycleId) anyerror!void,
     diff_block: *const fn (*anyopaque, diff_mod.DiffEntryPayload) anyerror!void,
+    context_compaction: *const fn (*anyopaque, types.HistoryTurn) anyerror!void = discardContextCompaction,
     append_history_turn: *const fn (*anyopaque, types.FinishedPrompt) anyerror!void,
     session_grant: *const fn (*anyopaque, types.PermissionGrant) anyerror!void,
     error_text: *const fn (*anyopaque, types.SemanticNotice) anyerror!void,
@@ -216,6 +218,7 @@ pub fn Runtime(comptime App: type) type {
                 .question_requested,
                 .clear_route_recovery_status,
                 .api_status_text,
+                .context_compaction,
                 .finish_prompt,
                 .session_grant,
                 .error_text,
@@ -866,6 +869,9 @@ pub fn Runtime(comptime App: type) type {
                     .diff_block => |payload| {
                         drain_owns_current = false;
                         try handlers.diff_block(handlers.ctx, payload);
+                    },
+                    .context_compaction => |turn| {
+                        try handlers.context_compaction(handlers.ctx, turn);
                     },
                     .tool_lifecycle => |lifecycle| {
                         switch (lifecycle) {
