@@ -473,7 +473,7 @@ const App = struct {
             app_callbacks.Bindings(App).onTaskCompletion,
             app_callbacks.Bindings(App).workerEventHandlers(self),
         );
-        try SessionTitleAppRuntime.poll(self);
+        if (self.session_title_generation.thread != null) try SessionTitleAppRuntime.poll(self);
         try self.flushRequestedFrame();
     }
 
@@ -2700,7 +2700,7 @@ const App = struct {
             try self.routeTerminalInputIngress(terminal_input);
         }
         try WorkerAppRuntime.tick(self, app_callbacks.Bindings(App).onTaskCompletion, app_callbacks.Bindings(App).workerEventHandlers(self));
-        try SessionTitleAppRuntime.poll(self);
+        if (self.session_title_generation.thread != null) try SessionTitleAppRuntime.poll(self);
         const now_ns = io_mod.nanoTimestamp();
         if (!self.approval_prompt.isActive() and !self.question_prompt.isActive() and !self.auth.apiKeyEntryActive()) {
             try self.pacer.tick(self.alloc, now_ns, self.pacerCallbacks());
