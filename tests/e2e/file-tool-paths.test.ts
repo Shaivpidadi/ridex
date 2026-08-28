@@ -50,6 +50,21 @@ function toolCall(id: string, name: string, input: object) {
   ]);
 }
 
+function toolCalls(calls: Array<{ id: string; name: string; input: object }>) {
+  return sse([
+    ...calls.map((call) => ({
+      type: "tool-call",
+      toolCallId: call.id,
+      toolName: call.name,
+      input: call.input,
+    })),
+    {
+      type: "finish",
+      finishReason: { unified: "tool-calls", raw: "tool-calls" },
+    },
+  ]);
+}
+
 function permissionDecision(decision: "clear" | "caution" = "clear") {
     return toolCall("permission_decision_1", "permission_decision", {
     risk: decision === "clear" ? "medium" : "high",
@@ -1459,6 +1474,112 @@ describe("filesystem path handling", () => {
           beforeToolCall: () => expect(existsSync(createdFolder)).toBe(false),
         });
         expect(existsSync(createdFolder)).toBe(true);
+      } finally {
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "failed patch defers queued fallback edits until the model observes current state",
+    async () => {
+      const root = createIsolatedRoot();
+      try {
+        const target = join(root.workspace, "target.txt");
+        writeFileSync(target, "before\n");
+        const gateway = startFakeGateway([
+          toolCall("failed_patch_1", "apply_patch", {
+            patch:
+              "*** Begin Patch\n*** Update File: target.txt\n@@\n-missing\n+after\n*** End Patch",
+          }),
+          (body) => {
+            expect(toolResultOutput(body, "failed_patch_1")).toContain(
+              "PATCH_CONTEXT_MISSING",
+            );
+            expect(readFileSync(target, "utf8")).toBe("before\n");
+            return toolCalls([
+              {
+                id: "failed_edit_1",
+                name: "edit_file",
+                input: {
+                  path: "target.txt",
+                  old_string: "stale",
+                  new_string: "after",
+                },
+              },
+              {
+                id: "queued_edit_1",
+                name: "edit_file",
+                input: {
+                  path: "target.txt",
+                  old_string: "before",
+                  new_string: "after",
+                },
+              },
+            ]);
+          },
+          (body) => {
+            expect(toolResultOutput(body, "failed_edit_1")).toContain(
+              "old_string not found",
+            );
+            expect(toolResultOutput(body, "queued_edit_1")).toContain(
+              "Not executed: a prior mutation in this batch failed",
+            );
+            expect(readFileSync(target, "utf8")).toBe("before\n");
+            return toolCall("recovery_read_1", "read_file", {
+              path: "target.txt",
+              line_count: 20,
+            });
+          },
+          (body) => {
+            expect(toolResultOutput(body, "recovery_read_1")).toContain(
+              "before",
+            );
+            return toolCall("recovery_patch_1", "apply_patch", {
+              patch:
+                "*** Begin Patch\n*** Update File: target.txt\n@@\n before\n@@\n-before\n+after\n*** End Patch",
+            });
+          },
+          (body) => {
+            expect(toolResultOutput(body, "recovery_patch_1")).toContain(
+              "Applied patch",
+            );
+            expect(readFileSync(target, "utf8")).toBe("after\n");
+            return finalText("patch recovery completed");
+          },
+        ]);
+        try {
+          const result = await runFx(
+            [
+              "ask",
+              "--yolo",
+              "--json",
+              "--no-save",
+              "Exercise transactional patch recovery.",
+            ],
+            {
+              cwd: root.workspace,
+              env: gatewayEnv(root, gateway, root.home, {
+                FX_EXPERIMENT_X9_EDITOR: "patch_v3",
+              }),
+              timeoutMs: TIMEOUT,
+            },
+          );
+          const json = parseFxJson(result);
+          expect(gateway.requests).toHaveLength(5);
+          expect(gateway.remainingResponseCount()).toBe(0);
+          expect(json.output).toBe("patch recovery completed");
+          expect(json.tool_calls).toEqual([
+            { name: "apply_patch", status: "error" },
+            { name: "edit_file", status: "error" },
+            { name: "read_file", status: "success" },
+            { name: "apply_patch", status: "success" },
+          ]);
+          expect(readFileSync(target, "utf8")).toBe("after\n");
+        } finally {
+          gateway.stop();
+        }
       } finally {
         rmSync(root.root, { recursive: true, force: true });
       }
