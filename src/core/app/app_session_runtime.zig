@@ -23,7 +23,6 @@ const io_mod = @import("../shared/io.zig");
 const list_window = @import("../shared/list_window.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const session_runtime = @import("../session/session.zig");
-const session_title_generator = @import("../session/session_title_generator.zig");
 const session_catalog = @import("../session/session_catalog.zig");
 const session_codec = @import("../session/session_codec.zig");
 const js_host_session_store = @import("../session/js_host_session_store.zig");
@@ -2965,11 +2964,12 @@ pub fn Runtime(comptime App: type) type {
         /// therefore wins without exposing the deterministic provisional title.
         pub fn applyGeneratedSessionTitle(
             app: *App,
-            generated: session_title_generator.GeneratedTitle,
+            source_session_id: []const u8,
+            generated_title: []const u8,
         ) !void {
             const active_id = activeSessionId(app) orelse return;
-            if (!shouldApplyGeneratedTitle(active_id, cachedSessionTitle(app), generated)) return;
-            const title = validateSessionTitle(generated.title) catch return;
+            if (!shouldApplyGeneratedTitle(active_id, cachedSessionTitle(app), source_session_id)) return;
+            const title = validateSessionTitle(generated_title) catch return;
             try applyActiveSessionTitle(app, title);
             app.shell.render_requests.request(.footer);
         }
@@ -2977,9 +2977,9 @@ pub fn Runtime(comptime App: type) type {
         fn shouldApplyGeneratedTitle(
             active_session_id: []const u8,
             current_title: ?[]const u8,
-            generated: session_title_generator.GeneratedTitle,
+            source_session_id: []const u8,
         ) bool {
-            return std.mem.eql(u8, active_session_id, generated.session_id) and
+            return std.mem.eql(u8, active_session_id, source_session_id) and
                 current_title == null;
         }
 
@@ -9825,14 +9825,10 @@ test "renameActiveSession requires an active session" {
 }
 
 test "generated session title requires matching session and no visible title" {
-    const generated = session_title_generator.GeneratedTitle{
-        .session_id = @constCast("session-a"),
-        .expected_title = @constCast("provisional"),
-        .title = @constCast("Generated title"),
-    };
-    try std.testing.expect(Runtime(TestApp).shouldApplyGeneratedTitle("session-a", null, generated));
-    try std.testing.expect(!Runtime(TestApp).shouldApplyGeneratedTitle("session-b", null, generated));
-    try std.testing.expect(!Runtime(TestApp).shouldApplyGeneratedTitle("session-a", "Manual title", generated));
+    const should_apply = Runtime(TestApp).shouldApplyGeneratedTitle;
+    try std.testing.expect(should_apply("session-a", null, "session-a"));
+    try std.testing.expect(!should_apply("session-b", null, "session-a"));
+    try std.testing.expect(!should_apply("session-a", "Manual title", "session-a"));
 }
 
 test "renameActiveSession persists the title to the sidecar and session index" {

@@ -78,7 +78,7 @@ The status line hides the workspace path and Git branch by default. Enable the `
 }
 ```
 
-List saved sessions with `fx sessions`. fx immediately derives a provisional name from the first prompt, then replaces it with a concise model-generated title in the background. A manual `/rename <title>` always takes precedence. Resume the latest session for the current workspace, or select an exact session ID, through the same command group:
+List saved sessions with `fx sessions`. fx generates a concise session title in the background after the first prompt, with the prompt-derived name retained as a fallback. A manual `/rename <title>` always takes precedence. Resume the latest session for the current workspace, or select an exact session ID, through the same command group:
 
 ```bash
 fx session resume last

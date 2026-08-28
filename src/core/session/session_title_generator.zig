@@ -6,19 +6,6 @@ const types = @import("../shared/types.zig");
 
 const Allocator = std.mem.Allocator;
 
-pub const GeneratedTitle = struct {
-    session_id: []u8,
-    expected_title: []u8,
-    title: []u8,
-
-    pub fn deinit(self: GeneratedTitle) void {
-        const alloc = std.heap.c_allocator;
-        alloc.free(self.session_id);
-        alloc.free(self.expected_title);
-        alloc.free(self.title);
-    }
-};
-
 pub const max_title_chars: usize = 50;
 const max_prompt_bytes: usize = 960;
 const max_response_bytes: usize = 256;

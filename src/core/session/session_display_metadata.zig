@@ -35,14 +35,6 @@ pub fn missingFallback(alloc: Allocator) !DisplayMetadata {
     };
 }
 
-/// Derives the deterministic provisional title for one text prompt.
-/// The caller owns the returned bytes.
-pub fn deriveTitleFromPrompt(alloc: Allocator, prompt: []const u8) !?[]u8 {
-    if (!std.unicode.utf8ValidateSlice(prompt)) return null;
-    const first_line = firstNonEmptyLine(prompt) orelse return null;
-    return try cappedTitle(alloc, first_line);
-}
-
 pub fn deriveFromHistory(alloc: Allocator, history: []const session.HistoryTurn) !DisplayMetadata {
     const candidate = firstPromptCandidate(history) orelse {
         return if (history.len == 0) missingFallback(alloc) else missingFallbackPresent(alloc);
