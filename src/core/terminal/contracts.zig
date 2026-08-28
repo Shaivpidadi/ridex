@@ -2413,14 +2413,57 @@ pub const StructuredErrorCode = enum {
     cancelled,
 };
 
+pub const StructuredErrorDiagnostic = struct {
+    pub const Reason = enum { stale_terminal_helper };
+    pub const Remediation = enum { restart_terminal_helper_after_closing_live_sessions };
+
+    reason: Reason,
+    missing_capabilities: u64,
+    remediation: Remediation,
+};
+
+pub const StructuredErrorValidationError = error{
+    InvalidSessionId,
+    InvalidStructuredErrorDiagnostic,
+};
+
 pub const StructuredError = struct {
     action: Action,
     code: StructuredErrorCode,
     session_id: ?[]const u8 = null,
     retryable: bool = false,
+    diagnostic: ?StructuredErrorDiagnostic = null,
 
-    pub fn validate(self: StructuredError) error{InvalidSessionId}!void {
+    pub fn jsonStringify(self: StructuredError, writer: anytype) !void {
+        try writer.beginObject();
+        try writer.objectField("action");
+        try writer.write(self.action);
+        try writer.objectField("code");
+        try writer.write(self.code);
+        try writer.objectField("session_id");
+        try writer.write(self.session_id);
+        try writer.objectField("retryable");
+        try writer.write(self.retryable);
+        if (self.diagnostic) |diagnostic| {
+            try writer.objectField("diagnostic");
+            try writer.write(diagnostic);
+        }
+        try writer.endObject();
+    }
+
+    pub fn validate(self: StructuredError) StructuredErrorValidationError!void {
         if (self.session_id) |session_id| try validate_session_id(session_id);
+        if (self.diagnostic) |diagnostic| {
+            if (self.code != .unsupported_host or
+                self.retryable or
+                diagnostic.missing_capabilities &
+                    protocol_capability_complete_process_tree_signals == 0 or
+                diagnostic.missing_capabilities &
+                    ~known_protocol_capabilities != 0)
+            {
+                return error.InvalidStructuredErrorDiagnostic;
+            }
+        }
     }
 };
 
@@ -2609,6 +2652,7 @@ pub const ResultValidationError = error{
     HostFrameTooLarge,
     InvalidMonitor,
     InvalidReturnOutcome,
+    InvalidStructuredErrorDiagnostic,
 };
 
 pub const ActionResult = union(enum) {
@@ -2816,6 +2860,7 @@ pub const OwnedResult = union(enum) {
                     else
                         null,
                     .retryable = failure.retryable,
+                    .diagnostic = failure.diagnostic,
                 },
             },
         };
@@ -3896,6 +3941,57 @@ test "results own every action-specific success and structured failure" {
     defer failure.deinit(std.testing.allocator);
     try std.testing.expectEqual(Action.read, failure.view().action());
     try failure.view().validate();
+}
+
+test "stale terminal helper diagnostics reject contradictory error state" {
+    const diagnostic = StructuredErrorDiagnostic{
+        .reason = .stale_terminal_helper,
+        .missing_capabilities = protocol_capability_complete_process_tree_signals,
+        .remediation = .restart_terminal_helper_after_closing_live_sessions,
+    };
+    try (StructuredError{
+        .action = .start,
+        .code = .unsupported_host,
+        .diagnostic = diagnostic,
+    }).validate();
+
+    const invalid = [_]StructuredError{
+        .{
+            .action = .start,
+            .code = .protocol_incompatible,
+            .diagnostic = diagnostic,
+        },
+        .{
+            .action = .start,
+            .code = .unsupported_host,
+            .retryable = true,
+            .diagnostic = diagnostic,
+        },
+        .{
+            .action = .start,
+            .code = .unsupported_host,
+            .diagnostic = .{
+                .reason = .stale_terminal_helper,
+                .missing_capabilities = 0,
+                .remediation = .restart_terminal_helper_after_closing_live_sessions,
+            },
+        },
+        .{
+            .action = .start,
+            .code = .unsupported_host,
+            .diagnostic = .{
+                .reason = .stale_terminal_helper,
+                .missing_capabilities = std.math.maxInt(u64),
+                .remediation = .restart_terminal_helper_after_closing_live_sessions,
+            },
+        },
+    };
+    for (invalid) |failure| {
+        try std.testing.expectError(
+            error.InvalidStructuredErrorDiagnostic,
+            failure.validate(),
+        );
+    }
 }
 
 test "start and wait results preserve every valid return outcome" {

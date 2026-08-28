@@ -1394,23 +1394,40 @@ fn resultFromCompletion(
             ),
         };
     }
-    return structuredFailure(
-        ctx,
+    return projectResult(ctx, .{ .failure = completionFailure(
         action,
         session_id,
-        switch (completion.kind) {
+        completion,
+    ) });
+}
+
+fn completionFailure(
+    action: contracts.Action,
+    session_id: ?[]const u8,
+    completion: client.Completion,
+) contracts.StructuredError {
+    const stale_helper = completion.is_missing_capability(
+        contracts.protocol_capability_complete_process_tree_signals,
+    );
+    return .{
+        .action = action,
+        .code = switch (completion.kind) {
             .cancelled => .cancelled,
-            .unavailable => if (completion.is_missing_capability(
-                contracts.protocol_capability_complete_process_tree_signals,
-            ))
+            .unavailable => if (stale_helper)
                 .unsupported_host
             else
                 .protocol_incompatible,
             .disconnected => .session_lost,
             .response => .protocol_incompatible,
         },
-        completion.kind == .disconnected,
-    );
+        .session_id = session_id,
+        .retryable = completion.kind == .disconnected,
+        .diagnostic = if (stale_helper) .{
+            .reason = .stale_terminal_helper,
+            .missing_capabilities = completion.missing_capabilities,
+            .remediation = .restart_terminal_helper_after_closing_live_sessions,
+        } else null,
+    };
 }
 
 fn stringifyResult(
@@ -2655,7 +2672,7 @@ test "terminal completion maps only complete signal capability misses to unsuppo
                 .correlation_id = .{ .value = 1 },
                 .missing_capabilities = contracts.protocol_capability_complete_process_tree_signals,
             },
-            .expected = "{\"failure\":{\"action\":\"start\",\"code\":\"unsupported_host\",\"session_id\":null,\"retryable\":false}}",
+            .expected = "{\"failure\":{\"action\":\"start\",\"code\":\"unsupported_host\",\"session_id\":null,\"retryable\":false,\"diagnostic\":{\"reason\":\"stale_terminal_helper\",\"missing_capabilities\":16,\"remediation\":\"restart_terminal_helper_after_closing_live_sessions\"}}}",
         },
         .{
             .completion = .{
