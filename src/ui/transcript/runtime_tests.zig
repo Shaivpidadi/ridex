@@ -1220,6 +1220,34 @@ test "stable zero-scroll frame yields the complete finalized presentation record
     try std.testing.expectEqualStrings("single visible line", pending.bytes);
 }
 
+test "transcript source captures entry spans only for an active presentation record" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = transcriptTestLayout(40, 8, 4),
+        .owned_top_row = 1,
+    };
+    defer runtime.deinit(alloc);
+    _ = try runtime.appendRawTranscriptEntryClassified(
+        alloc,
+        "recorded entry",
+        .unknown_raw,
+    );
+
+    var disabled = try runtime.prepareTranscriptSource(alloc, null);
+    defer disabled.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), disabled.entry_spans.len);
+
+    runtime.beginPresentationRecord();
+    var active = try runtime.prepareTranscriptSource(alloc, null);
+    defer active.deinit(alloc);
+    try std.testing.expect(active.entry_spans.len > 0);
+
+    runtime.degradePresentationRecord();
+    var degraded = try runtime.prepareTranscriptSource(alloc, null);
+    defer degraded.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), degraded.entry_spans.len);
+}
+
 test "mutable presentation hold keeps the record frame pending" {
     const alloc = std.testing.allocator;
     var runtime = commandOutputTestRuntime(undefined);

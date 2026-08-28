@@ -113,10 +113,23 @@ test "reset transcript reader lends a borrowed sequential frame source" {
 }
 
 fn streamSessionTranscript(app: anytype, reader: anytype) !u64 {
-    try app.shell.writeResumeStreamBytes(
+    app.shell.writeResumeStreamBytes(
         &app.metrics,
         resume_stream_autowrap_enable,
-    );
+    ) catch |enable_err| {
+        app.shell.writeResumeStreamBytes(
+            &app.metrics,
+            resume_stream_autowrap_disable,
+        ) catch |restore_err| {
+            debug_trace.logf(
+                "session",
+                "event=session_transcript_stream outcome=failed stage=enable_restore enable_err={s} restore_err={s}",
+                .{ @errorName(enable_err), @errorName(restore_err) },
+            );
+            return error.TerminalModeRestoreFailed;
+        };
+        return enable_err;
+    };
     const payload_result = streamSessionTranscriptPayload(app, reader);
     if (payload_result) |payload_bytes| {
         scrollResumePayloadIntoHistory(app) catch |padding_err| {
@@ -157,9 +170,8 @@ fn streamSessionTranscript(app: anytype, reader: anytype) !u64 {
 
 fn scrollResumePayloadIntoHistory(app: anytype) !void {
     var rows: u16 = 0;
-    const padding_rows: u16 = @intFromBool(
-        app.shell.layout.rows > app.shell.layout.content_bottom,
-    );
+    const padding_rows = (app.shell.layout.rows -|
+        app.shell.layout.content_bottom) +| 1;
     while (rows < padding_rows) : (rows += 1) {
         try app.shell.writeResumeStreamBytes(&app.metrics, "\r\n");
     }
@@ -277,10 +289,62 @@ test "session transcript stream moves the payload clear of startup chrome" {
     try std.testing.expectEqual(@as(u64, payload.len), streamed);
     try std.testing.expectEqualStrings(
         resume_stream_autowrap_enable ++ payload ++
-            "\r\n" ++ resume_stream_autowrap_disable,
+            "\r\n\r\n\r\n" ++ resume_stream_autowrap_disable,
         app.shell.output.items,
     );
     try std.testing.expect(app.shell.adopted);
+}
+
+test "session transcript stream restores autowrap when the enable write fails" {
+    const alloc = std.testing.allocator;
+    const FakeShell = struct {
+        alloc: Allocator,
+        layout: types.Layout = .{
+            .rows = 1,
+            .cols = 20,
+            .content_bottom = 1,
+            .divider_top_row = 1,
+            .input_row = 1,
+            .divider_bottom_row = 1,
+            .hint_row = 1,
+        },
+        output: std.ArrayList(u8) = .empty,
+        write_count: usize = 0,
+
+        fn deinit(self: *@This()) void {
+            self.output.deinit(self.alloc);
+        }
+
+        fn writeResumeStreamBytes(
+            self: *@This(),
+            _: *types.Metrics,
+            bytes: []const u8,
+        ) !void {
+            try self.output.appendSlice(self.alloc, bytes);
+            self.write_count += 1;
+            if (self.write_count == 1) return error.TestEnableWriteFailed;
+        }
+
+        fn adoptStreamedSessionHistory(_: *@This()) void {}
+    };
+    const FakeApp = struct {
+        shell: FakeShell,
+        metrics: types.Metrics = .{},
+    };
+    var app = FakeApp{ .shell = .{ .alloc = alloc } };
+    defer app.shell.deinit();
+
+    try std.testing.expectError(
+        error.TestEnableWriteFailed,
+        streamSessionTranscript(
+            &app,
+            MemoryTranscriptReader{ .bytes = "payload\r\n" },
+        ),
+    );
+    try std.testing.expectEqualStrings(
+        resume_stream_autowrap_enable ++ resume_stream_autowrap_disable,
+        app.shell.output.items,
+    );
 }
 
 const BackgroundSessionPolicy = enum {
@@ -1348,6 +1412,22 @@ pub const Persistence = struct {
 pub fn Runtime(comptime App: type) type {
     return struct {
         pub fn acquireResetTranscriptReader(app: *App) !?ResetTranscriptReader {
+            if (!app.shell.streamedResetSourceReady()) {
+                debug_trace.logf(
+                    "session",
+                    "event=session_transcript_reset outcome=unavailable reason=record_not_caught_up",
+                    .{},
+                );
+                return null;
+            }
+            const expected_committed_len = app.shell.presentationRecordCommittedLen() orelse {
+                debug_trace.logf(
+                    "session",
+                    "event=session_transcript_reset outcome=unavailable reason=record_degraded",
+                    .{},
+                );
+                return null;
+            };
             const writable = if (app.session_persistence.writable) |*value|
                 value
             else {
@@ -1360,7 +1440,17 @@ pub fn Runtime(comptime App: type) type {
             };
             var admission = try writable.admitActiveTranscript(app.alloc);
             switch (admission) {
-                .exact => return .{ .admission = admission },
+                .exact => |reader| if (reader.committed_len == expected_committed_len) {
+                    return .{ .admission = admission };
+                } else {
+                    admission.deinit();
+                    debug_trace.logf(
+                        "session",
+                        "event=session_transcript_reset outcome=unavailable reason=record_length_mismatch expected={d} actual={d}",
+                        .{ expected_committed_len, reader.committed_len },
+                    );
+                    return null;
+                },
                 .missing, .incomplete, .corrupt => {
                     const reason = @tagName(std.meta.activeTag(admission));
                     admission.deinit();
@@ -1504,13 +1594,21 @@ pub fn Runtime(comptime App: type) type {
                     if (retention_changed and
                         app.shell.streamedSessionHistoryActive())
                     {
+                        var anchor_reconciled = true;
                         app.shell.establishStreamedRetainedAnchor(app.alloc) catch |err| {
+                            anchor_reconciled = false;
                             debug_trace.logf(
                                 "session",
                                 "event=session_transcript outcome=anchor_pending err={s}",
                                 .{@errorName(err)},
                             );
                         };
+                        if (anchor_reconciled) {
+                            app.shell.commitPresentationRecord(
+                                delta.next_cursor,
+                                next_committed_len,
+                            );
+                        }
                     }
                 }
                 debug_trace.logf(
@@ -2117,11 +2215,35 @@ pub fn Runtime(comptime App: type) type {
             }
 
             try app.prepareLiveSessionResume(log_options);
+            finishPreparedSelectedSessionResume(
+                app,
+                store,
+                &admission,
+                admitted_id,
+                log_options,
+            ) catch |err| {
+                debug_trace.logf(
+                    "session",
+                    "event=session_transcript_resume outcome=failed_closed stage=live_post_prepare err={s}",
+                    .{@errorName(err)},
+                );
+                return error.LiveSessionResumeFailedClosed;
+            };
+            return true;
+        }
+
+        fn finishPreparedSelectedSessionResume(
+            app: *App,
+            store: session_store.Store,
+            admission: *session_store.TranscriptAdmission,
+            admitted_id: []const u8,
+            log_options: session_log.Options,
+        ) !void {
             try streamAdmittedTranscript(app, admission.transcript);
             var loaded = try subagent_resume_admission.resumeTranscriptAdmittedForExternalPrompt(
                 store,
                 app.alloc,
-                &admission,
+                admission,
                 admitted_id,
                 app.workspace_root,
                 .{
@@ -2137,7 +2259,6 @@ pub fn Runtime(comptime App: type) type {
             requestSubagentBackgroundRecovery(app);
             startResumedSessionReconciliation(app);
             try app.finishLiveSessionResume();
-            return true;
         }
 
         fn loadResumeTargetForWrite(
@@ -2234,11 +2355,16 @@ pub fn Runtime(comptime App: type) type {
                 try replayHistoryToSink(app, &sink, state.history);
                 try writeRecoveryCheckpointToSink(app, &sink, state);
                 const projection_finished_ns = io_mod.nanoTimestamp();
-                try projection.finalize();
+                const exact_transcript_streamed =
+                    app.session_persistence.resume_transcript_streamed;
+                try projection.finalizeForResume(!exact_transcript_streamed);
                 const finalization_finished_ns = io_mod.nanoTimestamp();
                 var committed_len = app.session_persistence.resume_transcript_committed_len;
                 if (!app.session_persistence.resume_transcript_streamed) {
-                    const transcript_bytes = projection.publicationBytes();
+                    const transcript_bytes = try projection.publicationWireBytes(
+                        app.shell.layout.cols,
+                    );
+                    defer app.alloc.free(transcript_bytes);
                     const streamed = try streamSessionTranscript(
                         app,
                         MemoryTranscriptReader{ .bytes = transcript_bytes },
@@ -2270,14 +2396,15 @@ pub fn Runtime(comptime App: type) type {
                         };
                     }
                 }
-                try app.installResumeProjectionRetained(&projection);
-                var live_sink = LiveHistorySink(App){ .app = app };
-                try writeResumeNotice(app, &live_sink, display_title, notice);
+                const record_cursor = projection.recordCursor();
                 if (committed_len) |len| {
-                    app.shell.resumePresentationRecord(len);
+                    app.shell.resumePresentationRecordAt(len, record_cursor);
                 } else {
                     app.shell.degradePresentationRecord();
                 }
+                try app.installResumeProjectionRetained(&projection);
+                var live_sink = LiveHistorySink(App){ .app = app };
+                try writeResumeNotice(app, &live_sink, display_title, notice);
                 app.session_persistence.resume_transcript_committed_len = null;
                 app.session_persistence.resume_transcript_streamed = false;
                 const install_finished_ns = io_mod.nanoTimestamp();
@@ -8019,6 +8146,56 @@ test "canceling a startup session picker starts a writable fresh session" {
     try std.testing.expect(app.session_persistence.writable != null);
 }
 
+test "reset transcript reader requires a healthy caught-up presentation record" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+
+    var app = try TestApp.init(alloc, paths.workspace);
+    defer app.deinit();
+    try configureTestPreferences(&app);
+    try Runtime(TestApp).initializePersistence(&app, true);
+    try Runtime(TestApp).beginFreshPersistedSession(&app);
+
+    const transcript = "persisted history\r\n";
+    try app.session_persistence.writable.?.publishTranscript(alloc, transcript);
+    app.shell.resumePresentationRecord(transcript.len);
+    app.shell.transcript_band_dirty = false;
+    app.shell.render_requests.clearReason(.transcript);
+    app.shell.adoptStreamedSessionHistory();
+    try app.shell.requestTerminalResetAfterResize(&app.metrics, null);
+
+    var exact = (try Runtime(TestApp).acquireResetTranscriptReader(&app)) orelse
+        return error.TestExpectedResetTranscriptReader;
+    exact.deinit();
+    app.shell.finishStreamedResetAttempt();
+
+    try app.shell.writeTranscriptClassified(
+        alloc,
+        &app.metrics,
+        "unpersisted live tail\n",
+        true,
+        .unknown_raw,
+    );
+    try app.shell.requestTerminalResetAfterResize(&app.metrics, null);
+    try std.testing.expect((try Runtime(TestApp).acquireResetTranscriptReader(&app)) == null);
+    app.shell.finishStreamedResetAttempt();
+
+    app.shell.degradePresentationRecord();
+    app.shell.transcript_band_dirty = false;
+    app.shell.render_requests.clearReason(.transcript);
+    try app.shell.requestTerminalResetAfterResize(&app.metrics, null);
+    try std.testing.expect((try Runtime(TestApp).acquireResetTranscriptReader(&app)) == null);
+}
+
 test "interactive session resume uses the live transition and shared restore path" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -8079,6 +8256,71 @@ test "interactive session resume uses the live transition and shared restore pat
         subagent_tool_host.RecoveryState.complete,
         host.recoveryState(),
     );
+}
+
+test "interactive session resume marks post-prepare stream failures fail closed" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+
+    var app = try TestApp.init(alloc, paths.workspace);
+    defer app.deinit();
+    try configureTestPreferences(&app);
+    try Runtime(TestApp).initializePersistence(&app, true);
+    const history = [_]types.HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("saved prompt") },
+        .assistant = @constCast("saved response"),
+    } }};
+    try writeSessionFixture(
+        alloc,
+        app.session_persistence.store.?,
+        "invalid-transcript-session",
+        &history,
+        0,
+    );
+    {
+        var target = try app.session_persistence.store.?.resumeForWrite(
+            alloc,
+            "invalid-transcript-session",
+        );
+        defer target.deinit(alloc);
+        try target.publishTranscript(alloc, "safe");
+        var transcript_file = try target.log.dir.dir.openFile(
+            std.testing.io,
+            "transcript.ansi",
+            .{ .mode = .read_write },
+        );
+        defer transcript_file.close(std.testing.io);
+        try transcript_file.writePositionalAll(std.testing.io, "\x1b[2J", 0);
+        try transcript_file.sync(std.testing.io);
+    }
+
+    try Runtime(TestApp).beginFreshPersistedSession(&app);
+    try Runtime(TestApp).openSessionPicker(&app);
+    try waitForSessionPickerLoad(&app);
+    var stdout_file = try tmp.dir.createFile(
+        std.testing.io,
+        "live-resume-failed-closed.stdout",
+        .{},
+    );
+    defer stdout_file.close(std.testing.io);
+    app.shell.stdout_file = stdout_file;
+    try app.shell.enableShadowVt(alloc);
+
+    try std.testing.expectError(
+        error.LiveSessionResumeFailedClosed,
+        Runtime(TestApp).resumeSelectedSession(&app),
+    );
+    try std.testing.expectEqual(@as(usize, 1), app.live_resume_prepare_count);
+    try std.testing.expectEqual(@as(usize, 0), app.live_resume_finish_count);
 }
 
 test "interactive session resume preserves the current writer when the target is unavailable" {

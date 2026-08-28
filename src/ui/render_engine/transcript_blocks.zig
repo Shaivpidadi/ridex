@@ -2298,6 +2298,7 @@ pub const TranscriptPreparationOptions = struct {
     entry_actions: []const EntryRenderAction = &.{},
     folded_summary_entry_ids: []const ?u32 = &.{},
     capture_provenance: bool = false,
+    capture_entry_spans: bool = false,
     entry_overrides: []const EntryRenderOverride = &.{},
 };
 
@@ -2349,7 +2350,7 @@ pub fn renderEntriesForPreparationInterruptible(
             .summary_transcript_indices = summary_indices,
             .line_provenance = if (options.capture_provenance) &line_provenance else null,
             .entry_overrides = options.entry_overrides,
-            .capture_entry_spans = true,
+            .capture_entry_spans = options.capture_entry_spans,
         },
         checkpoint,
     );
@@ -3579,7 +3580,7 @@ test "preparation records entry byte spans including their leading separators" {
         entries.items,
         80,
         .{},
-        .{},
+        .{ .capture_entry_spans = true },
     );
     defer prepared.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 2), prepared.entry_spans.len);

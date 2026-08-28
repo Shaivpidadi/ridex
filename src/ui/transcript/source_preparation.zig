@@ -557,6 +557,10 @@ fn prepareTranscriptSourceInternal(
                 .omitted_entry_id = omitted_entry_id,
                 .folded_summary_entry_ids = summary_entry_ids,
                 .capture_provenance = capture_provenance,
+                .capture_entry_spans = if (comptime @hasDecl(
+                    @TypeOf(self.*),
+                    "presentationRecordActive",
+                )) self.presentationRecordActive() else false,
                 .entry_actions = entry_actions,
             },
             checkpoint,

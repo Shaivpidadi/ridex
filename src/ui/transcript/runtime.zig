@@ -4269,6 +4269,7 @@ pub const TranscriptRuntime = struct {
     has_painted_transcript: bool = false,
     streamed_session_history_active: bool = false,
     streamed_reset_requested: bool = false,
+    streamed_reset_source_ready: bool = false,
     footer_viewport: footer_viewport_runtime.FooterViewport = .{},
     extra_input_rows: u16 = 0,
     footer_reserved_base_rows: u16 = 3,
@@ -4356,8 +4357,14 @@ pub const TranscriptRuntime = struct {
         return self.streamed_reset_requested;
     }
 
+    pub fn streamedResetSourceReady(self: *const TranscriptRuntime) bool {
+        return self.streamed_reset_requested and
+            self.streamed_reset_source_ready;
+    }
+
     pub fn finishStreamedResetAttempt(self: *TranscriptRuntime) void {
         self.streamed_reset_requested = false;
+        self.streamed_reset_source_ready = false;
         self.terminal_reset_pending = false;
     }
 
@@ -4515,6 +4522,17 @@ pub const TranscriptRuntime = struct {
                 ),
                 .ends_with_newline = false,
             } };
+        self.resumePresentationRecordAt(committed_len, cursor);
+    }
+
+    pub fn resumePresentationRecordAt(
+        self: *TranscriptRuntime,
+        committed_len: u64,
+        cursor: presentation_record.Cursor,
+    ) void {
+        std.debug.assert(committed_len > 0);
+        std.debug.assert(self.pending_presentation_record == null);
+        self.presentation_record_frame_pending = false;
         self.presentation_record = .{ .active = .{
             .cursor = cursor,
             .committed_len = committed_len,
@@ -4544,17 +4562,28 @@ pub const TranscriptRuntime = struct {
         };
     }
 
+    fn presentationRecordCaughtUp(self: *const TranscriptRuntime) bool {
+        if (self.pending_presentation_record != null) return false;
+        return switch (self.presentation_record) {
+            .active => |state| state.caught_up,
+            .disabled, .degraded => false,
+        };
+    }
+
     pub fn presentationRecordCanRestamp(self: *const TranscriptRuntime) bool {
-        if (self.pending_presentation_record != null or
+        if (!self.presentationRecordCaughtUp() or
             self.transcript_band_dirty or
             self.render_requests.hasReason(.transcript))
         {
             return false;
         }
-        return switch (self.presentation_record) {
-            .active => |state| state.caught_up,
-            .disabled, .degraded => false,
-        };
+        return true;
+    }
+
+    pub fn presentationRecordReadyForReset(
+        self: *const TranscriptRuntime,
+    ) bool {
+        return self.presentationRecordCaughtUp();
     }
 
     pub fn commitPresentationRecord(
@@ -4880,6 +4909,7 @@ pub const TranscriptRuntime = struct {
     pub fn clearTranscript(self: *TranscriptRuntime, alloc: Allocator) void {
         self.streamed_session_history_active = false;
         self.streamed_reset_requested = false;
+        self.streamed_reset_source_ready = false;
         const pending_resume_bytes = self.releasePendingResumeSource(alloc);
         if (pending_resume_bytes > 0) {
             debug_trace.logf(
@@ -6618,6 +6648,10 @@ pub const TranscriptRuntime = struct {
         history_row_delta: ?i32,
     ) !void {
         if (self.streamed_session_history_active) {
+            const source_ready = if (self.streamed_reset_requested)
+                self.streamed_reset_source_ready
+            else
+                self.presentationRecordReadyForReset();
             self.streamed_reset_requested = true;
             self.reflow_clear_guard_rows = 0;
             self.resize_history_row_delta = null;
@@ -6629,6 +6663,7 @@ pub const TranscriptRuntime = struct {
             self.footer_viewport.clearExternalInvalidation();
             self.invalidateTranscriptAnchor("streamed_session_history_resize");
             self.markTranscriptDirty();
+            self.streamed_reset_source_ready = source_ready;
             return;
         }
         try self.requestTerminalReset(metrics);
@@ -10248,6 +10283,16 @@ pub const TranscriptRuntime = struct {
         self.render_requests.request(.transcript);
     }
 
+    fn markPresentationRecordBehind(self: *TranscriptRuntime) void {
+        switch (self.presentation_record) {
+            .active => |*state| state.caught_up = false,
+            .disabled, .degraded => {},
+        }
+        if (self.streamed_reset_requested) {
+            self.streamed_reset_source_ready = false;
+        }
+    }
+
     pub fn nativeHistoryActive(self: *const TranscriptRuntime) bool {
         return switch (self.transcript_commit_state) {
             .invalid => false,
@@ -10257,10 +10302,7 @@ pub const TranscriptRuntime = struct {
     }
 
     pub fn markTranscriptContentDirty(self: *TranscriptRuntime) void {
-        switch (self.presentation_record) {
-            .active => |*state| state.caught_up = false,
-            .disabled, .degraded => {},
-        }
+        self.markPresentationRecordBehind();
         self.full_transcript_content_revision +%= 1;
         self.full_transcript_projection_cache.relationships.markDirtyAll();
         self.full_transcript_projection_cache.full.markDirtyAll();
@@ -10281,6 +10323,7 @@ pub const TranscriptRuntime = struct {
     }
 
     pub fn markTranscriptStructureDirty(self: *TranscriptRuntime) void {
+        self.markPresentationRecordBehind();
         self.full_transcript_content_revision +%= 1;
         self.full_transcript_review_revision +%= 1;
         self.full_transcript_projection_cache.relationships.markDirtyAll();
@@ -10311,6 +10354,7 @@ pub const TranscriptRuntime = struct {
             self.markTranscriptContentDirty();
             return;
         };
+        self.markPresentationRecordBehind();
         self.full_transcript_content_revision +%= 1;
         self.full_transcript_projection_cache.relationships.markDirtyFrom(entry_id, entry_index);
         self.full_transcript_projection_cache.full.markDirtyFrom(entry_id, entry_index);
@@ -10332,6 +10376,7 @@ pub const TranscriptRuntime = struct {
     }
 
     pub fn markTranscriptCommandOutputDirty(self: *TranscriptRuntime) void {
+        self.markPresentationRecordBehind();
         self.full_transcript_content_revision +%= 1;
         self.full_transcript_projection_cache.relationships.markDirtyAll();
         self.full_transcript_projection_cache.full.markDirtyAll();
@@ -10351,6 +10396,7 @@ pub const TranscriptRuntime = struct {
             self.markTranscriptCommandOutputDirty();
             return;
         };
+        self.markPresentationRecordBehind();
         self.full_transcript_content_revision +%= 1;
         self.full_transcript_projection_cache.relationships.markDirtyFrom(entry_id, entry_index);
         self.full_transcript_projection_cache.full.markDirtyFrom(entry_id, entry_index);
@@ -11592,6 +11638,35 @@ test "settled streamed session resize requests one file backed reset without cle
 
     runtime.finishStreamedResetAttempt();
     try std.testing.expect(!runtime.streamedResetRequested());
+}
+
+test "armed streamed reset keeps its ready source until the attempt finishes" {
+    var metrics: Metrics = .{};
+    var runtime = TranscriptRuntime{
+        .layout = invalidationTestLayout(),
+        .owned_top_row = 1,
+        .viewport_top_row = 1,
+    };
+    defer runtime.deinit(std.testing.allocator);
+    runtime.adoptStreamedSessionHistory();
+    runtime.resumePresentationRecord(10);
+    runtime.transcript_band_dirty = false;
+    runtime.render_requests.clearReason(.transcript);
+
+    try runtime.requestTerminalResetAfterResize(&metrics, null);
+    try std.testing.expect(runtime.streamedResetRequested());
+    try std.testing.expect(runtime.streamedResetSourceReady());
+
+    try runtime.armTerminalResetForCurrentFrame(&metrics);
+    try std.testing.expect(runtime.streamedResetRequested());
+    try std.testing.expect(runtime.streamedResetSourceReady());
+
+    try runtime.requestTerminalResetAfterResize(&metrics, null);
+    try std.testing.expect(runtime.streamedResetSourceReady());
+
+    runtime.finishStreamedResetAttempt();
+    try std.testing.expect(!runtime.streamedResetRequested());
+    try std.testing.expect(!runtime.streamedResetSourceReady());
 }
 
 test "marking transcript cache dirty also schedules transcript work" {

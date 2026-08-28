@@ -555,6 +555,7 @@ async function runStress(config: Config): Promise<Paths> {
       () => session!.sendKeys("Enter"),
       () => session!.waitForText(FINAL_MARKER, TIMEOUT * 20),
     );
+    await session.waitForComposer(TIMEOUT * 20);
     const headMarker = "RESUME_CHAT_000000";
     const middleMarker = `RESUME_CHAT_${pad(Math.floor(config.chatBatches * config.chatLinesPerBatch / 2))}`;
     const tailMarker = `RESUME_CHAT_${pad(config.chatBatches * config.chatLinesPerBatch - 1)}`;

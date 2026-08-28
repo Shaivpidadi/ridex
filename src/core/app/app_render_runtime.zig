@@ -70,21 +70,6 @@ fn set_transcript_assistant_tail_writable(
     );
 }
 
-const StreamedResetRoute = enum {
-    none,
-    preserve_reflow,
-    sequential,
-};
-
-fn streamedResetRoute(
-    requested: bool,
-    main_surface: bool,
-    source_available: bool,
-) StreamedResetRoute {
-    if (!requested or !main_surface) return .none;
-    return if (source_available) .sequential else .preserve_reflow;
-}
-
 pub const VisualEpochResetTrigger = enum {
     native_clear_probe,
     ctrl_l,
@@ -1853,24 +1838,17 @@ pub fn Runtime(comptime App: type) type {
                 !render_reconciliation.alternate_screen_owns_rendering;
             var reset_transcript_reader: ?app_session_runtime.ResetTranscriptReader = null;
             defer if (reset_transcript_reader) |*reader| reader.deinit();
-            var finish_streamed_reset_attempt = false;
-            defer if (finish_streamed_reset_attempt) {
-                presentation_shell.finishStreamedResetAttempt();
-            };
+            var sequential_reset_armed = false;
             const streamed_reset_requested = presentation_shell.streamedResetRequested();
             if (streamed_reset_requested and
                 child_view == null and
                 !render_reconciliation.alternate_screen_owns_rendering)
             {
                 reset_transcript_reader = try app_session_runtime.Runtime(App).acquireResetTranscriptReader(app);
-                switch (streamedResetRoute(
-                    true,
-                    true,
-                    reset_transcript_reader != null,
-                )) {
-                    .none => unreachable,
-                    .preserve_reflow => presentation_shell.finishStreamedResetAttempt(),
-                    .sequential => try presentation_shell.armTerminalResetForCurrentFrame(&app.metrics),
+                if (reset_transcript_reader != null) {
+                    try presentation_shell.armTerminalResetForCurrentFrame(&app.metrics);
+                } else {
+                    presentation_shell.finishStreamedResetAttempt();
                 }
             }
             const active_committed_layout = if (render_reconciliation.alternate_screen_owns_rendering)
@@ -2282,7 +2260,7 @@ pub fn Runtime(comptime App: type) type {
                         .start_col = 1,
                         .reset_replay = true,
                     };
-                    finish_streamed_reset_attempt = true;
+                    sequential_reset_armed = true;
                 } else {
                     presentation_shell.finishStreamedResetAttempt();
                 }
@@ -2380,7 +2358,8 @@ pub fn Runtime(comptime App: type) type {
                     },
                 },
             );
-            if (finish_streamed_reset_attempt and result.is_committed()) {
+            if (sequential_reset_armed and result.is_committed()) {
+                presentation_shell.finishStreamedResetAttempt();
                 debug_trace.logf(
                     "session",
                     "event=session_transcript_reset outcome=committed bytes={d}",
@@ -7009,23 +6988,4 @@ test "child approval arrival closes review and full transcript depths before ren
         trace,
         "depth_transition from=full to=inline route=child trigger=approval_handoff",
     ) != null);
-}
-
-test "streamed reset routing changes only a requested main surface with a safe source" {
-    try std.testing.expectEqual(
-        StreamedResetRoute.none,
-        streamedResetRoute(false, true, true),
-    );
-    try std.testing.expectEqual(
-        StreamedResetRoute.none,
-        streamedResetRoute(true, false, true),
-    );
-    try std.testing.expectEqual(
-        StreamedResetRoute.preserve_reflow,
-        streamedResetRoute(true, true, false),
-    );
-    try std.testing.expectEqual(
-        StreamedResetRoute.sequential,
-        streamedResetRoute(true, true, true),
-    );
 }

@@ -1803,6 +1803,7 @@ pub fn Runtime(comptime App: type) type {
             if (app.session_persistence.session_picker.selectedId() == null) return true;
 
             _ = app.resumeSelectedSession() catch |err| {
+                if (err == error.LiveSessionResumeFailedClosed) return err;
                 const picker = &app.session_persistence.session_picker;
                 debug_trace.logf(
                     "session",
@@ -5660,6 +5661,30 @@ test "app_input_runtime reports resume failure after picker transition" {
     try std.testing.expectEqual(@as(usize, 1), app.notice_write_count);
     try std.testing.expectEqualStrings("Unable to resume selected session.", app.notice_body.items);
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "SessionCommitBoundaryUnavailable") == null);
+}
+
+test "app_input_runtime propagates a fail-closed live resume error" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    const picker = &app.session_persistence.session_picker;
+    picker.active = true;
+    picker.load_state = .ready;
+    try picker.summaries.append(alloc, .{
+        .id = try alloc.dupe(u8, "fatal-session"),
+        .created_at_ms = 0,
+        .updated_at_ms = 0,
+        .conversation_language = session_runtime.ConversationLanguage.literal("en"),
+        .history_len = 1,
+    });
+    app.resume_selected_closes_picker = true;
+    app.resume_selected_error = error.LiveSessionResumeFailedClosed;
+
+    try std.testing.expectError(
+        error.LiveSessionResumeFailedClosed,
+        Runtime(RoutingFakeApp).handleByte(&app, '\r', 4096, 100),
+    );
+    try std.testing.expectEqual(@as(usize, 0), app.notice_write_count);
 }
 
 test "app_input_runtime Enter loads the next session page from the catalog action" {

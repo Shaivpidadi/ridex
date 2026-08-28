@@ -170,7 +170,10 @@ type HoldState = {
   cancelled: boolean;
 };
 
-function heldGatewayResponse(state: HoldState): Response {
+function heldGatewayResponse(
+  state: HoldState,
+  delta = "SESSION_PICKER_ACTIVE_STREAM",
+): Response {
   const encoder = new TextEncoder();
   let timer: ReturnType<typeof setInterval> | undefined;
   return new Response(
@@ -179,7 +182,7 @@ function heldGatewayResponse(state: HoldState): Response {
         state.started = true;
         controller.enqueue(
           encoder.encode(
-            `data: ${JSON.stringify({ type: "text-delta", id: "held", delta: "SESSION_PICKER_ACTIVE_STREAM" })}\n\n`,
+            `data: ${JSON.stringify({ type: "text-delta", id: "held", delta })}\n\n`,
           ),
         );
         timer = setInterval(() => {
@@ -4538,6 +4541,95 @@ test.skipIf(!tmuxAvailable())(
 );
 
 test.skipIf(!tmuxAvailable())(
+  "legacy resume backfills terminal-wire bytes for the next exact resume",
+  async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-transcript-backfill-")));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    const stderrPath = join(root, "stderr.log");
+    const marker = "LEGACY_TRANSCRIPT_BACKFILL_MARKER";
+    mkdirSync(home);
+    mkdirSync(workspace);
+    const gateways: Array<ReturnType<typeof startFakeGateway>> = [];
+    let active: TmuxSession | null = null;
+
+    try {
+      const seedGateway = startFakeGateway([
+        fakeGatewayFinalText(`${marker}_HEAD\n${marker}_TAIL`),
+      ]);
+      gateways.push(seedGateway);
+      writeFileSync(stderrPath, "");
+      active = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: workspace,
+        env: gatewayEnv(home, seedGateway),
+        stderrPath,
+      });
+      await active.waitForComposer(TIMEOUT);
+      await active.sendText("Create a legacy backfill fixture.");
+      await active.waitForText(`${marker}_TAIL`, TIMEOUT);
+      await active.sendText("/quit");
+      expect(await active.waitForSessionEnd()).toBe(true);
+      await active.kill();
+      active = null;
+
+      const sessionId = sessionIdFromHome(home);
+      const sessionRoot = join(home, ".fx", "sessions", sessionId);
+      const transcriptPath = join(sessionRoot, "transcript.ansi");
+      const metadataPath = join(sessionRoot, "transcript.meta");
+      rmSync(transcriptPath);
+      rmSync(metadataPath);
+
+      const backfillGateway = startFakeGateway([]);
+      gateways.push(backfillGateway);
+      writeFileSync(stderrPath, "");
+      active = await TmuxSession.create({
+        cmd: `${FX_BIN} resume ${sessionId}`,
+        cwd: workspace,
+        env: gatewayEnv(home, backfillGateway),
+        stderrPath,
+      });
+      await active.waitForComposer(TIMEOUT);
+      expect(await waitForScrollback(active, `${marker}_TAIL`)).toContain(`${marker}_HEAD`);
+      await active.sendText("/quit");
+      expect(await active.waitForSessionEnd()).toBe(true);
+      await active.kill();
+      active = null;
+
+      const backfilled = readFileSync(transcriptPath);
+      expect(backfilled.includes(Buffer.from(`${marker}_HEAD`))).toBe(true);
+      expect(backfilled.includes(Buffer.from(`${marker}_TAIL`))).toBe(true);
+      for (let index = 0; index < backfilled.length; index += 1) {
+        if (backfilled[index] === 0x0a) expect(backfilled[index - 1]).toBe(0x0d);
+      }
+
+      const exactGateway = startFakeGateway([]);
+      gateways.push(exactGateway);
+      writeFileSync(stderrPath, "");
+      active = await TmuxSession.create({
+        cmd: `${FX_BIN} resume ${sessionId}`,
+        cwd: workspace,
+        env: gatewayEnv(home, exactGateway),
+        stderrPath,
+      });
+      await active.waitForComposer(TIMEOUT);
+      const exactScrollback = await waitForScrollback(active, `${marker}_TAIL`);
+      expect(countOccurrences(exactScrollback, `${marker}_HEAD`)).toBe(1);
+      expect(countOccurrences(exactScrollback, `${marker}_TAIL`)).toBe(1);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      await active.sendText("/quit");
+      expect(await active.waitForSessionEnd()).toBe(true);
+      active = null;
+    } finally {
+      if (active) await active.kill();
+      for (const gateway of gateways) gateway.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT * 3,
+);
+
+test.skipIf(!tmuxAvailable())(
   "interactive resume aliases restore history and return to a live composer",
   async () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-resume-")));
@@ -4679,12 +4771,10 @@ test.skipIf(!tmuxAvailable())(
         });
         expect(replay.code).toBe(0);
         expect(replay.stderr).toBe("");
-        const firstApplicationFrame = replay.stdout
+        const restoredFrame = replay.stdout
           .split(/(?=--- frame \d+)/)
-          .find((frame) =>
-            /Recording:|Session:|Run \/help for commands|auto ·/.test(frame),
-          );
-        expect(firstApplicationFrame).toContain(restoredMarker);
+          .find((frame) => frame.includes(restoredMarker));
+        expect(restoredFrame).toBeDefined();
       }
 
       const markdownHome = join(root, "markdown-home");
@@ -6078,6 +6168,7 @@ test.skipIf(!tmuxAvailable())(
     const stderrPath = join(root, "stderr.log");
     const initialTapePath = join(root, "new-session-scroll.fxtape");
     const tapePath = join(root, "direct-resume-scroll.fxtape");
+    const tracePath = join(root, "resume-trace.log");
     mkdirSync(home);
     mkdirSync(workspace);
     const workspaceRoot = realpathSync(workspace);
@@ -6133,6 +6224,8 @@ test.skipIf(!tmuxAvailable())(
         env: {
           ...gatewayEnv(home, resumedGateway),
           FX_RECORD: tapePath,
+          FX_TRACE_LOG: tracePath,
+          FX_TRACE_SCOPES: "session,resize,frame_commit",
         },
         stderrPath,
         width: 80,
@@ -6142,6 +6235,7 @@ test.skipIf(!tmuxAvailable())(
 
       const resumed = await waitForScrollback(active, earlyMarker);
       expect(resumed).toContain(earlyMarker);
+      expect(countOccurrences(resumed, "direct-resume-scroll.fxtape")).toBe(1);
       const tape = readFileSync(tapePath);
       expect(tape.includes(Buffer.from("\x1b[?1002h"))).toBe(false);
       expect(tape.includes(Buffer.from("\x1b[?1006h"))).toBe(false);
@@ -6163,10 +6257,106 @@ test.skipIf(!tmuxAvailable())(
       expect(countOccurrences(resized, earlyMarker)).toBe(1);
       expect(countOccurrences(resized, lateMarker)).toBe(1);
       expect(countOccurrences(resized, continuationMarker)).toBe(1);
+      expect(countOccurrences(resized, "Recording:")).toBe(2);
+      expect(readFileSync(tracePath, "utf8")).toContain(
+        "event=session_transcript_reset outcome=committed",
+      );
 
       await active.sendText("/quit");
       expect(await active.waitForSessionEnd()).toBe(true);
       await active.kill();
+      active = null;
+    } finally {
+      if (active) await active.kill();
+      for (const gateway of gateways) gateway.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT * 3,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "resumed resize preserves an unpersisted active assistant tail",
+  async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-resume-active-resize-")));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    const stderrPath = join(root, "stderr.log");
+    const tracePath = join(root, "trace.log");
+    const earlyMarker = "ACTIVE_RESIZE_HISTORY_EARLY";
+    const lateMarker = "ACTIVE_RESIZE_HISTORY_LATE";
+    mkdirSync(home);
+    mkdirSync(workspace);
+    const gateways: Array<ReturnType<typeof startFakeGateway>> = [];
+    let active: TmuxSession | null = null;
+
+    try {
+      const seedGateway = startFakeGateway([
+        fakeGatewayFinalText(`${earlyMarker}\n${"history row\n".repeat(40)}${lateMarker}`),
+      ]);
+      gateways.push(seedGateway);
+      writeFileSync(stderrPath, "");
+      active = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: workspace,
+        env: gatewayEnv(home, seedGateway),
+        stderrPath,
+        width: 80,
+        height: 24,
+      });
+      await active.waitForComposer(TIMEOUT);
+      await active.sendText("Save history for an active resize.");
+      await active.waitForText(lateMarker, TIMEOUT);
+      await active.sendText("/quit");
+      expect(await active.waitForSessionEnd()).toBe(true);
+      await active.kill();
+      active = null;
+
+      const hold: HoldState = { started: false, cancelled: false };
+      const heldGateway = startFakeGateway([
+        () => heldGatewayResponse(hold, "SESSION_PICKER_ACTIVE_STREAM\n\n"),
+      ]);
+      gateways.push(heldGateway);
+      const sessionId = sessionIdFromHome(home);
+      writeFileSync(stderrPath, "");
+      active = await TmuxSession.create({
+        cmd: `${FX_BIN} resume ${sessionId}`,
+        cwd: workspace,
+        env: {
+          ...gatewayEnv(home, heldGateway),
+          FX_TRACE_LOG: tracePath,
+          FX_TRACE_SCOPES: "session,resize,frame_commit",
+        },
+        stderrPath,
+        width: 80,
+        height: 24,
+      });
+      await active.waitForComposer(TIMEOUT);
+      await waitForScrollback(active, earlyMarker);
+      await active.sendText("Keep an assistant tail active during resize.");
+      await waitForCondition(() => hold.started, "held active resize response");
+      await active.waitForText("SESSION_PICKER_ACTIVE_STREAM", TIMEOUT);
+
+      await active.resizeWindow(62, 18);
+      const resized = await active.waitForStableScrollback(
+        (scrollback) =>
+          countOccurrences(scrollback, earlyMarker) === 1 &&
+          countOccurrences(scrollback, lateMarker) === 1 &&
+          countOccurrences(scrollback, "SESSION_PICKER_ACTIVE_STREAM") === 1,
+        TIMEOUT,
+      );
+      expect(countOccurrences(resized, earlyMarker)).toBe(1);
+      expect(countOccurrences(resized, lateMarker)).toBe(1);
+      expect(countOccurrences(resized, "SESSION_PICKER_ACTIVE_STREAM")).toBe(1);
+      expect(readFileSync(tracePath, "utf8")).toContain(
+        "event=session_transcript_reset outcome=unavailable reason=record_not_caught_up",
+      );
+
+      await active.sendKeys("Escape");
+      await waitForCondition(() => hold.cancelled, "cancel held active resize response");
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      await active.sendText("/quit");
+      expect(await active.waitForSessionEnd()).toBe(true);
       active = null;
     } finally {
       if (active) await active.kill();

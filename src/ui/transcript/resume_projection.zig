@@ -4,9 +4,12 @@ const diff = @import("../../core/output/diff.zig");
 const types = @import("../../core/shared/types.zig");
 const command_output_content = @import("../../core/tooling/command_output_content.zig");
 const command_output_runtime = @import("command_output_runtime.zig");
+const transcript_painter = @import("painter.zig");
+const presentation_record = @import("presentation_record.zig");
 const source_preparation = @import("source_preparation.zig");
 const transcript_runtime = @import("runtime.zig");
 const transcript_store = @import("store.zig");
+const transcript_blocks = @import("../render_engine/transcript_blocks.zig");
 
 const Allocator = std.mem.Allocator;
 const TranscriptRuntime = transcript_runtime.TranscriptRuntime;
@@ -18,6 +21,8 @@ pub const ResumeProjection = struct {
     alloc: Allocator,
     created_at_ms: i64,
     retention_cap: usize,
+    postlude_entries: std.ArrayList(transcript_runtime.TranscriptEntry) = .empty,
+    record_cursor: presentation_record.Cursor = .start,
     publication_source: ?transcript_runtime.TranscriptPreparationSource = null,
     pending_diffs: std.ArrayList(diff.DiffEntry) = .empty,
     next_diff_id: u32,
@@ -30,14 +35,33 @@ pub const ResumeProjection = struct {
         created_at_ms: i64,
         next_diff_id: u32,
     ) !ResumeProjection {
+        return initDetached(alloc, source, created_at_ms, next_diff_id, true);
+    }
+
+    fn initDetached(
+        alloc: Allocator,
+        source: *TranscriptRuntime,
+        created_at_ms: i64,
+        next_diff_id: u32,
+        capture_postlude: bool,
+    ) !ResumeProjection {
         var detached = try transcript_store.cloneDetachedPresentationState(source, alloc);
+        errdefer detached.deinit(alloc);
         const retention_cap = detached.max_retained_transcript_bytes;
+        var postlude_entries: std.ArrayList(transcript_runtime.TranscriptEntry) = .empty;
+        if (capture_postlude and detached.entries.items.len > 0) {
+            postlude_entries = detached.entries;
+            detached.entries = .empty;
+        }
+        detached.clearTranscript(alloc);
+        detached.next_entry_id = 1;
         detached.max_retained_transcript_bytes = std.math.maxInt(usize);
         return .{
             .runtime = detached,
             .alloc = alloc,
             .created_at_ms = created_at_ms,
             .retention_cap = retention_cap,
+            .postlude_entries = postlude_entries,
             .next_diff_id = next_diff_id,
         };
     }
@@ -50,14 +74,19 @@ pub const ResumeProjection = struct {
         created_at_ms: i64,
         next_diff_id: u32,
     ) !ResumeProjection {
-        var projection = try init(alloc, source, created_at_ms, next_diff_id);
-        projection.runtime.clearTranscript(alloc);
-        projection.runtime.next_entry_id = 1;
-        return projection;
+        return initDetached(
+            alloc,
+            source,
+            created_at_ms,
+            next_diff_id,
+            false,
+        );
     }
 
     pub fn deinit(self: *ResumeProjection) void {
         if (!self.consumed) self.runtime.deinit(self.alloc);
+        for (self.postlude_entries.items) |*entry| entry.deinit(self.alloc);
+        self.postlude_entries.deinit(self.alloc);
         if (self.publication_source) |*source| source.deinit(self.alloc);
         for (self.pending_diffs.items) |*entry| entry.deinit(std.heap.c_allocator);
         self.pending_diffs.deinit(std.heap.c_allocator);
@@ -324,6 +353,14 @@ pub const ResumeProjection = struct {
         return self.finalizeForPresentation(false);
     }
 
+    pub fn finalizeForResume(
+        self: *ResumeProjection,
+        postlude_persisted: bool,
+    ) !void {
+        if (postlude_persisted) try self.appendPostlude();
+        return self.finalize();
+    }
+
     /// A live projection may end at a valid command-output prefix. Keep that
     /// block open so later output and its terminal event can continue it.
     pub fn finalizeLivePresentation(self: *ResumeProjection) !void {
@@ -355,6 +392,7 @@ pub const ResumeProjection = struct {
             &self.runtime,
             self.alloc,
         );
+        self.record_cursor = cursorAfterLastEntry(&self.runtime);
         var source = try source_preparation.prepareTranscriptSource(
             &self.runtime,
             self.alloc,
@@ -400,6 +438,31 @@ pub const ResumeProjection = struct {
         return self.publication_source.?.bytes;
     }
 
+    /// Returns allocator-owned terminal-wire bytes for direct stream and
+    /// persistence. Logical LF separators become explicit CRLF.
+    pub fn publicationWireBytes(
+        self: *const ResumeProjection,
+        cols: u16,
+    ) ![]u8 {
+        const bytes = self.publicationBytes();
+        const prepared = try transcript_painter.prepareTranscriptDocumentAppendBytes(
+            self.alloc,
+            bytes,
+            cols,
+            0,
+            bytes.len,
+            true,
+        );
+        if (prepared.len > 0) return prepared;
+        return self.alloc.dupe(u8, bytes);
+    }
+
+    pub fn recordCursor(self: *const ResumeProjection) presentation_record.Cursor {
+        std.debug.assert(self.finalized);
+        std.debug.assert(!self.consumed);
+        return self.record_cursor;
+    }
+
     /// Installs structured continuation state after historical bytes were
     /// already written directly to the terminal. No pending source is armed.
     pub fn installRetained(self: *ResumeProjection, target: *TranscriptRuntime) !void {
@@ -436,7 +499,11 @@ pub const ResumeProjection = struct {
             target.recomputeCursorFromTranscript();
         }
         target.reconcileDetachedInstallSource(self.publication_source.?.bytes);
-        if (!target.streamedSessionHistoryActive()) target.markTranscriptDirty();
+        if (try self.appendPostludeTo(target)) {
+            target.markTranscriptStructureDirty();
+        } else if (!target.streamedSessionHistoryActive()) {
+            target.markTranscriptDirty();
+        }
 
         var publication = self.publication_source.?;
         self.publication_source = null;
@@ -476,7 +543,58 @@ pub const ResumeProjection = struct {
         self.pending_diffs = .empty;
         return pending;
     }
+
+    fn appendPostlude(self: *ResumeProjection) !void {
+        _ = try self.appendPostludeTo(&self.runtime);
+    }
+
+    fn appendPostludeTo(
+        self: *ResumeProjection,
+        target: *TranscriptRuntime,
+    ) !bool {
+        if (self.postlude_entries.items.len == 0) return false;
+        try target.entries.ensureUnusedCapacity(
+            self.alloc,
+            self.postlude_entries.items.len,
+        );
+        for (self.postlude_entries.items) |*entry| {
+            setEntryId(entry, target.next_entry_id);
+            target.entries.appendAssumeCapacity(entry.*);
+            target.next_entry_id +%= 1;
+        }
+        self.postlude_entries.clearRetainingCapacity();
+        return true;
+    }
 };
+
+fn setEntryId(entry: *transcript_runtime.TranscriptEntry, id: u32) void {
+    switch (entry.*) {
+        .raw_bytes => |*value| value.id = id,
+        .semantic_notice => |*value| value.id = id,
+        .user_turn => |*value| value.id = id,
+        .assistant_turn => |*value| value.id = id,
+        .assistant_table => |*value| value.id = id,
+        .assistant_code_block => |*value| value.id = id,
+        .assistant_thematic_rule => |*value| value.id = id,
+    }
+}
+
+fn cursorAfterLastEntry(
+    runtime: *const TranscriptRuntime,
+) presentation_record.Cursor {
+    var index = runtime.entries.items.len;
+    while (index > 0) {
+        index -= 1;
+        const entry = runtime.entries.items[index];
+        if (!transcript_blocks.isEntryVisibleInCompactPresentation(entry)) continue;
+        return .{ .after = .{
+            .entry_id = entry.id(),
+            .kind = transcript_blocks.blockKindForEntry(entry),
+            .ends_with_newline = false,
+        } };
+    }
+    return .start;
+}
 
 test "resume projection finalizes complete flow before one retained-tail pass" {
     const alloc = std.testing.allocator;
@@ -510,6 +628,166 @@ test "resume projection finalizes complete flow before one retained-tail pass" {
     try std.testing.expect(std.mem.find(u8, projection.publication_source.?.bytes, "historical marker 0") != null);
     try std.testing.expect(std.mem.find(u8, projection.publication_source.?.bytes, "historical marker 11") != null);
     try std.testing.expect(projection.runtime.entries.items.len < 13);
+}
+
+test "resume projection appends current startup presentation after history" {
+    const alloc = std.testing.allocator;
+    var source: TranscriptRuntime = .{};
+    source.layout = .{
+        .rows = 24,
+        .cols = 80,
+        .content_bottom = 20,
+        .divider_top_row = 21,
+        .input_row = 22,
+        .divider_bottom_row = 23,
+        .hint_row = 24,
+    };
+    defer source.deinit(alloc);
+    _ = try source.appendRawTranscriptEntryClassified(
+        alloc,
+        "STARTUP_WARNING_MARKER\n",
+        .unknown_raw,
+    );
+    _ = try source.appendSemanticNotice(alloc, .{
+        .topic = "system",
+        .tone = .information,
+        .body = "STARTUP_WARNING_FULL_DETAIL",
+        .visibility = .full_only,
+    });
+
+    var projection = try ResumeProjection.init(alloc, &source, 42, 1);
+    defer projection.deinit();
+    _ = try projection.appendRawClassified(
+        "HISTORICAL_SESSION_MARKER\n",
+        .unknown_raw,
+    );
+    try projection.finalizeForResume(true);
+
+    const bytes = projection.publicationBytes();
+    const history = std.mem.find(u8, bytes, "HISTORICAL_SESSION_MARKER") orelse
+        return error.MissingHistoricalSessionMarker;
+    const startup = std.mem.find(u8, bytes, "STARTUP_WARNING_MARKER") orelse
+        return error.MissingStartupWarningMarker;
+    try std.testing.expect(history < startup);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        std.mem.count(u8, bytes, "HISTORICAL_SESSION_MARKER"),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        std.mem.count(u8, bytes, "STARTUP_WARNING_MARKER"),
+    );
+    try std.testing.expect(std.mem.find(
+        u8,
+        bytes,
+        "STARTUP_WARNING_FULL_DETAIL",
+    ) == null);
+    try std.testing.expectEqual(
+        @as(u32, 2),
+        projection.recordCursor().after.entry_id,
+    );
+}
+
+test "exact resume retains structured startup presentation outside the historical anchor" {
+    const alloc = std.testing.allocator;
+    var source: TranscriptRuntime = .{};
+    source.layout = .{
+        .rows = 24,
+        .cols = 80,
+        .content_bottom = 20,
+        .divider_top_row = 21,
+        .input_row = 22,
+        .divider_bottom_row = 23,
+        .hint_row = 24,
+    };
+    defer source.deinit(alloc);
+    _ = try source.appendRawTranscriptEntryClassified(
+        alloc,
+        "CURRENT_STARTUP_SUMMARY\n",
+        .unknown_raw,
+    );
+    _ = try source.appendSemanticNotice(alloc, .{
+        .topic = "system",
+        .tone = .information,
+        .body = "CURRENT_STARTUP_FULL_DETAIL",
+        .visibility = .full_only,
+    });
+
+    var projection = try ResumeProjection.init(alloc, &source, 42, 1);
+    defer projection.deinit();
+    _ = try projection.appendRawClassified(
+        "EXACT_HISTORICAL_ENTRY\n",
+        .unknown_raw,
+    );
+    try projection.finalizeForResume(false);
+
+    try std.testing.expect(std.mem.find(
+        u8,
+        projection.publicationBytes(),
+        "CURRENT_STARTUP_SUMMARY",
+    ) == null);
+    try std.testing.expectEqual(
+        @as(u32, 1),
+        projection.recordCursor().after.entry_id,
+    );
+    var target: TranscriptRuntime = .{};
+    target.layout = source.layout;
+    defer target.deinit(alloc);
+    try target.enableShadowVt(alloc);
+    target.adoptStreamedSessionHistory();
+    target.resumePresentationRecordAt(64, projection.recordCursor());
+    try projection.installRetained(&target);
+
+    try std.testing.expectEqual(@as(usize, 3), target.entries.items.len);
+    try std.testing.expectEqualStrings(
+        "CURRENT_STARTUP_SUMMARY\n",
+        target.entries.items[1].raw_bytes.bytes,
+    );
+    try std.testing.expectEqual(
+        types.NoticeVisibility.full_only,
+        target.entries.items[2].semantic_notice.visibility,
+    );
+    try std.testing.expectEqualStrings(
+        "CURRENT_STARTUP_FULL_DETAIL",
+        target.entries.items[2].semantic_notice.body,
+    );
+    try std.testing.expectEqual(@as(u32, 2), target.entries.items[1].id());
+    try std.testing.expectEqual(@as(u32, 3), target.entries.items[2].id());
+    try std.testing.expect(!target.presentationRecordReadyForReset());
+
+    var compact = try target.prepareTranscriptSource(alloc, null);
+    defer compact.deinit(alloc);
+    try std.testing.expect(std.mem.find(
+        u8,
+        compact.bytes,
+        "CURRENT_STARTUP_SUMMARY",
+    ) != null);
+    try std.testing.expect(std.mem.find(
+        u8,
+        compact.bytes,
+        "CURRENT_STARTUP_FULL_DETAIL",
+    ) == null);
+}
+
+test "resume projection converts complete publication to terminal wire bytes" {
+    const alloc = std.testing.allocator;
+    var source: TranscriptRuntime = .{};
+    source.layout.cols = 80;
+    defer source.deinit(alloc);
+
+    var projection = try ResumeProjection.initEmpty(alloc, &source, 42, 1);
+    defer projection.deinit();
+    _ = try projection.appendRawClassified("one\ntwo\n", .unknown_raw);
+    try projection.finalize();
+
+    const wire_bytes = try projection.publicationWireBytes(80);
+    defer alloc.free(wire_bytes);
+    try std.testing.expectEqualStrings("one\r\ntwo", wire_bytes);
+    for (wire_bytes, 0..) |byte, index| {
+        if (byte == '\n') {
+            try std.testing.expect(index > 0 and wire_bytes[index - 1] == '\r');
+        }
+    }
 }
 
 test "empty resume projection keeps layout without source conversation" {
