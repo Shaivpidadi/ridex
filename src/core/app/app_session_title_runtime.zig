@@ -16,6 +16,7 @@ pub const State = struct {
     thread: ?std.Thread = null,
     result: ?GeneratedTitle = null,
     cancel: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    finished: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 };
 
 pub fn Runtime(comptime App: type) type {
@@ -31,10 +32,10 @@ pub fn Runtime(comptime App: type) type {
             const credential = app.auth.apiKey() orelse return;
             const expected_title = session_display_metadata.deriveTitleFromPrompt(app.alloc, prompt) catch return orelse return;
             defer app.alloc.free(expected_title);
-            SessionRuntime.setCachedSessionTitle(app, expected_title) catch return;
 
             const task = Task.create(app, session_id, expected_title, prompt, credential) catch return;
             app.session_title_generation.cancel.store(false, .seq_cst);
+            app.session_title_generation.finished.store(false, .seq_cst);
             app.session_title_generation.thread = std.Thread.spawn(.{}, Task.run, .{task}) catch {
                 task.deinit();
                 return;
@@ -43,15 +44,21 @@ pub fn Runtime(comptime App: type) type {
 
         pub fn poll(app: *App) !void {
             const state = &app.session_title_generation;
+            if (!state.finished.load(.seq_cst)) return;
+            if (state.thread) |thread| thread.join();
+            state.thread = null;
+            state.finished.store(false, .seq_cst);
             state.mutex.lockUncancelable(io_mod.getIo());
             const result = state.result;
             state.result = null;
             state.mutex.unlock(io_mod.getIo());
-            const generated = result orelse return;
-            defer generated.deinit();
-            if (state.thread) |thread| thread.join();
-            state.thread = null;
-            try SessionRuntime.applyGeneratedSessionTitle(app, generated);
+            if (result) |generated| {
+                defer generated.deinit();
+                try SessionRuntime.applyGeneratedSessionTitle(app, generated);
+            } else {
+                try SessionRuntime.ensureCachedSessionTitle(app);
+                app.shell.render_requests.request(.footer);
+            }
         }
 
         pub fn stop(app: *App) void {
@@ -59,6 +66,7 @@ pub fn Runtime(comptime App: type) type {
             state.cancel.store(true, .seq_cst);
             if (state.thread) |thread| thread.join();
             state.thread = null;
+            state.finished.store(false, .seq_cst);
             state.mutex.lockUncancelable(io_mod.getIo());
             const result = state.result;
             state.result = null;
@@ -124,6 +132,7 @@ pub fn Runtime(comptime App: type) type {
             fn run(self: *Task) void {
                 defer self.deinit();
                 const app = self.app;
+                defer app.session_title_generation.finished.store(true, .seq_cst);
                 const title = session_title_generator.generate(std.heap.c_allocator, .{
                     .stream_provider = self.stream_provider,
                     .credential = .{ .secret = self.credential, .source = self.credential_source, .account_id = self.account_id, .tenant = self.gateway_team },

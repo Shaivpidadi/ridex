@@ -22,7 +22,7 @@ afterEach(async () => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
-test.skipIf(!tmuxAvailable())("interactive session replaces the provisional title", async () => {
+test.skipIf(!tmuxAvailable())("interactive session reveals only the generated title", async () => {
   const root = mkdtempSync(join(tmpdir(), "fx-e2e-session-title-"));
   roots.push(root);
   const home = join(root, "home");
@@ -30,8 +30,13 @@ test.skipIf(!tmuxAvailable())("interactive session replaces the provisional titl
   mkdirSync(home);
   mkdirSync(workspace);
 
+  let releaseTitle!: () => void;
+  const titleGate = new Promise<void>((resolve) => {
+    releaseTitle = resolve;
+  });
   const gateway = startDynamicFakeGateway(async (body) => {
     if (body.includes("Generate a brief title that helps the user")) {
+      await titleGate;
       return fakeGatewayFinalText("Generate session titles");
     }
     return fakeGatewayFinalText("I can help with that.");
@@ -61,8 +66,13 @@ test.skipIf(!tmuxAvailable())("interactive session replaces the provisional titl
   await session.waitForComposer(TIMEOUT);
   await session.sendText("/statusline session");
   await session.waitForComposer(TIMEOUT);
-  await session.sendText("please add automatic naming for saved conversations");
+  const prompt = "please add automatic naming for saved conversations";
+  await session.sendText(prompt);
   await session.waitForText("I can help with that.", TIMEOUT);
+  const footer = (await session.capturePaneGrid()).slice(-4).join("\n");
+  expect(footer).not.toContain(prompt);
+
+  releaseTitle();
   await session.waitForText("Generate session titles", TIMEOUT);
   await session.sendText("/quit");
   expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);

@@ -2638,9 +2638,15 @@ pub fn Runtime(comptime App: type) type {
                 };
             };
             if (snapshot_file_ownership) |ownership| ownership.transfer();
-            // The footer title freezes at the first usable prompt, matching the
-            // sidecar derivation the resume picker shows.
-            ensureCachedSessionTitle(app) catch {};
+            // While model-generated naming is active, keep the deterministic
+            // title in persistence only so the footer does not flash it first.
+            if (comptime @hasField(App, "session_title_generation")) {
+                if (app.session_title_generation.thread == null) {
+                    ensureCachedSessionTitle(app) catch {};
+                }
+            } else {
+                ensureCachedSessionTitle(app) catch {};
+            }
             commitJsHostSnapshot(app, "history_turn");
             if (comptime !@hasField(App, "session_persistence")) return .committed;
             app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
@@ -2954,15 +2960,15 @@ pub fn Runtime(comptime App: type) type {
             try applyActiveSessionTitle(app, title);
         }
 
-        /// Applies a generated title only while the originating session and
-        /// provisional title are still current. A manual rename therefore wins.
+        /// Applies a generated title only while the originating session is
+        /// still active and no visible title has appeared. A manual rename
+        /// therefore wins without exposing the deterministic provisional title.
         pub fn applyGeneratedSessionTitle(
             app: *App,
             generated: session_title_generator.GeneratedTitle,
         ) !void {
             const active_id = activeSessionId(app) orelse return;
-            const current = cachedSessionTitle(app) orelse return;
-            if (!shouldApplyGeneratedTitle(active_id, current, generated)) return;
+            if (!shouldApplyGeneratedTitle(active_id, cachedSessionTitle(app), generated)) return;
             const title = validateSessionTitle(generated.title) catch return;
             try applyActiveSessionTitle(app, title);
             app.shell.render_requests.request(.footer);
@@ -2970,11 +2976,11 @@ pub fn Runtime(comptime App: type) type {
 
         fn shouldApplyGeneratedTitle(
             active_session_id: []const u8,
-            current_title: []const u8,
+            current_title: ?[]const u8,
             generated: session_title_generator.GeneratedTitle,
         ) bool {
             return std.mem.eql(u8, active_session_id, generated.session_id) and
-                std.mem.eql(u8, current_title, generated.expected_title);
+                current_title == null;
         }
 
         fn applyActiveSessionTitle(app: *App, title: []const u8) !void {
@@ -9818,14 +9824,14 @@ test "renameActiveSession requires an active session" {
     );
 }
 
-test "generated session title requires matching session and provisional title" {
+test "generated session title requires matching session and no visible title" {
     const generated = session_title_generator.GeneratedTitle{
         .session_id = @constCast("session-a"),
         .expected_title = @constCast("provisional"),
         .title = @constCast("Generated title"),
     };
-    try std.testing.expect(Runtime(TestApp).shouldApplyGeneratedTitle("session-a", "provisional", generated));
-    try std.testing.expect(!Runtime(TestApp).shouldApplyGeneratedTitle("session-b", "provisional", generated));
+    try std.testing.expect(Runtime(TestApp).shouldApplyGeneratedTitle("session-a", null, generated));
+    try std.testing.expect(!Runtime(TestApp).shouldApplyGeneratedTitle("session-b", null, generated));
     try std.testing.expect(!Runtime(TestApp).shouldApplyGeneratedTitle("session-a", "Manual title", generated));
 }
 
