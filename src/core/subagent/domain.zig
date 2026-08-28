@@ -8,7 +8,7 @@ const model_provider = @import("../config/model_provider.zig");
 const Allocator = std.mem.Allocator;
 
 pub const max_name_bytes: usize = 128;
-pub const max_profile_bytes: usize = 128;
+pub const max_profile_name_bytes: usize = 128;
 pub const max_model_bytes: usize = 256;
 pub const max_prompt_bytes: usize = 64 * 1024;
 pub const max_profile_instructions_bytes: usize = 64 * 1024;
@@ -789,7 +789,7 @@ fn validateCreate(alloc: Allocator, input: CreateInput) ValidationError!CreateCo
     const mode = input.mode orelse return error.MissingMode;
     if (mode == .one_off and input.prompt == null) return error.MissingOneOffPrompt;
     try validateName(name_raw);
-    if (input.profile) |profile| try validateBoundedText(profile, max_profile_bytes, error.InvalidName);
+    if (input.profile) |profile| try validateBoundedText(profile, max_profile_name_bytes, error.InvalidName);
     if (input.model) |model| try validateModel(model);
     if (input.prompt) |prompt| try validateBoundedText(prompt, max_prompt_bytes, error.InvalidPrompt);
 

@@ -1,4 +1,5 @@
 const std = @import("std");
+const domain = @import("domain.zig");
 const io_mod = @import("../shared/io.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const text_utils = @import("../shared/text_utils.zig");
@@ -6,9 +7,7 @@ const types = @import("../shared/types.zig");
 
 const Allocator = std.mem.Allocator;
 
-pub const max_profile_name_bytes: usize = 128;
 pub const max_description_bytes: usize = 512;
-pub const max_instructions_bytes: usize = 64 * 1024;
 pub const max_file_bytes: usize = 72 * 1024;
 pub const max_profiles: usize = 128;
 
@@ -73,7 +72,7 @@ pub fn loadFromHome(alloc: Allocator, home: []const u8, name: []const u8) Error!
     defer dir.close(io_mod.getIo());
     const file_name = try std.fmt.allocPrint(alloc, "{s}.md", .{name});
     defer alloc.free(file_name);
-    var file = dir.openFile(io_mod.getIo(), file_name, .{ .mode = .read_only, .follow_symlinks = false }) catch |err| return switch (err) {
+    var file = io_mod.openExistingRegularFile(dir, file_name, .read_only) catch |err| return switch (err) {
         error.FileNotFound => error.ProfileNotFound,
         else => error.ProfileUnreadable,
     };
@@ -162,7 +161,7 @@ pub fn parse(alloc: Allocator, bytes: []const u8) Error!Profile {
     const end = std.mem.find(u8, bytes[4..], "\n---\n") orelse return error.InvalidProfile;
     const header = bytes[4 .. 4 + end];
     const body = std.mem.trim(u8, bytes[4 + end + 5 ..], " \t\r\n");
-    if (body.len == 0 or body.len > max_instructions_bytes) return error.InvalidProfile;
+    if (body.len == 0 or body.len > domain.max_profile_instructions_bytes) return error.InvalidProfile;
 
     var name: ?[]const u8 = null;
     var description: ?[]const u8 = null;
@@ -214,7 +213,7 @@ pub fn parse(alloc: Allocator, bytes: []const u8) Error!Profile {
 }
 
 pub fn validateProfileName(name: []const u8) Error!void {
-    if (name.len == 0 or name.len > max_profile_name_bytes) return error.InvalidProfileName;
+    if (name.len == 0 or name.len > domain.max_profile_name_bytes) return error.InvalidProfileName;
     for (name) |byte| {
         if (!std.ascii.isAlphanumeric(byte) and byte != '-' and byte != '_') {
             return error.InvalidProfileName;
@@ -250,6 +249,42 @@ test "profile parser rejects unknown fields" {
         \\---
         \\Review.
     ));
+}
+
+test "profile loader rejects hardlinked files" {
+    if (comptime @import("builtin").os.tag == .windows or @import("builtin").os.tag == .wasi) {
+        return error.SkipZigTest;
+    }
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx/agents");
+    try tmp.dir.writeFile(io_mod.getIo(), .{
+        .sub_path = "source.md",
+        .data =
+        \\---
+        \\name: reviewer
+        \\description: Reviews code
+        \\---
+        \\Review independently.
+        ,
+    });
+    try std.testing.expectEqual(
+        @as(c_int, 0),
+        std.c.linkat(
+            tmp.dir.handle,
+            "source.md",
+            tmp.dir.handle,
+            "home/.fx/agents/reviewer.md",
+            0,
+        ),
+    );
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    try std.testing.expectError(
+        error.ProfileUnreadable,
+        loadFromHome(alloc, home, "reviewer"),
+    );
 }
 
 fn checkParseAllocationFailures(alloc: Allocator) !void {

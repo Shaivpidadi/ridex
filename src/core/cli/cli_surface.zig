@@ -217,6 +217,16 @@ const LocalSurfaceOptions = struct {
     format: output_contracts.OutputFormat = .text,
 };
 
+const AgentsAction = union(enum) {
+    list,
+    show: []const u8,
+};
+
+const AgentsOptions = struct {
+    format: output_contracts.OutputFormat = .text,
+    action: AgentsAction = .list,
+};
+
 fn parseLoginProvider(rest: []const [:0]const u8) !?model_provider.ProviderId {
     if (rest.len == 0) return null;
     if (rest.len != 1) return error.InvalidLoginProviderArgs;
@@ -1160,57 +1170,47 @@ fn runNonInteractiveWithDeps(
             return .handled_success;
         },
         .agents => |rest| {
-            var format: output_contracts.OutputFormat = .text;
-            var positional: std.ArrayList([]const u8) = .empty;
-            defer positional.deinit(alloc);
-            for (rest) |arg| {
-                if (std.mem.eql(u8, arg, "--json")) {
-                    if (format == .json) {
-                        try writeTopLevelUsage(cfg.command_catalog, deps, .agents);
+            const options = parseAgentsArgs(rest) catch {
+                try writeTopLevelUsage(cfg.command_catalog, deps, .agents);
+                return .handled_failure;
+            };
+            switch (options.action) {
+                .list => {
+                    const profiles = subagent_profiles.list(alloc) catch |err| {
+                        try writeLookupFailure(alloc, deps, "agents", err, options.format);
                         return .handled_failure;
-                    }
-                    format = .json;
-                } else try positional.append(alloc, arg);
+                    };
+                    defer subagent_profiles.freeSummaries(alloc, profiles);
+                    const summaries = try alloc.alloc(output_contracts.AgentProfileSummary, profiles.len);
+                    defer alloc.free(summaries);
+                    for (profiles, 0..) |profile, index| summaries[index] = .{
+                        .name = profile.name,
+                        .description = profile.description,
+                    };
+                    const text = try (output_contracts.AgentProfileListSnapshot{ .profiles = summaries }).render(alloc, options.format);
+                    defer alloc.free(text);
+                    try writeFormattedOutput(deps, text, options.format);
+                    return .handled_success;
+                },
+                .show => |name| {
+                    var profile = subagent_profiles.load(alloc, name) catch |err| {
+                        try writeLookupFailure(alloc, deps, "agents", err, options.format);
+                        return .handled_failure;
+                    };
+                    defer profile.deinit(alloc);
+                    const text = try (output_contracts.AgentProfileDetailSnapshot{
+                        .name = profile.name,
+                        .description = profile.description,
+                        .model = profile.model,
+                        .effort = profile.effort,
+                        .permission_mode = profile.permission_mode,
+                        .instructions = profile.instructions,
+                    }).render(alloc, options.format);
+                    defer alloc.free(text);
+                    try writeFormattedOutput(deps, text, options.format);
+                    return .handled_success;
+                },
             }
-            if (positional.items.len == 0 or
-                (positional.items.len == 1 and std.mem.eql(u8, positional.items[0], "list")))
-            {
-                const profiles = subagent_profiles.list(alloc) catch |err| {
-                    try writeLookupFailure(alloc, deps, "agents", err, format);
-                    return .handled_failure;
-                };
-                defer subagent_profiles.freeSummaries(alloc, profiles);
-                const summaries = try alloc.alloc(output_contracts.AgentProfileSummary, profiles.len);
-                defer alloc.free(summaries);
-                for (profiles, 0..) |profile, index| summaries[index] = .{
-                    .name = profile.name,
-                    .description = profile.description,
-                };
-                const text = try (output_contracts.AgentProfileListSnapshot{ .profiles = summaries }).render(alloc, format);
-                defer alloc.free(text);
-                try writeFormattedOutput(deps, text, format);
-                return .handled_success;
-            }
-            if (positional.items.len == 2 and std.mem.eql(u8, positional.items[0], "show")) {
-                var profile = subagent_profiles.load(alloc, positional.items[1]) catch |err| {
-                    try writeLookupFailure(alloc, deps, "agents", err, format);
-                    return .handled_failure;
-                };
-                defer profile.deinit(alloc);
-                const text = try (output_contracts.AgentProfileDetailSnapshot{
-                    .name = profile.name,
-                    .description = profile.description,
-                    .model = profile.model,
-                    .effort = profile.effort,
-                    .permission_mode = profile.permission_mode,
-                    .instructions = profile.instructions,
-                }).render(alloc, format);
-                defer alloc.free(text);
-                try writeFormattedOutput(deps, text, format);
-                return .handled_success;
-            }
-            try writeTopLevelUsage(cfg.command_catalog, deps, .agents);
-            return .handled_failure;
         },
         .mcp => |rest| {
             return runTopLevelMcp(alloc, rest, cfg, deps);
@@ -3648,6 +3648,36 @@ fn parseLocalSurfaceArgs(args: []const [:0]const u8) !LocalSurfaceOptions {
     return options;
 }
 
+fn parseAgentsArgs(args: []const [:0]const u8) !AgentsOptions {
+    var positional: [2][]const u8 = undefined;
+    var positional_len: usize = 0;
+    var options = AgentsOptions{};
+    var json_seen = false;
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, "--json")) {
+            if (json_seen) return error.InvalidAgentsArgs;
+            json_seen = true;
+            options.format = .json;
+            continue;
+        }
+        if (positional_len == positional.len) return error.InvalidAgentsArgs;
+        positional[positional_len] = arg;
+        positional_len += 1;
+    }
+
+    if (positional_len == 0) return options;
+    if (std.mem.eql(u8, positional[0], "list")) {
+        if (positional_len != 1) return error.InvalidAgentsArgs;
+        return options;
+    }
+    if (std.mem.eql(u8, positional[0], "show")) {
+        if (positional_len != 2 or positional[1].len == 0) return error.InvalidAgentsArgs;
+        options.action = .{ .show = positional[1] };
+        return options;
+    }
+    return error.InvalidAgentsArgs;
+}
+
 fn parseUpgradeArgs(args: []const [:0]const u8) !UpgradeOptions {
     var options = UpgradeOptions{};
     var format_seen = false;
@@ -4359,6 +4389,33 @@ test "parse local surface args accepts only json" {
     try std.testing.expectEqual(output_contracts.OutputFormat.json, opts.format);
 
     try std.testing.expectError(error.InvalidLocalSurfaceArgs, parseLocalSurfaceArgs(&.{@constCast("--wat")}));
+}
+
+test "parse agents args accepts bounded grammar and json positions" {
+    const defaults = try parseAgentsArgs(&.{});
+    try std.testing.expectEqual(output_contracts.OutputFormat.text, defaults.format);
+    try std.testing.expect(defaults.action == .list);
+
+    const listed = try parseAgentsArgs(&.{ @constCast("--json"), @constCast("list") });
+    try std.testing.expectEqual(output_contracts.OutputFormat.json, listed.format);
+    try std.testing.expect(listed.action == .list);
+
+    const shown = try parseAgentsArgs(&.{
+        @constCast("show"),
+        @constCast("reviewer"),
+        @constCast("--json"),
+    });
+    try std.testing.expectEqual(output_contracts.OutputFormat.json, shown.format);
+    try std.testing.expectEqualStrings("reviewer", shown.action.show);
+
+    try std.testing.expectError(
+        error.InvalidAgentsArgs,
+        parseAgentsArgs(&.{ @constCast("--json"), @constCast("--json") }),
+    );
+    try std.testing.expectError(
+        error.InvalidAgentsArgs,
+        parseAgentsArgs(&.{ @constCast("show"), @constCast("reviewer"), @constCast("extra") }),
+    );
 }
 
 test "parse upgrade args accepts a remembered release channel" {
