@@ -4670,7 +4670,7 @@ describe("effect-aware command permissions", () => {
   );
 
   test.skipIf(!tmuxAvailable())(
-    "interactive fx delivers a child approval to the next same-turn parent step",
+    "interactive fx keeps child approval input bound across same-turn delivery and child switches",
     async () => {
       const root = createIsolatedRoot();
       const stderrPath = join(root.root, "interactive-child-approval-stderr.log");
@@ -4678,10 +4678,14 @@ describe("effect-aware command permissions", () => {
       const markerPath = join(root.workspace, "approval-must-not-exist");
       const rootPrompt = "INTERACTIVE_CREATE_APPROVAL_CHILD";
       const childPrompt = "INTERACTIVE_CHILD_REQUEST_APPROVAL";
+      const observerPrompt = "INTERACTIVE_CHILD_OBSERVER";
+      const observerName = "interactive-observer-child";
       const rootCreateCallId = "interactive_approval_create";
+      const observerCreateCallId = "interactive_approval_observer_create";
       const rootProbeCallId = "interactive_approval_probe";
       const childCommandCallId = "interactive_approval_command";
       let childId = "";
+      let observerChildId = "";
       let approval: PendingSubagentApproval | null = null;
       let sameTurnChecked = false;
       let noRedeliveryChecked = false;
@@ -4713,6 +4717,9 @@ describe("effect-aware command permissions", () => {
           noRedeliveryChecked = true;
           return finalText("INTERACTIVE_APPROVAL_NOT_REPEATED");
         }
+        if (userText.includes(observerPrompt)) {
+          return finalText("INTERACTIVE_OBSERVER_READY");
+        }
         if (body.includes(`\"toolCallId\":\"${childCommandCallId}\"`) &&
             body.includes('"type":"tool-result"')) {
           return finalText("INTERACTIVE_CHILD_DENIED_COMPLETE");
@@ -4736,13 +4743,13 @@ describe("effect-aware command permissions", () => {
           }
           return finalText("INTERACTIVE_PARENT_SAW_CHILD_APPROVAL");
         }
-        if (body.includes(`\"toolCallId\":\"${rootCreateCallId}\"`) &&
+        if (body.includes(`\"toolCallId\":\"${observerCreateCallId}\"`) &&
             body.includes('"type":"tool-result"')) {
           const created = JSON.parse(
-            toolResultText(body, rootCreateCallId),
+            toolResultText(body, observerCreateCallId),
           ) as { child_id: string; status: string };
           expect(created.status).toBe("created");
-          childId = created.child_id;
+          observerChildId = created.child_id;
           approval = await waitForPendingSubagentApproval(root, childId);
           expect(subagentState(root, childId)).toBe("awaiting_approval");
           await approvalUiObserved;
@@ -4754,6 +4761,24 @@ describe("effect-aware command permissions", () => {
             { path: "approval-fixture.txt" },
             rootProbeCallId,
           );
+        }
+        if (body.includes(`\"toolCallId\":\"${rootCreateCallId}\"`) &&
+            body.includes('"type":"tool-result"')) {
+          const created = JSON.parse(
+            toolResultText(body, rootCreateCallId),
+          ) as { child_id: string; status: string };
+          expect(created.status).toBe("created");
+          childId = created.child_id;
+          return gatewayToolCall("subagent", {
+            command: {
+              create: {
+                name: observerName,
+                mode: "persistent",
+                prompt: observerPrompt,
+                permission_mode: "ask",
+              },
+            },
+          }, observerCreateCallId);
         }
         if (userText.includes(rootPrompt)) {
           return gatewayToolCall("subagent", {
@@ -4808,11 +4833,47 @@ describe("effect-aware command permissions", () => {
       }
       expect(sameTurnChecked).toBe(true);
       expect(existsSync(markerPath)).toBe(false);
-      await activeSession.sendKeys("3");
-      await activeSession.waitForText(
-        "INTERACTIVE_PARENT_SAW_CHILD_APPROVAL",
-        TIMEOUT,
+
+      await activeSession.sendKeys("C-x");
+      await activeSession.waitForText("Agents & processes", TIMEOUT);
+      const observerSelected = (pane: string) => pane.split("\n").some((line) =>
+        (line.startsWith("› ") || line.startsWith("> ")) &&
+        line.includes(observerName)
       );
+      if (!observerSelected(await activeSession.capturePane())) {
+        await activeSession.sendKeys("Down");
+      }
+      if (!observerSelected(await activeSession.capturePane())) {
+        await activeSession.sendKeys("Up");
+      }
+      expect(observerSelected(await activeSession.capturePane())).toBe(true);
+      await activeSession.sendKeys("Enter");
+      await activeSession.waitForText("INTERACTIVE_OBSERVER_READY", TIMEOUT);
+
+      const approvalShapedComposerInput = "1HIDDEN_APPROVAL_GUARD";
+      await activeSession.sendLiteralText(approvalShapedComposerInput);
+      await activeSession.waitForText(approvalShapedComposerInput, TIMEOUT);
+      expect(subagentState(root, childId)).toBe("awaiting_approval");
+      expect(existsSync(markerPath)).toBe(false);
+
+      await activeSession.sendKeys("C-u");
+      await activeSession.sendKeys("Escape");
+      await activeSession.waitForText("Agents & processes", TIMEOUT);
+      const approvalChildSelected = (pane: string) => pane.split("\n").some((line) =>
+        (line.startsWith("› ") || line.startsWith("> ")) &&
+        line.includes("interactive-approval-child")
+      );
+      if (!approvalChildSelected(await activeSession.capturePane())) {
+        await activeSession.sendKeys("Up");
+      }
+      if (!approvalChildSelected(await activeSession.capturePane())) {
+        await activeSession.sendKeys("Down");
+      }
+      expect(approvalChildSelected(await activeSession.capturePane())).toBe(true);
+      await activeSession.sendKeys("Enter");
+      await activeSession.waitForText(COMMAND_APPROVAL_PROMPT, TIMEOUT);
+      await activeSession.sendKeys("3");
+      await activeSession.waitForText("INTERACTIVE_CHILD_DENIED_COMPLETE", TIMEOUT);
       expect(existsSync(markerPath)).toBe(false);
       const childDeadline = Date.now() + TIMEOUT;
       while (subagentState(root, childId) !== "idle" &&
@@ -4820,6 +4881,11 @@ describe("effect-aware command permissions", () => {
         await Bun.sleep(20);
       }
       expect(subagentState(root, childId)).toBe("idle");
+      await activeSession.sendKeys("C-x");
+      await activeSession.waitForText(
+        "INTERACTIVE_PARENT_SAW_CHILD_APPROVAL",
+        TIMEOUT,
+      );
       const stored = JSON.parse(readFileSync(
         join(root.home, ".fx", "sessions", childId, "subagent", "communication.json"),
         "utf8",
@@ -4835,7 +4901,7 @@ describe("effect-aware command permissions", () => {
       expect(await activeSession.waitForSessionEnd(5_000)).toBe(true);
       activeSession = null;
       expectHumanUnreadIndependent(root, childId, approval!.id);
-      const parentSessionId = onlyParentSessionId(root, [childId]);
+      const parentSessionId = onlyParentSessionId(root, [childId, observerChildId]);
       expectParentHistoryClean(root, parentSessionId, [
         "<subagent_deliveries",
         approval!.label,
@@ -4844,7 +4910,7 @@ describe("effect-aware command permissions", () => {
       expectNoHostileExecutables(root);
       expectNoCommandArtifacts(root);
     },
-    60_000,
+    90_000,
   );
 
   test.skipIf(!tmuxAvailable())(

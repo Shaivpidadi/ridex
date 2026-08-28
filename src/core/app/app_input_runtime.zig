@@ -1422,11 +1422,13 @@ pub fn Runtime(comptime App: type) type {
                 }
             }
             const binding = maybe_binding orelse return false;
-            // The current card remains resolvable while its presented flag and
-            // selected child route catch up with the committed approval screen.
-            if (committed) return true;
-            const child_id = app.subagents.childRouteId() orelse return false;
-            return std.mem.eql(u8, binding.child_id, child_id);
+            // The current card remains resolvable on a committed manager
+            // surface, but a mounted child must match the approval binding.
+            const child_id = app.subagents.childRouteId() orelse return committed;
+            return input_approval_runtime.approvalBindingMatchesChildRoute(
+                binding.child_id,
+                child_id,
+            );
         }
 
         fn handleTextByte(app: *App, owner: text_scalar.Owner, byte: u8, max_input_len: usize) !void {
@@ -10588,7 +10590,7 @@ const ApprovalOwnershipBinding = struct {
 
 const ApprovalOwnershipSubagents = struct {
     view_active: bool = true,
-    child_id: []const u8 = "selected-child",
+    child_id: ?[]const u8 = "selected-child",
     presented_binding: ?ApprovalOwnershipBinding = null,
     card_binding: ?ApprovalOwnershipBinding = null,
 
@@ -10621,7 +10623,7 @@ const ApprovalOwnershipApp = struct {
     subagents: ApprovalOwnershipSubagents = .{},
 };
 
-test "committed child approval owns input while its refreshed binding catches up" {
+test "committed child approval owns input only on its bound child surface" {
     const alloc = std.testing.allocator;
     var app = ApprovalOwnershipApp{};
     defer app.approval_prompt.deinit(alloc);
@@ -10646,6 +10648,14 @@ test "committed child approval owns input while its refreshed binding catches up
         !Runtime(ApprovalOwnershipApp).approvalOwnsCurrentSurface(&app),
     );
     app.subagents.card_binding = .{ .child_id = "approval-child" };
+    try std.testing.expect(
+        !Runtime(ApprovalOwnershipApp).approvalOwnsCurrentSurface(&app),
+    );
+    app.subagents.child_id = null;
+    try std.testing.expect(
+        Runtime(ApprovalOwnershipApp).approvalOwnsCurrentSurface(&app),
+    );
+    app.subagents.child_id = "approval-child";
     try std.testing.expect(
         Runtime(ApprovalOwnershipApp).approvalOwnsCurrentSurface(&app),
     );

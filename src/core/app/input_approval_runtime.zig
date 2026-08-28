@@ -37,6 +37,13 @@ const subagent_controller = @import("../../ui/subagent/controller.zig");
 
 const ToolPermissionDecision = types.ToolPermissionDecision;
 
+pub fn approvalBindingMatchesChildRoute(
+    binding_child_id: []const u8,
+    child_route_id: []const u8,
+) bool {
+    return std.mem.eql(u8, binding_child_id, child_route_id);
+}
+
 pub fn ApprovalRuntime(comptime App: type) type {
     return struct {
         const interrupt = input_interrupt_runtime.InterruptRuntime(App);
@@ -360,6 +367,20 @@ pub fn ApprovalRuntime(comptime App: type) type {
                 }
             }
             const binding = maybe_binding orelse return false;
+            if (comptime @hasDecl(@TypeOf(app.subagents), "childRouteId")) {
+                if (app.subagents.isViewActive()) {
+                    if (app.subagents.childRouteId()) |child_id| {
+                        if (!approvalBindingMatchesChildRoute(binding.child_id, child_id)) {
+                            debug_trace.logf(
+                                "subagent",
+                                "main approval response blocked request_id={s} child_id={s} outcome=visible_child_mismatch",
+                                .{ binding.approval_id, binding.child_id },
+                            );
+                            return true;
+                        }
+                    }
+                }
+            }
             const host = app_session_runtime.Runtime(App).subagentHost(app) orelse return true;
             var response = try app.approval_prompt.decision.materializeResponse(
                 app.alloc,
