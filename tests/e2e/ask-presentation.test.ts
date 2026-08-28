@@ -486,7 +486,7 @@ describe("fx ask presentation", () => {
   }, TIMEOUT);
 
   test.skipIf(!tmuxAvailable())(
-    "collapsed TTY tool groups show the latest five calls while active",
+    "collapsed TTY tool groups collapse each completed batch before the turn ends",
     async () => {
       const root = createRoot();
       const fxDir = join(root.home, ".fx");
@@ -519,6 +519,23 @@ describe("fx ask presentation", () => {
             finishReason: { unified: "tool-calls", raw: "tool-calls" },
           },
         ]),
+        fakeGatewaySse([
+          {
+            type: "text-delta",
+            id: "batch_separator",
+            delta: "First batch inspected.\n",
+          },
+          {
+            type: "tool-call",
+            toolCallId: "read_fixture_1_again",
+            toolName: "read_file",
+            input: { path: "fixture-1.txt" },
+          },
+          {
+            type: "finish",
+            finishReason: { unified: "tool-calls", raw: "tool-calls" },
+          },
+        ]),
         async () => {
           await finalReady;
           return fakeGatewayFinalText("All fixtures inspected.\n");
@@ -532,28 +549,34 @@ describe("fx ask presentation", () => {
         cwd: root.workspace,
         env: { ...gatewayEnv(root.home, gateway), NO_COLOR: undefined },
         width: 120,
-        height: 40,
+        height: 12,
         remainOnExit: true,
       });
       sessions.push(session);
       await session.waitForText("Run /help for commands", TIMEOUT);
       await session.sendText("Inspect all fixture files.");
 
-      await session.waitForText("6 tool calls · 6 read", TIMEOUT);
+      const requestDeadline = Date.now() + TIMEOUT;
+      while (gateway.requestCount() < 3 && Date.now() < requestDeadline) {
+        await Bun.sleep(25);
+      }
+      expect(gateway.requestCount()).toBe(3);
       const activePane = await session.capturePane();
-      expect(activePane).not.toContain("Reading fixture-1.txt");
-      for (let index = 2; index <= 6; index += 1) {
-        expect(activePane).toContain(`Read fixture-${index}.txt`);
+      expect(activePane).toContain("6 tool calls · 6 read");
+      expect(activePane).toContain("1 tool call · 1 read");
+      for (let index = 1; index <= 6; index += 1) {
+        expect(activePane).not.toContain(`Read fixture-${index}.txt`);
       }
 
       releaseFinal!();
       await session.waitForText("All fixtures inspected.", TIMEOUT);
-      const finalPane = await session.capturePane();
-      expect(finalPane).toContain("6 tool calls · 6 read");
+      const finalScrollback = await session.captureFullScrollback();
+      expect(finalScrollback).toContain("6 tool calls · 6 read");
+      expect(finalScrollback).toContain("1 tool call · 1 read");
       for (let index = 1; index <= 6; index += 1) {
-        expect(finalPane).not.toContain(`Read fixture-${index}.txt`);
+        expect(finalScrollback).not.toContain(`Read fixture-${index}.txt`);
       }
-      expect(finalPane).toContain("All fixtures inspected.");
+      expect(finalScrollback).toContain("All fixtures inspected.");
     },
     TIMEOUT,
   );

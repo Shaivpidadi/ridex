@@ -571,17 +571,21 @@ fn collapsedGroupMode(
     detail_indices: *const std.AutoHashMapUnmanaged(u32, usize),
 ) ?CollapsedGroupMode {
     if (!collapse_tool_calls) return null;
+
+    var concrete_group_id: ?types.ToolPresentationGroupId = null;
+    var concrete_group_terminal = true;
     for (status_indices) |status_index| {
         const entry_id = toolStatusEntryId(entries[status_index]) orelse continue;
         const detail = detailForEntry(details, detail_indices, entry_id, null) orelse continue;
-        const turn_id = if (detail.presentation_group_id) |group|
-            group.turn_id
-        else if (detail.lifecycle_id) |lifecycle|
-            lifecycle.turn_id
-        else
+        if (detail.presentation_group_id) |group_id| {
+            concrete_group_id = group_id;
+            concrete_group_terminal = concrete_group_terminal and detail.outcome != null;
             continue;
-        if (turn_id > finalized_turn_watermark) return .live_tail;
+        }
+        const lifecycle = detail.lifecycle_id orelse continue;
+        if (lifecycle.turn_id > finalized_turn_watermark) return .live_tail;
     }
+    if (concrete_group_id != null and !concrete_group_terminal) return .live_tail;
     return .summary;
 }
 
@@ -1152,7 +1156,7 @@ test "collapsed tool groups render only the summary header" {
     try std.testing.expect(projection.entry_actions.items[1] == .hide);
 }
 
-test "collapsed live tool groups show the latest five calls until turn finalization" {
+test "collapsed live tool groups show the latest five calls until batch finalization" {
     const alloc = std.testing.allocator;
     const entries = [_]TranscriptEntry{
         .{ .raw_bytes = .{ .id = 1, .bytes = @constCast("● Read one\n"), .class = .tool_status } },
@@ -1162,13 +1166,14 @@ test "collapsed live tool groups show the latest five calls until turn finalizat
         .{ .raw_bytes = .{ .id = 5, .bytes = @constCast("● Read five\n"), .class = .tool_status } },
         .{ .raw_bytes = .{ .id = 6, .bytes = @constCast("● Read six\n"), .class = .tool_status } },
     };
-    const details = [_]ToolDetailRecord{
-        .{ .entry_id = 1, .tool_name = @constCast("read_file"), .activity_kind = .read, .outcome = .completed, .lifecycle_id = .{ .turn_id = 1, .call_id = "one" } },
-        .{ .entry_id = 2, .tool_name = @constCast("read_file"), .activity_kind = .read, .outcome = .completed, .lifecycle_id = .{ .turn_id = 1, .call_id = "two" } },
-        .{ .entry_id = 3, .tool_name = @constCast("read_file"), .activity_kind = .read, .outcome = .completed, .lifecycle_id = .{ .turn_id = 1, .call_id = "three" } },
-        .{ .entry_id = 4, .tool_name = @constCast("read_file"), .activity_kind = .read, .outcome = .completed, .lifecycle_id = .{ .turn_id = 1, .call_id = "four" } },
-        .{ .entry_id = 5, .tool_name = @constCast("read_file"), .activity_kind = .read, .outcome = .completed, .lifecycle_id = .{ .turn_id = 1, .call_id = "five" } },
-        .{ .entry_id = 6, .tool_name = @constCast("read_file"), .activity_kind = .read, .outcome = .completed, .lifecycle_id = .{ .turn_id = 1, .call_id = "six" } },
+    const group_id: types.ToolPresentationGroupId = .{ .turn_id = 1, .anchor_step_id = 1 };
+    var details = [_]ToolDetailRecord{
+        .{ .entry_id = 1, .tool_name = @constCast("read_file"), .activity_kind = .read, .outcome = .completed, .lifecycle_id = .{ .turn_id = 1, .call_id = "one" }, .presentation_group_id = group_id },
+        .{ .entry_id = 2, .tool_name = @constCast("read_file"), .activity_kind = .read, .outcome = .completed, .lifecycle_id = .{ .turn_id = 1, .call_id = "two" }, .presentation_group_id = group_id },
+        .{ .entry_id = 3, .tool_name = @constCast("read_file"), .activity_kind = .read, .outcome = .completed, .lifecycle_id = .{ .turn_id = 1, .call_id = "three" }, .presentation_group_id = group_id },
+        .{ .entry_id = 4, .tool_name = @constCast("read_file"), .activity_kind = .read, .outcome = .completed, .lifecycle_id = .{ .turn_id = 1, .call_id = "four" }, .presentation_group_id = group_id },
+        .{ .entry_id = 5, .tool_name = @constCast("read_file"), .activity_kind = .read, .outcome = .completed, .lifecycle_id = .{ .turn_id = 1, .call_id = "five" }, .presentation_group_id = group_id },
+        .{ .entry_id = 6, .tool_name = @constCast("read_file"), .activity_kind = .read, .lifecycle_id = .{ .turn_id = 1, .call_id = "six" }, .presentation_group_id = group_id },
     };
 
     var live = try buildStyledFocusedWithFinalityInterruptible(
@@ -1178,7 +1183,7 @@ test "collapsed live tool groups show the latest five calls until turn finalizat
         120,
         null,
         true,
-        0,
+        std.math.maxInt(u64),
         .{},
         .{},
         null,
@@ -1194,6 +1199,7 @@ test "collapsed live tool groups show the latest five calls until turn finalizat
         live.entry_actions.items[0].override.bytes,
     );
 
+    details[5].outcome = .completed;
     var finalized = try buildStyledFocusedWithFinalityInterruptible(
         alloc,
         &entries,
@@ -1201,7 +1207,7 @@ test "collapsed live tool groups show the latest five calls until turn finalizat
         120,
         null,
         true,
-        1,
+        0,
         .{},
         .{},
         null,
