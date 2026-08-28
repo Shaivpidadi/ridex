@@ -840,6 +840,10 @@ tmuxTest(
     await active.waitForText("Edit a previous message", READY_TIMEOUT);
     await active.sendKeys("Down");
     await active.sendKeys("Enter");
+    await active.waitForText(
+      "Reverted to before the selected message.",
+      READY_TIMEOUT,
+    );
     await waitForActiveFooter(active, (footer) => footer === "┃ first rewind prompt");
 
     await active.sendKeys("C-u");

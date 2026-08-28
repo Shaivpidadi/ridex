@@ -1594,7 +1594,14 @@ pub fn Runtime(comptime App: type) type {
                 },
                 '\r' => {
                     if (comptime @hasField(App, "session_persistence")) {
-                        if (try app_session_runtime.Runtime(App).applySelectedConversationRewind(app)) return;
+                        if (try app_session_runtime.Runtime(App).applySelectedConversationRewind(app)) {
+                            try app.writeDomainNotice(.{
+                                .topic = "session",
+                                .tone = .neutral,
+                                .body = "Reverted to before the selected message. Edit and submit it to continue, or run /unrevert to restore.",
+                            }, true);
+                            return;
+                        }
                     }
                     if (try submitSettingsMenuSelection(app)) return;
                     if (try submitHelpMenuSelection(app, max_input_len, max_prompt_history)) return;
