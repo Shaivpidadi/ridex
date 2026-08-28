@@ -438,6 +438,17 @@ pub fn Handlers(comptime App: type) type {
                 },
                 .failed => |err| failed: {
                     warning = true;
+                    if (err == error.McpAuthorityReducedReloadFailed) {
+                        debug_trace.logf(
+                            "mcp",
+                            "authority-reducing reload left MCP unavailable",
+                            .{},
+                        );
+                        break :failed try app.alloc.dupe(
+                            u8,
+                            "MCP configuration could not be reloaded after project authority was reduced. MCP is unavailable; check the configuration and run /mcp reload.",
+                        );
+                    }
                     debug_trace.logf(
                         "mcp",
                         "profile reload retained current runtime err={s}",
@@ -455,6 +466,9 @@ pub fn Handlers(comptime App: type) type {
                 .tone = if (warning) .warning else .neutral,
                 .body = body,
             }, true);
+            if (comptime @hasDecl(App, "presentProjectMcpPrompt")) {
+                try app.presentProjectMcpPrompt();
+            }
         }
 
         pub fn collectMcpAuthenticationFacts(app: *App) !void {
@@ -1302,6 +1316,10 @@ pub fn Handlers(comptime App: type) type {
             var reload_notice: ?[]u8 = null;
             defer if (reload_notice) |notice| app.alloc.free(notice);
             var reload_warning = false;
+            if (result.project_action) |action| {
+                try applyProjectMcpAction(app, action, command_body);
+                return;
+            }
             if (result.reload) {
                 app.beginMcpReload() catch |err| {
                     reload_warning = true;
@@ -1337,6 +1355,70 @@ pub fn Handlers(comptime App: type) type {
                 .tone = if (reload_warning) .warning else .neutral,
                 .body = body,
             }, true);
+        }
+
+        pub fn applyProjectMcpAction(
+            app: *App,
+            action: @import("../mcp/project_config.zig").ProjectMcpAction,
+            success_body: []const u8,
+        ) !void {
+            if (comptime !@hasField(App, "workspace_root") or
+                !@hasDecl(App, "beginMcpAuthorityReduction"))
+            {
+                return error.McpProjectChoicesUnavailable;
+            } else {
+                const reducing_requested = switch (action) {
+                    .reject, .reset => true,
+                    .approve, .approve_all => false,
+                };
+                var attempt = config_runtime.attemptProjectMcpMutation(
+                    app.alloc,
+                    app.workspace_root,
+                    action,
+                );
+                defer attempt.deinit(app.alloc);
+                var warning = false;
+                var owned_notice: ?[]u8 = null;
+                defer if (owned_notice) |notice| app.alloc.free(notice);
+                switch (attempt) {
+                    .outcome => |outcome| switch (outcome) {
+                        .unchanged => {},
+                        .committed => |committed| {
+                            if (committed.authority_reduced) {
+                                try app.beginMcpAuthorityReduction(true);
+                            } else {
+                                try app.beginMcpReload();
+                            }
+                        },
+                    },
+                    .failure => |failure| {
+                        warning = true;
+                        if (failure.err == error.SettingsCommitIndeterminate and reducing_requested) {
+                            try app.beginMcpAuthorityReduction(false);
+                            owned_notice = try app.alloc.dupe(
+                                u8,
+                                "Project MCP choices may have been saved, so live MCP authority was retired. Run /mcp reload after checking settings.json.",
+                            );
+                        } else {
+                            owned_notice = try std.fmt.allocPrint(
+                                app.alloc,
+                                "Project MCP choices were not applied: {s}.",
+                                .{@errorName(failure.err)},
+                            );
+                        }
+                    },
+                }
+                try app.writeDomainNotice(.{
+                    .topic = "mcp",
+                    .tone = if (warning) .warning else .neutral,
+                    .body = owned_notice orelse success_body,
+                }, true);
+                if (warning and owned_notice != null and
+                    comptime @hasDecl(App, "presentProjectMcpPrompt"))
+                {
+                    try app.presentProjectMcpPrompt();
+                }
+            }
         }
 
         fn listMcpServersAndTools(ctx: *anyopaque, alloc: std.mem.Allocator) ![]u8 {
@@ -1597,6 +1679,7 @@ pub fn Handlers(comptime App: type) type {
                 .removed = result.removed,
                 .revocation_failed = result.revocation_failed,
                 .repaired_entries = result.repaired_entries,
+                .local_only = result.local_only,
             };
         }
 

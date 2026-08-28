@@ -1662,6 +1662,7 @@ while :; do :; done
       const afterAnsi = await active.captureFullScrollbackEscapes();
       writeFileSync(afterPath, after);
       writeFileSync(afterAnsiPath, afterAnsi);
+      expect(after).toContain(nextMarker);
       expect(historicalLines(after)).toEqual(historicalLines(before));
       expect(historicalLines(afterAnsi)).toEqual(historicalLines(beforeAnsi));
       await waitForCondition(
@@ -1712,7 +1713,6 @@ while :; do :; done
       expect(replayFrames.stderr).toBe("");
       expect(replayFrames.stdout).toContain(expectedRows[0]!);
       expect(replayFrames.stdout).toContain(tailMarker);
-      expect(replayFrames.stdout).toContain(nextMarker);
       const replayJson = await runFx(["replay", tapePath, "--json"], {
         cwd: realpathSync(workspace),
         env: { HOME: home },

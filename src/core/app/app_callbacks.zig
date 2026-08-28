@@ -1253,7 +1253,6 @@ const FakePacer = struct {
     defer_history: bool = false,
     enqueue_count: usize = 0,
     flush_count: usize = 0,
-    flush_result: assistant_pacer.FlushResult = .drained,
 
     fn deinit(self: *FakePacer, alloc: std.mem.Allocator) void {
         self.text.deinit(alloc);
@@ -1270,18 +1269,6 @@ const FakePacer = struct {
         return self.defer_history;
     }
 
-    pub fn flushPendingText(self: *FakePacer, callbacks: anytype) !assistant_pacer.FlushResult {
-        _ = callbacks;
-        self.flush_count += 1;
-        if (self.flush_result == .drained) self.text.clearRetainingCapacity();
-        return self.flush_result;
-    }
-
-    pub fn flushPendingTextAtBoundary(self: *FakePacer, callbacks: anytype) !void {
-        _ = try self.flushPendingText(callbacks);
-        self.text.clearRetainingCapacity();
-    }
-
     pub fn flushPresentationAtBoundary(
         self: *FakePacer,
         alloc: std.mem.Allocator,
@@ -1290,7 +1277,9 @@ const FakePacer = struct {
     ) !void {
         _ = alloc;
         _ = now_ns;
-        try self.flushPendingTextAtBoundary(callbacks);
+        _ = callbacks;
+        self.flush_count += 1;
+        self.text.clearRetainingCapacity();
     }
 };
 

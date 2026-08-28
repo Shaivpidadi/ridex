@@ -966,11 +966,15 @@ pub const Runtime = struct {
         return self.main_approval_presented;
     }
 
-    pub fn mainApprovalBinding(self: *const Runtime, prompt_id: u64) ?MainApprovalBinding {
-        if (!self.main_approval_presented) return null;
+    pub fn mainApprovalCardBinding(self: *const Runtime, prompt_id: u64) ?MainApprovalBinding {
         const card = self.main_approval_card orelse return null;
         if (card.prompt_id != prompt_id) return null;
         return .{ .child_id = card.child_id, .approval_id = card.approval_id };
+    }
+
+    pub fn mainApprovalBinding(self: *const Runtime, prompt_id: u64) ?MainApprovalBinding {
+        if (!self.main_approval_presented) return null;
+        return self.mainApprovalCardBinding(prompt_id);
     }
 
     pub fn dismissMainApproval(self: *Runtime) void {

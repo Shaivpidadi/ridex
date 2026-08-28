@@ -155,7 +155,6 @@ pub const StreamChunkContext = struct {
         source: []const u8,
     ) !void {
         try self.raw_text.appendSlice(self.alloc, source);
-        try self.hooks.push_text(self.hooks.ctx, .{ .assistant_source = source });
 
         var start: usize = 0;
         while (start < source.len and isTrimmedAssistantPrefixByte(source[start])) : (start += 1) {
@@ -1127,7 +1126,7 @@ test "presented recovery source seeds continuation without rendering twice" {
     try stream_ctx.restoreRecoverySource("Partial output before EOF.", true);
 
     try std.testing.expectEqualStrings("Partial output before EOF.", stream_ctx.raw_text.items);
-    try std.testing.expectEqual(@as(usize, 1), capture.source_spans.items.len);
+    try std.testing.expectEqual(@as(usize, 0), capture.source_spans.items.len);
     try std.testing.expectEqual(@as(usize, 0), capture.text_spans.items.len);
 
     stream_ctx.beginRecoveryAttempt();
@@ -1137,8 +1136,8 @@ test "presented recovery source seeds continuation without rendering twice" {
         "Partial output before EOF.Recovered final output once.",
         stream_ctx.raw_text.items,
     );
-    try std.testing.expectEqual(@as(usize, 2), capture.source_spans.items.len);
-    try std.testing.expectEqualStrings("Recovered final output once.", capture.source_spans.items[1]);
+    try std.testing.expectEqual(@as(usize, 1), capture.source_spans.items.len);
+    try std.testing.expectEqualStrings("Recovered final output once.", capture.source_spans.items[0]);
     try std.testing.expectEqual(@as(usize, 1), capture.text_spans.items.len);
     try std.testing.expectEqualStrings("Recovered final output once.", capture.text_spans.items[0]);
 }
@@ -1169,8 +1168,8 @@ test "presented recovery source preserves an unfinished semantic code fence" {
         prefix ++ " 1;\n```\nAfter code.\n",
         stream_ctx.raw_text.items,
     );
-    try std.testing.expectEqual(@as(usize, 2), capture.source_spans.items.len);
-    try std.testing.expectEqualStrings(" 1;\n```\nAfter code.\n", capture.source_spans.items[1]);
+    try std.testing.expectEqual(@as(usize, 1), capture.source_spans.items.len);
+    try std.testing.expectEqualStrings(" 1;\n```\nAfter code.\n", capture.source_spans.items[0]);
     try std.testing.expectEqual(@as(usize, 1), capture.code_blocks.items.len);
     try std.testing.expectEqualStrings("zig", capture.code_blocks.items[0].language);
     try std.testing.expectEqualStrings(" 1;\n", capture.code_blocks.items[0].code);

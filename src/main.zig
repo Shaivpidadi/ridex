@@ -577,6 +577,7 @@ const App = struct {
     metrics: Metrics = .{},
     fn loadNoMcpRuntime(
         _: Allocator,
+        _: []const u8,
         _: @import("core/mcp/elicitation.zig").Capabilities,
     ) !?*mcp_runtime_mod.McpRuntime {
         return null;
@@ -1493,11 +1494,28 @@ const App = struct {
     pub fn beginMcpReload(self: *App) !void {
         return self.mcp.beginReload(
             self.alloc,
+            self.workspace_root,
+            .{ .form = true, .url = true },
+            if (comptime host_target.is_wasm) loadNoMcpRuntime else builtin_mcp.loadRuntime,
+            builtin_mcp.previewNativeWorkspaceAuthority,
+            self.toolRegistry(),
+            @intCast(@max(io_mod.milliTimestamp(), 0)),
+        );
+    }
+
+    pub fn beginMcpAuthorityReduction(self: *App, rebuild: bool) !void {
+        return self.mcp.beginAuthorityReduction(
+            self.alloc,
+            self.workspace_root,
             .{ .form = true, .url = true },
             if (comptime host_target.is_wasm) loadNoMcpRuntime else builtin_mcp.loadRuntime,
             self.toolRegistry(),
             @intCast(@max(io_mod.milliTimestamp(), 0)),
-        );
+            rebuild,
+        ) catch |err| {
+            self.mcp.retireAuthoritySynchronously(self.alloc);
+            return err;
+        };
     }
 
     pub fn startMcpAuthentication(
@@ -1530,6 +1548,34 @@ const App = struct {
 
     pub fn startMcpDiscovery(self: *App) void {
         self.mcp.startDiscovery(self.toolRegistry());
+    }
+
+    pub fn presentProjectMcpPrompt(self: *App) !void {
+        const name = (try self.mcp.projectPromptDisplayName(self.alloc)) orelse return;
+        defer self.alloc.free(name);
+        var notice: std.Io.Writer.Allocating = .init(self.alloc);
+        defer notice.deinit();
+        try notice.writer.print(
+            "Project MCP server '{s}' is defined in .mcp.json.\n  [1] Approve  [2] Approve all  [3] Reject  [Esc] Dismiss remaining prompts\n",
+            .{name},
+        );
+        try self.writeTranscriptClassified(
+            notice.writer.buffered(),
+            true,
+            .unknown_raw,
+        );
+    }
+
+    pub fn projectMcpPromptActive(self: *App) bool {
+        return self.mcp.projectPromptActive();
+    }
+
+    pub fn projectMcpPromptName(self: *App, alloc: Allocator) !?[]u8 {
+        return self.mcp.projectPromptName(alloc);
+    }
+
+    pub fn suppressProjectMcpPrompts(self: *App) void {
+        self.mcp.suppressProjectPrompts();
     }
 
     fn effectiveToolSet(self: *const App) tool_set_contract.ToolSet {
@@ -2371,6 +2417,7 @@ const App = struct {
             self.terminal_input_runtime.hasPendingTerminalAction() or
             self.question_prompt.isActive() or
             self.approval_prompt.isActive() or
+            @constCast(&self.mcp).projectPromptActive() or
             self.auth.apiKeyEntryActive() or
             self.subagents.isViewActive() or
             !self.shell.has_committed_frame or
@@ -3252,7 +3299,15 @@ fn needsFullEntryConfig(args: []const [:0]const u8) bool {
 
 fn needsEarlyThreadedIo(args: []const [:0]const u8) bool {
     if (needsFullEntryConfig(args)) return true;
-    const command = cli_surface.commandAfterGlobalLaunchArgs(args) orelse return false;
+    const effective_args = cli_surface.argsAfterGlobalLaunchArgs(args);
+    if (effective_args.len == 0) return false;
+    const command = effective_args[0];
+    if (std.mem.eql(u8, command, "mcp")) {
+        if (effective_args.len < 2) return false;
+        return std.mem.eql(u8, effective_args[1], "auth") or
+            std.mem.eql(u8, effective_args[1], "list") or
+            std.mem.eql(u8, effective_args[1], "logout");
+    }
     return std.mem.eql(u8, command, "login") or
         std.mem.eql(u8, command, "logout") or
         std.mem.eql(u8, command, "teams") or
@@ -3282,6 +3337,22 @@ test "credential-reading commands use early threaded io without full entry confi
         const args = &.{command};
         try std.testing.expect(!needsFullEntryConfig(args));
         try std.testing.expect(needsEarlyThreadedIo(args));
+    }
+}
+
+test "MCP credential commands use early threaded io" {
+    for ([_][:0]const u8{ "auth", "list", "logout" }) |operation| {
+        try std.testing.expect(needsEarlyThreadedIo(&.{
+            @as([:0]const u8, "mcp"),
+            operation,
+            @as([:0]const u8, "fixture"),
+        }));
+    }
+    for ([_][:0]const u8{ "add", "path", "remove" }) |operation| {
+        try std.testing.expect(!needsEarlyThreadedIo(&.{
+            @as([:0]const u8, "mcp"),
+            operation,
+        }));
     }
 }
 
@@ -3386,7 +3457,10 @@ fn fullEntryConfig() app_entry_runtime.Config {
         .mode_registry = builtin_modes.registry,
         .tool_set = builtin_tools.advertisement_set,
         .inspect_mcp_profile_config = builtin_mcp.inspectProfileConfig,
+        .inspect_mcp_local_config = builtin_mcp.inspectLocalConfig,
         .load_mcp_runtime = builtin_mcp.loadRuntime,
+        .add_mcp_profile_server = builtin_mcp.addProfileServer,
+        .remove_mcp_profile_server = builtin_mcp.removeProfileServer,
         .acp_runner = .{ .run_fn = runAcpServer },
     };
 }
@@ -3421,7 +3495,10 @@ fn localEntryConfig() app_entry_runtime.Config {
         .mode_registry = builtin_modes.registry,
         .tool_set = builtin_tools.advertisement_set,
         .inspect_mcp_profile_config = builtin_mcp.inspectProfileConfig,
+        .inspect_mcp_local_config = builtin_mcp.inspectLocalConfig,
         .load_mcp_runtime = builtin_mcp.loadRuntime,
+        .add_mcp_profile_server = builtin_mcp.addProfileServer,
+        .remove_mcp_profile_server = builtin_mcp.removeProfileServer,
         .acp_runner = .{ .run_fn = runAcpServer },
     };
 }
@@ -3456,7 +3533,10 @@ fn emptyEntryConfig() app_entry_runtime.Config {
         .mode_registry = builtin_modes.registry,
         .tool_set = builtin_tools.advertisement_set,
         .inspect_mcp_profile_config = builtin_mcp.inspectProfileConfig,
+        .inspect_mcp_local_config = builtin_mcp.inspectLocalConfig,
         .load_mcp_runtime = builtin_mcp.loadRuntime,
+        .add_mcp_profile_server = builtin_mcp.addProfileServer,
+        .remove_mcp_profile_server = builtin_mcp.removeProfileServer,
         .acp_runner = .{ .run_fn = runAcpServer },
     };
 }

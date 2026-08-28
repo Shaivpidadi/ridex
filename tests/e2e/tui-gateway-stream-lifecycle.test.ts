@@ -1550,13 +1550,6 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       );
 
       hold.finish?.();
-      await waitForScrollback(
-        session!,
-        (value) =>
-          value.includes("  (↑8 ↓20k)") &&
-          !value.includes(finalSentinel),
-        "exact token progress during the paced response tail",
-      );
       await session!.waitForText(finalSentinel, TIMEOUT);
       const finalScrollback = await waitForScrollback(
         session!,
@@ -1571,6 +1564,113 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     },
     TIMEOUT * 2,
+  );
+
+  test(
+    "assistant publishes a complete markdown block before the following tool",
+    async () => {
+      root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-bounded-assistant-pacing-")));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const stderrPath = join(root, "stderr.log");
+      const tapePath = join(root, "session.fxtape");
+      const framesRoot = join(root, "replay-frames");
+      const hold: HoldState = { started: false, cancelled: false };
+      const renderedSentence =
+        "PACING_STREAM_SENTENCE keeps smooth markdown visible before tool presentation begins.";
+      const sourceSentence = renderedSentence.replace("smooth", "**smooth**");
+      const toolMarker = "PACING_TOOL_BOUNDARY_DONE";
+      const finalText = "PACING_STREAM_COMPLETE";
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace, { recursive: true });
+      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+
+      const queuedGateway = startFakeGateway([
+        () =>
+          heldGatewayResponse(
+            hold,
+            [{ type: "text-delta", id: "answer_1", delta: `${sourceSentence}\n\n` }],
+            [
+              { type: "tool-input-start", id: "pacing_tool", toolName: "terminal" },
+              {
+                type: "tool-call",
+                toolCallId: "pacing_tool",
+                toolName: "terminal",
+                input: {
+                  action: "exec",
+                  timeout_ms: 10_000,
+                  command: `printf ${toolMarker}`,
+                },
+              },
+              {
+                type: "finish",
+                finishReason: { unified: "tool-calls", raw: "tool-calls" },
+              },
+            ],
+          ),
+        fakeGatewayFinalText(finalText),
+      ]);
+      gateway = queuedGateway;
+      session = await TmuxSession.create({
+        cwd: realpathSync(workspace),
+        width: 120,
+        height: 40,
+        stderrPath,
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: "fake-bounded-assistant-pacing-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_AUTO_UPGRADE: "0",
+          FX_PERMISSION_MODE: "yolo",
+          FX_GATEWAY_BASE_URL: queuedGateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
+          FX_E2E_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
+          FX_MODEL: MODEL,
+          FX_RECORD: tapePath,
+          FX_RECORD_INPUT: "1",
+        },
+      });
+
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("Render markdown, then run the command.");
+      await waitForCondition(
+        () => queuedGateway.requests.length === 1 && hold.started,
+        "held markdown response",
+      );
+      await session.waitForText(renderedSentence, TIMEOUT);
+      hold.release?.();
+      await session.waitForText(finalText, TIMEOUT);
+
+      execFileSync(FX_BIN, ["replay", tapePath, "--frames-dir", framesRoot], {
+        encoding: "utf8",
+      });
+      const grids = readdirSync(join(framesRoot, "frames"))
+        .filter((name) => name.endsWith(".grid.txt"))
+        .sort()
+        .map((name) => readFileSync(join(framesRoot, "frames", name), "utf8"));
+      const prefixLength = (grid: string): number => {
+        for (let count = renderedSentence.length; count > 0; count -= 1) {
+          if (grid.includes(renderedSentence.slice(0, count))) return count;
+        }
+        return 0;
+      };
+      const prefixLengths = grids
+        .map(prefixLength)
+        .filter((count, index, values) => count > 0 && count !== values[index - 1]);
+      const paragraphFrame = grids.findIndex((grid) => grid.includes(renderedSentence));
+      const toolFrame = grids.findIndex((grid) => grid.includes(toolMarker));
+
+      expect(prefixLengths).toEqual([renderedSentence.length]);
+      expect(paragraphFrame).toBeGreaterThanOrEqual(0);
+      expect(toolFrame).toBeGreaterThanOrEqual(0);
+      expect(paragraphFrame).toBeLessThan(toolFrame);
+      expect(prefixLength(grids[toolFrame]!)).toBe(renderedSentence.length);
+      expect(grids[toolFrame]!.indexOf(renderedSentence)).toBeLessThan(
+        grids[toolFrame]!.indexOf(toolMarker),
+      );
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    TIMEOUT,
   );
 
   test(
@@ -2747,7 +2847,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
   );
 
   test(
-    "completed paced assistant text drains before a queued user prompt reaches scrollback",
+    "complete assistant block precedes a queued user prompt in scrollback",
     async () => {
       root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-prompt-boundary-")));
       const home = join(root, "home");
@@ -2755,6 +2855,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const stderrPath = join(root, "stderr.log");
       const tapePath = join(root, "session.fxtape");
       const tracePath = join(root, "trace.log");
+      const firstResponse: HoldState = { started: false, cancelled: false };
       const secondResponse = { started: false, cancelled: false };
       mkdirSync(join(home, ".fx"), { recursive: true });
       mkdirSync(workspacePath, { recursive: true });
@@ -2762,17 +2863,21 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const workspace = realpathSync(workspacePath);
 
       const splitGateway = startFakeGateway([
-        fakeGatewaySse([
-          { type: "text-delta", id: "split_old", delta: SPLIT_OLD_RESPONSE },
-          {
-            type: "finish",
-            finishReason: { unified: "stop", raw: "stop" },
-            usage: {
-              inputTokens: { total: 3 },
-              outputTokens: { total: 5 },
-            },
-          },
-        ]),
+        () =>
+          heldGatewayResponse(
+            firstResponse,
+            [{ type: "text-delta", id: "split_old", delta: `${SPLIT_OLD_RESPONSE}\n` }],
+            [
+              {
+                type: "finish",
+                finishReason: { unified: "stop", raw: "stop" },
+                usage: {
+                  inputTokens: { total: 3 },
+                  outputTokens: { total: 5 },
+                },
+              },
+            ],
+          ),
         () => heldGatewayResponse(secondResponse),
       ]);
       gateway = splitGateway;
@@ -2800,18 +2905,15 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       await session.waitForComposer(TIMEOUT);
       await session.sendText("Return the first split fixture.");
-      const beforePrompt = await waitForScrollback(
-        session,
-        (candidate) =>
-          existsSync(tracePath) &&
-          readFileSync(tracePath, "utf8").includes("event=stream_complete") &&
-          candidate.includes("SPLIT_OLD_TAIL_005") &&
-          !candidate.includes("SPLIT_OLD_TAIL_FINAL"),
-        "completed Gateway stream with assistant presentation still draining",
+      await waitForCondition(
+        () => splitGateway.requests.length === 1 && firstResponse.started,
+        "held first Gateway stream",
       );
-      expect(beforePrompt).not.toContain("SPLIT_OLD_TAIL_FINAL");
+      await session.waitForText("SPLIT_OLD_TAIL_FINAL", TIMEOUT);
 
       await session.sendText(SPLIT_NEW_USER_PROMPT);
+      expect(splitGateway.requests).toHaveLength(1);
+      firstResponse.release?.();
       await waitForCondition(
         () => splitGateway.requests.length === 2 && secondResponse.started,
         "held second Gateway stream",
@@ -2957,7 +3059,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(repairedResults).toEqual([
         expect.objectContaining({
           output: expect.objectContaining({
-            type: "text",
+            type: "error-text",
             value: expect.stringContaining("tool_execution_failed"),
           }),
         }),
