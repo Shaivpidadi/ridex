@@ -147,7 +147,6 @@ fn shellAuthority(
 }
 
 test {
-    _ = @import("command_runner.zig");
     _ = @import("local_executor.zig");
 }
 

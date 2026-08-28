@@ -118,7 +118,7 @@ const terminal_client_runtime = @import("../terminal/client.zig");
 
 test {
     _ = tool_admission;
-    _ = @import("command_result_mapping.zig");
+    _ = command_result_mapping;
     _ = @import("../session/command_replay_store.zig");
     _ = file_mutation_execution;
     _ = tool_presentation;
@@ -6690,6 +6690,7 @@ test "browser run_command reports incomplete output with preserved status" {
     try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, result.status);
     try expectToolErrorDetailBool(result.model_output, "output_incomplete", true);
     try expectToolErrorDetailInt(result.model_output, "exit_code", 0);
+    try expectContains(result.model_output, "partial");
     try expectContains(result.model_output, "Do not retry");
     const json = result.command_result_json orelse return error.TestExpectedEqual;
     try expectCommandResultInt(json, "exit_code", 0);
@@ -6798,6 +6799,7 @@ test "run_command returns model output and structured metadata" {
     try expectCommandResultInt(structured, "stderr_bytes", 13);
     try expectCommandResultBool(structured, "timed_out", false);
     try expectCommandResultBool(structured, "truncated", false);
+    try std.testing.expect(std.mem.find(u8, structured, "\"output_incomplete\"") == null);
 }
 
 test "run_command nonzero exit returns structured masked failure" {
