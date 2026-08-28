@@ -102,6 +102,7 @@ pub const UserSettingsPatch = struct {
     effort: ?types.ReasoningEffort = null,
     fast_mode: ?bool = null,
     slash_menu_categories: ?bool = null,
+    collapse_tool_calls: ?bool = null,
     update_channel: ?update_target.Channel = null,
     startup_scrollback: ?bool = null,
     prompt_history_enabled: ?bool = null,
@@ -120,6 +121,7 @@ pub const UserSettingsPatch = struct {
             self.effort == null and
             self.fast_mode == null and
             self.slash_menu_categories == null and
+            self.collapse_tool_calls == null and
             self.update_channel == null and
             self.startup_scrollback == null and
             self.prompt_history_enabled == null and
@@ -212,6 +214,7 @@ const UserPreferenceField = enum(u4) {
     effort,
     fast_mode,
     slash_menu_categories,
+    collapse_tool_calls,
     update_channel,
     startup_scrollback,
     prompt_history_enabled,
@@ -229,6 +232,7 @@ const UserPreferenceField = enum(u4) {
             .effort => "settings.json.preference-migration.effort.json",
             .fast_mode => "settings.json.preference-migration.fast_mode.json",
             .slash_menu_categories => "settings.json.preference-migration.slash_menu_categories.json",
+            .collapse_tool_calls => "settings.json.preference-migration.collapse_tool_calls.json",
             .update_channel => "settings.json.preference-migration.update_channel.json",
             .startup_scrollback => "settings.json.preference-migration.startup_scrollback.json",
             .prompt_history_enabled => "settings.json.preference-migration.prompt_history_enabled.json",
@@ -244,6 +248,7 @@ const user_preference_fields = [_]UserPreferenceField{
     .effort,
     .fast_mode,
     .slash_menu_categories,
+    .collapse_tool_calls,
     .update_channel,
     .startup_scrollback,
     .prompt_history_enabled,
@@ -915,6 +920,19 @@ test "clearing the credential choice removes the key rather than blanking it" {
     try std.testing.expect(!application.changed);
 }
 
+test "collapse tool calls user patch writes the profile preference" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    var parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), "{}", .{});
+    defer parsed.deinit();
+    var root = parsed.value;
+
+    const application = try applyUserPatchToRoot(arena.allocator(), &root, .{ .collapse_tool_calls = true });
+    try std.testing.expect(application.changed);
+    try std.testing.expect(root.object.get("collapse_tool_calls").?.bool);
+}
+
 test "provider patch writes one bounded provider model collection" {
     const alloc = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(alloc);
@@ -978,6 +996,7 @@ fn applyUserPatchToRoot(
     if (patch.effort) |value| application.changed = try putString(arena, &root.object, "effort", value.label()) or application.changed;
     if (patch.fast_mode) |value| application.changed = try putBool(arena, &root.object, "fast_mode", value) or application.changed;
     if (patch.slash_menu_categories) |value| application.changed = try putBool(arena, &root.object, "slash_menu_categories", value) or application.changed;
+    if (patch.collapse_tool_calls) |value| application.changed = try putBool(arena, &root.object, "collapse_tool_calls", value) or application.changed;
     if (patch.update_channel) |value| application.changed = try putString(arena, &root.object, "update_channel", value.label()) or application.changed;
     if (patch.startup_scrollback) |value| application.changed = try putBool(arena, &root.object, "startup_scrollback", value) or application.changed;
 
@@ -1101,6 +1120,13 @@ fn cleanupLegacyWorkspacePreferences(
             "slash_menu_categories",
             .slash_menu_categories,
             patch.slash_menu_categories != null,
+            application,
+        );
+        removeLegacyLeaf(
+            &entry.value_ptr.object,
+            "collapse_tool_calls",
+            .collapse_tool_calls,
+            patch.collapse_tool_calls != null,
             application,
         );
         removeLegacyLeaf(

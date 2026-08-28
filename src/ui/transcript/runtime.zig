@@ -4168,6 +4168,9 @@ pub const TranscriptRuntime = struct {
     full_transcript_content_revision: u64 = 0,
     full_transcript_review_revision: u64 = 0,
     compact_transcript_source_cache: CompactTranscriptSourceCache = .{},
+    /// When enabled, compact transcript tool groups render only their summary
+    /// header while the full transcript retains every individual tool call.
+    collapse_tool_calls: bool = false,
     /// Structured-entry store used to regenerate transcript bytes at the
     /// current width while retaining the raw byte buffer for append paths
     /// that still write pre-rendered transcript content.

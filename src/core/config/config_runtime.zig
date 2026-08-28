@@ -49,6 +49,7 @@ pub const Settings = struct {
     context: ?bool = null,
     fast_mode: ?bool = null,
     slash_menu_categories: ?bool = null,
+    collapse_tool_calls: ?bool = null,
     auto_upgrade: ?bool = null,
     update_channel: ?update_target.Channel = null,
     startup_scrollback: ?bool = null,
@@ -115,6 +116,7 @@ pub const ConfigSources = struct {
     effort: ConfigSource = .compiled_default,
     fast_mode: ConfigSource = .compiled_default,
     slash_menu_categories: ConfigSource = .compiled_default,
+    collapse_tool_calls: ConfigSource = .compiled_default,
     startup_scrollback: ConfigSource = .compiled_default,
     prompt_history_enabled: ConfigSource = .compiled_default,
     statusline_context: ConfigSource = .compiled_default,
@@ -573,6 +575,7 @@ fn hasLegacyWorkspacePreferences(root: std.json.Value) bool {
             "effort",
             "fast_mode",
             "slash_menu_categories",
+            "collapse_tool_calls",
             "startup_scrollback",
         }) |key| {
             if (workspace.contains(key)) return true;
@@ -602,6 +605,7 @@ fn isProfileOnlySettingKey(key: []const u8) bool {
         "effort",
         "fast_mode",
         "slash_menu_categories",
+        "collapse_tool_calls",
         "startup_scrollback",
         "prompt_history",
         "statusLine",
@@ -648,6 +652,7 @@ fn updateConfigSources(sources: *ConfigSources, settings: Settings, source: Conf
     if (settings.effort != null) sources.effort = source;
     if (settings.fast_mode != null) sources.fast_mode = source;
     if (settings.slash_menu_categories != null) sources.slash_menu_categories = source;
+    if (settings.collapse_tool_calls != null) sources.collapse_tool_calls = source;
     if (settings.startup_scrollback != null) sources.startup_scrollback = source;
     if (settings.prompt_history_enabled != null) sources.prompt_history_enabled = source;
     if (settings.statusline_context != null) sources.statusline_context = source;
@@ -1419,6 +1424,12 @@ fn parseProfileOnlyFields(
         settings.slash_menu_categories = value.bool;
     }
 
+    if (root.object.get("collapse_tool_calls")) |collapse_tool_calls_value| {
+        const value = collapse_tool_calls_value;
+        if (value != .bool) return error.InvalidCollapseToolCallsType;
+        settings.collapse_tool_calls = value.bool;
+    }
+
     if (root.object.get("auto_upgrade")) |auto_upgrade_value| {
         const value = auto_upgrade_value;
         if (value != .bool) return error.InvalidAutoUpgradeType;
@@ -1536,6 +1547,7 @@ fn mergeSettings(target: *Settings, incoming: *Settings, alloc: Allocator) void 
     if (incoming.context) |value| target.context = value;
     if (incoming.fast_mode) |value| target.fast_mode = value;
     if (incoming.slash_menu_categories) |value| target.slash_menu_categories = value;
+    if (incoming.collapse_tool_calls) |value| target.collapse_tool_calls = value;
     if (incoming.auto_upgrade) |value| target.auto_upgrade = value;
     if (incoming.update_channel) |value| target.update_channel = value;
     if (incoming.startup_scrollback) |value| target.startup_scrollback = value;
@@ -2150,6 +2162,26 @@ test "startup_scrollback parses merges rejects invalid type and round trips" {
     const json = try serializeJsonObject(std.testing.allocator, parsed.value);
     defer std.testing.allocator.free(json);
     try std.testing.expect(std.mem.find(u8, json, "\"startup_scrollback\":false") != null);
+}
+
+test "collapse tool calls parses merges and rejects invalid types" {
+    var absent = try parseSettingsJson(std.testing.allocator, "{}");
+    defer absent.deinit(std.testing.allocator);
+    try std.testing.expect(absent.collapse_tool_calls == null);
+
+    var first = try parseSettingsJson(std.testing.allocator, "{\"collapse_tool_calls\":true}");
+    defer first.deinit(std.testing.allocator);
+    try std.testing.expect(first.collapse_tool_calls.?);
+
+    var second = try parseSettingsJson(std.testing.allocator, "{\"collapse_tool_calls\":false}");
+    defer second.deinit(std.testing.allocator);
+    mergeSettings(&first, &second, std.testing.allocator);
+    try std.testing.expect(!first.collapse_tool_calls.?);
+
+    try std.testing.expectError(
+        error.InvalidCollapseToolCallsType,
+        parseSettingsJson(std.testing.allocator, "{\"collapse_tool_calls\":\"off\"}"),
+    );
 }
 
 test "slash menu categories parses merges and rejects invalid types" {

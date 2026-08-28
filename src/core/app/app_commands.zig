@@ -3434,6 +3434,9 @@ pub fn settingsCatalogSnapshot(app: anytype) settings_catalog.Snapshot {
             snapshot.slash_menu_categories = app.input_runtime.slash_menu_categories;
         }
     }
+    if (comptime @hasField(App, "shell") and @hasField(@TypeOf(app.shell), "collapse_tool_calls")) {
+        snapshot.collapse_tool_calls = app.shell.collapse_tool_calls;
+    }
     if (comptime @hasField(App, "statusline_context")) snapshot.statusline_context = app.statusline_context;
     if (comptime @hasField(App, "statusline_session")) snapshot.statusline_session = app.statusline_session;
     if (comptime @hasField(App, "workspace_identity")) snapshot.statusline_workspace = app.workspace_identity.enabled;
@@ -3494,6 +3497,21 @@ pub fn applySettingsCatalogChange(app: anytype, change: settings_catalog.Change)
             if (enabled != statuslineItemEnabled(app, item)) {
                 try applyStatuslineItem(app, item, enabled, .announce);
             }
+        },
+        .collapse_tool_calls => {
+            const enabled = parseOnOff(change.value) orelse return error.InvalidSettingsCatalogValue;
+            const runtime_changed = enabled != app.shell.collapse_tool_calls;
+            if (runtime_changed) {
+                app.shell.collapse_tool_calls = enabled;
+                app.shell.markTranscriptStructureDirty();
+                app.shell.render_requests.request(.transcript);
+            }
+            try persistUserPreferences(
+                app,
+                "collapse tool calls",
+                .{ .collapse_tool_calls = enabled },
+                runtime_changed,
+            );
         },
         .slash_menu_categories => {
             const enabled = parseOnOff(change.value) orelse return error.InvalidSettingsCatalogValue;
