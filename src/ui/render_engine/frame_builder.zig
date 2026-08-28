@@ -85,13 +85,22 @@ pub fn buildAndFlushFrame(
         committed_layout,
         &options,
     );
-    const repaint_window = frameRepaintWindow(plan, options.transcript_body);
+    const sequential_document = switch (options.document_append.source) {
+        .sequential => true,
+        .none, .bytes => false,
+    };
+    const repaint_window = if (sequential_document)
+        paint_plan.FrameRepaintWindow.fromPlan(plan, .{ .include_transcript = false })
+    else
+        frameRepaintWindow(plan, options.transcript_body);
     logFrameBuildPlan(plan, options);
 
+    var movement_document = options.document_append;
+    if (sequential_document) movement_document.source = .none;
     var movement = try terminal_diff.prepareTerminalMovementForFrame(
         alloc,
         shadow,
-        options.document_append,
+        movement_document,
         terminal_scroll_rows,
         options.scroll_plan.preserved_release_rows,
         plan.layout.cols,
@@ -122,7 +131,7 @@ pub fn buildAndFlushFrame(
         .scroll_plan = options.scroll_plan,
         .document_append = options.document_append,
         .terminal_transition = options.terminal_transition,
-        .prepared_movement = &movement,
+        .prepared_movement = if (sequential_document) null else &movement,
         .sink = shell.frameSink(),
         .metrics = metrics,
     });
@@ -437,6 +446,27 @@ const BuilderSink = struct {
     }
 };
 
+const BuilderSequentialSource = struct {
+    bytes: []const u8,
+
+    fn source(self: *BuilderSequentialSource) frame_scroll_plan.SequentialDocumentSource {
+        return .{
+            .ctx = self,
+            .committed_len = self.bytes.len,
+            .read_at = readAt,
+        };
+    }
+
+    fn readAt(ctx: *anyopaque, out: []u8, offset: u64) !usize {
+        const self: *BuilderSequentialSource = @ptrCast(@alignCast(ctx));
+        const start = std.math.cast(usize, offset) orelse return error.InvalidOffset;
+        if (start >= self.bytes.len) return 0;
+        const len = @min(out.len, self.bytes.len - start);
+        @memcpy(out[0..len], self.bytes[start..][0..len]);
+        return len;
+    }
+};
+
 fn testScrollPlan(rows: u16) frame_scroll_plan.FrameScrollPlan {
     return frame_scroll_plan.merge(4, 1, 0, rows);
 }
@@ -568,6 +598,44 @@ test "frame preparation invalidations preserve owned band and clean flag semanti
     invalidateCurrentOwnedBand(&empty_band_plan, .terminal_scroll);
     try std.testing.expect(empty_band_plan.footer_clean_allowed);
     try std.testing.expect(empty_band_plan.invalidation.isEmpty());
+}
+
+test "buildAndFlushFrame forwards a sequential reset document to the terminal owner" {
+    var sink = BuilderSink{};
+    defer sink.deinit(std.testing.allocator);
+    var shell = try TestShell.init(std.testing.allocator, sink.sink());
+    shell.bind();
+    defer shell.deinit();
+    shell.shadow.autowrap = false;
+
+    var source = BuilderSequentialSource{ .bytes = "history\r\n" };
+    var body = PaintCtx{ .text = "body", .owner = .transcript, .row = 2 };
+    var footer = PaintCtx{ .text = "footer", .owner = .footer, .row = 3 };
+    var plan = testPlan();
+    plan.reset_terminal = true;
+    var metrics: Metrics = .{};
+
+    const result = try buildAndFlushFrame(std.testing.allocator, &shell, &metrics, .{
+        .plan = plan,
+        .scroll_plan = testScrollPlan(0),
+        .document_append = .{
+            .source = .{ .sequential = source.source() },
+            .start_row = 1,
+            .start_col = 1,
+            .reset_replay = true,
+        },
+        .body_painter = .{ .ctx = &body, .paint = PaintCtx.painter },
+        .footer_painter = .{ .ctx = &footer, .paint = PaintCtx.painter },
+    });
+
+    try std.testing.expect(result.is_committed());
+    try std.testing.expect(result.document_append_applied());
+    const history = std.mem.find(u8, sink.bytes.items, source.bytes) orelse
+        return error.TestExpectedAppendBytes;
+    const painted_footer = std.mem.findPos(u8, sink.bytes.items, history, "footer") orelse
+        return error.TestExpectedFooter;
+    try std.testing.expect(history < painted_footer);
+    try std.testing.expect(std.mem.find(u8, sink.bytes.items, "body") == null);
 }
 
 test "buildAndFlushFrame runs body footer activity painters and one commit" {

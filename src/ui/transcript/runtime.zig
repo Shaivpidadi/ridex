@@ -325,7 +325,7 @@ pub const TranscriptTransition = struct {
     /// not release; consuming the transition requests a follow-up frame so
     /// the debt settles promptly instead of waiting for outside activity.
     history_settle_pending: bool = false,
-    /// Owns `document_append.bytes` when append preparation allocates wire bytes.
+    /// Owns the byte-backed document source when append preparation allocates wire bytes.
     document_append_bytes: []u8 = &.{},
     resize_reflow_rows: u16 = 0,
     semantic_rows: u32 = 0,
@@ -1171,6 +1171,57 @@ test "command output admission invalidates cached prefixes when reservation trim
     );
     try std.testing.expect(
         runtime.full_transcript_projection_cache.review.entries[0].?.dirty == .all,
+    );
+}
+
+test "presentation record protects uncommitted entries only until cursor advancement" {
+    const alloc = std.testing.allocator;
+    var runtime = cacheTestRuntime(.full, 40);
+    defer runtime.deinit(alloc);
+    runtime.max_retained_transcript_bytes = 8;
+    runtime.beginPresentationRecord();
+
+    const first_id = try runtime.appendRawTranscriptEntryClassified(
+        alloc,
+        "first",
+        .unknown_raw,
+    );
+    const second_id = try runtime.appendRawTranscriptEntryClassified(
+        alloc,
+        "second",
+        .unknown_raw,
+    );
+
+    try std.testing.expectEqual(@as(usize, 2), runtime.entries.items.len);
+    try std.testing.expectEqual(first_id, runtime.entries.items[0].id());
+    try std.testing.expectEqual(second_id, runtime.entries.items[1].id());
+
+    runtime.commitPresentationRecord(.{ .after = .{
+        .entry_id = second_id,
+        .kind = .unknown_raw,
+        .ends_with_newline = false,
+    } }, 11);
+    try runtime.enforceStructuredRetention(alloc, null);
+
+    try std.testing.expectEqual(@as(usize, 1), runtime.entries.items.len);
+    try std.testing.expectEqual(second_id, runtime.entries.items[0].id());
+}
+
+test "presentation record protection survives cloned assistant retention" {
+    const alloc = std.testing.allocator;
+    var runtime = cacheTestRuntime(.full, 40);
+    defer runtime.deinit(alloc);
+    runtime.max_retained_transcript_bytes = 8;
+    runtime.beginPresentationRecord();
+    var metrics: Metrics = .{};
+
+    _ = try runtime.streamAssistantChunk(alloc, &metrics, "first");
+    _ = try runtime.streamAssistantChunk(alloc, &metrics, "second");
+
+    try std.testing.expectEqual(@as(usize, 1), runtime.entries.items.len);
+    try std.testing.expectEqualStrings(
+        "firstsecond",
+        runtime.entries.items[0].assistant_turn.segments.text.items,
     );
 }
 
@@ -4175,6 +4226,7 @@ pub const TranscriptRuntime = struct {
     /// Core-owned producer state and policy for native-history release.
     transcript_release: transcript_release.State = .{},
     presentation_record: PresentationRecordState = .disabled,
+    presentation_record_frame_pending: bool = false,
     pending_presentation_record: ?PendingPresentationRecord = null,
     presentation_record_restamp_ready: bool = false,
     /// Sorted by entry id so exact lookup stays bounded as history grows.
@@ -4216,6 +4268,7 @@ pub const TranscriptRuntime = struct {
     /// `viewport_top_row`.
     has_painted_transcript: bool = false,
     streamed_session_history_active: bool = false,
+    streamed_reset_requested: bool = false,
     footer_viewport: footer_viewport_runtime.FooterViewport = .{},
     extra_input_rows: u16 = 0,
     footer_reserved_base_rows: u16 = 3,
@@ -4287,15 +4340,162 @@ pub const TranscriptRuntime = struct {
 
     pub fn adoptStreamedSessionHistory(self: *TranscriptRuntime) void {
         self.streamed_session_history_active = true;
+        const shadow = self.shadow_vt orelse return;
+        self.cursor_row = shadow.cursor_row;
+        self.cursor_col = shadow.cursor_col;
+        self.has_painted_transcript = true;
+    }
+
+    pub fn streamedSessionHistoryActive(
+        self: *const TranscriptRuntime,
+    ) bool {
+        return self.streamed_session_history_active;
+    }
+
+    pub fn streamedResetRequested(self: *const TranscriptRuntime) bool {
+        return self.streamed_reset_requested;
+    }
+
+    pub fn finishStreamedResetAttempt(self: *TranscriptRuntime) void {
+        self.streamed_reset_requested = false;
+        self.terminal_reset_pending = false;
+    }
+
+    pub fn establishStreamedRetainedAnchor(
+        self: *TranscriptRuntime,
+        alloc: Allocator,
+    ) !void {
+        if (!self.streamed_session_history_active) return;
+        const shadow = self.shadow_vt orelse return error.ShadowTerminalUnavailable;
+        const top = if (self.owned_top_row == 0 or
+            self.owned_top_row > self.layout.content_bottom)
+            1
+        else
+            self.owned_top_row;
+        if (self.layout.content_bottom < top) return error.InvalidTranscriptTransition;
+
+        var source = try self.prepareTranscriptSource(alloc, null);
+        defer source.deinit(alloc);
+        var metrics: Metrics = .{};
+        var prepared = try self.prepareTranscriptSurfacePaintFromSourceForArea(
+            alloc,
+            &metrics,
+            &source,
+            .{ .top = top, .bottom = self.layout.content_bottom },
+        );
+        defer prepared.deinit(alloc);
+
+        const flow = try alloc.dupe(u8, source.bytes);
+        errdefer alloc.free(flow);
+        const row_provenance = try alloc.dupe(
+            transcript_blocks.RowProvenance,
+            prepared.row_provenance.items,
+        );
+        errdefer if (row_provenance.len > 0) alloc.free(row_provenance);
+        const visual_offset = visualOffsetForSelection(
+            prepared.sourceVisualRows(),
+            prepared.selection,
+        );
+        const total_visual_rows = prepared.sourceTotalVisualRows();
+        const footer_rows = self.layout.rows -| self.layout.content_bottom;
+        const solved_layout = render_engine.frame_layout.solve(.{
+            .terminal = self.layout,
+            .owned_top = top,
+            .footer = .{
+                .natural_rows = footer_rows,
+                .min_rows = footer_rows,
+                .max_rows = footer_rows,
+            },
+            .transcript = .{
+                .natural_visual_rows = @intCast(@min(
+                    total_visual_rows,
+                    @as(u32, std.math.maxInt(u16)),
+                )),
+                .cursor_row = shadow.cursor_row,
+                .cursor_col = shadow.cursor_col,
+                .tail_kind = prepared.selection.tail_kind,
+            },
+            .prior = self.committed_frame_layout,
+        });
+        const layout = render_engine.frame_layout.CommittedLayoutSnapshot.fromLayout(
+            solved_layout,
+        );
+
+        var previous = self.transcript_commit_state;
+        self.transcript_commit_state = .{ .stable = .{
+            .selection = prepared.selection,
+            .visual_offset = visual_offset,
+            .history_visual_offset = visual_offset,
+            .total_visual_rows = total_visual_rows,
+            .flow = flow,
+            .cursor_row = shadow.cursor_row,
+            .cursor_col = shadow.cursor_col,
+            .occupied_last_row = prepared.selection.last_visible_row,
+            .occupied_last_row_blank = prepared.selection.last_visible_row_blank,
+            .layout_id = layout.layout_id,
+            .measured_history_origin = prepared.measured_history_origin,
+            .row_provenance = row_provenance,
+        } };
+        previous.deinit(alloc);
+
+        self.committed_frame_layout = layout;
+        self.cursor_row = shadow.cursor_row;
+        self.cursor_col = shadow.cursor_col;
+        self.last_rendered_cols = self.layout.cols;
+        self.last_visible_transcript_top_row = prepared.selection.top_row;
+        self.last_visible_transcript_start_line = prepared.selection.start_line;
+        self.last_visible_transcript_partial_skip_rows = prepared.selection.partial_skip_rows;
+        self.last_visible_transcript_split_active = prepared.selection.split_active;
+        self.last_visible_transcript_split_prefix_lines = prepared.selection.split_prefix_lines;
+        self.last_visible_transcript_split_suffix_start_line = prepared.selection.split_suffix_start_line;
+        self.last_visible_transcript_last_row = prepared.selection.last_visible_row;
+        self.last_visible_transcript_last_row_blank = prepared.selection.last_visible_row_blank;
+        self.last_visible_transcript_tail_kind = prepared.selection.tail_kind;
+        self.last_viewport_selection = prepared.selection;
+        self.has_painted_transcript = source.bytes.len > 0;
+        self.transcript_band_dirty = false;
+        self.render_requests.clearReason(.transcript);
     }
 
     pub fn beginPresentationRecord(self: *TranscriptRuntime) void {
         std.debug.assert(self.pending_presentation_record == null);
+        self.presentation_record_frame_pending = false;
         self.presentation_record = .{ .active = .{
             .cursor = .start,
             .committed_len = 0,
             .caught_up = false,
         } };
+    }
+
+    pub fn presentationRecordActive(self: *const TranscriptRuntime) bool {
+        return self.presentation_record == .active;
+    }
+
+    pub fn requestPresentationRecordFrame(self: *TranscriptRuntime) void {
+        if (self.presentationRecordActive()) {
+            self.presentation_record_frame_pending = true;
+        }
+    }
+
+    pub fn presentationRecordFramePending(
+        self: *const TranscriptRuntime,
+    ) bool {
+        return self.presentationRecordActive() and
+            self.presentation_record_frame_pending;
+    }
+
+    pub fn presentationRecordProtectsEntry(
+        self: *const TranscriptRuntime,
+        entry_id: u32,
+    ) bool {
+        return switch (self.presentation_record) {
+            .active => |state| switch (state.cursor) {
+                .start => true,
+                .after => |cursor| entry_id > cursor.entry_id,
+                .at => |cursor| entry_id >= cursor.entry_id,
+            },
+            .disabled, .degraded => false,
+        };
     }
 
     pub fn resumePresentationRecord(
@@ -4304,6 +4504,7 @@ pub const TranscriptRuntime = struct {
     ) void {
         std.debug.assert(committed_len > 0);
         std.debug.assert(self.pending_presentation_record == null);
+        self.presentation_record_frame_pending = false;
         const cursor: presentation_record.Cursor = if (self.entries.items.len == 0)
             .start
         else
@@ -4332,6 +4533,7 @@ pub const TranscriptRuntime = struct {
     pub fn takePresentationRecordRestamp(self: *TranscriptRuntime) bool {
         const ready = self.presentation_record_restamp_ready;
         self.presentation_record_restamp_ready = false;
+        if (ready) self.presentation_record_frame_pending = false;
         return ready;
     }
 
@@ -4365,12 +4567,14 @@ pub const TranscriptRuntime = struct {
                 state.cursor = next_cursor;
                 state.committed_len = committed_len;
                 state.caught_up = true;
+                self.presentation_record_frame_pending = false;
             },
             .disabled, .degraded => {},
         }
     }
 
     pub fn degradePresentationRecord(self: *TranscriptRuntime) void {
+        self.presentation_record_frame_pending = false;
         self.presentation_record = .degraded;
     }
 
@@ -4675,6 +4879,7 @@ pub const TranscriptRuntime = struct {
 
     pub fn clearTranscript(self: *TranscriptRuntime, alloc: Allocator) void {
         self.streamed_session_history_active = false;
+        self.streamed_reset_requested = false;
         const pending_resume_bytes = self.releasePendingResumeSource(alloc);
         if (pending_resume_bytes > 0) {
             debug_trace.logf(
@@ -6375,7 +6580,24 @@ pub const TranscriptRuntime = struct {
     }
 
     pub fn requestTerminalReset(self: *TranscriptRuntime, metrics: *Metrics) !void {
-        const min_body_rows = self.min_visible_viewport_rows;
+        self.prepareTerminalResetState();
+        try self.initViewportWithReservedRows(metrics, 1, self.min_visible_viewport_rows);
+    }
+
+    pub fn armTerminalResetForCurrentFrame(
+        self: *TranscriptRuntime,
+        metrics: *Metrics,
+    ) !void {
+        self.prepareTerminalResetState();
+        try transcript_viewport_runtime.initViewportForCurrentFrame(
+            self,
+            metrics,
+            1,
+            self.min_visible_viewport_rows,
+        );
+    }
+
+    fn prepareTerminalResetState(self: *TranscriptRuntime) void {
         self.reflow_clear_guard_rows = 0;
         self.resize_history_row_delta = null;
         self.viewport_clear_pending = false;
@@ -6388,7 +6610,6 @@ pub const TranscriptRuntime = struct {
         self.footer_viewport.has_frame = false;
         self.footer_viewport.clearExternalInvalidation();
         self.terminal_reset_pending = true;
-        try self.initViewportWithReservedRows(metrics, 1, min_body_rows);
     }
 
     pub fn requestTerminalResetAfterResize(
@@ -6397,11 +6618,13 @@ pub const TranscriptRuntime = struct {
         history_row_delta: ?i32,
     ) !void {
         if (self.streamed_session_history_active) {
+            self.streamed_reset_requested = true;
             self.reflow_clear_guard_rows = 0;
             self.resize_history_row_delta = null;
             self.pending_resize_observation = null;
             self.viewport_clear_pending = false;
             self.terminal_reset_pending = false;
+            self.render_requests.acknowledgeSettledResizeCommit();
             self.footer_viewport.has_frame = false;
             self.footer_viewport.clearExternalInvalidation();
             self.invalidateTranscriptAnchor("streamed_session_history_resize");
@@ -8271,14 +8494,15 @@ pub const TranscriptRuntime = struct {
         {
             switch (self.presentation_record) {
                 .active => |record| {
-                    const finalized_end = self.transcript_release.finality_floor(
+                    const finality_floor = self.transcript_release.finality_floor(
                         source.finality,
                         self.finalizedToolTurnWatermark(),
                         if (source.replaceable_last_line)
                             source.replaceable_start
                         else
                             null,
-                    ) orelse source.bytes.len;
+                    );
+                    const finalized_end = finality_floor orelse source.bytes.len;
                     switch (presentation_record.decide(
                         record.cursor,
                         source.cols,
@@ -8286,7 +8510,7 @@ pub const TranscriptRuntime = struct {
                         finalized_end,
                         source.entry_spans,
                     )) {
-                        .hold => presentation_record_caught_up = true,
+                        .hold => presentation_record_caught_up = finality_floor == null,
                         .incompatible => {
                             presentation_record_incompatible = true;
                             switch (record.cursor) {
@@ -8504,7 +8728,7 @@ pub const TranscriptRuntime = struct {
                 replay_padding_rows,
             );
             document_append = .{
-                .bytes = document_append_bytes,
+                .source = .{ .bytes = document_append_bytes },
                 .start_row = 1,
                 .start_col = 1,
                 .reset_replay = true,
@@ -8514,7 +8738,7 @@ pub const TranscriptRuntime = struct {
                 "document_append_plan raw_bytes={d} wire_bytes={d} start={d},{d} source_visual_offset={d} target_visual_offset={d} planned_scroll_rows={d}",
                 .{
                     target_flow.len,
-                    document_append.bytes.len,
+                    document_append.source.declaredLen(),
                     document_append.start_row,
                     document_append.start_col,
                     0,
@@ -8582,10 +8806,10 @@ pub const TranscriptRuntime = struct {
                 );
             }
             document_append = .{
-                .bytes = if (document_append_bytes.len > 0)
+                .source = .{ .bytes = if (document_append_bytes.len > 0)
                     document_append_bytes
                 else
-                    raw_append,
+                    raw_append },
                 .start_row = base.cursor_row,
                 .start_col = base.cursor_col,
                 .clear = if (base.history_replay) |replay|
@@ -8598,7 +8822,7 @@ pub const TranscriptRuntime = struct {
                 "document_append_plan raw_bytes={d} wire_bytes={d} start={d},{d} source_visual_offset={d} target_visual_offset={d} planned_scroll_rows={d}",
                 .{
                     raw_append.len,
-                    document_append.bytes.len,
+                    document_append.source.declaredLen(),
                     document_append.start_row,
                     document_append.start_col,
                     base.visual_offset,
@@ -10590,7 +10814,7 @@ test "resume recovery selects a safe materialized endpoint for every outcome" {
     };
     defer runtime.deinit(std.testing.allocator);
     const document_append: render_engine.frame_scroll_plan.FrameDocumentAppend = .{
-        .bytes = "first\n",
+        .source = .{ .bytes = "first\n" },
         .start_row = 2,
         .start_col = 3,
     };
@@ -11337,7 +11561,7 @@ test "terminal reset drops stale mid-scrollback footer clear before reanchor" {
     );
 }
 
-test "streamed session history resize invalidates only the retained tail" {
+test "settled streamed session resize requests one file backed reset without clearing" {
     var metrics: Metrics = .{};
     var runtime = TranscriptRuntime{
         .layout = invalidationTestLayout(),
@@ -11354,13 +11578,20 @@ test "streamed session history resize invalidates only the retained tail" {
     };
     defer runtime.deinit(std.testing.allocator);
     runtime.adoptStreamedSessionHistory();
+    runtime.render_requests.completeResizeGeometry(true);
+    try std.testing.expect(runtime.render_requests.pending_settled_width_reflow);
 
     try runtime.requestTerminalResetAfterResize(&metrics, 12);
 
     try std.testing.expect(!runtime.terminal_reset_pending);
+    try std.testing.expect(runtime.streamedResetRequested());
     try std.testing.expectEqual(@as(?ResizeObservation, null), runtime.pending_resize_observation);
     try std.testing.expectEqual(@as(?i32, null), runtime.resize_history_row_delta);
+    try std.testing.expect(!runtime.render_requests.pending_settled_width_reflow);
     try std.testing.expect(runtime.render_requests.hasReason(.transcript));
+
+    runtime.finishStreamedResetAttempt();
+    try std.testing.expect(!runtime.streamedResetRequested());
 }
 
 test "marking transcript cache dirty also schedules transcript work" {
@@ -11389,6 +11620,24 @@ test "frame invalidation overflow collapses to owned band with dominant reason" 
     try std.testing.expectEqual(render_engine.paint_plan.FrameInvalidationReason.shadow_feed_failure, pending.ranges()[0].reason);
     try std.testing.expectEqual(@as(u16, 7), pending.ranges()[0].top);
     try std.testing.expectEqual(@as(u16, 24), pending.ranges()[0].bottom);
+}
+
+test "current frame terminal reset arms no followup transcript invalidation" {
+    var metrics: Metrics = .{};
+    var runtime = TranscriptRuntime{
+        .layout = invalidationTestLayout(),
+        .owned_top_row = 7,
+        .viewport_top_row = 7,
+    };
+    defer runtime.deinit(std.testing.allocator);
+
+    try runtime.armTerminalResetForCurrentFrame(&metrics);
+
+    try std.testing.expect(runtime.terminal_reset_pending);
+    try std.testing.expectEqual(@as(u16, 1), runtime.owned_top_row);
+    try std.testing.expectEqual(@as(u16, 1), runtime.viewport_top_row);
+    try std.testing.expect(runtime.render_requests.pendingInvalidations().isEmpty());
+    try std.testing.expect(!runtime.render_requests.hasReason(.transcript));
 }
 
 test "preserved row acknowledgment lowers ownership and viewport boundaries" {

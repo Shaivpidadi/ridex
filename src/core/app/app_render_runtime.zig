@@ -70,6 +70,40 @@ fn set_transcript_assistant_tail_writable(
     );
 }
 
+const StreamedResetRoute = enum {
+    none,
+    preserve_reflow,
+    sequential,
+};
+
+fn streamedResetRoute(
+    requested: bool,
+    main_surface: bool,
+    source_available: bool,
+) StreamedResetRoute {
+    if (!requested or !main_surface) return .none;
+    return if (source_available) .sequential else .preserve_reflow;
+}
+
+test "streamed reset routing changes only a requested main surface with a safe source" {
+    try std.testing.expectEqual(
+        StreamedResetRoute.none,
+        streamedResetRoute(false, true, true),
+    );
+    try std.testing.expectEqual(
+        StreamedResetRoute.none,
+        streamedResetRoute(true, false, true),
+    );
+    try std.testing.expectEqual(
+        StreamedResetRoute.preserve_reflow,
+        streamedResetRoute(true, true, false),
+    );
+    try std.testing.expectEqual(
+        StreamedResetRoute.sequential,
+        streamedResetRoute(true, true, true),
+    );
+}
+
 pub const VisualEpochResetTrigger = enum {
     native_clear_probe,
     ctrl_l,
@@ -1836,6 +1870,28 @@ pub fn Runtime(comptime App: type) type {
             const presentation_commits_transcript =
                 child_view != null or
                 !render_reconciliation.alternate_screen_owns_rendering;
+            var reset_transcript_reader: ?app_session_runtime.ResetTranscriptReader = null;
+            defer if (reset_transcript_reader) |*reader| reader.deinit();
+            var finish_streamed_reset_attempt = false;
+            defer if (finish_streamed_reset_attempt) {
+                presentation_shell.finishStreamedResetAttempt();
+            };
+            const streamed_reset_requested = presentation_shell.streamedResetRequested();
+            if (streamed_reset_requested and
+                child_view == null and
+                !render_reconciliation.alternate_screen_owns_rendering)
+            {
+                reset_transcript_reader = try app_session_runtime.Runtime(App).acquireResetTranscriptReader(app);
+                switch (streamedResetRoute(
+                    true,
+                    true,
+                    reset_transcript_reader != null,
+                )) {
+                    .none => unreachable,
+                    .preserve_reflow => presentation_shell.finishStreamedResetAttempt(),
+                    .sequential => try presentation_shell.armTerminalResetForCurrentFrame(&app.metrics),
+                }
+            }
             const active_committed_layout = if (render_reconciliation.alternate_screen_owns_rendering)
                 app.terminal.alternate_frame_layout
             else
@@ -2233,10 +2289,23 @@ pub fn Runtime(comptime App: type) type {
                 },
                 .activity_result = .{ .painted = false, .row = 0, .overlay = false },
             };
-            const document_append = if (transcript_transition) |*transition|
+            var document_append = if (transcript_transition) |*transition|
                 transition.document_append
             else
                 render_engine.frame_scroll_plan.FrameDocumentAppend{};
+            if (reset_transcript_reader) |*reader| {
+                if (footer_frame.paint.reset_terminal) {
+                    document_append = .{
+                        .source = .{ .sequential = try reader.frameSource() },
+                        .start_row = 1,
+                        .start_col = 1,
+                        .reset_replay = true,
+                    };
+                    finish_streamed_reset_attempt = true;
+                } else {
+                    presentation_shell.finishStreamedResetAttempt();
+                }
+            }
             var transcript_body: render_engine.frame_builder.TranscriptBodyDisposition =
                 if (transcript_transition) |*transition| switch (transition.body_disposition) {
                     .paint => .paint,
@@ -2330,6 +2399,13 @@ pub fn Runtime(comptime App: type) type {
                     },
                 },
             );
+            if (finish_streamed_reset_attempt and result.is_committed()) {
+                debug_trace.logf(
+                    "session",
+                    "event=session_transcript_reset outcome=committed bytes={d}",
+                    .{document_append.source.declaredLen()},
+                );
+            }
             const scroll_commit = result.scrollCommit(scroll_plan);
             debug_trace.logf(
                 "frame_diff",
@@ -2338,7 +2414,7 @@ pub fn Runtime(comptime App: type) type {
                     @tagName(transcript_body),
                     counters.body_paints,
                     counters.retained_transcript_changed_cells,
-                    document_append.bytes.len,
+                    document_append.source.declaredLen(),
                     scroll_commit.planned_terminal_scroll_rows,
                     scroll_commit.physical_terminal_scroll_rows,
                     scroll_commit.accepted_terminal_scroll_rows,

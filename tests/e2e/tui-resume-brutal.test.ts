@@ -47,6 +47,7 @@ type Metrics = {
   scope: number[];
   page: number[];
   resize: number[];
+  replayResize: number[];
   close: number[];
   resume: number[];
   rssKib: number[];
@@ -102,6 +103,59 @@ function countScrollbackLines(path: string, marker: string): number {
   }
 }
 
+function sessionMarkerCounts(path: string): { total: number; unique: number } {
+  const markers = readFileSync(path, "utf8").match(/RESUME_CHAT_[0-9]{6}/g) ?? [];
+  return {
+    total: markers.length,
+    unique: new Set(markers).size,
+  };
+}
+
+function countOccurrences(text: string, marker: string): number {
+  return text.split(marker).length - 1;
+}
+
+async function waitForTraceCount(
+  path: string,
+  marker: string,
+  expected: number,
+  timeout: number,
+): Promise<void> {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    if (countOccurrences(readFileSync(path, "utf8"), marker) >= expected) return;
+    await Bun.sleep(25);
+  }
+  throw new Error(`Timed out waiting for trace marker ${marker} count ${expected}.`);
+}
+
+async function waitForExactSessionScrollback(
+  session: TmuxSession,
+  path: string,
+  expectedSessionLines: number,
+  exactMarkers: readonly string[],
+  timeout: number,
+): Promise<void> {
+  const deadline = Date.now() + timeout;
+  let consecutive = 0;
+  while (Date.now() < deadline) {
+    await session.captureFullScrollbackToFile(path);
+    const counts = sessionMarkerCounts(path);
+    const text = readFileSync(path, "utf8");
+    const exact = counts.total === expectedSessionLines &&
+      counts.unique === expectedSessionLines &&
+      exactMarkers.every((marker) => countOccurrences(text, marker) === 1);
+    if (exact) {
+      consecutive += 1;
+      if (consecutive === 2) return;
+    } else {
+      consecutive = 0;
+    }
+    await Bun.sleep(50);
+  }
+  throw new Error(`Timed out waiting for stable exact session scrollback at ${path}.`);
+}
+
 function percentile(values: number[], fraction: number): number {
   if (values.length === 0) return 0;
   const sorted = [...values].sort((a, b) => a - b);
@@ -112,6 +166,7 @@ function summarize(values: number[]) {
   const result: Record<string, number> = {
     count: values.length,
     p50Ms: Number(percentile(values, 0.5).toFixed(3)),
+    p90Ms: Number(percentile(values, 0.9).toFixed(3)),
     p95Ms: Number(percentile(values, 0.95).toFixed(3)),
     maxMs: Number(Math.max(0, ...values).toFixed(3)),
   };
@@ -445,6 +500,7 @@ async function runStress(config: Config): Promise<Paths> {
     scope: [],
     page: [],
     resize: [],
+    replayResize: [],
     close: [],
     resume: [],
     rssKib: [],
@@ -504,6 +560,11 @@ async function runStress(config: Config): Promise<Paths> {
     const tailMarker = `RESUME_CHAT_${pad(config.chatBatches * config.chatLinesPerBatch - 1)}`;
     const restoredScrollbackPath = join(paths.root, "restored-scrollback.txt");
     await session.captureFullScrollbackToFile(restoredScrollbackPath);
+    const expectedSessionLines = config.chatBatches * config.chatLinesPerBatch;
+    expect(sessionMarkerCounts(restoredScrollbackPath)).toEqual({
+      total: expectedSessionLines,
+      unique: expectedSessionLines,
+    });
     for (const marker of [headMarker, middleMarker, tailMarker, FINAL_MARKER]) {
       expect(countScrollbackLines(restoredScrollbackPath, marker)).toBe(1);
     }
@@ -514,11 +575,58 @@ async function runStress(config: Config): Promise<Paths> {
 
     await session.sendText("Continue after the complete transcript restore.");
     await session.waitForText(CONTINUATION_MARKER, TIMEOUT * 4);
-    await session.resizeWindow(90, 28);
+    await session.waitForComposer(TIMEOUT * 4);
     await session.captureFullScrollbackToFile(restoredScrollbackPath);
-    expect(countScrollbackLines(restoredScrollbackPath, headMarker)).toBe(1);
+    expect(sessionMarkerCounts(restoredScrollbackPath)).toEqual({
+      total: expectedSessionLines,
+      unique: expectedSessionLines,
+    });
     expect(countScrollbackLines(restoredScrollbackPath, tailMarker)).toBe(1);
     expect(countScrollbackLines(restoredScrollbackPath, CONTINUATION_MARKER)).toBe(1);
+    const resetCommitMarker = "event=session_transcript_reset outcome=committed";
+    const resizeAndAssertExact = async (width: number, height: number): Promise<void> => {
+      const resizedScrollbackPath = join(
+        paths.root,
+        `restored-${width}x${height}.txt`,
+      );
+      const priorCommits = countOccurrences(
+        readFileSync(paths.trace, "utf8"),
+        resetCommitMarker,
+      );
+      await time(
+        metrics.replayResize,
+        () => session!.resizeWindow(width, height),
+        () => waitForTraceCount(
+          paths.trace,
+          resetCommitMarker,
+          priorCommits + 1,
+          TIMEOUT * 20,
+        ),
+      );
+      await waitForExactSessionScrollback(
+        session!,
+        resizedScrollbackPath,
+        expectedSessionLines,
+        [headMarker, middleMarker, tailMarker, CONTINUATION_MARKER],
+        TIMEOUT * 20,
+      );
+      expect(sessionMarkerCounts(resizedScrollbackPath)).toEqual({
+        total: expectedSessionLines,
+        unique: expectedSessionLines,
+      });
+      expect(countScrollbackLines(resizedScrollbackPath, headMarker)).toBe(1);
+      expect(countScrollbackLines(resizedScrollbackPath, middleMarker)).toBe(1);
+      expect(countScrollbackLines(resizedScrollbackPath, tailMarker)).toBe(1);
+      expect(countScrollbackLines(resizedScrollbackPath, CONTINUATION_MARKER)).toBe(1);
+    };
+    const resizeGeometries = [
+      [140, 40],
+      [72, 24],
+      [120, 34],
+    ] as const;
+    for (const [width, height] of resizeGeometries) {
+      await resizeAndAssertExact(width, height);
+    }
     const postResumeTrace = readFileSync(paths.trace, "utf8");
     const exactStreamIndex = postResumeTrace.lastIndexOf(
       "event=session_transcript_stream outcome=exact",
@@ -541,6 +649,7 @@ async function runStress(config: Config): Promise<Paths> {
         scope: summarize(metrics.scope),
         page: summarize(metrics.page),
         resize: summarize(metrics.resize),
+        replayResize: summarize(metrics.replayResize),
         close: summarize(metrics.close),
         resume: summarize(metrics.resume),
       },

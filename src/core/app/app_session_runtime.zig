@@ -52,6 +52,7 @@ const shell_runtime = @import("../../ui/shell_runtime.zig");
 const transcript_runtime = @import("../../ui/transcript/runtime.zig");
 const ui_input = @import("../../ui/input/runtime.zig");
 const ui_render = @import("../../ui/render.zig");
+const frame_scroll_plan = @import("../../ui/render_engine/frame_scroll_plan.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -60,6 +61,57 @@ const resume_stream_autowrap_disable = "\x1b[?7l";
 const resume_stream_read_bytes: usize = 64 * 1024;
 const resume_stream_first_read_bytes: usize = 1024;
 
+pub const ResetTranscriptReader = struct {
+    admission: session_transcript.Admission,
+
+    pub fn frameSource(self: *ResetTranscriptReader) !frame_scroll_plan.SequentialDocumentSource {
+        const committed_len = switch (self.admission) {
+            .exact => |reader| reader.committed_len,
+            .missing, .incomplete, .corrupt => return error.TranscriptReaderUnavailable,
+        };
+        return .{
+            .ctx = self,
+            .committed_len = committed_len,
+            .read_at = readAt,
+        };
+    }
+
+    pub fn deinit(self: *ResetTranscriptReader) void {
+        self.admission.deinit();
+        self.* = undefined;
+    }
+
+    fn readAt(ctx: *anyopaque, out: []u8, offset: u64) !usize {
+        const self: *ResetTranscriptReader = @ptrCast(@alignCast(ctx));
+        return switch (self.admission) {
+            .exact => |reader| reader.readAt(out, offset),
+            .missing, .incomplete, .corrupt => error.TranscriptReaderUnavailable,
+        };
+    }
+};
+
+test "reset transcript reader lends a borrowed sequential frame source" {
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    var file = try temp.dir.createFile(
+        std.testing.io,
+        "transcript.ansi",
+        .{ .read = true },
+    );
+    try file.writeStreamingAll(std.testing.io, "history\r\n");
+
+    var reader = ResetTranscriptReader{ .admission = .{ .exact = .{
+        .file = file,
+        .committed_len = "history\r\n".len,
+    } } };
+    defer reader.deinit();
+    const source = try reader.frameSource();
+    try std.testing.expectEqual(@as(u64, "history\r\n".len), source.committed_len);
+    var buffer: [32]u8 = undefined;
+    const read = try source.readAt(&buffer, 0);
+    try std.testing.expectEqualStrings("history\r\n", buffer[0..read]);
+}
+
 fn streamSessionTranscript(app: anytype, reader: anytype) !u64 {
     try app.shell.writeResumeStreamBytes(
         &app.metrics,
@@ -67,6 +119,20 @@ fn streamSessionTranscript(app: anytype, reader: anytype) !u64 {
     );
     const payload_result = streamSessionTranscriptPayload(app, reader);
     if (payload_result) |payload_bytes| {
+        scrollResumePayloadIntoHistory(app) catch |padding_err| {
+            app.shell.writeResumeStreamBytes(
+                &app.metrics,
+                resume_stream_autowrap_disable,
+            ) catch |restore_err| {
+                debug_trace.logf(
+                    "session",
+                    "event=session_transcript_stream outcome=failed stage=padding_restore padding_err={s} restore_err={s}",
+                    .{ @errorName(padding_err), @errorName(restore_err) },
+                );
+                return error.TerminalModeRestoreFailed;
+            };
+            return padding_err;
+        };
         try app.shell.writeResumeStreamBytes(
             &app.metrics,
             resume_stream_autowrap_disable,
@@ -86,6 +152,16 @@ fn streamSessionTranscript(app: anytype, reader: anytype) !u64 {
             return error.TerminalModeRestoreFailed;
         };
         return payload_err;
+    }
+}
+
+fn scrollResumePayloadIntoHistory(app: anytype) !void {
+    var rows: u16 = 0;
+    const padding_rows: u16 = @intFromBool(
+        app.shell.layout.rows > app.shell.layout.content_bottom,
+    );
+    while (rows < padding_rows) : (rows += 1) {
+        try app.shell.writeResumeStreamBytes(&app.metrics, "\r\n");
     }
 }
 
@@ -152,6 +228,60 @@ const MemoryTranscriptReader = struct {
         return len;
     }
 };
+
+test "session transcript stream moves the payload clear of startup chrome" {
+    const alloc = std.testing.allocator;
+    const FakeShell = struct {
+        alloc: Allocator,
+        layout: types.Layout = .{
+            .rows = 3,
+            .cols = 20,
+            .content_bottom = 1,
+            .divider_top_row = 2,
+            .input_row = 2,
+            .divider_bottom_row = 2,
+            .hint_row = 3,
+        },
+        output: std.ArrayList(u8) = .empty,
+        adopted: bool = false,
+
+        fn deinit(self: *@This()) void {
+            self.output.deinit(self.alloc);
+        }
+
+        fn writeResumeStreamBytes(
+            self: *@This(),
+            _: *types.Metrics,
+            bytes: []const u8,
+        ) !void {
+            try self.output.appendSlice(self.alloc, bytes);
+        }
+
+        fn adoptStreamedSessionHistory(self: *@This()) void {
+            self.adopted = true;
+        }
+    };
+    const FakeApp = struct {
+        shell: FakeShell,
+        metrics: types.Metrics = .{},
+    };
+    var app = FakeApp{ .shell = .{ .alloc = alloc } };
+    defer app.shell.deinit();
+
+    const payload = "payload\r\n";
+    const streamed = try streamSessionTranscript(
+        &app,
+        MemoryTranscriptReader{ .bytes = payload },
+    );
+
+    try std.testing.expectEqual(@as(u64, payload.len), streamed);
+    try std.testing.expectEqualStrings(
+        resume_stream_autowrap_enable ++ payload ++
+            "\r\n" ++ resume_stream_autowrap_disable,
+        app.shell.output.items,
+    );
+    try std.testing.expect(app.shell.adopted);
+}
 
 const BackgroundSessionPolicy = enum {
     carry_forward,
@@ -1217,6 +1347,33 @@ pub const Persistence = struct {
 
 pub fn Runtime(comptime App: type) type {
     return struct {
+        pub fn acquireResetTranscriptReader(app: *App) !?ResetTranscriptReader {
+            const writable = if (app.session_persistence.writable) |*value|
+                value
+            else {
+                debug_trace.logf(
+                    "session",
+                    "event=session_transcript_reset outcome=unavailable reason=no_writer",
+                    .{},
+                );
+                return null;
+            };
+            var admission = try writable.admitActiveTranscript(app.alloc);
+            switch (admission) {
+                .exact => return .{ .admission = admission },
+                .missing, .incomplete, .corrupt => {
+                    const reason = @tagName(std.meta.activeTag(admission));
+                    admission.deinit();
+                    debug_trace.logf(
+                        "session",
+                        "event=session_transcript_reset outcome=unavailable reason={s}",
+                        .{reason},
+                    );
+                    return null;
+                },
+            }
+        }
+
         pub fn stageRequestedSessionTranscript(app: *App) !void {
             const requested = app.requested_resume orelse return;
             const store = app.session_persistence.store orelse return;
@@ -1329,6 +1486,33 @@ pub fn Runtime(comptime App: type) type {
                     delta.next_cursor,
                     next_committed_len,
                 );
+                if (comptime @hasDecl(
+                    @TypeOf(app.shell),
+                    "enforceStructuredRetentionAndReport",
+                )) {
+                    const retention_changed = app.shell.enforceStructuredRetentionAndReport(
+                        app.alloc,
+                        null,
+                    ) catch |err| blk: {
+                        debug_trace.logf(
+                            "session",
+                            "event=session_transcript outcome=retention_pending err={s}",
+                            .{@errorName(err)},
+                        );
+                        break :blk false;
+                    };
+                    if (retention_changed and
+                        app.shell.streamedSessionHistoryActive())
+                    {
+                        app.shell.establishStreamedRetainedAnchor(app.alloc) catch |err| {
+                            debug_trace.logf(
+                                "session",
+                                "event=session_transcript outcome=anchor_pending err={s}",
+                                .{@errorName(err)},
+                            );
+                        };
+                    }
+                }
                 debug_trace.logf(
                     "session",
                     "event=session_transcript outcome=committed delta_bytes={d} committed_bytes={d}",

@@ -249,6 +249,7 @@ fn protectedPreviousUserTurnId(self: anytype, protected_id: u32) ?u32 {
 }
 
 fn isProtectedEntry(self: anytype, entry_id: u32, protected_id: ?u32) bool {
+    if (presentationRecordProtectsEntry(self, entry_id)) return true;
     if (isLifecyclePinned(self, entry_id)) return true;
     for (self.command_output_blocks.items) |block| {
         if (command_output_runtime.isPrunedRangeAnchor(block, entry_id)) return true;
@@ -261,6 +262,14 @@ fn isProtectedEntry(self: anytype, entry_id: u32, protected_id: ?u32) bool {
     }
     if (replaceableEntryId(self)) |id| {
         if (entry_id == id) return true;
+    }
+    return false;
+}
+
+fn presentationRecordProtectsEntry(self: anytype, entry_id: u32) bool {
+    const Runtime = @TypeOf(self.*);
+    if (comptime @hasDecl(Runtime, "presentationRecordProtectsEntry")) {
+        return self.presentationRecordProtectsEntry(entry_id);
     }
     return false;
 }
@@ -327,6 +336,9 @@ fn buildProtectedEntryIdSet(
     errdefer protected_entry_ids.deinit(alloc);
 
     for (self.entries.items) |entry| {
+        if (presentationRecordProtectsEntry(self, entry.id())) {
+            try protected_entry_ids.put(alloc, entry.id(), {});
+        }
         if (entry == .raw_bytes and entry.raw_bytes.lifecycle_pinned) {
             try protected_entry_ids.put(alloc, entry.raw_bytes.id, {});
         }
@@ -612,6 +624,7 @@ fn trimProtectedEntriesToBudget(self: anytype, alloc: Allocator, cap: usize, pro
         for (self.entries.items) |*entry| {
             const entry_id = entry.id();
             if (!isProtectedEntry(self, entry_id, protected_id)) continue;
+            if (presentationRecordProtectsEntry(self, entry_id)) continue;
             if (isLifecyclePinned(self, entry_id)) continue;
 
             const before = entryRetainedBytes(entry.*);
@@ -1788,6 +1801,8 @@ fn cloneMutationState(self: anytype, alloc: Allocator) !@TypeOf(self.*) {
         .transcript_cache_origin_untrimmed = self.transcript_cache_origin_untrimmed,
         .max_transcript_bytes = self.max_transcript_bytes,
         .max_retained_transcript_bytes = self.max_retained_transcript_bytes,
+        .presentation_record = self.presentation_record,
+        .presentation_record_frame_pending = self.presentation_record_frame_pending,
         .command_output_display = self.command_output_display,
         .command_output_render = self.command_output_render,
         .full_transcript = self.full_transcript,

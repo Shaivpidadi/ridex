@@ -1280,7 +1280,7 @@ const App = struct {
         }
         projection.pending_diffs.clearRetainingCapacity();
         self.next_diff_id = projection.next_diff_id;
-        projection.installRetained(&self.shell);
+        try projection.installRetained(&self.shell);
     }
 
     pub fn historicalToolActivityKind(

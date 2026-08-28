@@ -624,6 +624,17 @@ pub const LoadedWritableSession = struct {
         return !positionsEqual(stamped, self.position);
     }
 
+    pub fn admitActiveTranscript(
+        self: *LoadedWritableSession,
+        alloc: Allocator,
+    ) !session_transcript.Admission {
+        return session_transcript.admitActive(
+            alloc,
+            &self.log.dir,
+            self.active_id,
+        );
+    }
+
     /// Returns a borrowed address that remains stable until deinit.
     pub fn childCapability(
         self: *LoadedWritableSession,

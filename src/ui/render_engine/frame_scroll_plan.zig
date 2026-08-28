@@ -5,16 +5,56 @@ pub const FrameDocumentAppendClear = union(enum) {
     rows: u16,
 };
 
+pub const SequentialDocumentSource = struct {
+    ctx: *anyopaque,
+    committed_len: u64,
+    read_at: *const fn (ctx: *anyopaque, out: []u8, offset: u64) anyerror!usize,
+
+    pub fn readAt(self: SequentialDocumentSource, out: []u8, offset: u64) !usize {
+        return self.read_at(self.ctx, out, offset);
+    }
+};
+
+pub const FrameDocumentSource = union(enum) {
+    none,
+    bytes: []const u8,
+    sequential: SequentialDocumentSource,
+
+    pub fn declaredLen(self: FrameDocumentSource) u64 {
+        return switch (self) {
+            .none => 0,
+            .bytes => |bytes| bytes.len,
+            .sequential => |source| source.committed_len,
+        };
+    }
+
+    pub fn isEmpty(self: FrameDocumentSource) bool {
+        return self.declaredLen() == 0;
+    }
+
+    pub fn inMemoryBytes(self: FrameDocumentSource) ![]const u8 {
+        return switch (self) {
+            .none => &.{},
+            .bytes => |bytes| bytes,
+            .sequential => error.SequentialDocumentUnsupported,
+        };
+    }
+};
+
 pub const FrameDocumentAppend = struct {
-    /// Terminal-wire bytes; every LF must be preceded by CR.
-    bytes: []const u8 = &.{},
+    /// Terminal-wire document source; byte-backed LF must be preceded by CR.
+    source: FrameDocumentSource = .none,
     start_row: u16 = 1,
     start_col: u16 = 1,
     clear: FrameDocumentAppendClear = .remainder,
     reset_replay: bool = false,
 
     pub fn isEmpty(self: FrameDocumentAppend) bool {
-        return self.bytes.len == 0;
+        return self.source.isEmpty();
+    }
+
+    pub fn inMemoryBytes(self: FrameDocumentAppend) ![]const u8 {
+        return self.source.inMemoryBytes();
     }
 
     pub fn validatedStartCol(self: FrameDocumentAppend, target_cols: u16, target_rows: u16) !u16 {
@@ -39,6 +79,42 @@ pub const FrameDocumentAppend = struct {
         };
     }
 };
+
+test "frame document source represents exactly one authority" {
+    const Fixture = struct {
+        bytes: []const u8,
+
+        fn readAt(ctx: *anyopaque, out: []u8, offset: u64) !usize {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            const start = std.math.cast(usize, offset) orelse return error.InvalidOffset;
+            if (start >= self.bytes.len) return 0;
+            const len = @min(out.len, self.bytes.len - start);
+            @memcpy(out[0..len], self.bytes[start..][0..len]);
+            return len;
+        }
+
+        fn source(self: *@This()) SequentialDocumentSource {
+            return .{
+                .ctx = self,
+                .committed_len = self.bytes.len,
+                .read_at = readAt,
+            };
+        }
+    };
+
+    const none: FrameDocumentSource = .none;
+    try std.testing.expect(none.isEmpty());
+    try std.testing.expectEqual(@as(u64, 0), none.declaredLen());
+
+    const bytes: FrameDocumentSource = .{ .bytes = "abc" };
+    try std.testing.expect(!bytes.isEmpty());
+    try std.testing.expectEqual(@as(u64, 3), bytes.declaredLen());
+
+    var fixture = Fixture{ .bytes = "abcdef" };
+    const sequential: FrameDocumentSource = .{ .sequential = fixture.source() };
+    try std.testing.expect(!sequential.isEmpty());
+    try std.testing.expectEqual(@as(u64, 6), sequential.declaredLen());
+}
 
 pub const AcceptedScrollRows = struct {
     preserved_release_rows: u16,
@@ -299,21 +375,21 @@ test "merge does not clamp document movement to terminal height" {
 
 test "document append validates target geometry and clamps start column" {
     const append = FrameDocumentAppend{
-        .bytes = "row\n",
+        .source = .{ .bytes = "row\n" },
         .start_row = 4,
         .start_col = 99,
     };
 
     try std.testing.expectEqual(@as(u16, 8), try append.validatedStartCol(8, 4));
     try std.testing.expectEqual(@as(u16, 1), try (FrameDocumentAppend{
-        .bytes = "row\n",
+        .source = .{ .bytes = "row\n" },
         .start_row = 4,
         .start_col = 0,
     }).validatedStartCol(8, 4));
     try std.testing.expectError(
         error.InvalidFrameScrollPlan,
         (FrameDocumentAppend{
-            .bytes = "row\n",
+            .source = .{ .bytes = "row\n" },
             .start_row = 5,
             .start_col = 1,
         }).validatedStartCol(8, 4),

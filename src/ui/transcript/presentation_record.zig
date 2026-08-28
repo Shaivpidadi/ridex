@@ -56,6 +56,7 @@ pub fn decide(
                 if (span.entry_id <= after.entry_id) return .incompatible;
             }
             const first = spans[index];
+            if (first.entry_id != after.entry_id +% 1) return .incompatible;
             prefix_newlines = transcript_blocks.blockSeparatorNewlineCount(
                 after.kind,
                 first.kind,
@@ -87,7 +88,8 @@ pub fn decide(
         }
     }
     const span = endpoint orelse return .incompatible;
-    const next: Cursor = if (finalized_end == span.end)
+    const next: Cursor = if (finalized_end == span.end and
+        span.kind != .assistant_turn)
         .{ .after = .{
             .entry_id = span.entry_id,
             .kind = span.kind,
@@ -123,8 +125,8 @@ test "presentation record cursor advances finalized entry bytes exactly once" {
     try std.testing.expect(first == .append);
     try std.testing.expectEqual(@as(usize, 0), first.append.start);
     try std.testing.expectEqual(@as(usize, 4), first.append.end);
-    try std.testing.expect(first.append.next == .after);
-    try std.testing.expectEqual(@as(u32, 1), first.append.next.after.entry_id);
+    try std.testing.expect(first.append.next == .at);
+    try std.testing.expectEqual(@as(u32, 1), first.append.next.at.entry_id);
 
     const second = decide(first.append.next, 80, 10, 10, &spans);
     try std.testing.expect(second == .append);
@@ -137,6 +139,23 @@ test "presentation record cursor advances finalized entry bytes exactly once" {
         .entry_offset = 1,
         .cols = 80,
     } }, 40, 10, 10, &spans) == .incompatible);
+}
+
+test "presentation record resumes when a finalized assistant entry grows" {
+    const initial_spans = [_]EntrySpan{
+        .{ .entry_id = 1, .kind = .assistant_turn, .start = 0, .content_start = 0, .end = 4 },
+    };
+    const initial = decide(.start, 80, 4, 4, &initial_spans);
+    try std.testing.expect(initial == .append);
+    try std.testing.expect(initial.append.next == .at);
+
+    const grown_spans = [_]EntrySpan{
+        .{ .entry_id = 1, .kind = .assistant_turn, .start = 0, .content_start = 0, .end = 8 },
+    };
+    const grown = decide(initial.append.next, 80, 8, 8, &grown_spans);
+    try std.testing.expect(grown == .append);
+    try std.testing.expectEqual(@as(usize, 4), grown.append.start);
+    try std.testing.expectEqual(@as(usize, 8), grown.append.end);
 }
 
 test "presentation record resumes after a fully recorded cursor entry is pruned" {
@@ -152,4 +171,17 @@ test "presentation record resumes after a fully recorded cursor entry is pruned"
     try std.testing.expect(decision == .append);
     try std.testing.expectEqual(@as(usize, 5), decision.append.start);
     try std.testing.expectEqual(@as(u16, 2), decision.append.prefix_newlines);
+}
+
+test "presentation record rejects an unrecorded pruned entry gap" {
+    const spans = [_]EntrySpan{
+        .{ .entry_id = 3, .kind = .system_notice, .start = 0, .content_start = 0, .end = 5 },
+        .{ .entry_id = 10, .kind = .user_turn, .start = 5, .content_start = 5, .end = 10 },
+    };
+    const decision = decide(.{ .after = .{
+        .entry_id = 8,
+        .kind = .assistant_turn,
+        .ends_with_newline = false,
+    } }, 80, 10, 10, &spans);
+    try std.testing.expect(decision == .incompatible);
 }

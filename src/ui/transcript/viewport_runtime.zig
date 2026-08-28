@@ -45,6 +45,37 @@ pub fn initViewport(self: anytype, metrics: *Metrics, requested_start_row: u16) 
 }
 
 pub fn initViewportWithReservedRows(self: anytype, metrics: *Metrics, requested_start_row: u16, min_body_rows: u16) !void {
+    return initViewportWithReservedRowsScheduling(
+        self,
+        metrics,
+        requested_start_row,
+        min_body_rows,
+        true,
+    );
+}
+
+pub fn initViewportForCurrentFrame(
+    self: anytype,
+    metrics: *Metrics,
+    requested_start_row: u16,
+    min_body_rows: u16,
+) !void {
+    return initViewportWithReservedRowsScheduling(
+        self,
+        metrics,
+        requested_start_row,
+        min_body_rows,
+        false,
+    );
+}
+
+fn initViewportWithReservedRowsScheduling(
+    self: anytype,
+    metrics: *Metrics,
+    requested_start_row: u16,
+    min_body_rows: u16,
+    schedule_frame: bool,
+) !void {
     _ = metrics;
     self.min_visible_viewport_rows = min_body_rows;
 
@@ -69,8 +100,12 @@ pub fn initViewportWithReservedRows(self: anytype, metrics: *Metrics, requested_
     self.owned_top_row = start_row;
     self.pending_scroll_compact = false;
     self.invalidateTranscriptAnchor("init_viewport_frame_reanchor");
-    requestTranscriptPaint(self);
-    recordViewportInvalidation(self, .viewport_reanchor, start_row, self.layout.rows);
+    if (schedule_frame) {
+        requestTranscriptPaint(self);
+        recordViewportInvalidation(self, .viewport_reanchor, start_row, self.layout.rows);
+    } else {
+        self.transcript_band_dirty = true;
+    }
     debug_trace.logf("frame_plan", "init_viewport_frame_deferred start={d} rows={d}", .{ start_row, self.layout.rows });
     debug_trace.logf("render", "initViewport exit viewport_top={d} cursor={d},{d} has_painted={s}", .{ self.viewport_top_row, self.cursor_row, self.cursor_col, if (self.has_painted_transcript) "true" else "false" });
 }

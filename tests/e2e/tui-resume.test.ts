@@ -6083,6 +6083,7 @@ test.skipIf(!tmuxAvailable())(
     const workspaceRoot = realpathSync(workspace);
     const earlyMarker = "SESSION_PICKER_SCROLLBACK_EARLY";
     const lateMarker = "SESSION_PICKER_SCROLLBACK_LATE";
+    const continuationMarker = "SESSION_PICKER_SCROLLBACK_CONTINUATION";
     const lines = Array.from(
       { length: 80 },
       (_, index) => `SESSION_PICKER_SCROLLBACK_LINE_${String(index).padStart(3, "0")} has enough text to wrap in the terminal viewport.`,
@@ -6121,7 +6122,9 @@ test.skipIf(!tmuxAvailable())(
       active = null;
 
       const sessionId = sessionIdFromHome(home);
-      const resumedGateway = startFakeGateway([]);
+      const resumedGateway = startFakeGateway([
+        fakeGatewayFinalText(continuationMarker),
+      ]);
       gateways.push(resumedGateway);
       writeFileSync(stderrPath, "");
       active = await TmuxSession.create({
@@ -6145,6 +6148,21 @@ test.skipIf(!tmuxAvailable())(
       expect(tape.includes(Buffer.from("\x1b[?1049h"))).toBe(false);
       expect(active.isPaneAlive()).toBe(true);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+      await active.sendText("Continue after restoring native scrollback.");
+      await active.waitForText(continuationMarker, TIMEOUT);
+      await active.waitForComposer(TIMEOUT);
+      await active.resizeWindow(72, 20);
+      const resized = await active.waitForStableScrollback(
+        (scrollback) =>
+          countOccurrences(scrollback, earlyMarker) === 1 &&
+          countOccurrences(scrollback, lateMarker) === 1 &&
+          countOccurrences(scrollback, continuationMarker) === 1,
+        TIMEOUT,
+      );
+      expect(countOccurrences(resized, earlyMarker)).toBe(1);
+      expect(countOccurrences(resized, lateMarker)).toBe(1);
+      expect(countOccurrences(resized, continuationMarker)).toBe(1);
 
       await active.sendText("/quit");
       expect(await active.waitForSessionEnd()).toBe(true);

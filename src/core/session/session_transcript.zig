@@ -233,6 +233,28 @@ pub fn admit(
     session_id: []const u8,
     current_position: session_replay.CommitPosition,
 ) !Admission {
+    return admitWithCurrentPosition(
+        alloc,
+        session_dir,
+        session_id,
+        current_position,
+    );
+}
+
+pub fn admitActive(
+    alloc: std.mem.Allocator,
+    session_dir: *io_mod.VerifiedDir,
+    session_id: []const u8,
+) !Admission {
+    return admitWithCurrentPosition(alloc, session_dir, session_id, null);
+}
+
+fn admitWithCurrentPosition(
+    alloc: std.mem.Allocator,
+    session_dir: *io_mod.VerifiedDir,
+    session_id: []const u8,
+    current_position: ?session_replay.CommitPosition,
+) !Admission {
     var metadata_handle = io_mod.openExistingRegularFile(
         session_dir.dir,
         metadata_file,
@@ -388,7 +410,7 @@ const AdmissionFacts = struct {
     committed_len: u64,
     data_len: u64,
     stored_position: session_replay.CommitPosition,
-    current_position: session_replay.CommitPosition,
+    current_position: ?session_replay.CommitPosition,
 };
 
 fn classify(facts: AdmissionFacts) AdmissionClass {
@@ -402,7 +424,10 @@ fn classify(facts: AdmissionFacts) AdmissionClass {
     if (facts.metadata == .missing or
         facts.committed_len == 0 or
         facts.committed_len != facts.data_len or
-        !positionsEqual(facts.stored_position, facts.current_position))
+        (if (facts.current_position) |current_position|
+            !positionsEqual(facts.stored_position, current_position)
+        else
+            false))
     {
         return .incomplete;
     }
@@ -692,6 +717,42 @@ test "transcript record admits exact committed bytes and treats a staged tail as
     );
     defer incomplete.deinit();
     try std.testing.expect(incomplete == .incomplete);
+}
+
+test "active transcript admits a complete older display prefix but rejects a staged tail" {
+    const alloc = std.testing.allocator;
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    var verified = io_mod.VerifiedDir{ .dir = try temp.dir.openDir(
+        std.testing.io,
+        ".",
+        .{ .iterate = true, .follow_symlinks = false },
+    ) };
+    defer verified.close();
+
+    try publishComplete(
+        alloc,
+        &verified,
+        "session-1",
+        test_position,
+        "one\r\ntwo\r\n",
+    );
+    var advanced = test_position;
+    advanced.through_seq += 1;
+    advanced.through_event_log_bytes += 64;
+
+    var cold = try admit(alloc, &verified, "session-1", advanced);
+    defer cold.deinit();
+    try std.testing.expect(cold == .incomplete);
+
+    var active = try admitActive(alloc, &verified, "session-1");
+    defer active.deinit();
+    try std.testing.expect(active == .exact);
+
+    try appendDataForTest(&verified, "staged");
+    var staged = try admitActive(alloc, &verified, "session-1");
+    defer staged.deinit();
+    try std.testing.expect(staged == .incomplete);
 }
 
 test "transcript append advances committed bytes only after durable data" {

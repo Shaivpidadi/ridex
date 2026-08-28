@@ -109,7 +109,15 @@ const DetachedWorkerEventBatch = struct {
         return self.events.items[self.next_unvisited - 1 ..];
     }
 
+    fn remaining(self: *const DetachedWorkerEventBatch) []const WorkerEvent {
+        return self.events.items[self.next_unvisited..];
+    }
+
     fn markClaimedAndRemainingTransferred(self: *DetachedWorkerEventBatch) void {
+        self.next_unvisited = self.events.items.len;
+    }
+
+    fn markRemainingTransferred(self: *DetachedWorkerEventBatch) void {
         self.next_unvisited = self.events.items.len;
     }
 
@@ -634,6 +642,7 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn drainEvents(app: *App, handlers: WorkerEventHandlers) !void {
+            if (presentationRecordFramePending(app)) return;
             const taken = app.worker.takeEventBatch();
             var batch = DetachedWorkerEventBatch.init(
                 std.heap.c_allocator,
@@ -668,6 +677,7 @@ pub fn Runtime(comptime App: type) type {
                 };
                 first_event = false;
                 var drain_owns_current = true;
+                var presentation_finality_closed = false;
                 defer if (drain_owns_current) {
                     worker_runtime.freeWorkerEvent(batch.alloc, event);
                 };
@@ -848,6 +858,7 @@ pub fn Runtime(comptime App: type) type {
                     },
                     .api_status_text => |text| {
                         resetStream(app, false);
+                        presentation_finality_closed = true;
                         app.shell.worker_status_state().set_api(text, .danger);
                         app.shell.render_requests.request(.footer);
                     },
@@ -883,6 +894,7 @@ pub fn Runtime(comptime App: type) type {
                     .finish_prompt => |finished| {
                         try flushPendingCommandOutputAtTurnBoundary(app, handlers);
                         resetStream(app, false);
+                        presentation_finality_closed = true;
                         app.shell.render_requests.request(.footer);
                         try handlers.append_history_turn(handlers.ctx, finished);
                     },
@@ -896,9 +908,20 @@ pub fn Runtime(comptime App: type) type {
                             break :events;
                         }
                         resetStream(app, false);
+                        presentation_finality_closed = true;
                         app.shell.render_requests.request(.footer);
                         try handlers.error_text(handlers.ctx, notice);
                     },
+                }
+                if (presentation_finality_closed and presentationRecordActive(app)) {
+                    requestPresentationRecordFrame(app);
+                    if (try retainRemainingEventSuffix(
+                        app,
+                        &batch,
+                        "session_transcript_finality_frame",
+                    )) {
+                        break :events;
+                    }
                 }
             }
 
@@ -941,6 +964,46 @@ pub fn Runtime(comptime App: type) type {
                 "retained detached worker events reason={s} count={d}",
                 .{ reason, retained.len },
             );
+        }
+
+        fn retainRemainingEventSuffix(
+            app: *App,
+            batch: *DetachedWorkerEventBatch,
+            reason: []const u8,
+        ) !bool {
+            const retained = batch.remaining();
+            if (retained.len == 0) return false;
+            try app.worker.prependOwnedEvents(batch.alloc, retained);
+            batch.markRemainingTransferred();
+            debug_trace.logf(
+                "worker",
+                "retained detached worker event suffix reason={s} count={d}",
+                .{ reason, retained.len },
+            );
+            return true;
+        }
+
+        fn presentationRecordActive(app: *const App) bool {
+            const Shell = @TypeOf(app.shell);
+            if (comptime @hasDecl(Shell, "presentationRecordActive")) {
+                return app.shell.presentationRecordActive();
+            }
+            return false;
+        }
+
+        fn requestPresentationRecordFrame(app: *App) void {
+            const Shell = @TypeOf(app.shell);
+            if (comptime @hasDecl(Shell, "requestPresentationRecordFrame")) {
+                app.shell.requestPresentationRecordFrame();
+            }
+        }
+
+        fn presentationRecordFramePending(app: *const App) bool {
+            const Shell = @TypeOf(app.shell);
+            if (comptime @hasDecl(Shell, "presentationRecordFramePending")) {
+                return app.shell.presentationRecordFramePending();
+            }
+            return false;
         }
 
         fn applyToolLifecycle(
@@ -1376,6 +1439,18 @@ const FakeShell = struct {
 
     fn nativeHistoryActive(self: *const FakeShell) bool {
         return self.native_history_active;
+    }
+
+    fn presentationRecordActive(self: *const FakeShell) bool {
+        return self.lifecycle.presentationRecordActive();
+    }
+
+    fn requestPresentationRecordFrame(self: *FakeShell) void {
+        self.lifecycle.requestPresentationRecordFrame();
+    }
+
+    fn presentationRecordFramePending(self: *const FakeShell) bool {
+        return self.lifecycle.presentationRecordFramePending();
     }
 
     fn trimTrailingBlankLines(self: *FakeShell) void {
@@ -3798,6 +3873,61 @@ test "core.app_worker_runtime split batches finalize lifecycle before history" {
 
     try std.testing.expectEqual(@as(usize, 1), capture.history_count);
     try std.testing.expect(capture.saw_finalized_fence);
+}
+
+test "core.app_worker_runtime persisted transcript yields after a finished prompt" {
+    var app = FakeApp.init(std.testing.allocator);
+    defer app.deinit();
+    app.worker.processing = true;
+    app.shell.lifecycle.beginPresentationRecord();
+
+    try app.worker.pushEvent(std.heap.c_allocator, .{ .finish_prompt = .{
+        .turn = .{ .compacted_summary = .{
+            .summary = @constCast("finished"),
+            .removed_turn_count = 1,
+            .compaction_count = 1,
+        } },
+    } });
+    try app.worker.pushEvent(std.heap.c_allocator, .{ .semantic_notice = .{
+        .topic = @constCast("system"),
+        .tone = .neutral,
+        .body = @constCast("next event"),
+    } });
+
+    const Capture = struct {
+        histories: usize = 0,
+        notices: usize = 0,
+
+        fn history(raw: *anyopaque, _: types.FinishedPrompt) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.histories += 1;
+        }
+
+        fn notice(raw: *anyopaque, _: types.SemanticNotice) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.notices += 1;
+        }
+    };
+    var capture = Capture{};
+    var handlers = NoopBridge.handlers(&app);
+    handlers.ctx = @ptrCast(&capture);
+    handlers.append_history_turn = Capture.history;
+    handlers.semantic_notice = Capture.notice;
+
+    try Runtime(FakeApp).tick(&app, noopTaskCompletion, handlers);
+
+    try std.testing.expectEqual(@as(usize, 1), capture.histories);
+    try std.testing.expectEqual(@as(usize, 0), capture.notices);
+    try std.testing.expectEqual(@as(usize, 1), app.worker.events.items.len);
+
+    try Runtime(FakeApp).tick(&app, noopTaskCompletion, handlers);
+    try std.testing.expectEqual(@as(usize, 0), capture.notices);
+    try std.testing.expectEqual(@as(usize, 1), app.worker.events.items.len);
+
+    app.shell.lifecycle.degradePresentationRecord();
+    try Runtime(FakeApp).tick(&app, noopTaskCompletion, handlers);
+    try std.testing.expectEqual(@as(usize, 1), capture.notices);
+    try std.testing.expectEqual(@as(usize, 0), app.worker.events.items.len);
 }
 
 test "core.app_worker_runtime reset before drain fences interrupted prefix and keeps next turn live" {

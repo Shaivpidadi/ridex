@@ -28,6 +28,11 @@ const TranscriptRuntime = transcript_runtime.TranscriptRuntime;
 const HardLineStarts = viewport_selection.HardLineStarts;
 const TranscriptBuffer = viewport_selection.TranscriptBuffer;
 const VisibleTranscriptLine = viewport_selection.VisibleTranscriptLine;
+
+fn documentAppendBytes(append: render_engine.frame_scroll_plan.FrameDocumentAppend) []const u8 {
+    return append.inMemoryBytes() catch unreachable;
+}
+
 fn renderEntriesToBytes(alloc: Allocator, entries: []const transcript_blocks.TranscriptEntry, cols: u16) ![]u8 {
     return transcript_runtime.renderEntriesToBytes(alloc, entries, cols, .{});
 }
@@ -1215,6 +1220,52 @@ test "stable zero-scroll frame yields the complete finalized presentation record
     try std.testing.expectEqualStrings("single visible line", pending.bytes);
 }
 
+test "mutable presentation hold keeps the record frame pending" {
+    const alloc = std.testing.allocator;
+    var runtime = commandOutputTestRuntime(undefined);
+    defer runtime.deinit(alloc);
+    runtime.beginPresentationRecord();
+    runtime.requestPresentationRecordFrame();
+    var metrics: Metrics = .{};
+    _ = try runtime.streamAssistantChunk(alloc, &metrics, "mutable assistant tail");
+
+    var source = try runtime.prepareTranscriptSource(alloc, null);
+    defer source.deinit(alloc);
+    var prepared = try prepareTestSourceForCurrentArea(&runtime, alloc, &source);
+    defer prepared.deinit(alloc);
+    var plan = testPaintPlan(&runtime, prepared.selection);
+    const scroll_plan = render_engine.frame_scroll_plan.FrameScrollPlan.none(
+        runtime.layout.rows,
+        runtime.owned_top_row,
+    );
+    var transition = try resolveAndSealTranscriptTransitionForTest(
+        &runtime,
+        alloc,
+        &source,
+        &prepared,
+        render_engine.frame_layout.CommittedLayoutSnapshot.fromPaintPlan(plan),
+        &plan,
+        scroll_plan,
+    );
+    defer transition.deinit(alloc);
+
+    runtime.consumeTranscriptTransition(alloc, &transition, .{
+        .bytes_written = 0,
+        .changed_cells = 0,
+        .full_repaint = false,
+        .terminal_scroll_rows_committed = 0,
+        .document_append_committed = false,
+        .committed_cursor_row = transition.cursor_row,
+        .committed_cursor_col = transition.cursor_col,
+        .shadow_state = .committed,
+        .next_invalidation = render_engine.paint_plan.FrameInvalidationSet.empty(),
+    });
+
+    try std.testing.expect(runtime.takePendingPresentationRecord() == null);
+    try std.testing.expect(!runtime.takePresentationRecordRestamp());
+    try std.testing.expect(runtime.presentationRecordFramePending());
+}
+
 fn cloneRecoveryTransitionForTest(
     alloc: Allocator,
     source: *const transcript_runtime.TranscriptTransition,
@@ -1224,7 +1275,7 @@ fn cloneRecoveryTransitionForTest(
     std.debug.assert(source.document_append_bytes.len == 0);
 
     var clone = source.*;
-    clone.document_append.bytes = &.{};
+    clone.document_append.source = .none;
     clone.document_append_bytes = &.{};
     clone.target_flow = &.{};
     clone.target_cache = .empty;
@@ -1900,7 +1951,7 @@ fn expectRendererAppendRestored(
     try expectDocumentWireEqualsLogical(
         alloc,
         grown_flow[stable_flow.len..],
-        transition.document_append.bytes,
+        documentAppendBytes(transition.document_append),
     );
 }
 
@@ -2450,7 +2501,7 @@ test "oversized compatible growth materializes only each accepted projection" {
     try std.testing.expect(first_transition.materialized.flow_len.? < grown_flow.items.len);
     try materialized_append.appendSlice(
         alloc,
-        first_transition.document_append.bytes,
+        documentAppendBytes(first_transition.document_append),
     );
 
     var first_painter = PreparedTranscriptFramePainter{
@@ -2545,7 +2596,7 @@ test "oversized compatible growth materializes only each accepted projection" {
     );
     try materialized_append.appendSlice(
         alloc,
-        retry_transition.document_append.bytes,
+        documentAppendBytes(retry_transition.document_append),
     );
     try expectDocumentWireEqualsLogical(
         alloc,
@@ -3094,7 +3145,7 @@ test "folded inexact growth advances only materialized viewport rows" {
     try expectDocumentWireEqualsLogical(
         alloc,
         followup_append,
-        followup_transition.document_append.bytes,
+        documentAppendBytes(followup_transition.document_append),
     );
     try std.testing.expectEqual(
         followup_flow.items.len,
@@ -3321,13 +3372,13 @@ test "staged soft-wrapped presentation resumes across committed projections" {
     try std.testing.expect(first_raw_end < grown_flow.items.len);
     try std.testing.expect(std.mem.endsWith(
         u8,
-        first_transition.document_append.bytes,
+        documentAppendBytes(first_transition.document_append),
         steady_bytes,
     ));
     try expectDocumentWireEqualsLogical(
         alloc,
         first_raw_append,
-        first_transition.document_append.bytes[0 .. first_transition.document_append.bytes.len - steady_bytes.len],
+        documentAppendBytes(first_transition.document_append)[0 .. documentAppendBytes(first_transition.document_append).len - steady_bytes.len],
     );
     try raw_append_bytes.appendSlice(alloc, first_raw_append);
 
@@ -3415,13 +3466,13 @@ test "staged soft-wrapped presentation resumes across committed projections" {
     const retry_raw_append = grown_flow.items[first_raw_end..];
     try std.testing.expect(std.mem.startsWith(
         u8,
-        retry_transition.document_append.bytes,
+        documentAppendBytes(retry_transition.document_append),
         resume_bytes,
     ));
     try expectDocumentWireEqualsLogical(
         alloc,
         retry_raw_append,
-        retry_transition.document_append.bytes[resume_bytes.len..],
+        documentAppendBytes(retry_transition.document_append)[resume_bytes.len..],
     );
     try raw_append_bytes.appendSlice(alloc, retry_raw_append);
     try std.testing.expectEqualStrings(
@@ -3540,7 +3591,7 @@ test "uncommitted stable-origin append retries from the materialized source endp
     try expectDocumentWireEqualsLogical(
         alloc,
         grown_flow[stable_flow.len..],
-        first_transition.document_append.bytes,
+        documentAppendBytes(first_transition.document_append),
     );
 
     runtime.consumeTranscriptTransition(alloc, &first_transition, .{
@@ -3584,7 +3635,7 @@ test "uncommitted stable-origin append retries from the materialized source endp
     try expectDocumentWireEqualsLogical(
         alloc,
         grown_flow[stable_flow.len..],
-        retry_transition.document_append.bytes,
+        documentAppendBytes(retry_transition.document_append),
     );
 }
 
@@ -3892,7 +3943,7 @@ test "stable origin projection rebase narrow to wide survives repeated partial a
     try expectDocumentWireEqualsLogical(
         alloc,
         grown_flow[flow.len..],
-        append_transition.document_append.bytes,
+        documentAppendBytes(append_transition.document_append),
     );
 }
 
@@ -4041,7 +4092,7 @@ test "stable origin projection rebase wide to narrow retains debt until exhauste
     try expectDocumentWireEqualsLogical(
         alloc,
         grown_flow[flow.len..],
-        append_transition.document_append.bytes,
+        documentAppendBytes(append_transition.document_append),
     );
 }
 
@@ -5491,7 +5542,7 @@ test "finalized transcript transition owns append suffix and commits one anchor"
     );
     defer transition.deinit(alloc);
 
-    try std.testing.expectEqualStrings("new\r\n", transition.document_append.bytes);
+    try std.testing.expectEqualStrings("new\r\n", documentAppendBytes(transition.document_append));
     try std.testing.expectEqual(@as(u16, 3), transition.document_append.start_row);
     try std.testing.expectEqual(@as(u16, 1), transition.document_append.start_col);
 
@@ -6420,7 +6471,7 @@ test "structured replacement preserves reflow debt and drops old semantic debt" 
     try expectDocumentWireEqualsLogical(
         alloc,
         append_transition.target_flow[replacement_flow.len..],
-        append_transition.document_append.bytes,
+        documentAppendBytes(append_transition.document_append),
     );
 }
 
@@ -6677,7 +6728,7 @@ test "invalid origin partial recovery rebases until complete repaint then append
     try expectDocumentWireEqualsLogical(
         alloc,
         grown_flow[flow.len..],
-        append_transition.document_append.bytes,
+        documentAppendBytes(append_transition.document_append),
     );
     try std.testing.expectEqual(
         stable.cursor_row,
@@ -15738,7 +15789,7 @@ test "catch-up release materializes history before staging a larger finality hol
 
     try std.testing.expectEqualStrings(
         "row-00\r\nrow-01\r\nrow-02\r\n",
-        transition.document_append.bytes,
+        documentAppendBytes(transition.document_append),
     );
     switch (transition.document_append.clear) {
         .rows => |rows| try std.testing.expectEqual(@as(u16, 3), rows),
@@ -15816,7 +15867,7 @@ test "partial finality release bounds append before staging withheld viewport" {
 
     try std.testing.expectEqualStrings(
         "row-08\r\n",
-        transition.document_append.bytes,
+        documentAppendBytes(transition.document_append),
     );
     try std.testing.expectEqual(@as(u32, 10), transition.visual_offset);
     try std.testing.expectEqual(@as(u32, 5), transition.history_visual_offset);

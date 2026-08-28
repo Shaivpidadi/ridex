@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const session_transcript = @import("../../core/session/session_transcript.zig");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
 const types = @import("../../core/shared/types.zig");
 const ui_terminal = @import("../terminal/terminal.zig");
@@ -347,6 +348,15 @@ pub fn flushFrame(input: FrameCommitInput) !FrameCommitResult {
     if (input.document_append.reset_replay and !input.surface.plan.reset_terminal) {
         return error.InvalidFrameScrollPlan;
     }
+    switch (input.document_append.source) {
+        .sequential => |source| return flushSequentialResetFrame(
+            input,
+            source,
+            &target,
+            repaint_window,
+        ),
+        .none, .bytes => {},
+    }
     var local_movement: ?PreparedTerminalMovement = null;
     defer if (local_movement) |*movement| movement.deinit(alloc);
     const movement = if (input.prepared_movement) |prepared|
@@ -383,7 +393,7 @@ pub fn flushFrame(input: FrameCommitInput) !FrameCommitResult {
                 terminal_scroll_rows,
                 movement.scroll_rows.materialized_scroll_rows,
                 movement.scroll_rows.alignment_scroll_rows,
-                input.document_append.bytes.len,
+                input.document_append.source.declaredLen(),
                 movement.document_append_end -| movement.document_append_start,
             },
         );
@@ -586,6 +596,24 @@ fn composeWireFrame(
     full_repaint: bool,
     terminal_scroll_bytes: []const u8,
 ) !usize {
+    try composeFramePrefix(wire_frame, input);
+    const prefix_len = wire_frame.written().len;
+    try wire_frame.writer.writeAll(terminal_scroll_bytes);
+    try composeFrameSuffix(
+        wire_frame,
+        input,
+        previous_for_diff,
+        target,
+        repaint_window,
+        full_repaint,
+    );
+    return prefix_len;
+}
+
+fn composeFramePrefix(
+    wire_frame: *std.Io.Writer.Allocating,
+    input: FrameCommitInput,
+) !void {
     if (input.surface.plan.reset_terminal and input.history_reset_uses_ris) {
         // RIS clears modes that fx enables at startup, so restore them before repainting.
         try wire_frame.writer.writeAll("\x1bc");
@@ -596,9 +624,16 @@ fn composeWireFrame(
     if (input.surface.plan.reset_terminal) {
         try wire_frame.writer.writeAll("\x1b[0m\x1b[2J\x1b[3J\x1b[H");
     }
-    const prefix_len = wire_frame.written().len;
-    try wire_frame.writer.writeAll(terminal_scroll_bytes);
+}
 
+fn composeFrameSuffix(
+    wire_frame: *std.Io.Writer.Allocating,
+    input: FrameCommitInput,
+    previous_for_diff: *const vt_emulator.Grid,
+    target: *const vt_emulator.Grid,
+    repaint_window: paint_plan.FrameRepaintWindow,
+    full_repaint: bool,
+) !void {
     if (!repaint_window.isEmpty()) {
         if (full_repaint) {
             var clear_baseline = try cloneAuthoritativeShadow(
@@ -626,7 +661,302 @@ fn composeWireFrame(
     try writeCursorPosition(&wire_frame.writer, target.*);
     if (input.synchronized_update) try wire_frame.writer.writeAll("\x1b[?2026l");
     if (target.cursor_visible) try wire_frame.writer.writeAll("\x1b[?25h");
-    return prefix_len;
+}
+
+const sequential_frame_read_bytes: usize = 64 * 1024;
+
+fn flushSequentialResetFrame(
+    input: FrameCommitInput,
+    source: frame_scroll_plan.SequentialDocumentSource,
+    target: *const vt_emulator.Grid,
+    repaint_window: paint_plan.FrameRepaintWindow,
+) !FrameCommitResult {
+    if (!input.surface.plan.reset_terminal or
+        !input.document_append.reset_replay or
+        input.prepared_movement != null or
+        input.scroll_plan.terminal_scroll_rows != 0 or
+        source.committed_len == 0)
+    {
+        return error.InvalidFrameScrollPlan;
+    }
+
+    const alloc = input.surface.alloc;
+    var physical_shadow = try cloneAuthoritativeShadow(
+        alloc,
+        input.previous,
+        target.cols,
+        target.rows,
+    );
+    var physical_shadow_owned = true;
+    defer if (physical_shadow_owned) physical_shadow.deinit();
+    var logical_shadow = try cloneAuthoritativeShadow(
+        alloc,
+        input.previous,
+        target.cols,
+        target.rows,
+    );
+    defer logical_shadow.deinit();
+
+    var prefix: std.Io.Writer.Allocating = .init(alloc);
+    defer prefix.deinit();
+    try composeFramePrefix(&prefix, input);
+    try prefix.writer.writeAll(input.terminal_transition.sequence());
+    try writeDocumentAppendPrelude(
+        &prefix.writer,
+        input.document_append,
+        target.cols,
+        target.rows,
+    );
+
+    var logical_prefix: std.Io.Writer.Allocating = .init(alloc);
+    defer logical_prefix.deinit();
+    var logical_input = input;
+    logical_input.synchronized_update = false;
+    try composeFramePrefix(&logical_prefix, logical_input);
+    try logical_prefix.writer.writeAll(input.terminal_transition.sequence());
+    try writeDocumentAppendPrelude(
+        &logical_prefix.writer,
+        input.document_append,
+        target.cols,
+        target.rows,
+    );
+
+    var bytes_written: usize = 0;
+    const prefix_stats = try writeSequentialFrameSegment(
+        input,
+        &physical_shadow,
+        &logical_shadow,
+        prefix.written(),
+        logical_prefix.written(),
+    );
+    if (prefix_stats.scroll_rows != 0) {
+        try recoverSequentialFrame(input);
+        return error.InvalidFrameScrollPlan;
+    }
+    bytes_written = try checkedFrameByteTotal(bytes_written, prefix.written().len);
+
+    const autowrap_was_enabled = logical_shadow.autowrap;
+    if (!autowrap_was_enabled) {
+        const enable_stats = try writeSequentialFrameSegment(
+            input,
+            &physical_shadow,
+            &logical_shadow,
+            "\x1b[?7h",
+            "\x1b[?7h",
+        );
+        if (enable_stats.scroll_rows != 0) {
+            try recoverSequentialFrame(input);
+            return error.InvalidFrameScrollPlan;
+        }
+        bytes_written = try checkedFrameByteTotal(bytes_written, "\x1b[?7h".len);
+    }
+
+    var storage: [sequential_frame_read_bytes + session_transcript.max_control_sequence_bytes]u8 = undefined;
+    var carry_len: usize = 0;
+    var read_offset: u64 = 0;
+    var emitted_bytes: u64 = 0;
+    var document_scroll_rows: u16 = 0;
+    while (read_offset < source.committed_len) {
+        const remaining = source.committed_len - read_offset;
+        const read_capacity = @min(
+            sequential_frame_read_bytes,
+            std.math.cast(usize, remaining) orelse sequential_frame_read_bytes,
+        );
+        const read = source.readAt(
+            storage[carry_len .. carry_len + read_capacity],
+            read_offset,
+        ) catch |err| {
+            try recoverSequentialFrame(input);
+            return err;
+        };
+        if (read == 0 or read > read_capacity) {
+            try recoverSequentialFrame(input);
+            return error.InvalidSequentialDocumentRead;
+        }
+        read_offset = std.math.add(u64, read_offset, @intCast(read)) catch {
+            try recoverSequentialFrame(input);
+            return error.TranscriptTooLarge;
+        };
+        const total = carry_len + read;
+        const eof = read_offset == source.committed_len;
+        const safe_len = session_transcript.validatedPrefix(storage[0..total], eof) catch |err| {
+            try recoverSequentialFrame(input);
+            return err;
+        };
+        if (safe_len > 0) {
+            const document_stats = try writeSequentialFrameSegment(
+                input,
+                &physical_shadow,
+                &logical_shadow,
+                storage[0..safe_len],
+                storage[0..safe_len],
+            );
+            document_scroll_rows +|= document_stats.scroll_rows;
+            bytes_written = try checkedFrameByteTotal(bytes_written, safe_len);
+            emitted_bytes = std.math.add(u64, emitted_bytes, @intCast(safe_len)) catch {
+                try recoverSequentialFrame(input);
+                return error.TranscriptTooLarge;
+            };
+        }
+        const remainder = total - safe_len;
+        if (remainder > session_transcript.max_control_sequence_bytes) {
+            try recoverSequentialFrame(input);
+            return error.InvalidTranscriptGrammar;
+        }
+        if (remainder > 0) {
+            std.mem.copyForwards(u8, storage[0..remainder], storage[safe_len..total]);
+        }
+        carry_len = remainder;
+    }
+    if (carry_len != 0 or emitted_bytes != source.committed_len) {
+        try recoverSequentialFrame(input);
+        return error.InvalidSequentialDocumentRead;
+    }
+
+    var padding_rows = target.rows -| input.surface.plan.transcript_band.bottom;
+    while (padding_rows > 0) : (padding_rows -= 1) {
+        const padding_stats = try writeSequentialFrameSegment(
+            input,
+            &physical_shadow,
+            &logical_shadow,
+            "\r\n",
+            "\r\n",
+        );
+        document_scroll_rows +|= padding_stats.scroll_rows;
+        bytes_written = try checkedFrameByteTotal(bytes_written, "\r\n".len);
+    }
+
+    if (!autowrap_was_enabled) {
+        const disable_stats = try writeSequentialFrameSegment(
+            input,
+            &physical_shadow,
+            &logical_shadow,
+            "\x1b[?7l",
+            "\x1b[?7l",
+        );
+        if (disable_stats.scroll_rows != 0) {
+            try recoverSequentialFrame(input);
+            return error.InvalidFrameScrollPlan;
+        }
+        bytes_written = try checkedFrameByteTotal(bytes_written, "\x1b[?7l".len);
+    }
+
+    const changed_cells = countChangedCells(logical_shadow, target.*, repaint_window);
+    var suffix: std.Io.Writer.Allocating = .init(alloc);
+    defer suffix.deinit();
+    composeFrameSuffix(
+        &suffix,
+        input,
+        &logical_shadow,
+        target,
+        repaint_window,
+        true,
+    ) catch |err| {
+        try recoverSequentialFrame(input);
+        return err;
+    };
+    const suffix_stats = try writeSequentialFrameSegment(
+        input,
+        &physical_shadow,
+        &logical_shadow,
+        suffix.written(),
+        suffix.written(),
+    );
+    if (suffix_stats.scroll_rows != 0) {
+        try recoverSequentialFrame(input);
+        return error.InvalidFrameScrollPlan;
+    }
+    bytes_written = try checkedFrameByteTotal(bytes_written, suffix.written().len);
+
+    if (!authoritativeShadowHasSteadyState(
+        physical_shadow,
+        input.previous.autowrap,
+        target.cursor_visible,
+    ) or
+        !targetMatches(physical_shadow, target.*, repaint_window))
+    {
+        return error.ShadowCrossCheckFailed;
+    }
+
+    input.previous.deinit();
+    input.previous.* = physical_shadow;
+    physical_shadow_owned = false;
+
+    const expected_scroll_rows = @max(
+        input.scroll_plan.terminal_scroll_rows,
+        document_scroll_rows,
+    );
+    const scroll_commit = input.scroll_plan.commitWithExpectedRows(
+        document_scroll_rows,
+        expected_scroll_rows,
+    );
+    const scroll_attribution: FrameScrollAttribution = .{
+        .document_append_scroll_rows = document_scroll_rows,
+    };
+    debug_trace.logf(
+        "frame_commit",
+        "sequential_reset bytes={d} document_bytes={d} applied_scroll_rows={d}",
+        .{ bytes_written, emitted_bytes, document_scroll_rows },
+    );
+    return committed_result(
+        bytes_written,
+        changed_cells,
+        true,
+        scroll_commit,
+        scroll_attribution,
+        true,
+        target,
+    );
+}
+
+fn writeSequentialFrameSegment(
+    input: FrameCommitInput,
+    physical_shadow: *vt_emulator.Grid,
+    logical_shadow: *vt_emulator.Grid,
+    physical_bytes: []const u8,
+    logical_bytes: []const u8,
+) !vt_emulator.FeedStats {
+    if (physical_bytes.len == 0 and logical_bytes.len == 0) return .{};
+    const sink_result = input.sink.write_frame(
+        input.sink.ctx,
+        input.metrics,
+        physical_bytes,
+    );
+    _ = acceptedBytesForSinkResult(physical_bytes, sink_result) catch |err| {
+        try recoverSequentialFrame(input);
+        return err;
+    };
+    switch (sink_result) {
+        .complete => {},
+        .partial => |partial| {
+            try recoverSequentialFrame(input);
+            return partial.err;
+        },
+    }
+    physical_shadow.feed(physical_bytes) catch |err| {
+        try recoverSequentialFrame(input);
+        return err;
+    };
+    var stats: vt_emulator.FeedStats = .{};
+    logical_shadow.feedWithStats(logical_bytes, &stats) catch |err| {
+        try recoverSequentialFrame(input);
+        return err;
+    };
+    return stats;
+}
+
+fn checkedFrameByteTotal(total: usize, next: usize) !usize {
+    return std.math.add(usize, total, next) catch error.FrameTooLarge;
+}
+
+fn recoverSequentialFrame(input: FrameCommitInput) !void {
+    const cleanup = recoveryBytes(input.synchronized_update, input.previous.autowrap);
+    const result = input.sink.write_frame(input.sink.ctx, input.metrics, cleanup);
+    _ = try acceptedBytesForSinkResult(cleanup, result);
+    switch (result) {
+        .complete => {},
+        .partial => return error.TerminalSyncRecoveryFailed,
+    }
 }
 
 fn recoverPartialFrame(
@@ -1020,7 +1350,7 @@ test "normal-screen transition precedes document movement in the prepared shadow
     try previous.feed("alternate");
 
     const document_append: frame_scroll_plan.FrameDocumentAppend = .{
-        .bytes = "doc",
+        .source = .{ .bytes = "doc" },
         .start_row = 2,
         .start_col = 1,
     };
@@ -1353,14 +1683,38 @@ fn appendDocumentMovement(
     target_rows: u16,
 ) !DocumentAppendMovement {
     if (document_append.isEmpty()) return .{};
-    for (document_append.bytes, 0..) |byte, index| {
-        if (byte == '\n' and (index == 0 or document_append.bytes[index - 1] != '\r'))
+    const document_bytes = try document_append.inMemoryBytes();
+    for (document_bytes, 0..) |byte, index| {
+        if (byte == '\n' and (index == 0 or document_bytes[index - 1] != '\r'))
             return error.InvalidFrameScrollPlan;
     }
 
     const append_start = bytes.written().len;
+    try writeDocumentAppendPrelude(
+        &bytes.writer,
+        document_append,
+        target_cols,
+        target_rows,
+    );
+    const autowrap_was_enabled = post_movement.autowrap;
+    if (!autowrap_was_enabled) try bytes.writer.writeAll("\x1b[?7h");
+    try bytes.writer.writeAll(document_bytes);
+    if (!autowrap_was_enabled) try bytes.writer.writeAll("\x1b[?7l");
+
+    const append_segment = try feedMovementSegment(bytes, post_movement, append_start);
+    return .{
+        .segment = append_segment,
+    };
+}
+
+fn writeDocumentAppendPrelude(
+    out: *std.Io.Writer,
+    document_append: frame_scroll_plan.FrameDocumentAppend,
+    target_cols: u16,
+    target_rows: u16,
+) !void {
     const start_col = try document_append.validatedStartCol(target_cols, target_rows);
-    try bytes.writer.print(
+    try out.print(
         "\x1b[{d};{d}H",
         .{ document_append.start_row, start_col },
     );
@@ -1369,7 +1723,7 @@ fn appendDocumentMovement(
             // Ordinary appends replace everything after the transcript endpoint.
             // Clear it before append rows can promote footer cells into scrollback.
             try writeDocumentAppendClear(
-                &bytes.writer,
+                out,
                 document_append.start_row,
                 start_col,
                 target_cols,
@@ -1378,22 +1732,13 @@ fn appendDocumentMovement(
         },
         .rows => {
             const clear_bottom = (try document_append.validatedClearBottom(target_rows)).?;
-            try writeBandClears(&bytes.writer, document_append.start_row, clear_bottom);
-            try bytes.writer.print(
+            try writeBandClears(out, document_append.start_row, clear_bottom);
+            try out.print(
                 "\x1b[{d};{d}H",
                 .{ document_append.start_row, start_col },
             );
         },
     }
-    const autowrap_was_enabled = post_movement.autowrap;
-    if (!autowrap_was_enabled) try bytes.writer.writeAll("\x1b[?7h");
-    try bytes.writer.writeAll(document_append.bytes);
-    if (!autowrap_was_enabled) try bytes.writer.writeAll("\x1b[?7l");
-
-    const append_segment = try feedMovementSegment(bytes, post_movement, append_start);
-    return .{
-        .segment = append_segment,
-    };
 }
 
 fn appendAlignmentScroll(
@@ -1599,6 +1944,34 @@ const TestSink = struct {
     }
 };
 
+const SequentialSourceFixture = struct {
+    bytes: []const u8,
+    max_read: usize,
+    fail_at_offset: ?u64 = null,
+    read_calls: usize = 0,
+
+    fn source(self: *SequentialSourceFixture) frame_scroll_plan.SequentialDocumentSource {
+        return .{
+            .ctx = self,
+            .committed_len = self.bytes.len,
+            .read_at = readAt,
+        };
+    }
+
+    fn readAt(ctx: *anyopaque, out: []u8, offset: u64) !usize {
+        const self: *SequentialSourceFixture = @ptrCast(@alignCast(ctx));
+        self.read_calls += 1;
+        if (self.fail_at_offset) |fail_at| {
+            if (offset >= fail_at) return error.TestSequentialReadFailure;
+        }
+        const start = std.math.cast(usize, offset) orelse return error.InvalidOffset;
+        if (start >= self.bytes.len) return 0;
+        const len = @min(@min(out.len, self.max_read), self.bytes.len - start);
+        @memcpy(out[0..len], self.bytes[start..][0..len]);
+        return len;
+    }
+};
+
 fn testScrollPlan(rows: u16) frame_scroll_plan.FrameScrollPlan {
     return frame_scroll_plan.merge(4, 1, 0, rows);
 }
@@ -1610,6 +1983,248 @@ fn makeSurface(alloc: Allocator, previous: vt_emulator.Grid, plan: paint_plan.Pa
     _ = try surface.writeAnsiBand(plan.footer_band.top, 1, ">", .footer, .same_owner);
     surface.cursor_target = .{ .row = plan.footer_band.top, .col = 2, .visible = true };
     return surface;
+}
+
+test "flushFrame streams a sequential reset document inside one synchronized transaction" {
+    var previous = try vt_emulator.Grid.init(std.testing.allocator, 8, 4);
+    defer previous.deinit();
+    previous.autowrap = false;
+
+    var plan = testPlan();
+    plan.reset_terminal = true;
+    var surface = try makeSurface(std.testing.allocator, previous, plan);
+    defer surface.deinit();
+
+    var fixture = SequentialSourceFixture{
+        .bytes = "one\r\ntwo\r\n",
+        .max_read = 3,
+    };
+    var sink = TestSink{};
+    defer sink.deinit(std.testing.allocator);
+    var metrics: Metrics = .{};
+
+    const result = try flushFrame(.{
+        .previous = &previous,
+        .surface = &surface,
+        .repaint_window = paint_plan.FrameRepaintWindow.fromPlan(
+            surface.plan,
+            .{ .include_transcript = true },
+        ),
+        .synchronized_update = true,
+        .scroll_plan = frame_scroll_plan.merge(4, 1, 0, 0),
+        .document_append = .{
+            .source = .{ .sequential = fixture.source() },
+            .start_row = 1,
+            .start_col = 1,
+            .reset_replay = true,
+        },
+        .sink = sink.frameSink(),
+        .metrics = &metrics,
+    });
+
+    try std.testing.expect(result.is_committed());
+    try std.testing.expect(result.document_append_applied());
+    try std.testing.expect(fixture.read_calls > 1);
+
+    const bytes = sink.bytes.items;
+    const sync_begin = std.mem.find(u8, bytes, "\x1b[?2026h") orelse return error.TestExpectedSyncBegin;
+    const cursor_hide = std.mem.find(u8, bytes, "\x1b[?25l") orelse return error.TestExpectedCursorHide;
+    const clear = std.mem.find(u8, bytes, "\x1b[0m\x1b[2J\x1b[3J\x1b[H") orelse return error.TestExpectedClear;
+    const autowrap_enable = std.mem.find(u8, bytes, "\x1b[?7h") orelse return error.TestExpectedAutowrapEnable;
+    const document = std.mem.find(u8, bytes, fixture.bytes) orelse return error.TestExpectedAppendBytes;
+    const autowrap_disable = std.mem.findPos(u8, bytes, document + fixture.bytes.len, "\x1b[?7l") orelse return error.TestExpectedAutowrapDisable;
+    const footer = std.mem.findPos(u8, bytes, autowrap_disable, ">") orelse return error.TestExpectedFooter;
+    const sync_end = std.mem.findPos(u8, bytes, footer, "\x1b[?2026l") orelse return error.TestExpectedSyncEnd;
+    const cursor_show = std.mem.findPos(u8, bytes, sync_end, "\x1b[?25h") orelse return error.TestExpectedCursorShow;
+    try std.testing.expect(sync_begin < cursor_hide);
+    try std.testing.expect(cursor_hide < clear);
+    try std.testing.expect(clear < autowrap_enable);
+    try std.testing.expect(autowrap_enable < document);
+    try std.testing.expect(document < autowrap_disable);
+    try std.testing.expect(autowrap_disable < footer);
+    try std.testing.expect(footer < sync_end);
+    try std.testing.expect(sync_end < cursor_show);
+    try std.testing.expect(!previous.autowrap);
+    try std.testing.expect(!previous.sync_active);
+}
+
+test "flushFrame stops a sequential reset before the footer when the reader fails" {
+    var previous = try vt_emulator.Grid.init(std.testing.allocator, 8, 4);
+    defer previous.deinit();
+    previous.autowrap = false;
+
+    var plan = testPlan();
+    plan.reset_terminal = true;
+    var surface = try makeSurface(std.testing.allocator, previous, plan);
+    defer surface.deinit();
+
+    var fixture = SequentialSourceFixture{
+        .bytes = "abcde-rest\r\n",
+        .max_read = 5,
+        .fail_at_offset = 5,
+    };
+    var sink = TestSink{};
+    defer sink.deinit(std.testing.allocator);
+    var metrics: Metrics = .{};
+
+    try std.testing.expectError(error.TestSequentialReadFailure, flushFrame(.{
+        .previous = &previous,
+        .surface = &surface,
+        .repaint_window = paint_plan.FrameRepaintWindow.fromPlan(
+            surface.plan,
+            .{ .include_transcript = true },
+        ),
+        .synchronized_update = true,
+        .scroll_plan = frame_scroll_plan.merge(4, 1, 0, 0),
+        .document_append = .{
+            .source = .{ .sequential = fixture.source() },
+            .start_row = 1,
+            .start_col = 1,
+            .reset_replay = true,
+        },
+        .sink = sink.frameSink(),
+        .metrics = &metrics,
+    }));
+
+    try std.testing.expect(std.mem.find(u8, sink.bytes.items, "abcde") != null);
+    try std.testing.expect(std.mem.find(u8, sink.bytes.items, "rest") == null);
+    try std.testing.expect(std.mem.find(u8, sink.bytes.items, ">") == null);
+}
+
+test "sequential reset output is invariant across UTF-8 SGR and OSC 8 chunk boundaries" {
+    const transcript = "plain \xf0\x9f\x99\x82 " ++
+        "\x1b[31mred\x1b[0m " ++
+        "\x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\\r\n";
+    const read_sizes = [_]usize{ 1, 3, 1024, sequential_frame_read_bytes };
+    var expected: ?[]u8 = null;
+    defer if (expected) |bytes| std.testing.allocator.free(bytes);
+
+    for (read_sizes) |read_size| {
+        var previous = try vt_emulator.Grid.init(std.testing.allocator, 16, 4);
+        defer previous.deinit();
+        previous.autowrap = false;
+        var plan = testPlan();
+        plan.layout.cols = 16;
+        plan.reset_terminal = true;
+        var surface = try makeSurface(std.testing.allocator, previous, plan);
+        defer surface.deinit();
+        var fixture = SequentialSourceFixture{
+            .bytes = transcript,
+            .max_read = read_size,
+        };
+        var sink = TestSink{};
+        defer sink.deinit(std.testing.allocator);
+        var metrics: Metrics = .{};
+
+        const result = try flushFrame(.{
+            .previous = &previous,
+            .surface = &surface,
+            .repaint_window = paint_plan.FrameRepaintWindow.fromPlan(
+                surface.plan,
+                .{ .include_transcript = true },
+            ),
+            .synchronized_update = true,
+            .scroll_plan = frame_scroll_plan.merge(4, 1, 0, 0),
+            .document_append = .{
+                .source = .{ .sequential = fixture.source() },
+                .start_row = 1,
+                .start_col = 1,
+                .reset_replay = true,
+            },
+            .sink = sink.frameSink(),
+            .metrics = &metrics,
+        });
+
+        try std.testing.expect(result.is_committed());
+        const document = std.mem.find(u8, sink.bytes.items, transcript) orelse
+            return error.TestExpectedAppendBytes;
+        try std.testing.expect(std.mem.findPos(
+            u8,
+            sink.bytes.items,
+            document + transcript.len,
+            transcript,
+        ) == null);
+        if (expected) |bytes| {
+            try std.testing.expectEqualSlices(u8, bytes, sink.bytes.items);
+        } else {
+            expected = try std.testing.allocator.dupe(u8, sink.bytes.items);
+        }
+    }
+}
+
+test "sequential reset rejects zero progress and never paints the suffix" {
+    var previous = try vt_emulator.Grid.init(std.testing.allocator, 8, 4);
+    defer previous.deinit();
+    previous.autowrap = false;
+    var plan = testPlan();
+    plan.reset_terminal = true;
+    var surface = try makeSurface(std.testing.allocator, previous, plan);
+    defer surface.deinit();
+    var fixture = SequentialSourceFixture{
+        .bytes = "history\r\n",
+        .max_read = 0,
+    };
+    var sink = TestSink{};
+    defer sink.deinit(std.testing.allocator);
+    var metrics: Metrics = .{};
+
+    try std.testing.expectError(error.InvalidSequentialDocumentRead, flushFrame(.{
+        .previous = &previous,
+        .surface = &surface,
+        .repaint_window = paint_plan.FrameRepaintWindow.fromPlan(
+            surface.plan,
+            .{ .include_transcript = true },
+        ),
+        .synchronized_update = true,
+        .scroll_plan = frame_scroll_plan.merge(4, 1, 0, 0),
+        .document_append = .{
+            .source = .{ .sequential = fixture.source() },
+            .start_row = 1,
+            .start_col = 1,
+            .reset_replay = true,
+        },
+        .sink = sink.frameSink(),
+        .metrics = &metrics,
+    }));
+    try std.testing.expect(std.mem.find(u8, sink.bytes.items, ">") == null);
+}
+
+test "sequential reset suffix write failure does not return a commit receipt" {
+    var previous = try vt_emulator.Grid.init(std.testing.allocator, 8, 4);
+    defer previous.deinit();
+    previous.autowrap = false;
+    var plan = testPlan();
+    plan.reset_terminal = true;
+    var surface = try makeSurface(std.testing.allocator, previous, plan);
+    defer surface.deinit();
+    var fixture = SequentialSourceFixture{
+        .bytes = "history\r\n",
+        .max_read = sequential_frame_read_bytes,
+    };
+    var sink = TestSink{ .fail_on_call = 5 };
+    defer sink.deinit(std.testing.allocator);
+    var metrics: Metrics = .{};
+
+    try std.testing.expectError(error.TestFrameWriteFailure, flushFrame(.{
+        .previous = &previous,
+        .surface = &surface,
+        .repaint_window = paint_plan.FrameRepaintWindow.fromPlan(
+            surface.plan,
+            .{ .include_transcript = true },
+        ),
+        .synchronized_update = true,
+        .scroll_plan = frame_scroll_plan.merge(4, 1, 0, 0),
+        .document_append = .{
+            .source = .{ .sequential = fixture.source() },
+            .start_row = 1,
+            .start_col = 1,
+            .reset_replay = true,
+        },
+        .sink = sink.frameSink(),
+        .metrics = &metrics,
+    }));
+    try std.testing.expect(std.mem.find(u8, sink.bytes.items, "history\r\n") != null);
+    try std.testing.expect(std.mem.find(u8, sink.bytes.items, ">") == null);
 }
 
 const TestFrameCommitOptions = struct {
@@ -1733,7 +2348,7 @@ test "normal-screen restore preserves saved modes through reset replay" {
         .restore_normal_screen = .{ .mouse_tracking_active = true },
     };
     const document_append: frame_scroll_plan.FrameDocumentAppend = .{
-        .bytes = "result\r\n",
+        .source = .{ .bytes = "result\r\n" },
         .start_row = 1,
         .start_col = 1,
         .reset_replay = true,
@@ -2178,7 +2793,7 @@ test "flushFrame writes nonempty zero-scroll document append even when target al
     previous.cursor_col = 1;
 
     const append = frame_scroll_plan.FrameDocumentAppend{
-        .bytes = "\x1b]8;;https://append.example\x1b\\\x1b]8;;\x1b\\",
+        .source = .{ .bytes = "\x1b]8;;https://append.example\x1b\\\x1b]8;;\x1b\\" },
         .start_row = 3,
         .start_col = 1,
     };
@@ -2237,7 +2852,7 @@ test "terminal movement clears only bounded history rows before alignment" {
     try previous.feed("\x1b[1;1Hone\x1b[2;1Htwo\x1b[3;1Hthree\x1b[4;1Hfour");
 
     const append = frame_scroll_plan.FrameDocumentAppend{
-        .bytes = "\r\n",
+        .source = .{ .bytes = "\r\n" },
         .start_row = 1,
         .start_col = 1,
         .clear = .{ .rows = 1 },
@@ -2420,7 +3035,7 @@ test "flushFrame attributes movement scroll and keeps repaint tail scroll neutra
 
     const scroll_plan = testScrollPlan(2);
     const append = frame_scroll_plan.FrameDocumentAppend{
-        .bytes = "x\r\n",
+        .source = .{ .bytes = "x\r\n" },
         .start_row = 4,
         .start_col = 1,
     };
@@ -3032,7 +3647,7 @@ test "terminal movement materializes appended document rows before alignment scr
     var movement = try prepareTerminalMovement(
         std.testing.allocator,
         &previous,
-        .{ .bytes = "new1\r\nnew2\r\nnew3\r\n", .start_row = 3, .start_col = 1 },
+        .{ .source = .{ .bytes = "new1\r\nnew2\r\nnew3\r\n" }, .start_row = 3, .start_col = 1 },
         3,
         8,
         4,
@@ -3057,7 +3672,7 @@ test "terminal movement records document append range relative to frame prefix" 
     var movement = try prepareTerminalMovement(
         std.testing.allocator,
         &previous,
-        .{ .bytes = "next\r\n", .start_row = 4, .start_col = 1 },
+        .{ .source = .{ .bytes = "next\r\n" }, .start_row = 4, .start_col = 1 },
         1,
         8,
         4,
@@ -3084,7 +3699,7 @@ test "terminal movement rejects bare LF document bytes" {
         prepareTerminalMovement(
             std.testing.allocator,
             &previous,
-            .{ .bytes = "bad\n", .start_row = 4, .start_col = 1 },
+            .{ .source = .{ .bytes = "bad\n" }, .start_row = 4, .start_col = 1 },
             1,
             8,
             4,
@@ -3100,7 +3715,7 @@ test "terminal movement plans decomposed text by display width" {
         std.testing.allocator,
         &previous,
         .{
-            .bytes = "e\u{0301}e\u{0301}e\u{0301}e\u{0301}e\u{0301}",
+            .source = .{ .bytes = "e\u{0301}e\u{0301}e\u{0301}e\u{0301}e\u{0301}" },
             .start_row = 4,
             .start_col = 1,
         },
@@ -3123,7 +3738,7 @@ test "terminal movement brackets document append with temporary autowrap restora
         std.testing.allocator,
         &previous,
         .{
-            .bytes = "wrapped\r\n",
+            .source = .{ .bytes = "wrapped\r\n" },
             .start_row = 4,
             .start_col = 1,
         },
@@ -3151,7 +3766,7 @@ test "terminal movement clears stale rows after the exact append cursor" {
     var movement = try prepareTerminalMovement(
         std.testing.allocator,
         &previous,
-        .{ .bytes = "\r\nnext\r\n", .start_row = 3, .start_col = 7 },
+        .{ .source = .{ .bytes = "\r\nnext\r\n" }, .start_row = 3, .start_col = 7 },
         1,
         8,
         4,
@@ -3175,7 +3790,7 @@ test "terminal movement preserves an occupied exact-width append endpoint" {
     var movement = try prepareTerminalMovement(
         std.testing.allocator,
         &previous,
-        .{ .bytes = "\r\nnext\r\n", .start_row = 3, .start_col = 8 },
+        .{ .source = .{ .bytes = "\r\nnext\r\n" }, .start_row = 3, .start_col = 8 },
         1,
         8,
         4,
@@ -3201,7 +3816,7 @@ test "terminal movement rejects materialized rows beyond plan" {
             std.testing.allocator,
             &previous,
             .{
-                .bytes = "one\r\ntwo\r\n",
+                .source = .{ .bytes = "one\r\ntwo\r\n" },
                 .start_row = 4,
                 .start_col = 1,
             },
@@ -3260,7 +3875,7 @@ test "reset replay uses materialized append rows as the complete write expectati
     defer surface.deinit();
 
     const document_append: frame_scroll_plan.FrameDocumentAppend = .{
-        .bytes = "replay\r\n",
+        .source = .{ .bytes = "replay\r\n" },
         .start_row = 4,
         .start_col = 1,
         .reset_replay = true,
@@ -3348,7 +3963,7 @@ test "terminal movement rejects append outside target geometry" {
         prepareTerminalMovement(
             std.testing.allocator,
             &previous,
-            .{ .bytes = "row\r\n", .start_row = 5, .start_col = 1 },
+            .{ .source = .{ .bytes = "row\r\n" }, .start_row = 5, .start_col = 1 },
             0,
             8,
             4,
@@ -3369,9 +3984,9 @@ test "prepared movement keeps scrolled-out and visible append links before paint
     try previous.feed("\x1b]8;;https://old.example\x1b\\\x1b]8;;\x1b\\");
 
     const append = frame_scroll_plan.FrameDocumentAppend{
-        .bytes = "\x1b]8;;https://a.example\x1b\\a\x1b]8;;\x1b\\\r\n" ++
+        .source = .{ .bytes = "\x1b]8;;https://a.example\x1b\\a\x1b]8;;\x1b\\\r\n" ++
             "1\r\n2\r\n3\r\n4\r\n" ++
-            "\x1b]8;;https://b.example\x1b\\b\x1b]8;;\x1b\\",
+            "\x1b]8;;https://b.example\x1b\\b\x1b]8;;\x1b\\" },
         .start_row = 4,
         .start_col = 1,
     };
@@ -3459,7 +4074,7 @@ test "flushFrame rejects retry after interrupted document append" {
             .repaint_window = paint_plan.FrameRepaintWindow.fromPlan(surface.plan, .{ .include_transcript = true }),
             .synchronized_update = false,
             .scroll_plan = testScrollPlan(1),
-            .document_append = .{ .bytes = "x\r\n", .start_row = 4, .start_col = 1 },
+            .document_append = .{ .source = .{ .bytes = "x\r\n" }, .start_row = 4, .start_col = 1 },
             .sink = sink.frameSink(),
             .metrics = &metrics,
         }),
@@ -3472,7 +4087,7 @@ test "flushFrame acknowledges complete document append before later repaint fail
     var surface = try makeSurface(std.testing.allocator, previous, testPlan());
     defer surface.deinit();
     const append = frame_scroll_plan.FrameDocumentAppend{
-        .bytes = "x\r\n",
+        .source = .{ .bytes = "x\r\n" },
         .start_row = 4,
         .start_col = 1,
     };
@@ -3510,7 +4125,7 @@ test "flushFrame acknowledges complete document append before later repaint fail
 
 test "flushFrame retry acknowledges document append and scroll exactly once" {
     const append = frame_scroll_plan.FrameDocumentAppend{
-        .bytes = "x\r\n",
+        .source = .{ .bytes = "x\r\n" },
         .start_row = 4,
         .start_col = 1,
     };
@@ -3602,7 +4217,7 @@ test "flushFrame retry acknowledges document append and scroll exactly once" {
         },
     );
     try std.testing.expect(retry.is_committed());
-    try std.testing.expect(std.mem.find(u8, retry_sink.bytes.items, append.bytes) == null);
+    try std.testing.expect(std.mem.find(u8, retry_sink.bytes.items, try append.inMemoryBytes()) == null);
     try physical.feed(retry_sink.bytes.items);
     try expect_grid_and_cursor_equal(uninterrupted, authoritative);
     try expect_grid_and_cursor_equal(uninterrupted, physical);
@@ -3689,7 +4304,7 @@ test "accepted frame write attributes partial scroll to the accepted movement se
     defer previous.deinit();
 
     const append = frame_scroll_plan.FrameDocumentAppend{
-        .bytes = "doc\r\n",
+        .source = .{ .bytes = "doc\r\n" },
         .start_row = 4,
         .start_col = 1,
     };

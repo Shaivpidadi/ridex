@@ -402,7 +402,7 @@ pub const ResumeProjection = struct {
 
     /// Installs structured continuation state after historical bytes were
     /// already written directly to the terminal. No pending source is armed.
-    pub fn installRetained(self: *ResumeProjection, target: *TranscriptRuntime) void {
+    pub fn installRetained(self: *ResumeProjection, target: *TranscriptRuntime) !void {
         std.debug.assert(self.finalized);
         std.debug.assert(!self.consumed);
         std.debug.assert(target.pending_resume_source == null);
@@ -429,9 +429,14 @@ pub const ResumeProjection = struct {
         target.replaceable_last_line = self.runtime.replaceable_last_line;
         target.replaceable_row = self.runtime.replaceable_row;
         target.replaceable_start = self.runtime.replaceable_start;
-        target.recomputeCursorFromTranscript();
+        if (target.streamedSessionHistoryActive()) {
+            target.adoptStreamedSessionHistory();
+            try target.establishStreamedRetainedAnchor(self.alloc);
+        } else {
+            target.recomputeCursorFromTranscript();
+        }
         target.reconcileDetachedInstallSource(self.publication_source.?.bytes);
-        target.markTranscriptDirty();
+        if (!target.streamedSessionHistoryActive()) target.markTranscriptDirty();
 
         var publication = self.publication_source.?;
         self.publication_source = null;
@@ -551,16 +556,28 @@ test "resume projection can install retained continuation without publication" {
     var target: TranscriptRuntime = .{};
     target.layout = source.layout;
     defer target.deinit(alloc);
+    try target.enableShadowVt(alloc);
+    target.shadow_vt.?.cursor_row = 7;
+    target.shadow_vt.?.cursor_col = 5;
+    target.adoptStreamedSessionHistory();
 
     var projection = try ResumeProjection.initEmpty(alloc, &source, 42, 1);
     defer projection.deinit();
     _ = try projection.appendRawClassified("retained marker\n", .unknown_raw);
     try projection.finalize();
-    projection.installRetained(&target);
+    try projection.installRetained(&target);
 
     try std.testing.expectEqual(@as(usize, 0), target.pendingResumeFlow().len);
     try std.testing.expectEqual(@as(usize, 1), target.entries.items.len);
     try std.testing.expect(std.mem.find(u8, target.transcript.items, "retained marker") != null);
+    try std.testing.expectEqual(@as(u16, 7), target.cursor_row);
+    try std.testing.expectEqual(@as(u16, 5), target.cursor_col);
+    var installed_source = try target.prepareTranscriptSource(alloc, null);
+    defer installed_source.deinit(alloc);
+    const stable = target.stableTranscriptProjectionForFlow(installed_source.bytes) orelse
+        return error.MissingStreamedTranscriptAnchor;
+    try std.testing.expectEqual(@as(u16, 7), stable.cursor_row);
+    try std.testing.expectEqual(@as(u16, 5), stable.cursor_col);
 }
 
 test "resume projection transfers a complete standalone runtime" {

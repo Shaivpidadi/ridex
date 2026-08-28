@@ -719,7 +719,7 @@ fn commitTestFrame(
         .body_disposition = body_disposition,
         .body_paints = counters.body_paints,
         .retained_transcript_changed_cells = counters.retained_transcript_changed_cells,
-        .document_append_bytes = document_append.bytes.len,
+        .document_append_bytes = @intCast(document_append.source.declaredLen()),
         .document_append_clear_rows = switch (document_append.clear) {
             .remainder => null,
             .rows => |rows| rows,
