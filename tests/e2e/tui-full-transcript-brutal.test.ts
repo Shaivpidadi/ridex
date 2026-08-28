@@ -1091,7 +1091,7 @@ async function runStress(config: StressConfig): Promise<StressRoot> {
         startupWaitMs: 0,
       });
       await waitForTraceAfter(paths.resumedTracePath, 0, [
-        "transcript_transition_commit state=recovering",
+        "transcript_transition_commit state=stable",
       ]);
       const resumeTraceStart = traceSize(paths.resumedTracePath);
       const resumeInputStarted = performance.now();
