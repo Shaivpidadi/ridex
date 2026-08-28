@@ -1590,6 +1590,9 @@ pub fn Runtime(comptime App: type) type {
                     }
                 },
                 '\r' => {
+                    if (comptime @hasField(App, "session_persistence")) {
+                        if (try app_session_runtime.Runtime(App).applySelectedConversationRewind(app)) return;
+                    }
                     if (try submitSettingsMenuSelection(app)) return;
                     if (try submitHelpMenuSelection(app, max_input_len, max_prompt_history)) return;
                     if (try submitAuthPickerSelection(app)) return;
@@ -2693,6 +2696,22 @@ pub fn Runtime(comptime App: type) type {
                 }
             }
             if (!draftHasState(app)) {
+                if (comptime @hasField(App, "session_persistence")) {
+                    if (!app_session_runtime.Runtime(App).canOpenConversationRewind(app)) {
+                        _ = disarmEscapeClear(app);
+                        return;
+                    }
+                    const transition = gesture_state.pressEscapeRewind(
+                        app.input_runtime.gestures,
+                        now,
+                    );
+                    app.input_runtime.gestures = transition.next;
+                    if (transition.result == .activated) {
+                        _ = app_session_runtime.Runtime(App).openConversationRewindPicker(app);
+                    }
+                    app.shell.render_requests.request(.footer);
+                    return;
+                }
                 _ = disarmEscapeClear(app);
                 return;
             }
@@ -2723,6 +2742,9 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn cancelCompactCommandMenu(app: *App) bool {
+            if (comptime @hasField(App, "session_persistence")) {
+                if (app_session_runtime.Runtime(App).cancelConversationRewindPicker(app)) return true;
+            }
             if (app.input_runtime.statusline_menu.active) {
                 app.input_runtime.statusline_menu.close();
                 return true;

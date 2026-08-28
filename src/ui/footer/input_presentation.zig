@@ -429,6 +429,8 @@ pub fn composeHintRow(
     // composer and needs the same cue.
     const right_text: []const u8 = if (ctx.esc_clear_armed)
         "esc again to clear"
+    else if (ctx.esc_revert_armed)
+        "esc again to edit a previous message"
     else if (question_hint != null)
         ""
     else if (danger_text.len > 0)
@@ -574,6 +576,11 @@ pub fn composeCompactCommandMenuHintRow(
     menu: render_input.CompactCommandMenuProjection,
 ) !std.ArrayList(u8) {
     const variants = switch (menu) {
+        .conversation_rewind => [_][]const u8{
+            "↑↓ Navigate     Enter Rewind     Esc Close",
+            "↑↓ Move  Enter Rewind  Esc",
+            "Enter Esc",
+        },
         .statusline => [_][]const u8{
             "↑↓ Navigate     ←→ Change     Esc Close",
             "↑↓ Move  ←→ Change  Esc",
