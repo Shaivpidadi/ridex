@@ -86,7 +86,7 @@ pub fn planCompaction(input: CompactionPlanInput) CompactionPlan {
     else
         source_target;
     if (input.protected_tokens >= total_target) return .{
-        .decision = .capacity_failure,
+        .decision = .no_op,
         .next_action = next_action,
         .usable_input_tokens = usable,
         .high_water_tokens = high_water,
@@ -409,6 +409,15 @@ test "compaction v2 triggers automatic work at eighty percent and targets ten pe
         .protected_tokens = 20,
     });
     try std.testing.expectEqual(@as(?usize, 60), protected_prompt.accepted_handoff_tokens);
+
+    const oversized_protected_prompt = planCompaction(.{
+        .trigger = .automatic,
+        .capabilities = capabilities,
+        .request_tokens = 640,
+        .source_tokens = 640,
+        .protected_tokens = 80,
+    });
+    try std.testing.expectEqual(CompactionDecision.no_op, oversized_protected_prompt.decision);
 }
 
 test "manual compaction shares the budget and stops after a smaller source" {
