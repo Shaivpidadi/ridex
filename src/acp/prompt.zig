@@ -2453,6 +2453,7 @@ pub fn mapToolKind(tool_name: []const u8) acp_types.ToolCallKind {
     if (std.mem.eql(u8, tool_name, "web_search")) return .search;
     if (std.mem.eql(u8, tool_name, "write_file")) return .edit;
     if (std.mem.eql(u8, tool_name, "edit_file")) return .edit;
+    if (std.mem.eql(u8, tool_name, "apply_patch")) return .edit;
     if (std.mem.eql(u8, tool_name, "delete_file")) return .delete;
     if (std.mem.eql(u8, tool_name, "rename_file")) return .move;
     if (std.mem.eql(u8, tool_name, "copy_file")) return .move;
@@ -2567,6 +2568,7 @@ test "mapToolKind maps common tools" {
     try std.testing.expectEqual(acp_types.ToolCallKind.read, mapToolKind("read_file"));
     try std.testing.expectEqual(acp_types.ToolCallKind.edit, mapToolKind("write_file"));
     try std.testing.expectEqual(acp_types.ToolCallKind.edit, mapToolKind("edit_file"));
+    try std.testing.expectEqual(acp_types.ToolCallKind.edit, mapToolKind("apply_patch"));
     try std.testing.expectEqual(acp_types.ToolCallKind.delete, mapToolKind("delete_file"));
     try std.testing.expectEqual(acp_types.ToolCallKind.move, mapToolKind("rename_file"));
     try std.testing.expectEqual(acp_types.ToolCallKind.search, mapToolKind("grep_files"));

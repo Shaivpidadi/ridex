@@ -21,6 +21,7 @@ const vision_impl = @import("../tools/agent/vision.zig");
 const create_folder_impl = @import("../tools/filesystem/create_folder.zig");
 const delete_file_impl = @import("../tools/filesystem/delete_file.zig");
 const edit_file_impl = @import("../tools/filesystem/edit_file.zig");
+const apply_patch_impl = @import("../tools/filesystem/apply_patch.zig");
 const file_info_impl = @import("../tools/filesystem/file_info.zig");
 const glob_files_impl = @import("../tools/filesystem/glob_files.zig");
 const grep_files_impl = @import("../tools/filesystem/grep_files.zig");
@@ -65,6 +66,8 @@ const write_file_description =
     "Create or overwrite a file using complete contents. Paths may be workspace-relative or external using an absolute path, ~/..., or a relative workspace escape such as ../...; external access is subject to permission policy. When to use: add a new file or intentionally replace an entire generated/small file. When NOT to use: targeted edits to existing files, partial replacements, deleting files, or unapproved external paths.";
 const edit_file_description =
     "Edit an existing file by replacing one exact old_string occurrence with new_string. Paths may be workspace-relative or external using an absolute path, ~/..., or a relative workspace escape such as ../...; external access is subject to permission policy. When to use: make a focused patch after reading the file. When NOT to use: broad rewrites, ambiguous repeated text, generated formatting, missing files, or cross-file refactors.";
+const apply_patch_description =
+    "Apply one transactional workspace patch across multiple files and multiple @@ hunks. Use the standard *** Begin Patch / *** Update File, *** Add File, *** Delete File / *** End Patch grammar. All paths and hunks are validated before any file is changed. When to use: make a coherent multi-file change or several exact edits in one file after reading the affected code. When NOT to use: external paths, binary files, generated rewrites, ambiguous context, or speculative edits.";
 const delete_file_description =
     "Delete a file or empty directory after the user request clearly requires removal. Paths may be workspace-relative or external using an absolute path, ~/..., or a relative workspace escape such as ../...; external access is subject to permission policy. When to use: remove obsolete files, generated artifacts, or empty folders. When NOT to use: clean up uncertain state, delete non-empty trees, or modify contents that should be edited instead.";
 const rename_file_description =
@@ -776,6 +779,35 @@ pub const edit_file = ToolSpec{
     .take_file_mutation_input_fn = edit_file_impl.takeFileMutationInput,
     .reads_only_fn = edit_file_impl.readsOnly,
     .irreversible_fn = edit_file_impl.isIrreversible,
+};
+
+pub const apply_patch = ToolSpec{
+    .name = "apply_patch",
+    .description = apply_patch_description,
+    .model_schema = .{
+        .name = "apply_patch",
+        .description = apply_patch_description,
+        .input_schema = .{
+            .properties = &.{
+                .{ .name = "patch", .json_type = .string, .description = "A complete standard patch enclosed by *** Begin Patch and *** End Patch. Update hunks use space, +, or - line prefixes and exact context." },
+            },
+            .required = &.{"patch"},
+        },
+    },
+    .model_visible = false,
+    .executor_kind = .apply_patch,
+    .activity_kind = .edit,
+    .requires_approval = true,
+    .action_label = "Applying patch",
+    .completed_action_label = "Applied patch",
+    .label_arg_kind = .none,
+    .label_arg_default = "files",
+    .permission_target_kind = .none,
+    .decode = apply_patch_impl.decode,
+    .validate = apply_patch_impl.validate,
+    .call = apply_patch_impl.call,
+    .reads_only_fn = apply_patch_impl.readsOnly,
+    .irreversible_fn = apply_patch_impl.isIrreversible,
 };
 
 pub const delete_file = ToolSpec{
@@ -1506,6 +1538,7 @@ pub const all = [_]tool_dispatch.Tool{
     read_file,
     write_file,
     edit_file,
+    apply_patch,
     delete_file,
     rename_file,
     copy_file,
@@ -1560,7 +1593,7 @@ test "built-in model-facing tool contract stays byte exact" {
 
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
-        "700ed0b345282b3fc25ac1ce0040acd13761f6efc76c9fb54c4552a26315e2f2",
+        "1a4ef1f665e775a78b18790b1430e8df7921bbcc534b5aad933d7ca0d45244b6",
         &actual_hex,
     );
 }
@@ -2190,6 +2223,7 @@ pub const advertisement_order = [_][]const u8{
     "file_info",
     "semantic_search",
     "edit_file",
+    "apply_patch",
     "write_file",
     "delete_file",
     "rename_file",
@@ -2258,6 +2292,7 @@ test "built-in tools register exact active local order" {
         "read_file",
         "write_file",
         "edit_file",
+        "apply_patch",
         "delete_file",
         "rename_file",
         "copy_file",
@@ -2491,6 +2526,26 @@ test "built-in edit_file owns product metadata schema and callbacks" {
     try std.testing.expect(edit_file.take_file_mutation_input_fn.? == edit_file_impl.takeFileMutationInput);
     try std.testing.expect(edit_file.reads_only_fn == edit_file_impl.readsOnly);
     try std.testing.expect(edit_file.irreversible_fn == edit_file_impl.isIrreversible);
+}
+
+test "built-in apply_patch is hidden and workspace scoped" {
+    const schema_json = try tool_specs.toolGatewaySchemaJson(std.testing.allocator, apply_patch);
+    defer std.testing.allocator.free(schema_json);
+
+    try std.testing.expectEqualStrings("apply_patch", apply_patch.name);
+    try std.testing.expect(!apply_patch.model_visible);
+    try std.testing.expect(std.mem.find(u8, schema_json, "\"required\":[\"patch\"]") != null);
+    try std.testing.expect(std.mem.find(u8, apply_patch.description, "transactional workspace patch") != null);
+    try std.testing.expectEqual(tool_dispatch.ExecutorKind.apply_patch, apply_patch.executor_kind);
+    try std.testing.expectEqual(types.ToolActivityKind.edit, apply_patch.activity_kind);
+    try std.testing.expect(apply_patch.requires_approval);
+    try std.testing.expectEqual(tool_dispatch.PermissionTargetKind.none, apply_patch.permission_target_kind);
+    try std.testing.expect(apply_patch.decode == apply_patch_impl.decode);
+    try std.testing.expect(apply_patch.validate.? == apply_patch_impl.validate);
+    try std.testing.expect(apply_patch.call == apply_patch_impl.call);
+    try std.testing.expect(apply_patch.take_file_mutation_input_fn == null);
+    try std.testing.expect(apply_patch.reads_only_fn == apply_patch_impl.readsOnly);
+    try std.testing.expect(apply_patch.irreversible_fn == apply_patch_impl.isIrreversible);
 }
 
 test "built-in delete_file owns product metadata schema and callbacks" {
