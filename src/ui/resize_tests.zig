@@ -3971,7 +3971,7 @@ test "approval banner keeps one blank row after bottom assistant line" {
     }
     try body.appendSlice(h.alloc, "final assistant tail");
     _ = try h.shell.streamAssistantChunk(h.alloc, &h.metrics, body.items);
-    _ = try approval.syncRequest(h.alloc, .{ .label = "open_file" });
+    _ = try approval.syncRequest(h.alloc, .{ .label = "read_file" });
     h.frame_redraw = true;
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
@@ -4002,7 +4002,7 @@ test "approval banner frames prompt after completed tool status" {
     }
     _ = try h.shell.appendRawTranscriptEntryClassified(h.alloc, body.items, .subagent_status);
     _ = try appendCompletedToolStatus(&h, "Listed project");
-    _ = try approval.syncRequest(h.alloc, .{ .label = "open_file" });
+    _ = try approval.syncRequest(h.alloc, .{ .label = "read_file" });
     h.frame_redraw = true;
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();

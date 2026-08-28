@@ -731,10 +731,10 @@ describe("gateway stream lifecycle", () => {
       expect(serializedToolNames(oracleRequest)).toEqual(
         AUTO_PERPLEXITY_WITHOUT_DURABLE_TOOLS_SERIALIZED_TOOL_NAMES,
       );
-      expect(request.tools).toHaveLength(25);
+      expect(request.tools).toHaveLength(17);
       expect(findUnavailableCapabilityReferences(oracleRequest)).toEqual([]);
       expect(customProviderGuidanceState(oracleRequest)).toEqual({
-          providerToolIndices: [22],
+        providerToolIndices: [14],
         guidanceMessageIndices: [1],
       });
       expect(request.prompt[0]?.role).toBe("system");
@@ -2158,7 +2158,7 @@ describe("gateway stream lifecycle", () => {
           'data: {"type":"tool-input-start","id":"call_1","toolName":"read_file"}\n\n' +
             'data: {"type":"tool-input-delta","id":"call_1","delta":"{\\"path\\":\\"victim.txt\\"}"}\n\n' +
             'data: {"type":"tool-input-end","id":"call_1"}\n\n' +
-            'data: {"type":"tool-call","toolCallId":"call_1","toolName":"delete_file"}\n\n' +
+            'data: {"type":"tool-call","toolCallId":"call_1","toolName":"edit_file"}\n\n' +
             'data: {"type":"finish","finishReason":{"unified":"tool-calls","raw":"tool-calls"}}\n\n' +
             "data: [DONE]\n\n",
         );
@@ -2182,7 +2182,7 @@ describe("gateway stream lifecycle", () => {
 
       expect(existsSync(victimPath)).toBe(true);
       expect(json.tool_calls).not.toContainEqual({
-        name: "delete_file",
+        name: "edit_file",
         status: "success",
       });
     } finally {
@@ -2607,8 +2607,8 @@ describe("gateway stream lifecycle", () => {
     mkdirSync(blockedPath);
     chmodSync(blockedPath, 0);
     const responses = [
-      fakeGatewayToolCall("os_access_denial_context", "list_files", { path: blockedPath }),
-      fakeGatewayToolCall(callId, "list_files", { path: blockedPath }),
+      fakeGatewayToolCall("os_access_denial_context", "glob_files", { pattern: "*", path: blockedPath }),
+      fakeGatewayToolCall(callId, "glob_files", { pattern: "*", path: blockedPath }),
       fakeGatewayFinalText("Reported the operating-system access denial."),
     ];
     const gateway = startGateway(() =>
@@ -2632,16 +2632,16 @@ describe("gateway stream lifecycle", () => {
       const resultPart = parts.find((part) =>
         part.type === "tool-result" &&
         part.toolCallId === callId &&
-        part.toolName === "list_files"
+        part.toolName === "glob_files"
       );
       const output = contentText(resultPart?.output);
 
       expect(result.code).toBe(0);
-      expect(result.stderr).toContain(`Listing ${blockedPath}`);
+      expect(result.stderr).toContain("Matching *");
       expect(json.error).toBeUndefined();
       expect(gateway.requestCount()).toBe(3);
       expect(output).toContain("tool_execution_failed");
-      expect(output).toContain("list_files");
+      expect(output).toContain("glob_files");
       expect(output).toContain(blockedPath);
       expect(output).toContain("AccessDenied");
       expect(output).toContain("Do not retry");

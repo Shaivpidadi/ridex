@@ -2588,7 +2588,7 @@ test "durable state repairs duplicate-key execution and interrupted tool argumen
             .user = .{ .text = @constCast("continue") },
             .tool_call = .{
                 .id = "call_interrupted",
-                .name = "list_files",
+                .name = "glob_files",
                 .arguments_json = duplicate_arguments,
             },
         } },
@@ -2656,7 +2656,7 @@ test "current history decode rejects ambiguous malformed tool result pairings" {
     var mismatched_call = [_]session.ToolCall{
         .{ .id = "call_bad", .name = "read_file", .arguments_json = "{]" },
     };
-    var mismatched_result = [_]session.PersistedToolResult{persistedResultForTest("call_bad", "list_files")};
+    var mismatched_result = [_]session.PersistedToolResult{persistedResultForTest("call_bad", "glob_files")};
     try expectMalformedPairRejected(mismatched_call[0..], mismatched_result[0..]);
 }
 

@@ -158,20 +158,12 @@ fn discardVisionToolOutput(
 fn discardVisionBackgroundUrl(_: *anyopaque, _: u64, _: []const u8) void {}
 
 const test_tools = [_]tool_dispatch.Tool{
-    builtin_tools.list_files,
     builtin_tools.glob_files,
     builtin_tools.grep_files,
     builtin_tools.read_file,
     builtin_tools.write_file,
     builtin_tools.edit_file,
-    builtin_tools.delete_file,
-    builtin_tools.rename_file,
-    builtin_tools.copy_file,
-    builtin_tools.create_folder,
-    builtin_tools.file_info,
     builtin_tools.memory,
-    builtin_tools.semantic_search,
-    builtin_tools.open_file,
     builtin_tools.web_fetch,
     builtin_tools.web_search,
     builtin_tools.terminal,

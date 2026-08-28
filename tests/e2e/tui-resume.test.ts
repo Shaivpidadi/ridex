@@ -2562,6 +2562,8 @@ test.skipIf(!tmuxAvailable())(
         if (/^└ (?:Running|Ran) /.test(row)) return "<command status>";
         if (/^│  \d+ output lines$/.test(row)) return "<output count>";
         if (/^│  \d+ more lines · → to expand$/.test(row)) return "<fold count>";
+        if (row.includes("enter queue · ctrl+enter steer")) return "<status line>";
+        if (/^(?:auto · )?gpt-5$/.test(row)) return "<status line>";
         return row;
       });
       const normalizedBefore = normalizeLiveMetadata(readingBefore);
@@ -3035,7 +3037,7 @@ test.skipIf(!tmuxAvailable())(
 
     const gateway = startFakeGateway([
       fakeGatewaySse([
-        { type: "tool-call", toolCallId: "parallel-list", toolName: "list_files", input: { path: "." } },
+        { type: "tool-call", toolCallId: "parallel-glob", toolName: "glob_files", input: { pattern: "*" } },
         { type: "tool-call", toolCallId: "parallel-read", toolName: "read_file", input: { path: "README.md" } },
         { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
       ]),

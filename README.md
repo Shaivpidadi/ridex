@@ -66,7 +66,7 @@ cd your_project
 fx
 ```
 
-The current directory becomes the primary workspace. Enter a prompt, or run `/help` to browse interactive commands.
+The current directory becomes the primary workspace. Enter a prompt, or run `/help` to browse interactive commands. While fx is working, press Enter to queue a follow-up or Ctrl+Enter to steer the active turn at its next model boundary. If the turn has already closed, fx safely queues the steering prompt as the next turn.
 
 The status line hides the workspace path and Git branch by default. Enable the `Status line workspace` option in `/settings`, run `/statusline workspace`, or set it in `~/.fx/settings.json`:
 

@@ -2924,7 +2924,7 @@ fn appendFocusedVerificationContext(tracker: ?*change_tracker.ChangeTracker, are
     var wrote_evals = false;
     var wrote_test_paths: usize = 0;
     for (current_tracker.stack.items) |op| {
-        const path = op.new_path orelse op.path;
+        const path = op.path;
         if (!wrote_zig and std.mem.endsWith(u8, path, ".zig")) {
             try note.writer.writeAll("- touched_area=zig: run focused Zig tests/build checks for the changed module before broader verification.\n");
             wrote_zig = true;

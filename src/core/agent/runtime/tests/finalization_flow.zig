@@ -1345,7 +1345,7 @@ test "common Stop parallel cancellation preserves ordinary cancelled peer as com
     const calls = [_]ToolCall{
         toolCall("call_ordinary_cancel", "read_file", "{\"path\":\"README.md\"}"),
         toolCall("call_owner_signal", "grep_files", "{\"pattern\":\"Hooks\"}"),
-        toolCall("call_completed_peer", "file_info", "{\"path\":\"src/main.zig\"}"),
+        toolCall("call_completed_peer", "glob_files", "{\"pattern\":\"src/main.zig\"}"),
     };
     var gateway = FakeGateway.init(alloc, &.{
         .{ .content = "candidate" },

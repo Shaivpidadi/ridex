@@ -8776,12 +8776,12 @@ test "schema v3 load repairs duplicate-key tool arguments before gateway project
 
     var calls = [_]session.ToolCall{.{
         .id = @constCast("persisted_duplicate_call"),
-        .name = @constCast("list_files"),
+        .name = @constCast("glob_files"),
         .arguments_json = @constCast(duplicate_arguments),
     }};
     var results = [_]session.PersistedToolResult{.{
         .tool_call_id = @constCast("persisted_duplicate_call"),
-        .tool_name = @constCast("list_files"),
+        .tool_name = @constCast("glob_files"),
         .status = .success,
         .output = @constCast("stale success"),
         .output_bytes = 13,

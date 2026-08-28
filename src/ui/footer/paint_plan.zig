@@ -582,6 +582,7 @@ fn pushQueuedPromptBannerRows(
         var summary = try input_presentation.composeQueuedSummaryRow(
             alloc,
             ctx.queued_count,
+            ctx.steering_count,
             ctx.queued_paused,
             width,
         );
@@ -593,6 +594,7 @@ fn pushQueuedPromptBannerRows(
                 width,
                 false,
                 ctx.queued_cancel_all_available,
+                ctx.steering_count > 0,
             );
             try pushFooterBandRow(alloc, frame, plan, plan.footer.banner +| painted, &hint);
             painted +|= 1;
@@ -716,6 +718,7 @@ fn pushQueuedPromptBannerRows(
             width,
             empty_draft,
             ctx.queued_cancel_all_available,
+            ctx.steering_count > 0,
         );
         try pushFooterBandRow(alloc, frame, plan, hint_row, &hint);
     }

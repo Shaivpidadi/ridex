@@ -1441,7 +1441,7 @@ describe("acp: model-independent", () => {
           .map((message) => acpContentText(message.content))
           .join("\n");
         expect(prompt).toContain(submitted);
-        expect(request.tools).toHaveLength(26);
+        expect(request.tools).toHaveLength(18);
         const toolNames = serializedToolNames(oracleRequest);
         expect(toolNames).toEqual(
           AUTO_PERPLEXITY_SERIALIZED_TOOL_NAMES,
@@ -1451,7 +1451,7 @@ describe("acp: model-independent", () => {
           .toHaveLength(1);
         expect(findUnavailableCapabilityReferences(oracleRequest)).toEqual([]);
         expect(customProviderGuidanceState(oracleRequest)).toEqual({
-          providerToolIndices: [23],
+          providerToolIndices: [15],
           guidanceMessageIndices: [1],
         });
         expect(gateway.requests[0]!.body).not.toContain(
