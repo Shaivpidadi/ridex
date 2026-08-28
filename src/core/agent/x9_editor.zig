@@ -11,14 +11,9 @@ pub const Arms = struct {
     pub fn additionalVisibleToolNames(self: Arms) ?[]const []const u8 {
         return if (self.editor == .patch_v3) patch_tool_names[0..] else null;
     }
-
-    pub fn blockedToolNames(self: Arms) ?[]const []const u8 {
-        return if (self.editor == .patch_v3) exact_edit_tool_names[0..] else null;
-    }
 };
 
 const patch_tool_names = [_][]const u8{"apply_patch"};
-const exact_edit_tool_names = [_][]const u8{"edit_file"};
 
 pub const ParseError = error{
     InvalidX9EditorArm,
@@ -42,13 +37,11 @@ test "X9 editor defaults to behavior-neutral control" {
     const arms = try parse(null);
     try std.testing.expectEqual(EditorArm.control, arms.editor);
     try std.testing.expect(arms.additionalVisibleToolNames() == null);
-    try std.testing.expect(arms.blockedToolNames() == null);
 }
 
-test "X9 patch arm replaces exact edit" {
+test "X9 patch arm adds the transactional editor" {
     const arms = try parse("patch_v3");
     try std.testing.expectEqualStrings("apply_patch", arms.additionalVisibleToolNames().?[0]);
-    try std.testing.expectEqualStrings("edit_file", arms.blockedToolNames().?[0]);
 }
 
 test "X9 editor rejects unknown arms" {

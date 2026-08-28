@@ -14,7 +14,6 @@ pub const Options = struct {
     mcp_runtime: ?*mcp_runtime.McpRuntime = null,
     subagent_available: bool = false,
     additional_visible_tool_names: ?[]const []const u8 = null,
-    blocked_tool_names: ?[]const []const u8 = null,
 };
 
 const BuildKind = enum { full, read_only };
@@ -877,9 +876,6 @@ fn appendBuiltinTool(
     tool_set: tool_set_contract.ToolSet,
     options: Options,
 ) !void {
-    if (options.blocked_tool_names) |blocked_names| {
-        if (toolNameInSet(blocked_names, tool.name)) return;
-    }
     if (!tool.model_visible) {
         const promoted = if (options.additional_visible_tool_names) |names|
             toolNameInSet(names, tool.name)
@@ -1084,21 +1080,19 @@ test "yolo advertisement ignores permission filtering" {
     try expectContainsName(projection.advertised_names, "web_search");
 }
 
-test "experiment options promote apply_patch and block edit_file" {
+test "experiment options promote apply_patch alongside edit_file" {
     var control = try buildTestModelToolProjection(std.testing.allocator, .{});
     defer control.deinit(std.testing.allocator);
     try expectNotContainsName(control.advertised_names, "apply_patch");
     try expectContainsName(control.advertised_names, "edit_file");
 
     const promoted = [_][]const u8{"apply_patch"};
-    const blocked = [_][]const u8{"edit_file"};
     var patch_v3 = try buildTestModelToolProjection(std.testing.allocator, .{
         .additional_visible_tool_names = &promoted,
-        .blocked_tool_names = &blocked,
     });
     defer patch_v3.deinit(std.testing.allocator);
     try expectContainsName(patch_v3.advertised_names, "apply_patch");
-    try expectNotContainsName(patch_v3.advertised_names, "edit_file");
+    try expectContainsName(patch_v3.advertised_names, "edit_file");
 }
 
 test "category-wide denies and later overrides select the expected tools" {

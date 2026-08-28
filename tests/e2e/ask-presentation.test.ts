@@ -221,7 +221,7 @@ describe("fx ask presentation", () => {
     ]);
     expect(gateway.requests).toHaveLength(2);
     expect(gateway.requests[0].body).toContain('"name":"apply_patch"');
-    expect(gateway.requests[0].body).not.toContain('"name":"edit_file"');
+    expect(gateway.requests[0].body).toContain('"name":"edit_file"');
     expect(result.stderr).toContain("Applying patch");
   }, TIMEOUT);
 

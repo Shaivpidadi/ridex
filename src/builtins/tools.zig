@@ -67,7 +67,7 @@ const write_file_description =
 const edit_file_description =
     "Edit an existing file by replacing one exact old_string occurrence with new_string. Paths may be workspace-relative or external using an absolute path, ~/..., or a relative workspace escape such as ../...; external access is subject to permission policy. When to use: make a focused patch after reading the file. When NOT to use: broad rewrites, ambiguous repeated text, generated formatting, missing files, or cross-file refactors.";
 const apply_patch_description =
-    "Apply one transactional workspace patch across multiple files and multiple @@ hunks. Use the standard *** Begin Patch / *** Update File, *** Add File, *** Delete File / *** End Patch grammar. All paths and hunks are validated before any file is changed. When to use: make a coherent multi-file change or several exact edits in one file after reading the affected code. When NOT to use: external paths, binary files, generated rewrites, ambiguous context, or speculative edits.";
+    "Apply one transactional workspace patch across files or @@ hunks after reading them. Use *** Begin Patch with Update, Add, or Delete File operations. Prefer this for coherent multi-file or multi-hunk changes; use edit_file for one exact replacement. If context fails, re-read the file before retrying. Do not use for external paths, binary files, generated rewrites, or speculative edits.";
 const delete_file_description =
     "Delete a file or empty directory after the user request clearly requires removal. Paths may be workspace-relative or external using an absolute path, ~/..., or a relative workspace escape such as ../...; external access is subject to permission policy. When to use: remove obsolete files, generated artifacts, or empty folders. When NOT to use: clean up uncertain state, delete non-empty trees, or modify contents that should be edited instead.";
 const rename_file_description =
@@ -789,7 +789,7 @@ pub const apply_patch = ToolSpec{
         .description = apply_patch_description,
         .input_schema = .{
             .properties = &.{
-                .{ .name = "patch", .json_type = .string, .description = "A complete standard patch enclosed by *** Begin Patch and *** End Patch. Update hunks use space, +, or - line prefixes and exact context." },
+                .{ .name = "patch", .json_type = .string, .description = "Complete *** Begin Patch / *** End Patch text. Update hunks use space, +, or - line prefixes and current file context." },
             },
             .required = &.{"patch"},
         },
@@ -1593,7 +1593,7 @@ test "built-in model-facing tool contract stays byte exact" {
 
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
-        "1a4ef1f665e775a78b18790b1430e8df7921bbcc534b5aad933d7ca0d45244b6",
+        "4299aadc343b552218f1fa2886c219fbb3470a1d786be56afac4812acaf98764",
         &actual_hex,
     );
 }

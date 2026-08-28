@@ -225,7 +225,7 @@ const Parser = struct {
             if (line.len == 0 or line[0] != '+') {
                 return self.invalid("apply_patch Add File lines require a + prefix");
             }
-            try content.writer.writeAll(raw[1..]);
+            try content.writer.writeAll(line[1..]);
             try content.writer.writeByte('\n');
             previous_added = true;
             self.index += 1;
@@ -295,7 +295,7 @@ const Parser = struct {
                 return self.invalid("apply_patch hunk lines require a space, +, or - prefix");
             }
 
-            const body = raw[1..];
+            const body = line[1..];
             switch (line[0]) {
                 ' ' => {
                     try appendPatchLine(&old_out, body);
@@ -456,7 +456,11 @@ pub fn call(
                     update.anchor_eof,
                 )) {
                     .content => |content| content,
-                    .failure => |reason| return .{ .failure = try ctx.allocator.dupe(u8, reason) },
+                    .failure => |reason| return .{ .failure = try std.fmt.allocPrint(
+                        ctx.allocator,
+                        "{s} in {s}; re-read it, or use edit_file for one exact replacement",
+                        .{ reason, update.path },
+                    ) },
                 };
                 if (std.mem.eql(u8, before, patched)) {
                     return .{ .failure = try std.fmt.allocPrint(
@@ -628,18 +632,28 @@ fn applyHunks(
 ) Allocator.Error!ContentResult {
     var current = try alloc.dupe(u8, original);
     var search_start: usize = 0;
+    const use_crlf = prefersCrLf(original);
 
     for (hunks, 0..) |hunk, hunk_index| {
-        const relative = std.mem.find(u8, current[search_start..], hunk.old_text) orelse {
+        const old_text = try patchTextForLineEndings(alloc, hunk.old_text, use_crlf);
+        const new_text = try patchTextForLineEndings(alloc, hunk.new_text, use_crlf);
+        var matched_old_len = old_text.len;
+        var replacement_text = new_text;
+        const match_start = if (std.mem.find(u8, current[search_start..], old_text)) |relative|
+            search_start + relative
+        else if (eofMatchWithoutTrailingNewline(current, search_start, old_text)) |start| blk: {
+            matched_old_len = current.len - start;
+            replacement_text = withoutTrailingLineEnding(new_text) orelse new_text;
+            break :blk start;
+        } else {
             return .{ .failure = try std.fmt.allocPrint(
                 alloc,
                 "apply_patch failed: hunk {d} context not found",
                 .{hunk_index + 1},
             ) };
         };
-        const match_start = search_start + relative;
         if (anchor_eof and hunk_index + 1 == hunks.len and
-            match_start + hunk.old_text.len != current.len)
+            match_start + matched_old_len != current.len)
         {
             return .{ .failure = try std.fmt.allocPrint(
                 alloc,
@@ -649,7 +663,7 @@ fn applyHunks(
         }
         const second_search_start = match_start + 1;
         if (second_search_start <= current.len and
-            std.mem.find(u8, current[second_search_start..], hunk.old_text) != null)
+            std.mem.find(u8, current[second_search_start..], old_text) != null)
         {
             return .{ .failure = try std.fmt.allocPrint(
                 alloc,
@@ -659,8 +673,8 @@ fn applyHunks(
         }
         const new_len = std.math.add(
             usize,
-            current.len - hunk.old_text.len,
-            hunk.new_text.len,
+            current.len - matched_old_len,
+            replacement_text.len,
         ) catch {
             return .{ .failure = try alloc.dupe(u8, "apply_patch result is too large") };
         };
@@ -670,19 +684,72 @@ fn applyHunks(
         const next = try alloc.alloc(u8, new_len);
         @memcpy(next[0..match_start], current[0..match_start]);
         @memcpy(
-            next[match_start .. match_start + hunk.new_text.len],
-            hunk.new_text,
+            next[match_start .. match_start + replacement_text.len],
+            replacement_text,
         );
-        const suffix_start = match_start + hunk.old_text.len;
+        const suffix_start = match_start + matched_old_len;
         @memcpy(
-            next[match_start + hunk.new_text.len ..],
+            next[match_start + replacement_text.len ..],
             current[suffix_start..],
         );
         alloc.free(current);
         current = next;
-        search_start = match_start + hunk.new_text.len;
+        search_start = match_start + replacement_text.len;
     }
     return .{ .content = current };
+}
+
+fn prefersCrLf(content: []const u8) bool {
+    var newlines: usize = 0;
+    var crlf_newlines: usize = 0;
+    for (content, 0..) |byte, index| {
+        if (byte != '\n') continue;
+        newlines += 1;
+        if (index > 0 and content[index - 1] == '\r') crlf_newlines += 1;
+    }
+    return newlines > 0 and newlines == crlf_newlines;
+}
+
+fn patchTextForLineEndings(
+    alloc: Allocator,
+    text: []const u8,
+    use_crlf: bool,
+) Allocator.Error![]const u8 {
+    if (!use_crlf or std.mem.findScalar(u8, text, '\n') == null) return text;
+    var extra: usize = 0;
+    for (text, 0..) |byte, index| {
+        if (byte == '\n' and (index == 0 or text[index - 1] != '\r')) extra += 1;
+    }
+    if (extra == 0) return text;
+    const converted = try alloc.alloc(u8, text.len + extra);
+    var output_index: usize = 0;
+    for (text, 0..) |byte, index| {
+        if (byte == '\n' and (index == 0 or text[index - 1] != '\r')) {
+            converted[output_index] = '\r';
+            output_index += 1;
+        }
+        converted[output_index] = byte;
+        output_index += 1;
+    }
+    return converted;
+}
+
+fn eofMatchWithoutTrailingNewline(
+    content: []const u8,
+    search_start: usize,
+    old_text: []const u8,
+) ?usize {
+    const without_newline = withoutTrailingLineEnding(old_text) orelse return null;
+    if (without_newline.len == 0 or without_newline.len > content.len) return null;
+    const start = content.len - without_newline.len;
+    if (start < search_start or !std.mem.eql(u8, content[start..], without_newline)) return null;
+    return start;
+}
+
+fn withoutTrailingLineEnding(text: []const u8) ?[]const u8 {
+    if (std.mem.endsWith(u8, text, "\r\n")) return text[0 .. text.len - 2];
+    if (std.mem.endsWith(u8, text, "\n")) return text[0 .. text.len - 1];
+    return null;
 }
 
 fn applyChange(alloc: Allocator, change: PreparedChange) !void {
@@ -932,6 +999,11 @@ test "apply_patch v3 validates every hunk before writing any file" {
     }, input);
     defer result.deinit(std.testing.allocator);
     try std.testing.expect(std.meta.activeTag(result) == .failure);
+    try std.testing.expect(std.mem.find(
+        u8,
+        result.failure,
+        "hunk 1 context not found in b.txt; re-read it, or use edit_file",
+    ) != null);
     const a = try readTestFile(std.testing.allocator, tmp.dir, "a.txt");
     defer std.testing.allocator.free(a);
     try std.testing.expectEqualStrings("one\n", a);
@@ -956,6 +1028,69 @@ test "apply_patch v3 supports the standard end-of-file anchor" {
     const actual = try readTestFile(std.testing.allocator, tmp.dir, "a.txt");
     defer std.testing.allocator.free(actual);
     try std.testing.expectEqualStrings("one\nTWO\n", actual);
+}
+
+test "apply_patch v3 accepts CRLF patch input" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestFile(tmp.dir, "a.txt", "one\ntwo\n");
+    const root = try workspaceRoot(std.testing.allocator, tmp);
+    defer std.testing.allocator.free(root);
+    const input = try decodeInput(
+        \\{"patch":"*** Begin Patch\r\n*** Update File: a.txt\r\n@@\r\n-two\r\n+TWO\r\n*** End Patch"}
+    );
+    defer input.deinit(std.testing.allocator);
+    const result = try call(.{
+        .allocator = std.testing.allocator,
+        .workspace_root = root,
+    }, input);
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(std.meta.activeTag(result) == .success);
+    const actual = try readTestFile(std.testing.allocator, tmp.dir, "a.txt");
+    defer std.testing.allocator.free(actual);
+    try std.testing.expectEqualStrings("one\nTWO\n", actual);
+}
+
+test "apply_patch v3 preserves a CRLF file" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestFile(tmp.dir, "a.txt", "one\r\ntwo\r\n");
+    const root = try workspaceRoot(std.testing.allocator, tmp);
+    defer std.testing.allocator.free(root);
+    const input = try decodeInput(
+        \\{"patch":"*** Begin Patch\n*** Update File: a.txt\n@@\n-two\n+TWO\n*** End Patch"}
+    );
+    defer input.deinit(std.testing.allocator);
+    const result = try call(.{
+        .allocator = std.testing.allocator,
+        .workspace_root = root,
+    }, input);
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(std.meta.activeTag(result) == .success);
+    const actual = try readTestFile(std.testing.allocator, tmp.dir, "a.txt");
+    defer std.testing.allocator.free(actual);
+    try std.testing.expectEqualStrings("one\r\nTWO\r\n", actual);
+}
+
+test "apply_patch v3 safely matches an unterminated final line" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestFile(tmp.dir, "a.txt", "one\ntwo");
+    const root = try workspaceRoot(std.testing.allocator, tmp);
+    defer std.testing.allocator.free(root);
+    const input = try decodeInput(
+        \\{"patch":"*** Begin Patch\n*** Update File: a.txt\n@@\n-two\n+TWO\n*** End Patch"}
+    );
+    defer input.deinit(std.testing.allocator);
+    const result = try call(.{
+        .allocator = std.testing.allocator,
+        .workspace_root = root,
+    }, input);
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(std.meta.activeTag(result) == .success);
+    const actual = try readTestFile(std.testing.allocator, tmp.dir, "a.txt");
+    defer std.testing.allocator.free(actual);
+    try std.testing.expectEqualStrings("one\nTWO", actual);
 }
 
 test "apply_patch v3 refuses workspace escapes" {

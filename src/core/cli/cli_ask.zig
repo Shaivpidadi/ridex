@@ -266,7 +266,6 @@ fn runAskChild(
             .mcp_runtime = ctx.mcp,
             .subagent_available = true,
             .additional_visible_tool_names = ctx.x9_editor_arms.additionalVisibleToolNames(),
-            .blocked_tool_names = ctx.x9_editor_arms.blockedToolNames(),
         },
         true,
     ) catch return error.OutOfMemory;
@@ -1667,7 +1666,6 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         .mcp_runtime = ctx.mcp,
         .subagent_available = ctx.subagent_host != null,
         .additional_visible_tool_names = ctx.x9_editor_arms.additionalVisibleToolNames(),
-        .blocked_tool_names = ctx.x9_editor_arms.blockedToolNames(),
     }, session_child_capability != null);
     defer tool_projection.deinit(alloc);
 
