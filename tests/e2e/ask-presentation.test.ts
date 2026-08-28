@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -483,6 +484,79 @@ describe("fx ask presentation", () => {
     expect(gateway.requests).toHaveLength(2);
     expect(result.stderr).toContain("Reading fixture.txt");
   }, TIMEOUT);
+
+  test.skipIf(!tmuxAvailable())(
+    "collapsed TTY tool groups show the latest five calls while active",
+    async () => {
+      const root = createRoot();
+      const fxDir = join(root.home, ".fx");
+      const settingsPath = join(fxDir, "settings.json");
+      mkdirSync(fxDir, { mode: 0o700 });
+      chmodSync(fxDir, 0o700);
+      writeFileSync(
+        settingsPath,
+        JSON.stringify({ collapse_tool_calls: true }),
+        { mode: 0o600 },
+      );
+      chmodSync(settingsPath, 0o600);
+      for (let index = 1; index <= 6; index += 1) {
+        writeFileSync(join(root.workspace, `fixture-${index}.txt`), `${index}\n`);
+      }
+      let releaseFinal: (() => void) | undefined;
+      const finalReady = new Promise<void>((resolve) => {
+        releaseFinal = resolve;
+      });
+      const gateway = startFakeGateway([
+        fakeGatewaySse([
+          ...Array.from({ length: 6 }, (_, index) => ({
+            type: "tool-call",
+            toolCallId: `read_fixture_${index + 1}`,
+            toolName: "read_file",
+            input: { path: `fixture-${index + 1}.txt` },
+          })),
+          {
+            type: "finish",
+            finishReason: { unified: "tool-calls", raw: "tool-calls" },
+          },
+        ]),
+        async () => {
+          await finalReady;
+          return fakeGatewayFinalText("All fixtures inspected.\n");
+        },
+      ]);
+      gateways.push(gateway);
+
+      const session = await TmuxSession.create({
+        isolated: true,
+        cmd: terminalCommand([]),
+        cwd: root.workspace,
+        env: { ...gatewayEnv(root.home, gateway), NO_COLOR: undefined },
+        width: 120,
+        height: 40,
+        remainOnExit: true,
+      });
+      sessions.push(session);
+      await session.waitForText("Run /help for commands", TIMEOUT);
+      await session.sendText("Inspect all fixture files.");
+
+      await session.waitForText("6 tool calls · 6 read", TIMEOUT);
+      const activePane = await session.capturePane();
+      expect(activePane).not.toContain("Reading fixture-1.txt");
+      for (let index = 2; index <= 6; index += 1) {
+        expect(activePane).toContain(`Read fixture-${index}.txt`);
+      }
+
+      releaseFinal!();
+      await session.waitForText("All fixtures inspected.", TIMEOUT);
+      const finalPane = await session.capturePane();
+      expect(finalPane).toContain("6 tool calls · 6 read");
+      for (let index = 1; index <= 6; index += 1) {
+        expect(finalPane).not.toContain(`Read fixture-${index}.txt`);
+      }
+      expect(finalPane).toContain("All fixtures inspected.");
+    },
+    TIMEOUT,
+  );
 
   test.skipIf(!tmuxAvailable())(
     "TTY stdout uses the Minimal transcript and compact tool group",
