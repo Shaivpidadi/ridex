@@ -624,7 +624,7 @@ function splitHeldTextResponse(
 
 function duplicateKeyToolResponse(): Response {
   return fakeGatewaySse([
-    { type: "tool-input-start", id: "queued_duplicate_list", toolName: "list_files" },
+    { type: "tool-input-start", id: "queued_duplicate_list", toolName: "glob_files" },
     { type: "tool-input-delta", id: "queued_duplicate_list", delta: '{"' },
     { type: "tool-input-delta", id: "queued_duplicate_list", delta: "dept" },
     { type: "tool-input-delta", id: "queued_duplicate_list", delta: 'h"' },
@@ -638,7 +638,7 @@ function duplicateKeyToolResponse(): Response {
     {
       type: "tool-call",
       toolCallId: "queued_duplicate_list",
-      toolName: "list_files",
+      toolName: "glob_files",
       input: '{"depth":1, "depth":2}',
     },
     {
@@ -1888,7 +1888,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       queuedGateway = startDynamicFakeGateway(() => {
         responseIndex += 1;
         if (responseIndex === 1) {
-          return fakeGatewayToolCall("list_1", "list_files", { path: "." });
+          return fakeGatewayToolCall("list_1", "glob_files", { pattern: "*", path: "." });
         }
         if (responseIndex >= 2 && responseIndex <= 11) {
           return new Response(
@@ -3043,12 +3043,12 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const repairedCalls = parts.filter((part) =>
         part.type === "tool-call" &&
         part.toolCallId === "queued_duplicate_list" &&
-        part.toolName === "list_files"
+        part.toolName === "glob_files"
       );
       const repairedResults = parts.filter((part) =>
         part.type === "tool-result" &&
         part.toolCallId === "queued_duplicate_list" &&
-        part.toolName === "list_files"
+        part.toolName === "glob_files"
       );
       const trace = readFileSync(tracePath, "utf8");
       const stderr = readFileSync(stderrPath, "utf8");
@@ -5359,8 +5359,8 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const tableGateway = startFakeGateway([
         fakeGatewaySerializedToolCall(
           "launch-history-list",
-          "list_files",
-          JSON.stringify({ path: "." }),
+          "glob_files",
+          JSON.stringify({ pattern: "*", path: "." }),
           "I'll inspect the docs and determine their authorship.",
         ),
         fakeGatewaySerializedToolCall(
@@ -6211,16 +6211,17 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
   );
 
   test(
-    "current compact view groups tool rows while Ctrl-O keeps full details",
+    "collapse tool calls hides compact child rows while Ctrl-O keeps full details",
     async () => {
       root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-minimal-tool-groups-")));
       const home = join(root, "home");
       const workspace = join(root, "workspace");
+      const settingsPath = join(home, ".fx", "settings.json");
       const stderrPath = join(root, "stderr.log");
       const tapePath = join(root, "session.fxtape");
       mkdirSync(join(home, ".fx"), { recursive: true });
       mkdirSync(workspace, { recursive: true });
-      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+      writeFileSync(settingsPath, "{}");
       const wrappedToolDetail = Array.from(
         { length: 16 },
         (_, index) => `WRAPPED_TOOL_DETAIL_${String(index + 1).padStart(2, "0")}`,
@@ -6265,14 +6266,14 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           {
             type: "tool-call",
             toolCallId: "minimal_list_workspace",
-            toolName: "list_files",
-            input: { path: "." },
+            toolName: "glob_files",
+            input: { pattern: "*", path: "." },
           },
           {
             type: "tool-call",
             toolCallId: "minimal_list_nested",
-            toolName: "list_files",
-            input: { path: "nested" },
+            toolName: "glob_files",
+            input: { pattern: "*", path: "nested" },
           },
           {
             type: "tool-call",
@@ -6389,6 +6390,38 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(compact).not.toContain("\n● Ran printf FIRST_GROUP_COMMAND");
       expect(compact).not.toContain("\n● Ran printf SECOND_GROUP_COMMAND");
 
+      await session.sendText("/settings");
+      await session.waitForText("←→ Change", TIMEOUT);
+      await session.sendLiteral("collapse tool calls");
+      await session.waitForPane(
+        (pane) =>
+          pane.includes("Collapse tool calls") &&
+          !pane.includes("Slash menu categories"),
+        TIMEOUT,
+      );
+      await session.sendKeys("Right");
+      await session.waitForPane(
+        (pane) =>
+          pane.includes("● 10 tool calls · 6 read · 2 list · 2 commands") &&
+          !pane.includes("Read one.txt"),
+        TIMEOUT,
+      );
+      expect(
+        JSON.parse(readFileSync(settingsPath, "utf8")).collapse_tool_calls,
+      ).toBe(true);
+      await session.sendKeys("Escape");
+      await session.waitForPane(
+        (pane) => pane.includes(finalText) && !pane.includes("←→ Change"),
+        TIMEOUT,
+      );
+      const collapsed = await session.capturePane();
+      expect(collapsed).toContain("● 10 tool calls · 6 read · 2 list · 2 commands");
+      expect(collapsed).toContain("● 2 tool calls · 1 read · 1 command");
+      expect(collapsed).not.toContain("Read one.txt");
+      expect(collapsed).not.toContain("Read seven.txt");
+      expect(collapsed).not.toContain("Ran printf SECOND_GROUP_COMMAND");
+      expect(collapsed).not.toContain("Ran sleep 1; printf SECOND_GROUP_LIVE_COMMAND");
+
       await session.sendKeys("C-o");
       await session.waitForText("MINIMAL_GROUP_DETAIL_SIX", TIMEOUT);
       await session.sendKeys("Right");
@@ -6423,8 +6456,8 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       await session.waitForText(finalText, TIMEOUT);
       const restored = await session.capturePane();
       expect(restored).toContain("● 10 tool calls");
-      expect(restored).toContain("├ Read one.txt");
-      expect(restored).toContain("├ Read seven.txt");
+      expect(restored).not.toContain("├ Read one.txt");
+      expect(restored).not.toContain("├ Read seven.txt");
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     },
     TIMEOUT,
@@ -7019,7 +7052,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           .toHaveLength(1);
         expect(findUnavailableCapabilityReferences(request)).toEqual([]);
         expect(customProviderGuidanceState(request)).toEqual({
-          providerToolIndices: [23],
+          providerToolIndices: [15],
           guidanceMessageIndices: [1],
         });
         expect(
@@ -8085,8 +8118,8 @@ describe.skipIf(!tmuxAvailable())("transcript scrollback release", () => {
       gateway = startFakeGateway([
         fakeGatewaySerializedToolCall(
           "sb-list",
-          "list_files",
-          JSON.stringify({ path: "docs" }),
+          "glob_files",
+          JSON.stringify({ pattern: "*", path: "docs" }),
           "I'll inspect the SWR wiring end to end.",
         ),
         ...Array.from({ length: 17 }, (_, index) => readResponse(index + 1)),

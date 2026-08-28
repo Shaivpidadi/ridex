@@ -178,13 +178,21 @@ pub fn parseProfileJson(alloc: Allocator, json_text: []const u8) !std.ArrayList(
     return configs;
 }
 
+inline fn failProfileParse(err: anytype) @TypeOf(err)!ProfileParseResult {
+    return @errorCast(failProfileParseDynamic(err));
+}
+
+noinline fn failProfileParseDynamic(err: anyerror) anyerror!ProfileParseResult {
+    return err;
+}
+
 pub fn parseProfileDocument(alloc: Allocator, json_text: []const u8) !ProfileParseResult {
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, json_text, .{}) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return error.McpConfigInvalidJson,
+        error.OutOfMemory => return failProfileParse(error.OutOfMemory),
+        else => return failProfileParse(error.McpConfigInvalidJson),
     };
     defer parsed.deinit();
-    if (parsed.value != .object) return error.McpConfigRootMustBeObject;
+    if (parsed.value != .object) return failProfileParse(error.McpConfigRootMustBeObject);
 
     const object = parsed.value.object;
     const canonical = object.get("mcp");
@@ -855,21 +863,48 @@ pub fn configRetainsWorkspaceAuthority(
     return false;
 }
 
+inline fn failServerConfig(err: anytype) @TypeOf(err)!McpServerConfig {
+    return @errorCast(failServerConfigDynamic(err));
+}
+
+noinline fn failServerConfigDynamic(err: anyerror) anyerror!McpServerConfig {
+    return err;
+}
+
+test "project config failures preserve exact error types and identities" {
+    const invalid = failServerConfig(error.McpConfigInvalidType);
+    try std.testing.expect(
+        @TypeOf(invalid) == error{McpConfigInvalidType}!McpServerConfig,
+    );
+    try std.testing.expectError(error.McpConfigInvalidType, invalid);
+    try std.testing.expectError(
+        error.McpConfigServerMustBeObject,
+        failServerConfig(error.McpConfigServerMustBeObject),
+    );
+    try std.testing.expectError(error.OutOfMemory, failServerConfig(error.OutOfMemory));
+
+    const invalid_profile = failProfileParse(error.McpConfigInvalidJson);
+    try std.testing.expect(
+        @TypeOf(invalid_profile) == error{McpConfigInvalidJson}!ProfileParseResult,
+    );
+    try std.testing.expectError(error.McpConfigInvalidJson, invalid_profile);
+}
+
 fn parseServerEntry(
     alloc: Allocator,
     name: []const u8,
     value: std.json.Value,
     policy: ParsePolicy,
 ) !McpServerConfig {
-    if (value != .object) return error.McpConfigServerMustBeObject;
+    if (value != .object) return failServerConfig(error.McpConfigServerMustBeObject);
     if (!mcp_contract.sourceAllowsScope(policy.source, policy.scope) or
         !mcp_contract.sourceAllowsWorkspaceAdmission(policy.source, policy.workspace_admission))
     {
-        return error.McpConfigPolicyInvalid;
+        return failServerConfig(error.McpConfigPolicyInvalid);
     }
     const object = value.object;
     const type_string = if (object.get("type")) |kind_value|
-        (if (kind_value == .string) kind_value.string else return error.McpConfigInvalidType)
+        (if (kind_value == .string) kind_value.string else return failServerConfig(error.McpConfigInvalidType))
     else
         "local";
     const transport: McpTransport = if (std.mem.eql(u8, type_string, "sse"))
@@ -880,22 +915,22 @@ fn parseServerEntry(
         .stdio;
     if (transport == .stdio and
         !std.mem.eql(u8, type_string, "local") and
-        !std.mem.eql(u8, type_string, "stdio")) return error.McpConfigInvalidType;
+        !std.mem.eql(u8, type_string, "stdio")) return failServerConfig(error.McpConfigInvalidType);
 
     const enabled = if (object.get("enabled")) |field|
-        if (field == .bool) field.bool else return error.McpConfigInvalidEnabled
+        if (field == .bool) field.bool else return failServerConfig(error.McpConfigInvalidEnabled)
     else
         true;
     const configured_required = if (object.get("required")) |field|
-        if (field == .bool) field.bool else return error.McpConfigInvalidRequired
+        if (field == .bool) field.bool else return failServerConfig(error.McpConfigInvalidRequired)
     else
         false;
     const required = if (policy.force_optional) false else configured_required;
 
     if (transport != .stdio) {
-        const url_value = object.get("url") orelse return error.McpConfigMissingUrl;
-        if (url_value != .string) return error.McpConfigInvalidUrl;
-        streamable_http.validateEndpoint(url_value.string) catch return error.McpConfigInvalidUrl;
+        const url_value = object.get("url") orelse return failServerConfig(error.McpConfigMissingUrl);
+        if (url_value != .string) return failServerConfig(error.McpConfigInvalidUrl);
+        streamable_http.validateEndpoint(url_value.string) catch return failServerConfig(error.McpConfigInvalidUrl);
         const timeouts = try parseTimeouts(object);
         const env = try parseSelectedEnvironment(alloc, object);
         errdefer freeEnvVars(alloc, env);
@@ -909,10 +944,10 @@ fn parseServerEntry(
         errdefer freeHttpHeaderEnv(alloc, header_env);
         const bearer_token_env = try parseOptionalOwnedString(alloc, object, "bearer_token_env");
         errdefer if (bearer_token_env) |field| alloc.free(field);
-        if (bearer_token_env) |field| if (!isValidEnvName(field)) return error.McpConfigInvalidBearerEnvironment;
+        if (bearer_token_env) |field| if (!isValidEnvName(field)) return failServerConfig(error.McpConfigInvalidBearerEnvironment);
         var auth = parseProfileAuth(alloc, object) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => return error.McpConfigInvalidOAuth,
+            error.OutOfMemory => return failServerConfig(error.OutOfMemory),
+            else => return failServerConfig(error.McpConfigInvalidOAuth),
         };
         errdefer if (auth) |*field| field.deinit(alloc);
         const owned_name = try alloc.dupe(u8, name);
@@ -945,10 +980,10 @@ fn parseServerEntry(
         mcp_contract.default_restart_limit,
         0,
         std.math.maxInt(u8),
-    ) catch return error.McpConfigInvalidRestartLimit;
+    ) catch return failServerConfig(error.McpConfigInvalidRestartLimit);
     const command = parseCommandSpec(alloc, object) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return error.McpConfigInvalidCommand,
+        error.OutOfMemory => return failServerConfig(error.OutOfMemory),
+        else => return failServerConfig(error.McpConfigInvalidCommand),
     };
     errdefer freeParsedCommandSpec(alloc, command);
     const env = try parseSelectedEnvironment(alloc, object);

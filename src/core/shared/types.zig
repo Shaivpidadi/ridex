@@ -919,9 +919,11 @@ pub const FileEvidence = struct {
 pub const ExecutionMemory = struct {
     tool_steps: []ToolExecutionStep = &.{},
     files: []FileEvidence = &.{},
+    /// User guidance consumed between model steps, in presentation order.
+    steering: [][]u8 = &.{},
 
     pub fn isEmpty(self: ExecutionMemory) bool {
-        return self.tool_steps.len == 0 and self.files.len == 0;
+        return self.tool_steps.len == 0 and self.files.len == 0 and self.steering.len == 0;
     }
 };
 
@@ -2019,15 +2021,19 @@ pub fn dupeExecutionMemory(alloc: std.mem.Allocator, memory: ExecutionMemory) !E
     const tool_steps = try dupeToolExecutionSteps(alloc, memory.tool_steps);
     errdefer freeToolExecutionSteps(alloc, tool_steps);
     const files = try dupeFileEvidenceSlice(alloc, memory.files);
+    errdefer freeFileEvidenceSlice(alloc, files);
+    const steering = try dupePermissionFeedback(alloc, memory.steering);
     return .{
         .tool_steps = tool_steps,
         .files = files,
+        .steering = steering,
     };
 }
 
 pub fn freeExecutionMemory(alloc: std.mem.Allocator, memory: ExecutionMemory) void {
     freeToolExecutionSteps(alloc, memory.tool_steps);
     freeFileEvidenceSlice(alloc, memory.files);
+    freePermissionFeedback(alloc, memory.steering);
 }
 
 pub fn dupeToolExecutionSteps(alloc: std.mem.Allocator, steps: []const ToolExecutionStep) ![]ToolExecutionStep {

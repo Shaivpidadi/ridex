@@ -11939,13 +11939,13 @@ test "historical tool detail insertion preserves entry id order" {
         20,
         .{
             .id = "updated-call",
-            .name = "list_files",
+            .name = "glob_files",
             .arguments_json = "{\"path\":\"src\"}",
         },
         .list,
         .{
             .tool_call_id = @constCast("updated-call"),
-            .tool_name = @constCast("list_files"),
+            .tool_name = @constCast("glob_files"),
             .status = .success,
             .output = @constCast("updated result"),
             .output_bytes = 14,
@@ -11954,7 +11954,7 @@ test "historical tool detail insertion preserves entry id order" {
     );
     try std.testing.expectEqual(@as(usize, 3), runtime.tool_details.items.len);
     const updated = runtime.toolDetailForEntry(20).?;
-    try std.testing.expectEqualStrings("list_files", updated.tool_name);
+    try std.testing.expectEqualStrings("glob_files", updated.tool_name);
     try std.testing.expectEqualStrings("{\"path\":\"src\"}", updated.arguments_json.?);
     try std.testing.expectEqualStrings("updated result", updated.result.?);
 }
@@ -14281,7 +14281,7 @@ test "transcript lifecycle identity updates are idempotent and atomic" {
         runtime.applyToolLifecycle(alloc, .{ .authoritative_started = .{
             .id = lifecycleId(1, "target"),
             .reconciles_provisional_call_id = "alias",
-            .tool_name = "list_files",
+            .tool_name = "glob_files",
             .activity_kind = .list,
         } }),
     );

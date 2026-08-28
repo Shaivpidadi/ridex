@@ -6464,16 +6464,8 @@ test "fx ask preserves CLI headless blocker diagnostics" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
-    try tmp.dir.createDirPath(io_mod.getIo(), "external");
-    {
-        var source = try tmp.dir.createFile(io_mod.getIo(), "workspace/source.txt", .{ .truncate = true });
-        defer source.close(io_mod.getIo());
-        try source.writeStreamingAll(io_mod.getIo(), "source\n");
-    }
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
     defer alloc.free(workspace);
-    const external = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "external");
-    defer alloc.free(external);
 
     var stdout_capture: TestCapture = .{};
     defer stdout_capture.deinit(alloc);
@@ -6518,33 +6510,6 @@ test "fx ask preserves CLI headless blocker diagnostics" {
 
     ctx.permission_rules.deinit(alloc);
     ctx.permission_rules = .{};
-    stdout_capture.bytes.clearRetainingCapacity();
-    stderr_capture.bytes.clearRetainingCapacity();
-
-    const source = try std.fs.path.join(arena, &.{ workspace, "source.txt" });
-    const external_destination = try std.fs.path.join(arena, &.{ external, "copied.txt" });
-    const blocked_copy = ToolCall{
-        .id = "external-file-mutation",
-        .name = "copy_file",
-        .arguments_json = try std.fmt.allocPrint(
-            arena,
-            "{{\"source\":\"{s}\",\"destination\":\"{s}\"}}",
-            .{ source, external_destination },
-        ),
-    };
-    const external_outcome = try requestToolPermissionOutcome(
-        &ctx,
-        arena,
-        blocked_copy,
-        .auto,
-        &.{},
-        &.{},
-    );
-    try std.testing.expectEqual(ToolPermissionDecision.deny, external_outcome.decision);
-    try std.testing.expectEqual(types.ToolPermissionDenialReason.review_unavailable, external_outcome.denial_reason.?);
-    try std.testing.expectEqualStrings("", stdout_capture.bytes.items);
-    try std.testing.expectEqualStrings("", stderr_capture.bytes.items);
-
     stdout_capture.bytes.clearRetainingCapacity();
     stderr_capture.bytes.clearRetainingCapacity();
 
@@ -6608,171 +6573,6 @@ test "fx ask preserves CLI headless blocker diagnostics" {
     try std.testing.expect(default_safe_web_search.execution_authority != null);
     try std.testing.expectEqualStrings("", stdout_capture.bytes.items);
     try std.testing.expectEqualStrings("", stderr_capture.bytes.items);
-}
-
-test "fx ask ordinary multi-target admission preserves deny precedence without diagnostics" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
-    {
-        var source = try tmp.dir.createFile(io_mod.getIo(), "workspace/source.txt", .{ .truncate = true });
-        defer source.close(io_mod.getIo());
-        try source.writeStreamingAll(io_mod.getIo(), "source\n");
-    }
-    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
-    defer alloc.free(root);
-
-    var stdout_capture: TestCapture = .{};
-    defer stdout_capture.deinit(alloc);
-    var stderr_capture: TestCapture = .{};
-    defer stderr_capture.deinit(alloc);
-    var ctx = AskContext.init(
-        alloc,
-        testConfig(),
-        testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeyStartup),
-        root,
-    );
-    defer ctx.deinit();
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    const cases = [_]struct {
-        tool_name: []const u8,
-        arguments_json: []const u8,
-        source_action: types.PermissionAction,
-        destination_action: types.PermissionAction,
-    }{
-        .{
-            .tool_name = "copy_file",
-            .arguments_json = "{\"source\":\"source.txt\",\"destination\":\"destination.txt\"}",
-            .source_action = .ask,
-            .destination_action = .deny,
-        },
-        .{
-            .tool_name = "copy_file",
-            .arguments_json = "{\"source\":\"source.txt\",\"destination\":\"destination.txt\"}",
-            .source_action = .deny,
-            .destination_action = .ask,
-        },
-        .{
-            .tool_name = "rename_file",
-            .arguments_json = "{\"old_path\":\"source.txt\",\"new_path\":\"destination.txt\"}",
-            .source_action = .ask,
-            .destination_action = .deny,
-        },
-        .{
-            .tool_name = "rename_file",
-            .arguments_json = "{\"old_path\":\"source.txt\",\"new_path\":\"destination.txt\"}",
-            .source_action = .deny,
-            .destination_action = .ask,
-        },
-    };
-
-    for (cases, 0..) |case, index| {
-        ctx.permission_rules.deinit(alloc);
-        ctx.permission_rules = try testPermissionRuleSetPair(
-            alloc,
-            case.tool_name,
-            "source.txt",
-            case.source_action,
-            "destination.txt",
-            case.destination_action,
-        );
-        const outcome = try requestToolPermissionOutcome(&ctx, arena, .{
-            .id = try std.fmt.allocPrint(arena, "multi-target-{d}", .{index}),
-            .name = case.tool_name,
-            .arguments_json = case.arguments_json,
-        }, .ask, &.{}, &.{});
-        try std.testing.expectEqual(ToolPermissionDecision.policy_denied, outcome.decision);
-        try std.testing.expect(outcome.execution_authority == null);
-        try std.testing.expectEqualStrings("", stdout_capture.bytes.items);
-        try std.testing.expectEqualStrings("", stderr_capture.bytes.items);
-    }
-}
-
-test "CLI ask auto mode requires review when only one copy or rename target is configured" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
-    try tmp.dir.createDirPath(io_mod.getIo(), "external");
-    {
-        var workspace_file = try tmp.dir.createFile(io_mod.getIo(), "workspace/source.txt", .{ .truncate = true });
-        defer workspace_file.close(io_mod.getIo());
-        try workspace_file.writeStreamingAll(io_mod.getIo(), "workspace\n");
-    }
-    {
-        var external_file = try tmp.dir.createFile(io_mod.getIo(), "external/source.txt", .{ .truncate = true });
-        defer external_file.close(io_mod.getIo());
-        try external_file.writeStreamingAll(io_mod.getIo(), "external\n");
-    }
-
-    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
-    defer alloc.free(workspace);
-    const external = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "external");
-    defer alloc.free(external);
-    const external_pattern = try std.fmt.allocPrint(alloc, "{s}/**", .{external});
-    defer alloc.free(external_pattern);
-
-    var stdout_capture: TestCapture = .{};
-    defer stdout_capture.deinit(alloc);
-    var stderr_capture: TestCapture = .{};
-    defer stderr_capture.deinit(alloc);
-    var ctx = AskContext.init(alloc, testConfig(), testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeyStartup), workspace);
-    defer ctx.deinit();
-
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const workspace_source = try std.fs.path.join(arena, &.{ workspace, "source.txt" });
-    const workspace_copy = try std.fs.path.join(arena, &.{ workspace, "copied.txt" });
-    const workspace_rename = try std.fs.path.join(arena, &.{ workspace, "renamed.txt" });
-    const external_source = try std.fs.path.join(arena, &.{ external, "source.txt" });
-    const external_copy = try std.fs.path.join(arena, &.{ external, "copied.txt" });
-    const external_rename = try std.fs.path.join(arena, &.{ external, "renamed.txt" });
-
-    const cases = [_]struct {
-        tool_name: []const u8,
-        permission_name: []const u8,
-        arguments_json: []const u8,
-    }{
-        .{
-            .tool_name = "copy_file",
-            .permission_name = "copy_file",
-            .arguments_json = try std.fmt.allocPrint(arena, "{{\"source\":\"{s}\",\"destination\":\"{s}\"}}", .{ workspace_source, external_copy }),
-        },
-        .{
-            .tool_name = "copy_file",
-            .permission_name = "copy_file",
-            .arguments_json = try std.fmt.allocPrint(arena, "{{\"source\":\"{s}\",\"destination\":\"{s}\"}}", .{ external_source, workspace_copy }),
-        },
-        .{
-            .tool_name = "rename_file",
-            .permission_name = "rename_file",
-            .arguments_json = try std.fmt.allocPrint(arena, "{{\"old_path\":\"{s}\",\"new_path\":\"{s}\"}}", .{ workspace_source, external_rename }),
-        },
-        .{
-            .tool_name = "rename_file",
-            .permission_name = "rename_file",
-            .arguments_json = try std.fmt.allocPrint(arena, "{{\"old_path\":\"{s}\",\"new_path\":\"{s}\"}}", .{ external_source, workspace_rename }),
-        },
-    };
-
-    for (cases, 0..) |case, index| {
-        ctx.permission_rules.deinit(alloc);
-        ctx.permission_rules = try testPermissionRuleSet(alloc, case.permission_name, external_pattern, .allow);
-        const outcome = try requestToolPermissionOutcome(&ctx, arena, .{
-            .id = try std.fmt.allocPrint(arena, "mixed-{d}", .{index}),
-            .name = case.tool_name,
-            .arguments_json = case.arguments_json,
-        }, .auto, &.{}, &.{});
-        try std.testing.expectEqual(ToolPermissionDecision.deny, outcome.decision);
-        try std.testing.expectEqual(types.ToolPermissionDenialReason.review_unavailable, outcome.denial_reason.?);
-        stdout_capture.bytes.clearRetainingCapacity();
-        stderr_capture.bytes.clearRetainingCapacity();
-    }
 }
 
 test "runWithDeps projects exec-only terminal when saved setup has no capability" {
@@ -8563,8 +8363,8 @@ test "fx ask JSON captures parallel tool results without corrupting records" {
                     .result_allocator = arena,
                     .call = .{
                         .id = "parallel-capture",
-                        .name = "list_files",
-                        .arguments_json = "{}",
+                        .name = "glob_files",
+                        .arguments_json = "{\"pattern\":\"*\"}",
                     },
                     .authority = .ordinary,
                     .session_grants = &.{},
@@ -8601,7 +8401,7 @@ test "fx ask JSON captures parallel tool results without corrupting records" {
     try std.testing.expect(!failed.load(.seq_cst));
     try std.testing.expectEqual(expected_count, ctx.tool_call_records.items.len);
     for (ctx.tool_call_records.items) |record| {
-        try std.testing.expectEqualStrings("list_files", record.name);
+        try std.testing.expectEqualStrings("glob_files", record.name);
         try std.testing.expectEqualStrings("success", record.status);
     }
 }

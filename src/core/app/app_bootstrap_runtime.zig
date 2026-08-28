@@ -292,6 +292,7 @@ pub fn Runtime(comptime App: type) type {
             app.context_enabled = startup.context_enabled;
             app.fast_mode = startup.fast_mode;
             app.input_runtime.slash_menu_categories = startup.slash_menu_categories;
+            app.shell.collapse_tool_calls = startup.collapse_tool_calls;
             app.auto_upgrade_enabled = startup.auto_upgrade;
             app.upgrader.configure_channel(startup.update_channel);
             app.effort = startup.effort;

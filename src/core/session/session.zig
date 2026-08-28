@@ -4768,7 +4768,7 @@ test "partial-text interrupted history projects partial assistant with closure b
 
 test "completed-tool interrupted history projects summary before marker" {
     const alloc = std.testing.allocator;
-    var completed_tool_names = [_][]u8{ @constCast("list_files"), @constCast("glob_files") };
+    var completed_tool_names = [_][]u8{ @constCast("glob_files"), @constCast("glob_files") };
     const history = [_]HistoryTurn{.{ .interrupted = .{
         .user = .{ .text = @constCast("use all ur tools 1 by 1 - I need u to test them") },
         .completed_tool_names = completed_tool_names[0..],
@@ -4782,7 +4782,7 @@ test "completed-tool interrupted history projects summary before marker" {
     try std.testing.expectEqual(.user, messages.items[0].role);
     try std.testing.expectEqualStrings("use all ur tools 1 by 1 - I need u to test them", messages.items[0].content.?.asText());
     try std.testing.expectEqual(.assistant, messages.items[1].role);
-    try std.testing.expectEqualStrings("Interrupted by user after completing 2 tool calls: list_files, glob_files.", messages.items[1].content.?.asText());
+    try std.testing.expectEqualStrings("Interrupted by user after completing 2 tool calls: glob_files, glob_files.", messages.items[1].content.?.asText());
     try std.testing.expectEqual(.user, messages.items[2].role);
     try std.testing.expect(std.mem.find(u8, messages.items[2].content.?.asText(), "<turn_aborted>") != null);
 
@@ -4797,7 +4797,7 @@ test "completed-tool interrupted history projects summary before marker" {
     try std.testing.expectEqual(core_types.ChatRole.user, chat_messages.items[0].role);
     try std.testing.expectEqualStrings("use all ur tools 1 by 1 - I need u to test them", chat_messages.items[0].content.?);
     try std.testing.expectEqual(core_types.ChatRole.assistant, chat_messages.items[1].role);
-    try std.testing.expectEqualStrings("Interrupted by user after completing 2 tool calls: list_files, glob_files.", chat_messages.items[1].content.?);
+    try std.testing.expectEqualStrings("Interrupted by user after completing 2 tool calls: glob_files, glob_files.", chat_messages.items[1].content.?);
     try std.testing.expectEqual(core_types.ChatRole.user, chat_messages.items[2].role);
     try std.testing.expect(std.mem.find(u8, chat_messages.items[2].content.?, "<turn_aborted>") != null);
 }

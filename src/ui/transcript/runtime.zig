@@ -4168,6 +4168,9 @@ pub const TranscriptRuntime = struct {
     full_transcript_content_revision: u64 = 0,
     full_transcript_review_revision: u64 = 0,
     compact_transcript_source_cache: CompactTranscriptSourceCache = .{},
+    /// When enabled, compact transcript tool groups render only their summary
+    /// header while the full transcript retains every individual tool call.
+    collapse_tool_calls: bool = false,
     /// Structured-entry store used to regenerate transcript bytes at the
     /// current width while retaining the raw byte buffer for append paths
     /// that still write pre-rendered transcript content.
@@ -4253,6 +4256,27 @@ pub const TranscriptRuntime = struct {
     /// of the shared shadow grid.
     detached_commit_alloc: ?Allocator = null,
     ui_observer: render_engine.ui_observer.UiObserver = .{},
+
+    pub noinline fn init() TranscriptRuntime {
+        var result: TranscriptRuntime = .{
+            .full_transcript_projection_cache = undefined,
+            .compact_transcript_source_cache = undefined,
+        };
+        for (&result.full_transcript_projection_cache.review.entries) |*entry| {
+            entry.* = null;
+        }
+        result.full_transcript_projection_cache.review.next_replacement = 0;
+        for (&result.full_transcript_projection_cache.full.entries) |*entry| {
+            entry.* = null;
+        }
+        result.full_transcript_projection_cache.full.next_replacement = 0;
+        result.full_transcript_projection_cache.relationships.cached = null;
+        for (&result.compact_transcript_source_cache.entries) |*entry| {
+            entry.* = null;
+        }
+        result.compact_transcript_source_cache.next_replacement = 0;
+        return result;
+    }
 
     pub fn enableShadowVt(self: *TranscriptRuntime, alloc: Allocator) !void {
         return transcript_io.enableShadowVt(self, alloc);
@@ -10010,6 +10034,36 @@ pub const TranscriptRuntime = struct {
         self.cursor_col = 1;
     }
 };
+
+test "transcript runtime initializer preserves empty projection caches" {
+    var runtime = TranscriptRuntime.init();
+    defer runtime.deinit(std.testing.allocator);
+
+    for (runtime.full_transcript_projection_cache.review.entries) |entry| {
+        try std.testing.expect(entry == null);
+    }
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        runtime.full_transcript_projection_cache.review.next_replacement,
+    );
+    for (runtime.full_transcript_projection_cache.full.entries) |entry| {
+        try std.testing.expect(entry == null);
+    }
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        runtime.full_transcript_projection_cache.full.next_replacement,
+    );
+    try std.testing.expect(
+        runtime.full_transcript_projection_cache.relationships.cached == null,
+    );
+    for (runtime.compact_transcript_source_cache.entries) |entry| {
+        try std.testing.expect(entry == null);
+    }
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        runtime.compact_transcript_source_cache.next_replacement,
+    );
+}
 
 fn frameBandsEqual(a: render_engine.paint_plan.FrameBand, b: render_engine.paint_plan.FrameBand) bool {
     return a.top == b.top and a.bottom == b.bottom and a.owner == b.owner;

@@ -4900,7 +4900,7 @@ test "consumeSseStream rejects a final tool name that conflicts with streamed id
             "data: {{\"type\":\"tool-input-start\",\"id\":\"A\",\"toolName\":\"read_file\"}}\n\n" ++
                 "data: {{\"type\":\"tool-input-delta\",\"id\":\"A\",\"delta\":\"{{\\\"path\\\":\\\"victim.txt\\\"}}\"}}\n\n" ++
                 "data: {{\"type\":\"tool-input-end\",\"id\":\"A\"}}\n\n" ++
-                "data: {{\"type\":\"tool-call\",\"toolCallId\":\"A\",\"toolName\":\"delete_file\"{s}}}\n\n" ++
+                "data: {{\"type\":\"tool-call\",\"toolCallId\":\"A\",\"toolName\":\"edit_file\"{s}}}\n\n" ++
                 "data: [DONE]\n\n",
             .{final_input},
         );

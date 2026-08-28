@@ -463,39 +463,6 @@ describe("lean auto mode reliability", () => {
   );
 
   test(
-    "an explicit delete_file request reaches the reviewer and clears the exact deletion",
-    async () => {
-      const root = createIsolatedRoot();
-      const target = join(root.workspace, "keep.txt");
-      writeFileSync(target, "keep\n");
-      const gateway = startGateway(
-        [
-          fakeGatewayToolCall("deterministic_delete", "delete_file", {
-            path: target,
-          }),
-          fakeGatewayFinalText("delete completed"),
-        ],
-        [fakeGatewayPermissionDecision("clear", "delete_review_clear")],
-      );
-
-      const result = await runFx(
-        ["ask", "--quiet", "--json", "--no-save", "Delete keep.txt as requested."],
-        {
-          cwd: root.workspace,
-          env: gatewayEnv(root, gateway),
-          timeoutMs: TIMEOUT,
-        },
-      );
-
-      expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
-      expect(result.stdout).toContain("delete completed");
-      expect(gateway.classifierRequests).toHaveLength(1);
-      expect(existsSync(target)).toBe(false);
-    },
-    TIMEOUT,
-  );
-
-  test(
     "git checkout hooks remain reviewer owned",
     async () => {
       for (const hookMode of ["default", "configured"] as const) {
@@ -663,48 +630,24 @@ describe("lean auto mode reliability", () => {
   );
 
   test(
-    "existing replacement and startup targets remain reviewer owned",
+    "existing startup targets remain reviewer owned",
     async () => {
       const root = createIsolatedRoot();
-      const copySource = join(root.root, "copy-source.txt");
-      const copyDestination = join(root.root, "copy-destination.txt");
-      const renameSource = join(root.root, "rename-source.txt");
-      const renameDestination = join(root.root, "rename-destination.txt");
       const startup = join(root.home, ".zshrc");
-      writeFileSync(copySource, "copy source\n");
-      writeFileSync(copyDestination, "copy destination\n");
-      writeFileSync(renameSource, "rename source\n");
-      writeFileSync(renameDestination, "rename destination\n");
       writeFileSync(startup, "startup before\n");
 
       const gateway = startGateway(
         [
-          fakeGatewayToolCall("review_copy", "copy_file", {
-            source: copySource,
-            destination: copyDestination,
-          }),
-          (body) => {
-            expect(body).toContain("review_caution");
-            return fakeGatewayToolCall("review_rename", "rename_file", {
-              old_path: renameSource,
-              new_path: renameDestination,
-            });
-          },
-          (body) => {
-            expect(body).toContain("review_caution");
-            return fakeGatewayToolCall("review_startup", "write_file", {
+          fakeGatewayToolCall("review_startup", "write_file", {
               path: startup,
               content: "startup after\n",
-            });
-          },
+          }),
           (body) => {
             expect(body).toContain("review_caution");
             return fakeGatewayFinalText("replacement effects stayed blocked");
           },
         ],
         [
-          fakeGatewayPermissionDecision("caution", "copy_review"),
-          fakeGatewayPermissionDecision("caution", "rename_review"),
           fakeGatewayPermissionDecision("caution", "startup_review"),
         ],
       );
@@ -719,11 +662,7 @@ describe("lean auto mode reliability", () => {
       );
 
       expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
-      expect(gateway.classifierRequests).toHaveLength(3);
-      expect(readFileSync(copySource, "utf8")).toBe("copy source\n");
-      expect(readFileSync(copyDestination, "utf8")).toBe("copy destination\n");
-      expect(readFileSync(renameSource, "utf8")).toBe("rename source\n");
-      expect(readFileSync(renameDestination, "utf8")).toBe("rename destination\n");
+      expect(gateway.classifierRequests).toHaveLength(1);
       expect(readFileSync(startup, "utf8")).toBe("startup before\n");
     },
     TIMEOUT,
