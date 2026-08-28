@@ -3020,6 +3020,7 @@ describe("gateway stream lifecycle", () => {
     let step = 0;
     let canonicalHandle = "";
     let suffixlessHandle = "";
+    let projectedQueryInput: unknown = null;
     const gateway = startGateway((body) => {
       switch (step++) {
         case 0:
@@ -3035,7 +3036,10 @@ describe("gateway stream lifecycle", () => {
           expect(canonicalHandle.endsWith(".txt")).toBe(true);
           suffixlessHandle = canonicalHandle.slice(0, -4);
           return fakeGatewayToolCall(readResultCallId, "read_tool_result", {
+            mode: "query",
             handle: suffixlessHandle,
+            start_byte: 1,
+            byte_count: 64,
             query: needle,
           });
         }
@@ -3045,6 +3049,15 @@ describe("gateway stream lifecycle", () => {
           expect(output).toContain(
             `<tool_result_query handle="${canonicalHandle}">`,
           );
+          const request = JSON.parse(body) as {
+            prompt: Array<{ content?: Array<Record<string, unknown>> }>;
+          };
+          const parts = request.prompt.flatMap((message) => message.content ?? []);
+          projectedQueryInput = parts.find((part) =>
+            part.type === "tool-call" &&
+            part.toolCallId === readResultCallId &&
+            part.toolName === "read_tool_result"
+          )?.input;
           return fakeGatewayFinalText("Suffixless result handle inspected.");
         }
         default:
@@ -3078,12 +3091,165 @@ describe("gateway stream lifecycle", () => {
       expect(sessionEvents).toContain(suffixlessHandle);
       expect(sessionEvents).toContain(canonicalHandle);
       expect(sessionEvents).toContain(needle);
+      expect(projectedQueryInput).toEqual({
+        mode: "query",
+        handle: suffixlessHandle,
+        query: needle,
+      });
       expect(result.stderr).not.toContain("ResultHandleNotFound");
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });
     }
   });
+
+  test("model optional fields canonicalize before permission and preserve flat history", async () => {
+    const root = createFixtureRoot("model-optional-fields");
+    const tracePath = join(root.root, "trace.log");
+    writeFileSync(
+      join(root.home, ".fx", "settings.json"),
+      JSON.stringify({ max_tool_result_bytes: 4096 }),
+    );
+    mkdirSync(join(root.workspace, "src"), { recursive: true });
+    mkdirSync(join(root.workspace, "tests", "e2e"), { recursive: true });
+    writeFileSync(
+      join(root.workspace, "src", "project.zig"),
+      "enabledMcpjsonServers\nenableAllProjectMcpServers\n",
+    );
+    writeFileSync(join(root.workspace, "tests", "e2e", "acp.test.ts"), "export {};\n");
+    const lines = Array.from(
+      { length: 500 },
+      (_, index) => `fixture line ${index.toString().padStart(3, "0")}: ${"x".repeat(72)}`,
+    );
+    writeFileSync(join(root.workspace, "large-result.txt"), `${lines.join("\n")}\n`);
+
+    const globCallId = "optional_glob_empty_1";
+    const grepOneCallId = "optional_grep_empty_1";
+    const grepTwoCallId = "optional_grep_empty_2";
+    const readFileCallId = "optional_read_file_1";
+    const readResultCallId = "optional_read_result_1";
+    let step = 0;
+    let handle = "";
+    let searchResults: string[] = [];
+    let rangeResult = "";
+    let projectedInput: unknown = null;
+    const gateway = startDynamicFakeGateway((body) => {
+      switch (step++) {
+        case 0:
+          return fakeGatewaySse([
+            {
+              type: "tool-call",
+              toolCallId: globCallId,
+              toolName: "glob_files",
+              input: {
+                pattern: "tests/e2e/*acp*.test.ts",
+                path: "",
+                mode: "matches",
+              },
+            },
+            {
+              type: "tool-call",
+              toolCallId: grepOneCallId,
+              toolName: "grep_files",
+              input: {
+                pattern: "enabledMcpjsonServers",
+                path: "",
+                include: "*.zig",
+                mode: "matches",
+              },
+            },
+            {
+              type: "tool-call",
+              toolCallId: grepTwoCallId,
+              toolName: "grep_files",
+              input: {
+                pattern: "enableAllProjectMcpServers",
+                path: "",
+                include: "*.zig",
+                mode: "matches",
+              },
+            },
+            {
+              type: "finish",
+              finishReason: { unified: "tool-calls", raw: "tool-calls" },
+            },
+          ]);
+        case 1:
+          searchResults = [
+            toolResultOutput(body, globCallId),
+            toolResultOutput(body, grepOneCallId),
+            toolResultOutput(body, grepTwoCallId),
+          ];
+          return fakeGatewayToolCall(readFileCallId, "read_file", {
+            path: "large-result.txt",
+          });
+        case 2: {
+          const output = toolResultOutput(body, readFileCallId);
+          handle = output.match(
+            /<tool_result_handle>([^<]+)<\/tool_result_handle>/,
+          )?.[1] ?? "";
+          return fakeGatewayToolCall(readResultCallId, "read_tool_result", {
+            mode: "range",
+            handle,
+            start_byte: 1,
+            byte_count: 512,
+            query: "must-be-elided",
+          });
+        }
+        case 3: {
+          rangeResult = toolResultOutput(body, readResultCallId);
+          const request = JSON.parse(body) as {
+            prompt: Array<{ content?: Array<Record<string, unknown>> }>;
+          };
+          const parts = request.prompt.flatMap((message) => message.content ?? []);
+          projectedInput = parts.find((part) =>
+            part.type === "tool-call" &&
+            part.toolCallId === readResultCallId &&
+            part.toolName === "read_tool_result"
+          )?.input;
+          return fakeGatewayFinalText("MODEL_OPTIONAL_FIELDS_OK");
+        }
+        default:
+          return new Response("unexpected request", { status: 500 });
+      }
+    });
+
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--yolo", "Exercise model optional fields."],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 20_000,
+        },
+      );
+      const json = parseAskJson(result.stdout);
+      const sessionRoot = join(root.home, ".fx", "sessions", json.session_id);
+
+      expect(result.code).toBe(0);
+      expect(json.output).toContain("MODEL_OPTIONAL_FIELDS_OK");
+      expect(gateway.requestCount()).toBe(4);
+      expect(searchResults.every((output) => !output.includes("InvalidPath"))).toBe(true);
+      expect(searchResults.every((output) => !output.includes("preflight failed"))).toBe(true);
+      expect(handle).not.toBe("");
+      expect(rangeResult).toContain("fixture line 000");
+      expect(projectedInput).toEqual({
+        mode: "range",
+        handle,
+        start_byte: 1,
+        byte_count: 512,
+      });
+      expect(json.tool_calls.filter((call) => call.status !== "success")).toHaveLength(0);
+      expect(json.tool_calls).toHaveLength(5);
+      const sessionEvents = readFileSync(join(sessionRoot, "events.jsonl"), "utf8");
+      expect(sessionEvents).toContain(`\\\"handle\\\":\\\"${handle}\\\"`);
+      expect(sessionEvents).not.toContain("must-be-elided");
+      expect(sessionEvents).not.toContain("\\\"mode\\\":\\\"range\\\"");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 30_000);
 
   test("no-save terminal timeout returns a readable process-scoped replay handle", async () => {
     const root = createFixtureRoot("terminal-timeout-replay");

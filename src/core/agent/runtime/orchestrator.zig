@@ -223,7 +223,7 @@ fn projected_terminal_request_arguments(
     return try out.toOwnedSlice();
 }
 
-fn free_terminal_request_projection(
+fn free_request_projection(
     alloc: Allocator,
     source: []const ChatMessage,
     projected: []const ChatMessage,
@@ -251,7 +251,7 @@ fn project_terminal_request_messages(
 
     var projected: ?[]ChatMessage = null;
     errdefer if (projected) |messages| {
-        free_terminal_request_projection(alloc, source, messages);
+        free_request_projection(alloc, source, messages);
     };
 
     for (source, 0..) |message, message_index| {
@@ -490,6 +490,502 @@ fn normalize_terminal_request_tool_calls(
     return normalized orelse source;
 }
 
+const RegisteredOptionalModelEligibility = struct {
+    glob_files: bool = false,
+    grep_files: bool = false,
+    read_tool_result: bool = false,
+
+    fn allows(self: @This(), executor_kind: tool_dispatch.ExecutorKind) bool {
+        return switch (executor_kind) {
+            .glob_files => self.glob_files,
+            .grep_files => self.grep_files,
+            .read_tool_result => self.read_tool_result,
+            else => false,
+        };
+    }
+};
+
+fn registered_optional_model_eligibility(
+    advertised_functions: []const model_tool_schema.FunctionSchema,
+    vision_mode: runtime_gateway_step.VisionToolMode,
+) RegisteredOptionalModelEligibility {
+    if (vision_mode == .required) return .{};
+    var result: RegisteredOptionalModelEligibility = .{};
+    for (advertised_functions) |function| {
+        if (std.mem.eql(u8, function.name, "glob_files")) {
+            result.glob_files = true;
+        } else if (std.mem.eql(u8, function.name, "grep_files")) {
+            result.grep_files = true;
+        } else if (std.mem.eql(u8, function.name, "read_tool_result")) {
+            result.read_tool_result = true;
+        }
+    }
+    return result;
+}
+
+const RegisteredOptionalModelDirection = enum {
+    execution,
+    request,
+};
+
+fn transform_read_tool_result_model_arguments(
+    arena: Allocator,
+    object: *std.json.ObjectMap,
+    direction: RegisteredOptionalModelDirection,
+) Allocator.Error!bool {
+    return switch (direction) {
+        .execution => blk: {
+            if (object.get("mode")) |mode| {
+                if (mode != .string) break :blk false;
+                if (std.mem.eql(u8, mode.string, "range")) {
+                    _ = object.orderedRemove("mode");
+                    _ = object.orderedRemove("query");
+                    break :blk true;
+                }
+                if (std.mem.eql(u8, mode.string, "query")) {
+                    const query = object.get("query") orelse break :blk false;
+                    if (query != .string or query.string.len == 0) break :blk false;
+                    _ = object.orderedRemove("mode");
+                    _ = object.orderedRemove("start_byte");
+                    _ = object.orderedRemove("byte_count");
+                    break :blk true;
+                }
+                break :blk false;
+            }
+
+            const query = object.get("query") orelse break :blk false;
+            if (query != .string) break :blk false;
+            if (query.string.len == 0) {
+                _ = object.orderedRemove("query");
+                break :blk true;
+            }
+            const removed_start = object.orderedRemove("start_byte");
+            const removed_count = object.orderedRemove("byte_count");
+            break :blk removed_start or removed_count;
+        },
+        .request => blk: {
+            if (object.get("mode") != null) break :blk false;
+            const handle = object.get("handle") orelse break :blk false;
+            if (handle != .string) break :blk false;
+            if (object.get("query")) |query| {
+                if (query != .string) break :blk false;
+                if (query.string.len == 0) {
+                    _ = object.orderedRemove("query");
+                    try object.put(arena, "mode", .{ .string = "range" });
+                    break :blk true;
+                }
+                _ = object.orderedRemove("start_byte");
+                _ = object.orderedRemove("byte_count");
+                try object.put(arena, "mode", .{ .string = "query" });
+                break :blk true;
+            }
+            try object.put(arena, "mode", .{ .string = "range" });
+            break :blk true;
+        },
+    };
+}
+
+fn registered_optional_model_arguments(
+    alloc: Allocator,
+    executor_kind: tool_dispatch.ExecutorKind,
+    direction: RegisteredOptionalModelDirection,
+    arguments_json: []const u8,
+) Allocator.Error!?[]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, arguments_json, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+
+    const changed = switch (executor_kind) {
+        .glob_files, .grep_files => blk: {
+            const path = parsed.value.object.get("path") orelse break :blk false;
+            if (path != .string or path.string.len != 0) break :blk false;
+            _ = parsed.value.object.orderedRemove("path");
+            break :blk true;
+        },
+        .read_tool_result => try transform_read_tool_result_model_arguments(
+            parsed.arena.allocator(),
+            &parsed.value.object,
+            direction,
+        ),
+        else => false,
+    };
+    if (!changed) return null;
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    std.json.Stringify.value(parsed.value, .{}, &out.writer) catch return error.OutOfMemory;
+    return try out.toOwnedSlice();
+}
+
+fn normalize_registered_optional_tool_calls(
+    alloc: Allocator,
+    registry: tool_dispatch.Registry,
+    eligibility: RegisteredOptionalModelEligibility,
+    source: []const ToolCall,
+) Allocator.Error![]const ToolCall {
+    var normalized: ?[]ToolCall = null;
+    errdefer if (normalized) |calls| {
+        for (calls, source) |call, original| {
+            if (call.arguments_json.ptr != original.arguments_json.ptr) {
+                alloc.free(@constCast(call.arguments_json));
+            }
+        }
+        alloc.free(calls);
+    };
+
+    for (source, 0..) |call, index| {
+        if (call.argument_integrity != .valid) continue;
+        const tool = registry.lookup(call.name) orelse continue;
+        if (!eligibility.allows(tool.executor_kind)) continue;
+        const arguments_json = try registered_optional_model_arguments(
+            alloc,
+            tool.executor_kind,
+            .execution,
+            call.arguments_json,
+        ) orelse continue;
+        if (normalized == null) {
+            normalized = alloc.dupe(ToolCall, source) catch |err| {
+                alloc.free(arguments_json);
+                return err;
+            };
+        }
+        normalized.?[index].arguments_json = arguments_json;
+    }
+    return normalized orelse source;
+}
+
+fn project_registered_optional_request_messages(
+    alloc: Allocator,
+    registry: tool_dispatch.Registry,
+    eligibility: RegisteredOptionalModelEligibility,
+    source: []const ChatMessage,
+) Allocator.Error![]const ChatMessage {
+    var projected: ?[]ChatMessage = null;
+    errdefer if (projected) |messages| {
+        free_request_projection(alloc, source, messages);
+    };
+
+    for (source, 0..) |message, message_index| {
+        if (message.role != .assistant) continue;
+        for (message.tool_calls, 0..) |call, call_index| {
+            if (call.argument_integrity != .valid) continue;
+            const tool = registry.lookup(call.name) orelse continue;
+            if (!eligibility.allows(tool.executor_kind)) continue;
+            const arguments_json = try registered_optional_model_arguments(
+                alloc,
+                tool.executor_kind,
+                .request,
+                call.arguments_json,
+            ) orelse continue;
+            if (projected == null) {
+                projected = alloc.dupe(ChatMessage, source) catch |err| {
+                    alloc.free(arguments_json);
+                    return err;
+                };
+            }
+            if (projected.?[message_index].tool_calls.ptr == message.tool_calls.ptr) {
+                projected.?[message_index].tool_calls = alloc.dupe(ToolCall, message.tool_calls) catch |err| {
+                    alloc.free(arguments_json);
+                    return err;
+                };
+            }
+            @constCast(projected.?[message_index].tool_calls)[call_index].arguments_json = arguments_json;
+        }
+    }
+    return projected orelse source;
+}
+
+test "registered optional model arguments preserve mode and identity laws" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const glob = (try registered_optional_model_arguments(
+        arena,
+        .glob_files,
+        .execution,
+        "{\"pattern\":\"*.zig\",\"path\":\"\",\"mode\":\"matches\"}",
+    )).?;
+    try std.testing.expectEqualStrings(
+        "{\"pattern\":\"*.zig\",\"mode\":\"matches\"}",
+        glob,
+    );
+    try std.testing.expect((try registered_optional_model_arguments(
+        arena,
+        .grep_files,
+        .execution,
+        "{\"pattern\":\"needle\",\"path\":\".\"}",
+    )) == null);
+    for ([_][]const u8{
+        "{\"pattern\":\"needle\",\"path\":null}",
+        "{\"pattern\":\"needle\",\"path\":7}",
+        "{\"pattern\":\"needle\",\"path\":\" \"}",
+    }) |arguments_json| {
+        try std.testing.expect((try registered_optional_model_arguments(
+            arena,
+            .grep_files,
+            .execution,
+            arguments_json,
+        )) == null);
+    }
+
+    const range = (try registered_optional_model_arguments(
+        arena,
+        .read_tool_result,
+        .execution,
+        "{\"mode\":\"range\",\"handle\":\"result.txt\",\"start_byte\":2,\"byte_count\":9,\"query\":\"wrong\"}",
+    )).?;
+    try std.testing.expectEqualStrings(
+        "{\"handle\":\"result.txt\",\"start_byte\":2,\"byte_count\":9}",
+        range,
+    );
+    const query = (try registered_optional_model_arguments(
+        arena,
+        .read_tool_result,
+        .execution,
+        "{\"mode\":\"query\",\"handle\":\"result.txt\",\"start_byte\":2,\"byte_count\":9,\"query\":\"needle\"}",
+    )).?;
+    try std.testing.expectEqualStrings(
+        "{\"handle\":\"result.txt\",\"query\":\"needle\"}",
+        query,
+    );
+    const legacy_empty = (try registered_optional_model_arguments(
+        arena,
+        .read_tool_result,
+        .execution,
+        "{\"handle\":\"result.txt\",\"start_byte\":2,\"byte_count\":9,\"query\":\"\"}",
+    )).?;
+    try std.testing.expectEqualStrings(range, legacy_empty);
+    const legacy_query = (try registered_optional_model_arguments(
+        arena,
+        .read_tool_result,
+        .execution,
+        "{\"handle\":\"result.txt\",\"start_byte\":2,\"byte_count\":9,\"query\":\"needle\"}",
+    )).?;
+    try std.testing.expectEqualStrings(query, legacy_query);
+    try std.testing.expect((try registered_optional_model_arguments(
+        arena,
+        .read_tool_result,
+        .execution,
+        "{\"mode\":\"invalid\",\"handle\":\"result.txt\"}",
+    )) == null);
+    try std.testing.expect((try registered_optional_model_arguments(
+        arena,
+        .read_tool_result,
+        .execution,
+        "{\"mode\":7,\"handle\":\"result.txt\"}",
+    )) == null);
+    try std.testing.expect((try registered_optional_model_arguments(
+        arena,
+        .read_tool_result,
+        .execution,
+        "{\"mode\":\"query\",\"handle\":\"result.txt\",\"query\":\"\"}",
+    )) == null);
+
+    const projected_range = (try registered_optional_model_arguments(
+        arena,
+        .read_tool_result,
+        .request,
+        range,
+    )).?;
+    const round_trip_range = (try registered_optional_model_arguments(
+        arena,
+        .read_tool_result,
+        .execution,
+        projected_range,
+    )).?;
+    try std.testing.expectEqualStrings(range, round_trip_range);
+    try std.testing.expect((try registered_optional_model_arguments(
+        arena,
+        .read_tool_result,
+        .request,
+        projected_range,
+    )) == null);
+
+    const projected_query = (try registered_optional_model_arguments(
+        arena,
+        .read_tool_result,
+        .request,
+        query,
+    )).?;
+    const round_trip_query = (try registered_optional_model_arguments(
+        arena,
+        .read_tool_result,
+        .execution,
+        projected_query,
+    )).?;
+    try std.testing.expectEqualStrings(query, round_trip_query);
+
+    try std.testing.expect((try registered_optional_model_arguments(
+        arena,
+        .read_tool_result,
+        .execution,
+        "{",
+    )) == null);
+    try std.testing.expect((try registered_optional_model_arguments(
+        arena,
+        .read_file,
+        .execution,
+        "{\"path\":\"\"}",
+    )) == null);
+}
+
+test "registered optional model projection is attempt local and copy on write" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const seed = tool_dispatch.Tool{
+        .name = "glob_files",
+        .description = "test",
+        .model_schema = .{ .name = "glob_files", .description = "test" },
+        .executor_kind = .glob_files,
+        .decode = undefined,
+        .call = undefined,
+        .reads_only_fn = undefined,
+        .irreversible_fn = undefined,
+    };
+    var grep = seed;
+    grep.name = "grep_files";
+    grep.model_schema.name = "grep_files";
+    grep.executor_kind = .grep_files;
+    var result_reader = seed;
+    result_reader.name = "read_tool_result";
+    result_reader.model_schema.name = "read_tool_result";
+    result_reader.executor_kind = .read_tool_result;
+    const tools = [_]tool_dispatch.Tool{ seed, grep, result_reader };
+    const registry = tool_dispatch.Registry{ .tools = &tools };
+    const advertised = [_]model_tool_schema.FunctionSchema{
+        seed.model_schema,
+        grep.model_schema,
+        result_reader.model_schema,
+    };
+    const eligible = registered_optional_model_eligibility(&advertised, .unavailable);
+    try std.testing.expect(eligible.glob_files);
+    try std.testing.expect(eligible.grep_files);
+    try std.testing.expect(eligible.read_tool_result);
+    try std.testing.expect(!registered_optional_model_eligibility(&advertised, .required).read_tool_result);
+
+    const source_calls = [_]ToolCall{
+        .{ .id = "glob", .name = "glob_files", .arguments_json = "{\"pattern\":\"*.zig\",\"path\":\"\"}" },
+        .{ .id = "range", .name = "read_tool_result", .arguments_json = "{\"mode\":\"range\",\"handle\":\"result.txt\",\"start_byte\":2,\"byte_count\":9,\"query\":\"wrong\"}" },
+    };
+    const normalized = try normalize_registered_optional_tool_calls(
+        arena,
+        registry,
+        eligible,
+        &source_calls,
+    );
+    try std.testing.expect(normalized.ptr != source_calls[0..].ptr);
+    try std.testing.expectEqualStrings(
+        "{\"pattern\":\"*.zig\"}",
+        normalized[0].arguments_json,
+    );
+    try std.testing.expectEqualStrings(
+        "{\"handle\":\"result.txt\",\"start_byte\":2,\"byte_count\":9}",
+        normalized[1].arguments_json,
+    );
+    const unnormalized = try normalize_registered_optional_tool_calls(
+        arena,
+        registry,
+        .{},
+        &source_calls,
+    );
+    try std.testing.expectEqual(source_calls[0..].ptr, unnormalized.ptr);
+
+    const messages = [_]ChatMessage{
+        .{ .role = .assistant, .tool_calls = normalized },
+        .{ .role = .tool, .content = "keep result", .tool_call_id = "range", .tool_name = "read_tool_result" },
+    };
+    const projected = try project_registered_optional_request_messages(
+        arena,
+        registry,
+        eligible,
+        &messages,
+    );
+    try std.testing.expect(projected.ptr != messages[0..].ptr);
+    try std.testing.expectEqualStrings(
+        "{\"handle\":\"result.txt\",\"start_byte\":2,\"byte_count\":9,\"mode\":\"range\"}",
+        projected[0].tool_calls[1].arguments_json,
+    );
+    try std.testing.expectEqualStrings("keep result", projected[1].content.?);
+    const idempotent = try project_registered_optional_request_messages(
+        arena,
+        registry,
+        eligible,
+        projected,
+    );
+    try std.testing.expectEqual(projected.ptr, idempotent.ptr);
+    const ineligible = try project_registered_optional_request_messages(
+        arena,
+        registry,
+        .{},
+        &messages,
+    );
+    try std.testing.expectEqual(messages[0..].ptr, ineligible.ptr);
+}
+
+fn check_registered_optional_model_allocation_failures(alloc: Allocator) !void {
+    const result_reader = tool_dispatch.Tool{
+        .name = "read_tool_result",
+        .description = "test",
+        .model_schema = .{ .name = "read_tool_result", .description = "test" },
+        .executor_kind = .read_tool_result,
+        .decode = undefined,
+        .call = undefined,
+        .reads_only_fn = undefined,
+        .irreversible_fn = undefined,
+    };
+    const registry = tool_dispatch.Registry{ .tools = &.{result_reader} };
+    const source_calls = [_]ToolCall{.{
+        .id = "range",
+        .name = "read_tool_result",
+        .arguments_json = "{\"mode\":\"range\",\"handle\":\"result.txt\",\"start_byte\":2,\"byte_count\":9,\"query\":\"wrong\"}",
+    }};
+    const normalized = try normalize_registered_optional_tool_calls(
+        alloc,
+        registry,
+        .{ .read_tool_result = true },
+        &source_calls,
+    );
+    if (normalized.ptr == source_calls[0..].ptr) return error.TestUnexpectedResult;
+    defer {
+        alloc.free(@constCast(normalized[0].arguments_json));
+        alloc.free(@constCast(normalized));
+    }
+    try std.testing.expectEqualStrings(
+        "{\"handle\":\"result.txt\",\"start_byte\":2,\"byte_count\":9}",
+        normalized[0].arguments_json,
+    );
+
+    const source_messages = [_]ChatMessage{.{
+        .role = .assistant,
+        .tool_calls = normalized,
+    }};
+    const projected = try project_registered_optional_request_messages(
+        alloc,
+        registry,
+        .{ .read_tool_result = true },
+        &source_messages,
+    );
+    if (projected.ptr == source_messages[0..].ptr) return error.TestUnexpectedResult;
+    defer free_request_projection(alloc, &source_messages, projected);
+    try std.testing.expectEqualStrings(
+        "{\"handle\":\"result.txt\",\"start_byte\":2,\"byte_count\":9,\"mode\":\"range\"}",
+        projected[0].tool_calls[0].arguments_json,
+    );
+}
+
+test "registered optional model projection cleans every allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        check_registered_optional_model_allocation_failures,
+        .{},
+    );
+}
+
 test "terminal request normalization follows effective attempt advertisement" {
     const nested = tool_dispatch.Tool{
         .name = "terminal",
@@ -672,7 +1168,7 @@ fn check_terminal_request_projection_allocation_failures(alloc: Allocator) !void
     };
     const projected = try project_terminal_request_messages(alloc, registry, true, &source);
     if (projected.ptr == source[0..].ptr) return error.TestUnexpectedResult;
-    defer free_terminal_request_projection(alloc, &source, projected);
+    defer free_request_projection(alloc, &source, projected);
     try std.testing.expectEqualStrings("{\"request\":{}}", projected[0].tool_calls[0].arguments_json);
     try std.testing.expectEqualStrings("{\"request\":{\"action\":null}}", projected[0].tool_calls[1].arguments_json);
     try std.testing.expectEqualStrings(
@@ -3486,11 +3982,21 @@ fn processQueuedPromptLoop(
                 base_nested_terminal_advertised,
                 vision_mode,
             );
-            const request_messages = try project_terminal_request_messages(
+            const registered_optional_eligibility = registered_optional_model_eligibility(
+                config.advertised_functions,
+                vision_mode,
+            );
+            const terminal_request_messages = try project_terminal_request_messages(
                 overlay_arena,
                 deps.tool_registry,
                 terminal_request_eligible,
                 projected_request_messages,
+            );
+            const request_messages = try project_registered_optional_request_messages(
+                overlay_arena,
+                deps.tool_registry,
+                registered_optional_eligibility,
+                terminal_request_messages,
             );
             last_gateway_message_count = request_messages.len;
             const provider_opts = model_capabilities.resolveProviderOptionsForCapabilities(request_capabilities, config.effort, route_fast_mode);
@@ -3981,6 +4487,12 @@ fn processQueuedPromptLoop(
                     arena,
                     deps.tool_registry,
                     terminal_request_eligible,
+                    completion.tool_calls,
+                );
+                completion.tool_calls = try normalize_registered_optional_tool_calls(
+                    arena,
+                    deps.tool_registry,
+                    registered_optional_eligibility,
                     completion.tool_calls,
                 );
             }

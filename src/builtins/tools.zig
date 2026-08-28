@@ -570,7 +570,7 @@ const subagent_command_schema = model_tool_schema.ObjectSchema{
 const vision_description =
     "Inspect authorized images attached by the user or local image paths supplied in the conversation, and return structured factual evidence. Pass exactly one source: image_ids for attached images, or paths for local images. When to use: read visible text, UI state, objects, layout, or other visual details needed for the task. When NOT to use: inspect paths the user did not supply, infer details not visible in an image, or repeat evidence already available in the conversation.";
 const read_tool_result_description =
-    "Read a stored tool result or captured command output by opaque handle from the active session or process, using a bounded byte range or literal query. When to use: inspect more after a tool-result preview or command-output handle says retained output is available. When NOT to use: read arbitrary files, search the workspace, recover secrets, or inspect results from another session or process.";
+    "Read a stored tool result or captured command output by opaque handle from the active session or process. Set mode=range for start_byte/byte_count and omit query. Set mode=query for one non-empty literal query and omit range fields. When to use: inspect more after a tool-result preview or command-output handle says retained output is available. When NOT to use: read arbitrary files, search the workspace, recover secrets, or inspect results from another session or process.";
 
 pub const glob_files = ToolSpec{
     .name = "glob_files",
@@ -581,7 +581,7 @@ pub const glob_files = ToolSpec{
         .input_schema = .{
             .properties = &.{
                 .{ .name = "pattern", .json_type = .string, .description = "Glob pattern to match, such as src/**/*.zig or *.md." },
-                .{ .name = "path", .json_type = .string, .description = "Optional search root relative to the workspace root, or an external path using an absolute path, ~/..., or a relative workspace escape such as ../...; external access is subject to permission policy. Defaults to current directory; narrow it when possible." },
+                .{ .name = "path", .json_type = .string, .bounds = &.{ .min_length = 1 }, .description = "Optional search root relative to the workspace root, or an external path using an absolute path, ~/..., or a relative workspace escape such as ../...; external access is subject to permission policy. Omit this field to use the current directory; never send an empty string. Narrow it when possible." },
                 .{ .name = "mode", .json_type = .string, .shape = &.{ .enum_values = &.{ "matches", "count" } }, .description = "Use matches to return sample paths, or count to return an exact matching path count without listing entries." },
             },
             .required = &.{"pattern"},
@@ -611,7 +611,7 @@ pub const grep_files = ToolSpec{
         .input_schema = .{
             .properties = &.{
                 .{ .name = "pattern", .json_type = .string, .description = "Literal plain-text pattern to search for." },
-                .{ .name = "path", .json_type = .string, .description = "Optional search root relative to the workspace root, or an external path using an absolute path, ~/..., or a relative workspace escape such as ../...; external access is subject to permission policy. Defaults to current directory; narrow it when possible." },
+                .{ .name = "path", .json_type = .string, .bounds = &.{ .min_length = 1 }, .description = "Optional search root relative to the workspace root, or an external path using an absolute path, ~/..., or a relative workspace escape such as ../...; external access is subject to permission policy. Omit this field to use the current directory; never send an empty string. Narrow it when possible." },
                 .{ .name = "include", .json_type = .string, .description = "Optional glob pattern applied to candidate file paths before reading files, such as *.zig or src/**/*.ts." },
                 .{ .name = "case_insensitive", .json_type = .boolean, .description = "Search case-insensitively when true." },
                 .{ .name = "mode", .json_type = .string, .shape = &.{ .enum_values = &.{ "matches", "files_with_matches", "count" } }, .description = "Use matches for line matches, files_with_matches for unique matching paths, or count for exact matching-line and matching-file counts." },
@@ -1223,12 +1223,14 @@ pub const read_tool_result = ToolSpec{
         .description = read_tool_result_description,
         .input_schema = .{
             .properties = &.{
+                .{ .name = "mode", .json_type = .string, .shape = &.{ .enum_values = &.{ "range", "query" } }, .description = "Required operation mode. Use range for byte offsets/counts, or query for a literal line search." },
                 .{ .name = "handle", .json_type = .string, .description = "Opaque handle from a prior tool-result preview or captured command output." },
-                .{ .name = "start_byte", .json_type = .integer, .description = "Optional 1-based byte offset for range reads. Defaults to 1." },
-                .{ .name = "byte_count", .json_type = .integer, .description = "Optional positive byte count for range reads. Bounded by the tool." },
-                .{ .name = "query", .json_type = .string, .description = "Optional literal line query. When set, range fields are ignored." },
+                .{ .name = "start_byte", .json_type = .integer, .description = "Only for mode=range. Optional 1-based byte offset. Defaults to 1." },
+                .{ .name = "byte_count", .json_type = .integer, .description = "Only for mode=range. Optional positive byte count. Bounded by the tool." },
+                .{ .name = "query", .json_type = .string, .bounds = &.{ .min_length = 1 }, .description = "Only for mode=query. Required non-empty literal line query. Omit start_byte and byte_count." },
             },
-            .required = &.{"handle"},
+            .required = &.{ "mode", "handle" },
+            .additional_properties = false,
         },
     },
     .executor_kind = .read_tool_result,
@@ -1299,7 +1301,7 @@ test "built-in model-facing tool contract stays byte exact" {
 
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
-        "2bd29939ef7288131a7a2c6f1cb97da0e76a351bf6a8f7e39c3010a444d31df9",
+        "9dbc432d40f2a5558d8348f18dcc287b0384cad0ebe8dcd84c86863494009478",
         &actual_hex,
     );
 }
@@ -2048,7 +2050,8 @@ test "built-in glob_files owns product metadata schema and callbacks" {
     try std.testing.expect(std.mem.find(u8, glob_files.description, "external access is subject to permission policy") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"required\":[\"pattern\"]") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"mode\":{\"type\":\"string\",\"enum\":[\"matches\",\"count\"]") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "\"path\":{\"type\":\"string\"") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "\"path\":{\"type\":\"string\",\"minLength\":1") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "Omit this field to use the current directory") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "external path") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "~/...") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "../...") != null);
@@ -2087,6 +2090,8 @@ test "built-in grep_files owns product metadata schema and callbacks" {
     try std.testing.expect(std.mem.find(u8, schema_json, "\"head_limit\"") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"offset\"") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"context_lines\"") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "\"path\":{\"type\":\"string\",\"minLength\":1") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "Omit this field to use the current directory") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "external path") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "~/...") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "../...") != null);
@@ -2681,13 +2686,16 @@ test "built-in read_tool_result owns product metadata schema and callbacks" {
 
     try std.testing.expectEqualStrings("read_tool_result", read_tool_result.name);
     try std.testing.expect(std.mem.find(u8, read_tool_result.description, "opaque handle from the active session or process") != null);
-    try std.testing.expect(std.mem.find(u8, read_tool_result.description, "bounded byte range or literal query") != null);
+    try std.testing.expect(std.mem.find(u8, read_tool_result.description, "mode=range") != null);
+    try std.testing.expect(std.mem.find(u8, read_tool_result.description, "mode=query") != null);
     try std.testing.expect(std.mem.find(u8, read_tool_result.description, "inspect results from another session or process") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"handle\":{\"type\":\"string\"") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"start_byte\":{\"type\":\"integer\"") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"byte_count\":{\"type\":\"integer\"") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "\"query\":{\"type\":\"string\"") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "\"required\":[\"handle\"]") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "\"mode\":{\"type\":\"string\",\"enum\":[\"range\",\"query\"]") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "\"query\":{\"type\":\"string\",\"minLength\":1") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "\"additionalProperties\":false") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "\"required\":[\"mode\",\"handle\"]") != null);
     try std.testing.expectEqual(tool_dispatch.ExecutorKind.read_tool_result, read_tool_result.executor_kind);
     try std.testing.expectEqual(types.ToolActivityKind.read, read_tool_result.activity_kind);
     try std.testing.expect(!read_tool_result.requires_approval);
