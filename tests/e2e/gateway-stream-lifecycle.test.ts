@@ -2934,6 +2934,76 @@ describe("gateway stream lifecycle", () => {
     }
   });
 
+  test("indeterminate terminal termination reports one truthful result without replaying effects", async () => {
+    const root = createFixtureRoot("terminal-indeterminate-outcome");
+    const tracePath = join(root.root, "trace.log");
+    const effectPath = join(root.workspace, "command-effect.txt");
+    const callId = "terminal_indeterminate_1";
+    let observedFailure = "";
+    let step = 0;
+    const gateway = startGateway((body) => {
+      switch (step++) {
+        case 0:
+          return fakeGatewayToolCall(callId, "terminal", {
+            action: "exec",
+            command: "printf 'effect\\n' >> command-effect.txt",
+            timeout_ms: 30_000,
+          });
+        case 1:
+          observedFailure = toolResultOutput(body, callId);
+          return fakeGatewayFinalText("Indeterminate command outcome acknowledged without retry.");
+        default:
+          return new Response("unexpected request", { status: 500 });
+      }
+    });
+
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--yolo", "--no-save", "Run the mutation exactly once."],
+        {
+          cwd: root.workspace,
+          env: {
+            ...fixtureEnv(root, gateway, tracePath),
+            FX_COMMAND_TEST_INDETERMINATE_AFTER_EXIT: "1",
+          },
+          timeoutMs: 15_000,
+        },
+      );
+      const json = JSON.parse(result.stdout) as {
+        exit_code: number;
+        output: string;
+        tool_calls: Array<{
+          name: string;
+          status: string;
+          command_result?: { termination_indeterminate?: boolean };
+        }>;
+      };
+
+      expect(result.code).toBe(0);
+      expect(json.exit_code).toBe(0);
+      expect(json.output).toContain("acknowledged without retry");
+      expect(gateway.requestCount()).toBe(2);
+      expect(readFileSync(effectPath, "utf8")).toBe("effect\n");
+      expect(observedFailure).toContain("could not be confirmed");
+      expect(observedFailure).toContain("Do not retry");
+      expect(observedFailure).not.toContain("Unexpected");
+      expect(json.tool_calls).toHaveLength(1);
+      expect(json.tool_calls[0]).toMatchObject({
+        name: "terminal",
+        status: "error",
+        command_result: { termination_indeterminate: true },
+      });
+      expect(readFileSync(tracePath, "utf8")).toContain(
+        "command termination became indeterminate",
+      );
+      expect(result.stderr).not.toContain("Unexpected");
+      expect(result.stderr).not.toContain("error.Unexpected");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
   test("suffixless stored result handle remains readable", async () => {
     const root = createFixtureRoot("suffixless-tool-result-handle");
     const tracePath = join(root.root, "trace.log");

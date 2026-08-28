@@ -5893,6 +5893,81 @@ describe("acp: model-independent", () => {
   );
 
   test(
+    "session/list exposes bounded titled pages",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-paged-session-list-");
+      const gateway = startFakeGateway([
+        finalText("ACP titled session created"),
+      ]);
+      const title = "Paginated ACP session title";
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        const titledSessionId = await startCodeSession(client);
+        const prompted = await runPrompt(client, title);
+        expect(prompted.promptResult.error).toBeUndefined();
+        await client.close();
+        client = null;
+
+        for (let index = 0; index < 100; index += 1) {
+          writeAcpSession(
+            root.home,
+            root.workspace,
+            `paged-session-${String(index).padStart(3, "0")}`,
+            index + 1,
+          );
+        }
+
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 10);
+
+        const first = await client.request("session/list", {}, 11) as any;
+        expect(first.result?.sessions).toHaveLength(100);
+        expect(first.result?.nextCursor).toEqual(expect.any(String));
+        const titledSession = first.result.sessions.find(
+          (session: { sessionId: string }) =>
+            session.sessionId === titledSessionId
+        );
+        expect(titledSession?.title).toBe(title);
+
+        const second = await client.request(
+          "session/list",
+          { cursor: first.result.nextCursor },
+          12,
+        ) as any;
+        expect(second.result?.sessions).toHaveLength(1);
+        expect(second.result?.nextCursor).toBeUndefined();
+        const firstIds = new Set(
+          first.result.sessions.map((session: { sessionId: string }) =>
+            session.sessionId
+          ),
+        );
+        expect(firstIds.has(second.result.sessions[0].sessionId)).toBe(false);
+        const listed = await client.request(
+          "session/list",
+          { cursor: "not-a-session-cursor" },
+          13,
+        ) as any;
+        expect(listed.error).toEqual({
+          code: -32602,
+          message: "Invalid params",
+        });
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "session/list treats null cwd as omitted",
     async () => {
       const root = createIsolatedRoot("fx-acp-null-session-list-");

@@ -999,41 +999,47 @@ fn handleLoadFailure(
 }
 
 pub fn handleListSessions(state: *server.ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void {
-    const cwd_filter = parseListSessionsCwd(alloc, msg) catch |err| switch (err) {
-        error.InvalidParams => return state.writer.writeError(alloc, msg.id, .{
+    var params_arena = std.heap.ArenaAllocator.init(alloc);
+    defer params_arena.deinit();
+    const params = parseListSessionsParams(params_arena.allocator(), msg) catch
+        return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_params,
             .message = "Invalid params",
-        }),
-        else => return err,
-    };
-    defer if (cwd_filter) |cwd| alloc.free(cwd);
+        });
     var store = (if (state.cfg.home_override) |home|
-        session_store.Store.initReadOnlyFromHome(alloc, home, cwd_filter orelse state.workspace_root)
+        session_store.Store.initReadOnlyFromHome(alloc, home, params.cwd orelse state.workspace_root)
     else
-        session_store.Store.initReadOnly(alloc, cwd_filter orelse state.workspace_root)) catch {
+        session_store.Store.initReadOnly(alloc, params.cwd orelse state.workspace_root)) catch {
         try state.writer.writeResponse(alloc, msg.id, "{\"sessions\":[]}");
         return;
     };
     defer store.deinit(alloc);
 
-    var session_list = (if (cwd_filter != null)
-        store.listForWorkspace(alloc)
-    else
-        store.list(alloc)) catch {
+    var page = store.listSessionPage(
+        alloc,
+        if (params.cwd != null) .current_workspace else .all_workspaces,
+        params.continuation,
+        session_store.session_list_default_limit,
+    ) catch {
         try state.writer.writeResponse(alloc, msg.id, "{\"sessions\":[]}");
         return;
     };
-    defer {
-        for (session_list.items) |*s| s.deinit(alloc);
-        session_list.deinit(alloc);
-    }
+    defer page.deinit(alloc);
+    var next_cursor_buf: [320]u8 = undefined;
+    const next_cursor = if (page.has_more and page.summaries.items.len > 0)
+        try std.fmt.bufPrint(&next_cursor_buf, "v1:{d}:{s}", .{
+            page.summaries.items[page.summaries.items.len - 1].updated_at_ms,
+            page.summaries.items[page.summaries.items.len - 1].id,
+        })
+    else
+        null;
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
 
     try out.writer.writeAll("{\"sessions\":[");
     var wrote_session = false;
-    for (session_list.items) |summary| {
+    for (page.summaries.items) |summary| {
         const workspace_root = summary.workspace_root orelse {
             debug_trace.logf(
                 "acp",
@@ -1056,32 +1062,73 @@ pub fn handleListSessions(state: *server.ServerState, alloc: Allocator, msg: *js
         try writeJsonStr(summary.id, &out.writer);
         try out.writer.writeAll(",\"cwd\":");
         try writeJsonStr(workspace_root, &out.writer);
+        if (summary.title) |title| {
+            try out.writer.writeAll(",\"title\":");
+            try writeJsonStr(title, &out.writer);
+        }
         try out.writer.writeAll(",\"updatedAt\":");
         const iso = try formatIso8601(alloc, summary.updated_at_ms);
         defer alloc.free(iso);
         try writeJsonStr(iso, &out.writer);
         try out.writer.writeAll("}");
     }
-    try out.writer.writeAll("]}");
+    try out.writer.writeAll("]");
+    if (next_cursor) |cursor| {
+        try out.writer.writeAll(",\"nextCursor\":");
+        try writeJsonStr(cursor, &out.writer);
+    }
+    try out.writer.writeAll("}");
 
     try state.writer.writeResponse(alloc, msg.id, out.writer.buffered());
 }
 
-fn parseListSessionsCwd(
+const ListSessionsParams = struct {
+    cwd: ?[]const u8 = null,
+    continuation: ?session_store.ResumableSessionContinuation = null,
+};
+
+fn parseListSessionsParams(
     alloc: Allocator,
     msg: *jsonrpc.Message,
-) !?[]u8 {
-    const raw = msg.params_raw orelse return null;
+) !ListSessionsParams {
+    const raw = msg.params_raw orelse return .{};
     const parsed = std.json.parseFromSlice(std.json.Value, alloc, raw, .{}) catch
         return error.InvalidParams;
-    defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidParams;
-    const cwd = parsed.value.object.get("cwd") orelse return null;
-    if (cwd == .null) return null;
-    if (cwd != .string or !std.fs.path.isAbsolute(cwd.string)) {
+    var result = ListSessionsParams{};
+    if (parsed.value.object.get("cwd")) |cwd| {
+        if (cwd != .null) {
+            if (cwd != .string or !std.fs.path.isAbsolute(cwd.string)) {
+                return error.InvalidParams;
+            }
+            result.cwd = cwd.string;
+        }
+    }
+    if (parsed.value.object.get("cursor")) |cursor| {
+        if (cursor != .null) {
+            if (cursor != .string) return error.InvalidParams;
+            result.continuation = parseListCursor(cursor.string) catch
+                return error.InvalidParams;
+        }
+    }
+    return result;
+}
+
+fn parseListCursor(raw: []const u8) !session_store.ResumableSessionContinuation {
+    if (raw.len == 0 or raw.len > 320) return error.InvalidParams;
+    var fields = std.mem.splitScalar(u8, raw, ':');
+    if (!std.mem.eql(u8, fields.next() orelse return error.InvalidParams, "v1")) {
         return error.InvalidParams;
     }
-    return try alloc.dupe(u8, cwd.string);
+    const updated_at_ms = std.fmt.parseInt(
+        i64,
+        fields.next() orelse return error.InvalidParams,
+        10,
+    ) catch return error.InvalidParams;
+    const id = fields.next() orelse return error.InvalidParams;
+    if (updated_at_ms < 0 or fields.next() != null) return error.InvalidParams;
+    session_store.validateSessionId(id) catch return error.InvalidParams;
+    return .{ .updated_at_ms = updated_at_ms, .id = id };
 }
 
 fn sendHistoryTurnAsUpdates(state: *server.ServerState, alloc: Allocator, session_id: []const u8, turn: types.HistoryTurn) !void {

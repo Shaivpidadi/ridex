@@ -1402,14 +1402,30 @@ pub fn Runtime(comptime App: type) type {
         fn approvalOwnsCurrentSurface(app: *const App) bool {
             if (!app.approval_prompt.isActive()) return false;
             if (!app.subagents.isViewActive()) return true;
+            const request = app.approval_prompt.request orelse return false;
             if (comptime !@hasDecl(@TypeOf(app.subagents), "childRouteId") or
                 !@hasDecl(@TypeOf(app.subagents), "mainApprovalBinding"))
             {
                 return true;
             }
+            const committed = if (comptime @hasField(App, "approval_screen"))
+                if (app.approval_screen.screen_commit) |commit|
+                    commit.request_id == request.id
+                else
+                    false
+            else
+                false;
+            var maybe_binding = app.subagents.mainApprovalBinding(request.id);
+            if (maybe_binding == null and committed) {
+                if (comptime @hasDecl(@TypeOf(app.subagents), "mainApprovalCardBinding")) {
+                    maybe_binding = app.subagents.mainApprovalCardBinding(request.id);
+                }
+            }
+            const binding = maybe_binding orelse return false;
+            // The current card remains resolvable while its presented flag and
+            // selected child route catch up with the committed approval screen.
+            if (committed) return true;
             const child_id = app.subagents.childRouteId() orelse return false;
-            const request = app.approval_prompt.request orelse return false;
-            const binding = app.subagents.mainApprovalBinding(request.id) orelse return false;
             return std.mem.eql(u8, binding.child_id, child_id);
         }
 
@@ -10564,6 +10580,75 @@ fn installReadyRoutingFileApproval(app: *RoutingFakeApp) !void {
         .changed_or_notice_visible = true,
         .document_scrollable = true,
     });
+}
+
+const ApprovalOwnershipBinding = struct {
+    child_id: []const u8,
+};
+
+const ApprovalOwnershipSubagents = struct {
+    view_active: bool = true,
+    child_id: []const u8 = "selected-child",
+    presented_binding: ?ApprovalOwnershipBinding = null,
+    card_binding: ?ApprovalOwnershipBinding = null,
+
+    pub fn isViewActive(self: *const ApprovalOwnershipSubagents) bool {
+        return self.view_active;
+    }
+
+    pub fn childRouteId(self: *const ApprovalOwnershipSubagents) ?[]const u8 {
+        return self.child_id;
+    }
+
+    pub fn mainApprovalBinding(
+        self: *const ApprovalOwnershipSubagents,
+        _: u64,
+    ) ?ApprovalOwnershipBinding {
+        return self.presented_binding;
+    }
+
+    pub fn mainApprovalCardBinding(
+        self: *const ApprovalOwnershipSubagents,
+        _: u64,
+    ) ?ApprovalOwnershipBinding {
+        return self.card_binding;
+    }
+};
+
+const ApprovalOwnershipApp = struct {
+    approval_prompt: approval_prompt.ApprovalPrompt = .{},
+    approval_screen: interaction_state.ApprovalScreenState = .{},
+    subagents: ApprovalOwnershipSubagents = .{},
+};
+
+test "committed child approval owns input while its refreshed binding catches up" {
+    const alloc = std.testing.allocator;
+    var app = ApprovalOwnershipApp{};
+    defer app.approval_prompt.deinit(alloc);
+    try std.testing.expect(try app.approval_prompt.syncRequest(
+        alloc,
+        .{ .id = 41, .label = "write external-child.txt" },
+    ));
+
+    try std.testing.expect(
+        !Runtime(ApprovalOwnershipApp).approvalOwnsCurrentSurface(&app),
+    );
+    app.approval_screen.recordScreenCommit(41, .{
+        .request_id = 41,
+        .rows = 24,
+        .cols = 112,
+        .file_identity_visible = true,
+        .all_decision_controls_visible = true,
+        .changed_or_notice_visible = true,
+        .document_scrollable = false,
+    });
+    try std.testing.expect(
+        !Runtime(ApprovalOwnershipApp).approvalOwnsCurrentSurface(&app),
+    );
+    app.subagents.card_binding = .{ .child_id = "approval-child" };
+    try std.testing.expect(
+        Runtime(ApprovalOwnershipApp).approvalOwnsCurrentSurface(&app),
+    );
 }
 
 test "app_input_runtime consumes legacy X10 reports during active file approval" {
