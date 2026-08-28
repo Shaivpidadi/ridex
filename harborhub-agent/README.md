@@ -1,11 +1,12 @@
-# FX hardened apply_patch Harbor Hub agent
+# FX patch recovery Harbor Hub agent
 
-This source package lets Harbor Hub stage the exact Linux binary for the
-hardened Patch v3 follow-up. It preserves the benchmarked `fx ask --yolo --json`
-execution path; ACP is only the hosted transport envelope.
+This source package lets Harbor Hub stage the exact Linux binary for the X11
+patch recovery experiment. It preserves the benchmarked
+`fx ask --yolo --json` execution path; ACP is only the hosted transport
+envelope.
 
-- FX experiment source commit: `d335962babe9dcbbdd839cd63279e9e4bbcc18b0`
-- Binary SHA-256: `f7728ec1bbbeb8dd0fef4f6fd8c900d25628bfd18f5494e9653ada173d8059b9`
+- FX experiment source commit: `30bc05e2188d162f896bad9407ed0d1f45d24ab1`
+- Binary SHA-256: `b9807ac081c3b6e102cf7f7e71641250fb9d2171c1e36f8d35be4b8317af2a32`
 - Binary target: `x86_64-linux-musl`
 - Optimization profile: `ReleaseSafe`
 - Model: `vercel_ai_gateway/openai/gpt-5.6-sol`
@@ -18,7 +19,8 @@ Use Harbor's direct credential mode with `AI_GATEWAY_API_KEY` and
 `FX_EXPERIMENT_X9_EDITOR=patch_v3` and
 `FX_EXPERIMENT_X9_PROVIDER_RETRY=control` to match the prior Patch v3 run.
 
-This build keeps `edit_file` available while adding the transactional
-multi-file/multi-hunk `apply_patch` tool. The hardening adds bounded context
-recovery for whitespace drift while retaining ambiguity and transaction-safety
-checks.
+This build keeps `edit_file` available alongside transactional multi-file and
+multi-hunk `apply_patch`. It adds deterministic missing, ambiguous, and no-op
+outcomes; skips context-only hunks; and prevents queued fallback mutations from
+running behind an unobserved failed mutation. Reads remain available so the
+model can inspect current state before retrying.

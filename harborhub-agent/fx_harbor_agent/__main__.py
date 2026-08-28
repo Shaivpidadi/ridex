@@ -41,7 +41,7 @@ from acp.schema import (
 
 REQUESTED_MODEL = "vercel_ai_gateway/openai/gpt-5.6-sol"
 FX_BINARY = Path(__file__).resolve().parent.parent / "bin" / "fx"
-FX_BINARY_SHA256 = "f7728ec1bbbeb8dd0fef4f6fd8c900d25628bfd18f5494e9653ada173d8059b9"
+FX_BINARY_SHA256 = "b9807ac081c3b6e102cf7f7e71641250fb9d2171c1e36f8d35be4b8317af2a32"
 FX_LOG = Path("/logs/agent/fx.json")
 FX_STDERR_LOG = Path("/logs/agent/fx-stderr.log")
 FX_TRACE_LOG = Path("/logs/agent/fx-trace.log")
@@ -87,9 +87,9 @@ class FxAskAgent(Agent):
             protocol_version=PROTOCOL_VERSION,
             agent_capabilities=AgentCapabilities(),
             agent_info=Implementation(
-                name="fx-x9-ask",
-                title="FX hardened apply_patch wrapper",
-                version="0.0.6-x10.d335962",
+                name="fx-x11-ask",
+                title="FX patch recovery wrapper",
+                version="0.0.6-x11.30bc05e",
             ),
         )
 

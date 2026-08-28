@@ -1,1 +1,1 @@
-"""Harbor Hub ACP wrapper for the pinned hardened apply_patch FX binary."""
+"""Harbor Hub ACP wrapper for the pinned FX patch recovery binary."""
