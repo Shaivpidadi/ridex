@@ -133,19 +133,22 @@ fn streamSessionTranscript(app: anytype, reader: anytype) !u64 {
     };
     const payload_result = streamSessionTranscriptPayload(app, reader);
     if (payload_result) |payload_bytes| {
-        scrollResumePayloadIntoHistory(app) catch |padding_err| {
+        app.shell.writeResumeStreamBytes(
+            &app.metrics,
+            "\r\n",
+        ) catch |guard_err| {
             app.shell.writeResumeStreamBytes(
                 &app.metrics,
                 resume_stream_autowrap_disable,
             ) catch |restore_err| {
                 debug_trace.logf(
                     "session",
-                    "event=session_transcript_stream outcome=failed stage=padding_restore padding_err={s} restore_err={s}",
-                    .{ @errorName(padding_err), @errorName(restore_err) },
+                    "event=session_transcript_stream outcome=failed stage=guard_restore guard_err={s} restore_err={s}",
+                    .{ @errorName(guard_err), @errorName(restore_err) },
                 );
                 return error.TerminalModeRestoreFailed;
             };
-            return padding_err;
+            return guard_err;
         };
         try app.shell.writeResumeStreamBytes(
             &app.metrics,
@@ -169,12 +172,12 @@ fn streamSessionTranscript(app: anytype, reader: anytype) !u64 {
     }
 }
 
-fn scrollResumePayloadIntoHistory(app: anytype) !void {
-    var rows: u16 = 0;
-    const padding_rows = (app.shell.layout.rows -|
+fn extendResumeStreamGuardForRetainedProjection(app: anytype) !void {
+    const desired_rows = (app.shell.layout.rows -|
         app.shell.layout.content_bottom) +|
         footer_paint_plan.idle_footer_gap_reservation_rows +| 1;
-    while (rows < padding_rows) : (rows += 1) {
+    var emitted_rows: u16 = 1;
+    while (emitted_rows < desired_rows) : (emitted_rows += 1) {
         try app.shell.writeResumeStreamBytes(&app.metrics, "\r\n");
     }
 }
@@ -243,7 +246,7 @@ const MemoryTranscriptReader = struct {
     }
 };
 
-test "session transcript stream moves the payload clear of startup chrome" {
+test "session transcript stream writes the payload before adopting history" {
     const alloc = std.testing.allocator;
     const FakeShell = struct {
         alloc: Allocator,
@@ -290,8 +293,7 @@ test "session transcript stream moves the payload clear of startup chrome" {
 
     try std.testing.expectEqual(@as(u64, payload.len), streamed);
     try std.testing.expectEqualStrings(
-        resume_stream_autowrap_enable ++ payload ++
-            "\r\n\r\n\r\n\r\n\r\n" ++ resume_stream_autowrap_disable,
+        resume_stream_autowrap_enable ++ payload ++ "\r\n" ++ resume_stream_autowrap_disable,
         app.shell.output.items,
     );
     try std.testing.expect(app.shell.adopted);
@@ -2399,12 +2401,23 @@ pub fn Runtime(comptime App: type) type {
                     }
                 }
                 const record_cursor = projection.recordCursor();
+                if (projection.retentionChanged()) {
+                    try extendResumeStreamGuardForRetainedProjection(app);
+                }
                 if (committed_len) |len| {
                     app.shell.resumePresentationRecordAt(len, record_cursor);
                 } else {
                     app.shell.degradePresentationRecord();
                 }
+                if (comptime @hasField(
+                    @TypeOf(app.shell),
+                    "footer_reserved_base_rows",
+                )) {
+                    app.shell.footer_reserved_base_rows =
+                        footer_paint_plan.composerReservedBaseRows();
+                }
                 try app.installResumeProjectionRetained(&projection);
+                try app.commitStartupResumeReplayAnchor();
                 try projection.installPostludeRetained(
                     &app.shell,
                     &app.metrics,

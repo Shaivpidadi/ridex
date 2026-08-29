@@ -26,6 +26,7 @@ pub const ResumeProjection = struct {
     publication_source: ?transcript_runtime.TranscriptPreparationSource = null,
     pending_diffs: std.ArrayList(diff.DiffEntry) = .empty,
     next_diff_id: u32,
+    retention_changed: bool = false,
     finalized: bool = false,
     consumed: bool = false,
 
@@ -412,6 +413,7 @@ pub const ResumeProjection = struct {
             self.alloc,
             null,
         );
+        self.retention_changed = retention_changed;
         if (!retention_changed) {
             self.runtime.transcript.clearRetainingCapacity();
             self.runtime.replaceable_last_line = false;
@@ -461,6 +463,12 @@ pub const ResumeProjection = struct {
         std.debug.assert(self.finalized);
         std.debug.assert(!self.consumed);
         return self.record_cursor;
+    }
+
+    pub fn retentionChanged(self: *const ResumeProjection) bool {
+        std.debug.assert(self.finalized);
+        std.debug.assert(!self.consumed);
+        return self.retention_changed;
     }
 
     /// Installs structured continuation state after historical bytes were
@@ -680,6 +688,7 @@ test "resume projection finalizes complete flow before one retained-tail pass" {
     try std.testing.expect(std.mem.find(u8, projection.publication_source.?.bytes, "historical marker 0") != null);
     try std.testing.expect(std.mem.find(u8, projection.publication_source.?.bytes, "historical marker 11") != null);
     try std.testing.expect(projection.runtime.entries.items.len < 13);
+    try std.testing.expect(projection.retentionChanged());
 }
 
 test "resume projection appends current startup presentation after history" {

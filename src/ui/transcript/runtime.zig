@@ -4404,7 +4404,10 @@ pub const TranscriptRuntime = struct {
             prepared.selection,
         );
         const total_visual_rows = prepared.sourceTotalVisualRows();
-        const footer_rows = self.layout.rows -| self.layout.content_bottom;
+        const footer_rows = @min(
+            self.layout.rows,
+            self.footer_reserved_base_rows +| 1 +| self.extra_input_rows,
+        );
         const solved_layout = render_engine.frame_layout.solve(.{
             .terminal = self.layout,
             .owned_top = top,
@@ -4418,6 +4421,8 @@ pub const TranscriptRuntime = struct {
                     total_visual_rows,
                     @as(u32, std.math.maxInt(u16)),
                 )),
+                .trailing_boundary_blank_rows = source.preview.trailing_boundary_blank_rows,
+                .footer_boundary_gap_rows = source.preview.footer_boundary_gap_rows,
                 .cursor_row = shadow.cursor_row,
                 .cursor_col = shadow.cursor_col,
                 .tail_kind = prepared.selection.tail_kind,
@@ -4427,7 +4432,6 @@ pub const TranscriptRuntime = struct {
         const layout = render_engine.frame_layout.CommittedLayoutSnapshot.fromLayout(
             solved_layout,
         );
-
         var previous = self.transcript_commit_state;
         self.transcript_commit_state = .{ .stable = .{
             .selection = prepared.selection,
