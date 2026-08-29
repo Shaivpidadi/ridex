@@ -159,7 +159,7 @@ const Entry = struct {
     start_gate: std.Io.Event = .unset,
     thread: ?std.Thread = null,
     published_running: bool = false,
-    tombstone_sequence: std.atomic.Value(u64) = .init(0),
+    tombstone_sequence: std.atomic.Value(u32) = .init(0),
     active_operations: usize = 0,
     pending_delete: bool = false,
 
@@ -414,7 +414,7 @@ pub const Runtime = struct {
     entries: [max_entries]?*Entry = @splat(null),
     next_reservation_id: u64 = 1,
     next_generated_id: u64 = 1,
-    next_tombstone_sequence: std.atomic.Value(u64) = .init(1),
+    next_tombstone_sequence: std.atomic.Value(u32) = .init(1),
     shutting_down: bool = false,
     replay_store: command_replay_store.EphemeralStore,
     pending_admissions: usize = 0,
@@ -984,11 +984,17 @@ pub const Runtime = struct {
         const slot = self.emptySlotLocked() orelse return error.ExecutionCapacityExceeded;
         const entry = try Entry.init(self, input);
         self.entries[slot] = entry;
-        entry.thread = std.Thread.spawn(.{}, Entry.workerMain, .{entry}) catch |err| {
+        if (comptime builtin.single_threaded) {
             self.entries[slot] = null;
             entry.deinit();
-            return err;
-        };
+            return error.ManagedExecutionUnavailable;
+        } else {
+            entry.thread = std.Thread.spawn(.{}, Entry.workerMain, .{entry}) catch |err| {
+                self.entries[slot] = null;
+                entry.deinit();
+                return err;
+            };
+        }
         const next = contract.transition(entry.state, entry.barrier, .child_started);
         entry.state = next.state;
         entry.barrier = next.barrier;
