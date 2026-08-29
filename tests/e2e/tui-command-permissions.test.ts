@@ -1128,11 +1128,10 @@ function largeEffectfulCommand(marker: string) {
   return command;
 }
 
-async function expectSavedTerminalExec(
+async function expectSavedShellRun(
     root: IsolatedRoot,
     sessionId: string,
     command: string,
-    background = false,
     status: "success" | "failure" = "success",
 ) {
   const result = await runFx(
@@ -1148,10 +1147,10 @@ async function expectSavedTerminalExec(
   const call = step.tool_calls.find((entry: any) => entry.name === "shell");
   expect(JSON.parse(call.arguments_json)).toEqual(
     expect.objectContaining({
-      action: "exec",
+      action: "run",
+      yield_time_ms: 30_000,
       timeout_ms: 600_000,
       command,
-      ...(background ? { background: true } : {}),
     }),
   );
   expect(step.tool_results).toContainEqual(
@@ -2437,19 +2436,17 @@ describe("effect-aware command permissions", () => {
           gateway.requests[1]!.body,
           "terminal_session_command",
         );
-        expect(commandResult).toContain(
-          "exit_code=0\n" +
-            "<stdout>\n" +
-            "TTY_SESSION_STDOUT_BEGIN\n" +
-            "TTY_SESSION_STDOUT_END\n" +
-            "</stdout>\n" +
-            "<stderr>\n" +
-            "TTY_SESSION_STDERR\n" +
-            "</stderr>\n",
-        );
-        expect(commandResult).toMatch(
-          /<command_output_handle>fx-command-replay-[^<]+<\/command_output_handle>/,
-        );
+        const commandSnapshot = JSON.parse(commandResult);
+        expect(commandSnapshot).toMatchObject({
+          state: "completed",
+          backend: "captured",
+          persistence: "process",
+          exit_code: 0,
+        });
+        expect(commandSnapshot.output_delta).toContain("TTY_SESSION_STDOUT_BEGIN");
+        expect(commandSnapshot.output_delta).toContain("TTY_SESSION_STDOUT_END");
+        expect(commandSnapshot.output_delta).toContain("TTY_SESSION_STDERR");
+        expect(commandSnapshot.full_output_handle).toMatch(/^fx-command-replay-.+\.bin$/);
         expect(gateway.requests[1]!.body).not.toContain("\\u001e");
         expect(gateway.requests[1]!.body).not.toContain("\\u0006");
         expect(gateway.requests[1]!.body).not.toContain("\\u0000");
@@ -2458,7 +2455,7 @@ describe("effect-aware command permissions", () => {
           gateway.requests[3]!.body,
           "terminal_session_pwd",
         );
-        expect(pwdResult).toContain(`\n${root.workspace}\n`);
+        expect(JSON.parse(pwdResult).output_delta).toContain(root.workspace);
 
         const scrollback = await activeSession.captureFullScrollback();
         const completedIndex = scrollback.indexOf("Ran exec python3");
@@ -2509,7 +2506,7 @@ describe("effect-aware command permissions", () => {
         await activeSession.kill();
         activeSession = null;
 
-        await expectSavedTerminalExec(
+        await expectSavedShellRun(
           root,
           sessionIdFromHome(root),
           command,
@@ -5456,7 +5453,7 @@ describe("effect-aware command permissions", () => {
       expect(await activeSession.waitForSessionEnd()).toBe(true);
       await activeSession.kill();
       activeSession = null;
-      await expectSavedTerminalExec(
+      await expectSavedShellRun(
         foregroundRoot,
         sessionIdFromHome(foregroundRoot),
         foregroundCommand,
@@ -5982,11 +5979,10 @@ describe("effect-aware command permissions", () => {
       expect(
         Buffer.byteLength(cliGateway.classifierRequests[0]!.body),
       ).toBeGreaterThan(16 * 1024);
-      await expectSavedTerminalExec(
+      await expectSavedShellRun(
         cliRoot,
         cliJson.session_id,
         cliCommand,
-        false,
         "success",
       );
 
@@ -6015,11 +6011,10 @@ describe("effect-aware command permissions", () => {
       expect(
         Buffer.byteLength(acpGateway.classifierRequests[0]!.body),
       ).toBeGreaterThan(16 * 1024);
-      await expectSavedTerminalExec(
+      await expectSavedShellRun(
         acpRoot,
         sessionIdFromHome(acpRoot),
         acpCommand,
-        false,
         "success",
       );
     },
