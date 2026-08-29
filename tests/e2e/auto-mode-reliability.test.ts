@@ -356,8 +356,8 @@ describe("lean auto mode reliability", () => {
             },
           ]),
           (body) => {
-            expect(toolResultText(body, "clean_direct_pwd")).toContain("exit_code=0");
-            expect(toolResultText(body, "clean_direct_git_status")).toContain("exit_code=0");
+            expect(toolResultText(body, "clean_direct_pwd")).toContain("\"exit_code\":0");
+            expect(toolResultText(body, "clean_direct_git_status")).toContain("\"exit_code\":0");
             expect(toolResultText(body, "clean_blocked_reset", "execution-denied")).toContain("review_caution");
             return fakeGatewayFinalText("Clean command group complete.");
           },
@@ -430,7 +430,7 @@ describe("lean auto mode reliability", () => {
           [
             userCommandCall(reviewedCommand, `reviewed_${name}`),
             (body) => {
-              expect(toolResultText(body, `reviewed_${name}`)).toContain("exit_code=0");
+              expect(toolResultText(body, `reviewed_${name}`)).toContain("\"exit_code\":0");
               return fakeGatewayFinalText(`${name} reviewed and ran`);
             },
           ],
@@ -844,19 +844,19 @@ describe("lean auto mode reliability", () => {
         [
           userCommandCall(probeCommand, "media_probe"),
           (body) => {
-            expect(toolResultText(body, "media_probe")).toContain("exit_code=0");
+            expect(toolResultText(body, "media_probe")).toContain("\"exit_code\":0");
             return userCommandCall(rebuildCommand, "media_rebuild");
           },
           (body) => {
-            expect(toolResultText(body, "media_rebuild")).toContain("exit_code=0");
+            expect(toolResultText(body, "media_rebuild")).toContain("\"exit_code\":0");
             return userCommandCall(renderCommand, "media_render");
           },
           (body) => {
-            expect(toolResultText(body, "media_render")).toContain("exit_code=0");
+            expect(toolResultText(body, "media_render")).toContain("\"exit_code\":0");
             return userCommandCall(pythonCommand, "media_python");
           },
           (body) => {
-            expect(toolResultText(body, "media_python")).toContain("exit_code=0");
+            expect(toolResultText(body, "media_python")).toContain("\"exit_code\":0");
             return fakeGatewayToolCall("media_html", "write_file", {
               path: htmlPath,
               content: uiContent,
@@ -935,7 +935,7 @@ describe("lean auto mode reliability", () => {
             return commandCall("pwd", "safe_after_injection");
           },
           (body) => {
-            expect(toolResultText(body, "safe_after_injection")).toContain("exit_code=0");
+            expect(toolResultText(body, "safe_after_injection")).toContain("\"exit_code\":0");
             return fakeGatewayFinalText("Injected instruction ignored safely.");
           },
         ],
@@ -1270,7 +1270,7 @@ describe("lean auto mode reliability", () => {
       await activeSession.sendText("Initialize the saved allow session.");
       await activeSession.waitForText("allow session initialized", TIMEOUT);
       await activeSession.sendText(
-        `/permissions remember allow terminal ${JSON.stringify({ action: "exec", timeout_ms: 600_000, command: allowedCommand })}`,
+        `/permissions remember allow shell ${JSON.stringify({ action: "run", timeout_ms: 600_000, command: allowedCommand })}`,
       );
       await activeSession.waitForText("Remember allow for this saved session", TIMEOUT);
       await activeSession.sendKeys("1");
@@ -1392,7 +1392,7 @@ describe("lean auto mode reliability", () => {
       await activeSession.sendText("Initialize this saved session.");
       await activeSession.waitForText("session initialized", TIMEOUT);
       await activeSession.sendText(
-        `/permissions remember deny terminal ${JSON.stringify({ action: "exec", timeout_ms: 600_000, command: blockedCommand })}`,
+        `/permissions remember deny shell ${JSON.stringify({ action: "run", timeout_ms: 600_000, command: blockedCommand })}`,
       );
       await activeSession.waitForText("Remember deny for this saved session", TIMEOUT);
       await activeSession.sendKeys("1");
