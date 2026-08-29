@@ -33,6 +33,10 @@ const Allocator = std.mem.Allocator;
 const activity_overlay = render_engine.activity_overlay;
 const footer_layout = render_engine.footer_layout;
 const engine_paint_plan = render_engine.paint_plan;
+
+/// Maximum normal-buffer space reserved between an idle transcript tail and
+/// the footer. Direct resume streaming must protect the same future rows.
+pub const idle_footer_gap_reservation_rows: u16 = 2;
 const transcript_blocks = render_engine.transcript_blocks;
 const viewport_selection = render_engine.viewport_selection;
 const Layout = types.Layout;
@@ -310,8 +314,8 @@ fn initialFooterReservation(
         .transient_row => false,
     };
     const idle_reservation_rows: u16 = switch (banner_activity) {
-        .overlay_entry => if (input.footer_gap_active) 2 else 1,
-        .none => if (input.footer_gap_active) 2 else 1,
+        .overlay_entry => if (input.footer_gap_active) idle_footer_gap_reservation_rows else 1,
+        .none => if (input.footer_gap_active) idle_footer_gap_reservation_rows else 1,
         .transient_row => 0,
     };
     const banner_idle_gap_offset: u16 = switch (banner_activity) {

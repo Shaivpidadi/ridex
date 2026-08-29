@@ -52,6 +52,7 @@ const shell_runtime = @import("../../ui/shell_runtime.zig");
 const transcript_runtime = @import("../../ui/transcript/runtime.zig");
 const ui_input = @import("../../ui/input/runtime.zig");
 const ui_render = @import("../../ui/render.zig");
+const footer_paint_plan = @import("../../ui/footer/paint_plan.zig");
 const frame_scroll_plan = @import("../../ui/render_engine/frame_scroll_plan.zig");
 
 const Allocator = std.mem.Allocator;
@@ -171,7 +172,8 @@ fn streamSessionTranscript(app: anytype, reader: anytype) !u64 {
 fn scrollResumePayloadIntoHistory(app: anytype) !void {
     var rows: u16 = 0;
     const padding_rows = (app.shell.layout.rows -|
-        app.shell.layout.content_bottom) +| 1;
+        app.shell.layout.content_bottom) +|
+        footer_paint_plan.idle_footer_gap_reservation_rows +| 1;
     while (rows < padding_rows) : (rows += 1) {
         try app.shell.writeResumeStreamBytes(&app.metrics, "\r\n");
     }
@@ -289,7 +291,7 @@ test "session transcript stream moves the payload clear of startup chrome" {
     try std.testing.expectEqual(@as(u64, payload.len), streamed);
     try std.testing.expectEqualStrings(
         resume_stream_autowrap_enable ++ payload ++
-            "\r\n\r\n\r\n" ++ resume_stream_autowrap_disable,
+            "\r\n\r\n\r\n\r\n\r\n" ++ resume_stream_autowrap_disable,
         app.shell.output.items,
     );
     try std.testing.expect(app.shell.adopted);
@@ -2403,6 +2405,10 @@ pub fn Runtime(comptime App: type) type {
                     app.shell.degradePresentationRecord();
                 }
                 try app.installResumeProjectionRetained(&projection);
+                try projection.installPostludeRetained(
+                    &app.shell,
+                    &app.metrics,
+                );
                 var live_sink = LiveHistorySink(App){ .app = app };
                 try writeResumeNotice(app, &live_sink, display_title, notice);
                 app.session_persistence.resume_transcript_committed_len = null;

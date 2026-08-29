@@ -499,17 +499,69 @@ pub const ResumeProjection = struct {
             target.recomputeCursorFromTranscript();
         }
         target.reconcileDetachedInstallSource(self.publication_source.?.bytes);
-        if (try self.appendPostludeTo(target)) {
-            target.markTranscriptStructureDirty();
-        } else if (!target.streamedSessionHistoryActive()) {
-            target.markTranscriptDirty();
-        }
+        if (!target.streamedSessionHistoryActive()) target.markTranscriptDirty();
 
         var publication = self.publication_source.?;
         self.publication_source = null;
         publication.deinit(self.alloc);
         self.consumed = true;
         self.runtime.deinit(self.alloc);
+    }
+
+    /// Replays current-startup entries through the ordinary append contracts
+    /// after the complete historical source has established its anchor.
+    pub fn installPostludeRetained(
+        self: *ResumeProjection,
+        target: *TranscriptRuntime,
+        metrics: *types.Metrics,
+    ) !void {
+        std.debug.assert(self.finalized);
+        std.debug.assert(self.consumed);
+
+        var first_entry_id: ?u32 = null;
+        while (self.postlude_entries.items.len > 0) {
+            const entry = self.postlude_entries.items[0];
+            const entry_id = switch (entry) {
+                .raw_bytes => |raw| blk: {
+                    if (raw.lifecycle_pinned) return error.InvalidResumePostlude;
+                    const next_id = target.next_entry_id;
+                    try target.writeTranscriptClassified(
+                        self.alloc,
+                        metrics,
+                        raw.bytes,
+                        true,
+                        raw.class,
+                    );
+                    break :blk next_id;
+                },
+                .semantic_notice => |notice| if (notice.pending_replacement)
+                    try target.appendReplaceableSemanticNotice(self.alloc, .{
+                        .topic = notice.topic,
+                        .tone = notice.tone,
+                        .body = notice.body,
+                        .visibility = notice.visibility,
+                    })
+                else
+                    try target.appendSemanticNotice(self.alloc, .{
+                        .topic = notice.topic,
+                        .tone = notice.tone,
+                        .body = notice.body,
+                        .visibility = notice.visibility,
+                    }),
+                .user_turn,
+                .assistant_turn,
+                .assistant_table,
+                .assistant_code_block,
+                .assistant_thematic_rule,
+                => return error.InvalidResumePostlude,
+            };
+            if (first_entry_id == null) first_entry_id = entry_id;
+            var removed = self.postlude_entries.orderedRemove(0);
+            removed.deinit(self.alloc);
+        }
+        if (first_entry_id) |entry_id| {
+            target.markTranscriptContentDirtyFrom(entry_id);
+        }
     }
 
     /// Transfers a finalized detached projection into a standalone transcript
@@ -737,6 +789,8 @@ test "exact resume retains structured startup presentation outside the historica
     target.adoptStreamedSessionHistory();
     target.resumePresentationRecordAt(64, projection.recordCursor());
     try projection.installRetained(&target);
+    var metrics: types.Metrics = .{};
+    try projection.installPostludeRetained(&target, &metrics);
 
     try std.testing.expectEqual(@as(usize, 3), target.entries.items.len);
     try std.testing.expectEqualStrings(
