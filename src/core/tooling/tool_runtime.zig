@@ -753,6 +753,13 @@ fn executeRegisteredTool(
     execution.selected_dynamic_tool_schema_json = selected_dynamic_tool_sink.schema_json;
     execution.context_notices = context_notice_sink.notices.items;
     execution.result_commit = result_commit_token;
+    if (dispatch_ctx.cancel_flag) |cancel_flag| {
+        if (cancel_flag.load(.seq_cst) and
+            tool_dispatch.toolActivityKind(registry, call.name) == .command)
+        {
+            execution.cancelled = true;
+        }
+    }
     return execution;
 }
 

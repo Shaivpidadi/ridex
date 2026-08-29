@@ -499,7 +499,16 @@ pub const Runtime = struct {
             entry.mutex.unlock(zio);
             if (terminal) break;
             if (input.cancel_flag) |flag| {
-                if (flag.load(.seq_cst)) return error.Cancelled;
+                if (flag.load(.seq_cst)) {
+                    entry.cancel.store(true, .seq_cst);
+                    self.joinEntry(entry);
+                    const prepared = try self.prepareSnapshot(
+                        alloc,
+                        entry.execution_id,
+                    );
+                    published = true;
+                    return prepared;
+                }
             }
             const elapsed = io_mod.milliTimestamp() - started_ms;
             if (elapsed >= input.yield_time_ms) break;

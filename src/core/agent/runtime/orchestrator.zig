@@ -7392,6 +7392,10 @@ fn processQueuedPromptLoop(
 
             if (execution.cancelled and config.cancel_flag.load(.seq_cst)) {
                 runtime_telemetry.traceCancelObserved(step_ctx, true);
+                if (execution.result_commit) |commit| {
+                    try commit.commit();
+                    result_commit_pending = false;
+                }
                 var replay_handed_off = execution.command_replay_capture == null;
                 defer if (!replay_handed_off) {
                     execution.command_replay_capture.?.discard(arena);

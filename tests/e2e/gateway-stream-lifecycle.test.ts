@@ -181,15 +181,27 @@ function delayedSuccessfulResponse(): Response {
 function lengthLimitedCommandResponse(command: string): Response {
   return sse(
     'data: {"type":"text-delta","id":"answer","delta":"visible partial output"}\n\n' +
-      'data: {"type":"tool-input-start","id":"command_provisional","toolName":"terminal"}\n\n' +
+      'data: {"type":"tool-input-start","id":"command_provisional","toolName":"shell"}\n\n' +
       `data: ${JSON.stringify({
         type: "tool-call",
-        toolName: "terminal",
-        input: { action: "exec", command, timeout_ms: 600_000 },
+        toolName: "shell",
+        input: {
+          request: { action: "run", command, timeout_ms: 600_000 },
+        },
       })}\n\n` +
       'data: {"type":"finish","finishReason":{"unified":"length","raw":"length"}}\n\n' +
       "data: [DONE]\n\n",
   );
+}
+
+function fakeShellRun(
+  callId: string,
+  command: string,
+  options: Record<string, unknown> = {},
+): Response {
+  return fakeGatewayToolCall(callId, "shell", {
+    request: { action: "run", command, ...options },
+  });
 }
 
 function providerErrorResponse(detail = "route temporarily unavailable"): Response {
@@ -367,6 +379,22 @@ function toolResultOutput(body: string, callId: string): string {
   );
   if (!result) throw new Error(`Missing tool result for ${callId}`);
   return contentText(result.output);
+}
+
+type ShellResult = {
+  state: string;
+  backend: string;
+  persistence: string;
+  output_delta: string;
+  full_output_handle: string | null;
+  exit_code: number | null;
+  signal: string | null;
+  termination_indeterminate: boolean;
+  error: string | null;
+};
+
+function shellResult(body: string, callId: string): ShellResult {
+  return JSON.parse(toolResultOutput(body, callId)) as ShellResult;
 }
 
 function hasCurrentToolResult(body: string, callId: string): boolean {
@@ -627,7 +655,7 @@ describe("gateway stream lifecycle", () => {
       ...extra,
     });
     const ordinary = fixture(
-      "Persist until the task is handled. Use the task clearly matches wording only as prose. Do not rely on memory or general knowledge. terminal_extra and prefixweb_searchsuffix are not capability symbols.",
+      "Persist until the task is handled. Use the task clearly matches wording only as prose. Do not rely on memory or general knowledge. shell_extra and prefixweb_searchsuffix are not capability symbols.",
     );
     expect(findUnavailableCapabilityReferences(ordinary)).toEqual([]);
 
@@ -640,7 +668,7 @@ describe("gateway stream lifecycle", () => {
         });
       }
     }
-    for (const capability of ["terminal", "web_search", "ask_user_question"]) {
+    for (const capability of ["shell", "web_search", "ask_user_question"]) {
       expect(
         findUnavailableCapabilityReferences(fixture(`Use ${capability} now.`)),
       ).toContainEqual({
@@ -678,7 +706,7 @@ describe("gateway stream lifecycle", () => {
     expect(findUnavailableCapabilityReferences(capabilitySearchCurrent)).toEqual([]);
 
     const excludedText = [
-      "Use terminal and web_search.",
+      "Use shell and web_search.",
       AMBIGUOUS_CAPABILITY_CLAUSES.subagent[0],
       AMBIGUOUS_CAPABILITY_CLAUSES.skill[0],
     ].join(" ");
@@ -700,7 +728,7 @@ describe("gateway stream lifecycle", () => {
     })).toEqual([]);
   });
 
-  test("no-save ask sends status text with the exec-only terminal surface", async () => {
+  test("no-save ask sends status text with the process-only shell surface", async () => {
     const root = createFixtureRoot("status-text-ask");
     const tracePath = join(root.root, "trace.log");
     const gateway = startGateway(() => fakeGatewayFinalText("STATUS_TEXT_ASK_COMPLETE"));
@@ -735,8 +763,8 @@ describe("gateway stream lifecycle", () => {
       expect(request.prompt[0]?.role).toBe("system");
       expect(request.prompt[1]?.role).toBe("system");
       expect(contentText(request.prompt[1]?.content)).toBe(WEB_SEARCH_GUIDANCE);
-      expect(toolByName(oracleRequest, "terminal")?.description).toBe(
-        "Run one captured command with a required finite timeout_ms and return its result. Timeout cleanup covers the process group and tracked descendants; fully detached descendant cleanup is best effort on macOS.",
+      expect(toolByName(oracleRequest, "shell")?.description).toBe(
+        "Run every command with shell.run. Fast commands complete in one call; commands still running after yield_time_ms return one owned session_id. Use yield_time_ms=0 for an immediate managed background handle. Continue only with shell.wait, send input only to tty=true work with shell.write, stop owned work with shell.stop, and inspect live work with shell.list. Never detach with &, nohup, setsid, or double-forking.",
       );
       expect(toolByName(oracleRequest, "skill")?.description).toContain(
         "the task clearly matches one",
@@ -2896,7 +2924,7 @@ describe("gateway stream lifecycle", () => {
     }
   });
 
-  test("approved long foreground terminal writes its heredoc without signal 9", async () => {
+  test("approved long foreground shell run writes its heredoc without signal 9", async () => {
     const root = createFixtureRoot("long-foreground-command");
     const tracePath = join(root.root, "trace.log");
     const outputPath = join(root.workspace, "long-command-output.txt");
@@ -2908,9 +2936,8 @@ describe("gateway stream lifecycle", () => {
     const command = `cat <<'FX_LONG_COMMAND' > long-command-output.txt\n${payload}\nFX_LONG_COMMAND\n`;
     expect(Buffer.byteLength(command)).toBeGreaterThan(20 * 1024);
     const responses = [
-      fakeGatewayToolCall(callId, "terminal", {
-        action: "exec",
-        command,
+      fakeShellRun(callId, command, {
+        yield_time_ms: 30_000,
         timeout_ms: 600_000,
       }),
       fakeGatewayFinalText("Long command fixture written."),
@@ -2934,7 +2961,7 @@ describe("gateway stream lifecycle", () => {
       expect(gateway.requestCount()).toBe(2);
       expect(json.tool_calls).toContainEqual(
         expect.objectContaining({
-          name: "terminal",
+          name: "shell",
           status: "success",
         }),
       );
@@ -2946,7 +2973,7 @@ describe("gateway stream lifecycle", () => {
     }
   });
 
-  test("indeterminate terminal termination reports one truthful result without replaying effects", async () => {
+  test("indeterminate shell termination reports one truthful result without replaying effects", async () => {
     const root = createFixtureRoot("terminal-indeterminate-outcome");
     const tracePath = join(root.root, "trace.log");
     const effectPath = join(root.workspace, "command-effect.txt");
@@ -2956,11 +2983,11 @@ describe("gateway stream lifecycle", () => {
     const gateway = startGateway((body) => {
       switch (step++) {
         case 0:
-          return fakeGatewayToolCall(callId, "terminal", {
-            action: "exec",
-            command: "printf 'effect\\n' >> command-effect.txt",
-            timeout_ms: 30_000,
-          });
+          return fakeShellRun(
+            callId,
+            "printf 'effect\\n' >> command-effect.txt",
+            { timeout_ms: 30_000 },
+          );
         case 1:
           observedFailure = toolResultOutput(body, callId);
           return fakeGatewayFinalText("Indeterminate command outcome acknowledged without retry.");
@@ -2996,12 +3023,15 @@ describe("gateway stream lifecycle", () => {
       expect(json.output).toContain("acknowledged without retry");
       expect(gateway.requestCount()).toBe(2);
       expect(readFileSync(effectPath, "utf8")).toBe("effect\n");
-      expect(observedFailure).toContain("could not be confirmed");
-      expect(observedFailure).toContain("Do not retry");
+      expect(JSON.parse(observedFailure)).toMatchObject({
+        state: "completed",
+        exit_code: null,
+        termination_indeterminate: true,
+      });
       expect(observedFailure).not.toContain("Unexpected");
       expect(json.tool_calls).toHaveLength(1);
       expect(json.tool_calls[0]).toMatchObject({
-        name: "terminal",
+        name: "shell",
         status: "error",
         command_result: { termination_indeterminate: true },
       });
@@ -3097,7 +3127,7 @@ describe("gateway stream lifecycle", () => {
     }
   });
 
-  test("no-save terminal timeout returns a readable process-scoped replay handle", async () => {
+  test("no-save shell timeout returns a readable process-scoped replay handle", async () => {
     const root = createFixtureRoot("terminal-timeout-replay");
     const tracePath = join(root.root, "trace.log");
     const markerPath = join(root.workspace, "must-not-run.txt");
@@ -3110,30 +3140,28 @@ describe("gateway stream lifecycle", () => {
     const gateway = startGateway((body) => {
       switch (step++) {
         case 0:
-          return fakeGatewayToolCall(invalidCallId, "terminal", {
-            action: "exec",
-            command: "printf should-not-run > must-not-run.txt",
-            timeout_ms: undefined,
+          return fakeGatewayToolCall(invalidCallId, "shell", {
+            request: { action: "run", timeout_ms: 500 },
           });
         case 1: {
           const correction = toolResultOutput(body, invalidCallId);
           expect(correction).toContain("missing_fields");
-          expect(correction).toContain("timeout_ms");
+          expect(correction).toContain("command");
           expect(existsSync(markerPath)).toBe(false);
-          return fakeGatewayToolCall(timeoutCallId, "terminal", {
-            action: "exec",
-            command: `sleep 30 & child=$!; printf '%s' "$child" > ${JSON.stringify(childPidPath)}; printf 'PRE-TIMEOUT-OUT\\n'; wait "$child"`,
-            profile: "clean",
-            timeout_ms: 500,
-          });
+          return fakeShellRun(
+            timeoutCallId,
+            `sleep 30 & child=$!; printf '%s' "$child" > ${JSON.stringify(childPidPath)}; printf 'PRE-TIMEOUT-OUT\\n'; wait "$child"`,
+            { profile: "clean", timeout_ms: 500 },
+          );
         }
         case 2: {
-          const timedOut = toolResultOutput(body, timeoutCallId);
-          expect(timedOut).toContain("timeout=true");
-          const match = timedOut.match(
-            /<command_output_handle>([^<]+)<\/command_output_handle>/,
-          );
-          replayHandle = match?.[1] ?? "";
+          const timedOut = shellResult(body, timeoutCallId);
+          expect(timedOut).toMatchObject({
+            state: "stopped",
+            error: "TimeoutExpired",
+          });
+          expect(timedOut.output_delta).toContain("PRE-TIMEOUT-OUT");
+          replayHandle = timedOut.full_output_handle ?? "";
           expect(replayHandle).not.toBe("");
           return fakeGatewayToolCall(readCallId, "read_tool_result", {
             handle: replayHandle,
@@ -3207,41 +3235,29 @@ describe("gateway stream lifecycle", () => {
     }
   }, 30_000);
 
-  test("terminal timeout prevents the default user shell from evaluating trailing statements", async () => {
+  test("shell timeout prevents the default user shell from evaluating trailing statements", async () => {
     const root = createFixtureRoot("terminal-timeout-stops-trailing-statements");
     const tracePath = join(root.root, "trace.log");
     const effectPath = join(root.workspace, "post-timeout-effect.txt");
     const timeoutCallId = "terminal_timeout_stops_trailing_1";
-    const readCallId = "terminal_timeout_stops_trailing_read_1";
     const trailingMarker = "POST-TIMEOUT-SHOULD-NOT-RUN";
     let step = 0;
-    let replayHandle = "";
     const gateway = startGateway((body) => {
       switch (step++) {
         case 0:
-          return fakeGatewayToolCall(timeoutCallId, "terminal", {
-            action: "exec",
-            command: `printf 'PRE-TIMEOUT\n'; sleep 2; printf '${trailingMarker}\n'; printf '${trailingMarker}' > ${JSON.stringify(effectPath)}`,
-            timeout_ms: 500,
-          });
-        case 1: {
-          const timedOut = toolResultOutput(body, timeoutCallId);
-          expect(timedOut).toContain("timeout=true");
-          expect(existsSync(effectPath)).toBe(false);
-          const match = timedOut.match(
-            /<command_output_handle>([^<]+)<\/command_output_handle>/,
+          return fakeShellRun(
+            timeoutCallId,
+            `printf 'PRE-TIMEOUT\n'; sleep 2; printf '${trailingMarker}\n'; printf '${trailingMarker}' > ${JSON.stringify(effectPath)}`,
+            { yield_time_ms: 30_000, timeout_ms: 500 },
           );
-          replayHandle = match?.[1] ?? "";
-          expect(replayHandle).not.toBe("");
-          return fakeGatewayToolCall(readCallId, "read_tool_result", {
-            handle: replayHandle,
-            query: trailingMarker,
+        case 1: {
+          const timedOut = shellResult(body, timeoutCallId);
+          expect(timedOut).toMatchObject({
+            state: "stopped",
+            error: "TimeoutExpired",
           });
-        }
-        case 2: {
-          const replay = toolResultOutput(body, readCallId);
-          expect(replay).toContain("(no matches)");
-          expect(replay).not.toContain(`[stdout]\n${trailingMarker}`);
+          expect(existsSync(effectPath)).toBe(false);
+          expect(timedOut.output_delta).not.toContain(trailingMarker);
           return fakeGatewayFinalText("Post-timeout statements were blocked.");
         }
         default:
@@ -3262,7 +3278,7 @@ describe("gateway stream lifecycle", () => {
 
       expect(result.code).toBe(0);
       expect(json.output).toContain("Post-timeout statements were blocked.");
-      expect(gateway.requestCount()).toBe(3);
+      expect(gateway.requestCount()).toBe(2);
       expect(existsSync(effectPath)).toBe(false);
       expect(readFileSync(tracePath, "utf8")).toContain(
         "command termination requested source=timeout",
@@ -3273,7 +3289,7 @@ describe("gateway stream lifecycle", () => {
     }
   }, 30_000);
 
-  test("terminal timeout reaps a descendant that escapes with setsid", async () => {
+  test("shell timeout reaps a descendant that escapes with setsid", async () => {
     const root = createFixtureRoot("terminal-timeout-reaps-setsid");
     const tracePath = join(root.root, "trace.log");
     const pidPath = join(root.workspace, "escaped-timeout.pid");
@@ -3295,14 +3311,16 @@ describe("gateway stream lifecycle", () => {
     const gateway = startGateway((body) => {
       switch (step++) {
         case 0:
-          return fakeGatewayToolCall(timeoutCallId, "terminal", {
-            action: "exec",
-            command,
+          return fakeShellRun(timeoutCallId, command, {
+            profile: "clean",
+            yield_time_ms: 30_000,
             timeout_ms: 2_000,
           });
         case 1: {
-          const timedOut = toolResultOutput(body, timeoutCallId);
-          expect(timedOut).toContain("timeout=true");
+          expect(shellResult(body, timeoutCallId)).toMatchObject({
+            state: "stopped",
+            error: "TimeoutExpired",
+          });
           expect(existsSync(pidPath)).toBe(true);
           escapedPid = Number.parseInt(readFileSync(pidPath, "utf8"), 10);
           expect(Number.isSafeInteger(escapedPid) && escapedPid > 0).toBe(true);
@@ -3339,7 +3357,7 @@ describe("gateway stream lifecycle", () => {
     }
   }, 30_000);
 
-  test("terminal timeout reaps env-cleared Bash double-fork descendants", async () => {
+  test("shell timeout reaps env-cleared Bash double-fork descendants", async () => {
     const root = createFixtureRoot("terminal-timeout-reaps-env-bash-descendants");
     const tracePath = join(root.root, "trace.log");
     const pidPath = join(root.workspace, "escaped-timeout.pids");
@@ -3397,9 +3415,9 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     const gateway = startGateway((body) => {
       switch (step++) {
         case 0:
-          return fakeGatewayToolCall(timeoutCallId, "terminal", {
-            action: "exec",
-            command,
+          return fakeShellRun(timeoutCallId, command, {
+            profile: "clean",
+            yield_time_ms: 30_000,
             timeout_ms: 2_000,
           });
         case 1: {
@@ -3440,11 +3458,10 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(json.output).toContain("Combined timeout cleanup complete.");
       expect(gateway.requestCount()).toBe(2);
       if (gatewayObservationError) throw gatewayObservationError;
-      expect(timeoutOutput).toContain("timeout=true");
-      expect(timeoutOutput).toContain(
-        "cleanup_scope=process_group_and_tracked_descendants",
-      );
-      expect(timeoutOutput).toContain("cleanup_guarantee=best_effort");
+      expect(JSON.parse(timeoutOutput)).toMatchObject({
+        state: "stopped",
+        error: "TimeoutExpired",
+      });
       expect(escapedPids).toHaveLength(descendantCount);
       expect(new Set(escapedPids).size).toBe(descendantCount);
       for (const pid of escapedPids) {
@@ -3500,7 +3517,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   }, 30_000);
 
-  test("saved terminal replay handle remains readable after resume without re-execution", async () => {
+  test("saved shell replay handle remains readable after resume without re-execution", async () => {
     const root = createFixtureRoot("saved-terminal-replay");
     const firstTracePath = join(root.root, "first-trace.log");
     const resumeTracePath = join(root.root, "resume-trace.log");
@@ -3509,19 +3526,16 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     const readCallId = "saved_terminal_read_1";
     let replayHandle = "";
     const firstResponses = [
-      fakeGatewayToolCall(commandCallId, "terminal", {
-        action: "exec",
-        command: "printf 'run\\n' >> executions.txt; printf 'SAVED-REPLAY-NEEDLE\\n'",
-        profile: "clean",
-        timeout_ms: 600_000,
-      }),
+      fakeShellRun(
+        commandCallId,
+        "printf 'run\\n' >> executions.txt; printf 'SAVED-REPLAY-NEEDLE\\n'",
+        { profile: "clean", timeout_ms: 600_000 },
+      ),
       (body: string) => {
-        const commandOutput = toolResultOutput(body, commandCallId);
-        const match = commandOutput.match(
-          /<command_output_handle>([^<]+)<\/command_output_handle>/,
-        );
-        replayHandle = match?.[1] ?? "";
+        const commandOutput = shellResult(body, commandCallId);
+        replayHandle = commandOutput.full_output_handle ?? "";
         expect(replayHandle).not.toBe("");
+        expect(commandOutput.output_delta).toContain("SAVED-REPLAY-NEEDLE");
         return fakeGatewayToolCall(readCallId, "read_tool_result", {
           handle: replayHandle,
           query: "SAVED-REPLAY-NEEDLE",
@@ -3610,13 +3624,14 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       ),
     );
     const gateway = startGateway(() =>
-      fakeGatewayToolCall("no_save_sigkill_1", "terminal", {
-        action: "exec",
-        command:
-          "awk 'BEGIN { for (i = 0; i < 100000; i++) printf \"x\"; printf \"\\n\" }'; sleep 30",
-        profile: "clean",
-        timeout_ms: 600_000,
-      })
+      fakeShellRun(
+        "no_save_sigkill_1",
+        "awk 'BEGIN { for (i = 0; i < 100000; i++) printf \"x\"; printf \"\\n\" }'; sleep 30",
+        {
+          profile: "clean",
+          timeout_ms: 600_000,
+        },
+      )
     );
     const proc = Bun.spawn(
       [FX_BIN, "ask", "--yolo", "--no-save", "Run the crash cleanup fixture."],
@@ -3663,7 +3678,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
   }, 20_000);
 
   test.skipIf(process.platform !== "linux")(
-    "a second headless terminal exec survives replacing the running fx binary",
+    "a second headless shell run survives replacing the running fx binary",
     async () => {
       const root = createFixtureRoot("headless-reexec-after-rebuild");
       const tracePath = join(root.root, "trace.log");
@@ -3688,25 +3703,25 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
             if (fxPid === null) {
               return new Response("fx pid unavailable", { status: 500 });
             }
-            return fakeGatewayToolCall(firstCallId, "terminal", {
-              action: "exec",
-              timeout_ms: 600_000,
-              command: [
+            return fakeShellRun(
+              firstCallId,
+              [
                 `printf '%s\\n' "$PPID" > ${JSON.stringify(firstHelperPidPath)}`,
                 `mv -f ${JSON.stringify(replacementBin)} ${JSON.stringify(liveBin)}`,
                 `readlink ${JSON.stringify(`/proc/${fxPid}/exe`)} > ${JSON.stringify(parentExePath)}`,
                 "printf 'first-terminal-exec-ok\\n'",
               ].join("; "),
-            });
+              { timeout_ms: 600_000 },
+            );
           case 1:
-            return fakeGatewayToolCall(secondCallId, "terminal", {
-              action: "exec",
-              timeout_ms: 600_000,
-              command: [
+            return fakeShellRun(
+              secondCallId,
+              [
                 `printf '%s\\n' "$PPID" > ${JSON.stringify(secondHelperPidPath)}`,
                 "printf 'second-terminal-exec-ok\\n'",
               ].join("; "),
-            });
+              { timeout_ms: 600_000 },
+            );
           case 2:
             return fakeGatewayFinalText("Both terminal commands completed.");
           default:
@@ -3752,8 +3767,8 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         expect(exitCode).toBe(0);
         expect(json.error).toBeUndefined();
         expect(json.tool_calls).toEqual([
-          expect.objectContaining({ name: "terminal", status: "success" }),
-          expect.objectContaining({ name: "terminal", status: "success" }),
+          expect.objectContaining({ name: "shell", status: "success" }),
+          expect.objectContaining({ name: "shell", status: "success" }),
         ]);
         expect(gateway.requestCount()).toBe(3);
         expect(firstOutput).toContain("first-terminal-exec-ok");
@@ -3791,7 +3806,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     30_000,
   );
 
-  test("SIGTERM drains an active headless terminal command without panic or survivors", async () => {
+  test("SIGTERM drains an active headless shell command without panic or survivors", async () => {
     const root = createFixtureRoot("headless-sigterm");
     const tracePath = join(root.root, "trace.log");
     const pidPath = join(root.workspace, "active-command.pid");
@@ -3801,9 +3816,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       "while :; do sleep 1; done",
     ].join("; ");
     const gateway = startGateway(() =>
-      fakeGatewayToolCall("headless_sigterm_1", "terminal", {
-        action: "exec",
-        command,
+      fakeShellRun("headless_sigterm_1", command, {
         timeout_ms: 600_000,
       })
     );
@@ -3872,7 +3885,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   }, 20_000);
 
-  test("saved SIGINT retains cancelled terminal output for resume without re-execution", async () => {
+  test("saved SIGINT retains cancelled shell output for resume without re-execution", async () => {
     const root = createFixtureRoot("saved-cancelled-terminal-replay");
     const firstTracePath = join(root.root, "first-trace.log");
     const resumeTracePath = join(root.root, "resume-trace.log");
@@ -3892,9 +3905,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     let replayHandle = "";
     const gateway = startGateway((body) => {
       if (phase === "initial") {
-        return fakeGatewayToolCall(commandCallId, "terminal", {
-          action: "exec",
-          command,
+        return fakeShellRun(commandCallId, command, {
           profile: "clean",
           timeout_ms: 600_000,
         });
@@ -4710,11 +4721,11 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     let responseIndex = 0;
     const gateway = startGateway(() => {
       if (responseIndex++ === 0) {
-        return fakeGatewayToolCall("prompt_too_long_tool_1", "terminal", {
-          action: "exec",
-          timeout_ms: 600_000,
-          command: `printf 'once\\n' >> '${sideEffectPath}'`,
-        });
+        return fakeShellRun(
+          "prompt_too_long_tool_1",
+          `printf 'once\\n' >> '${sideEffectPath}'`,
+          { timeout_ms: 600_000 },
+        );
       }
       return new Response(
         JSON.stringify({ error: { message: "provider payload rejected" } }),
@@ -4743,7 +4754,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(serializedError).toContain("prompt_too_long=true");
       expect(serializedError).toContain("no local tool actions were replayed");
       expect(output.tool_calls).toHaveLength(1);
-      expect(output.tool_calls[0]?.name).toBe("terminal");
+      expect(output.tool_calls[0]?.name).toBe("shell");
       expect(output.tool_calls[0]?.status).toBe("success");
       expect(readFileSync(sideEffectPath, "utf8")).toBe("once\n");
       expect(gateway.requestCount()).toBe(2);
@@ -5819,7 +5830,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     const sentinelPath = join(root.workspace, "command-must-not-run.txt");
     const responses = [
       sse(
-        'data: {"type":"tool-call","toolCallId":"command_1","toolName":"terminal","input":{"action":"exec","command":"printf executed > command-must-not-run.txt","timeout_ms":30000}}\n\n' +
+        'data: {"type":"tool-call","toolCallId":"command_1","toolName":"shell","input":{"request":{"action":"run","command":"printf executed > command-must-not-run.txt","timeout_ms":30000}}}\n\n' +
           'data: {"type":"finish","finishReason":{"unified":"error","raw":"provider_error"}}\n\n' +
           "data: [DONE]\n\n",
       ),
@@ -6288,7 +6299,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     const sentinelPath = join(root.workspace, "command-must-not-run.txt");
     const gateway = startGateway(() =>
       sse(
-        'data: {"type":"tool-call","toolCallId":"command_1","toolName":"terminal","input":{"action":"exec","command":"printf executed > command-must-not-run.txt","timeout_ms":30000}}\n\n' +
+        'data: {"type":"tool-call","toolCallId":"command_1","toolName":"shell","input":{"request":{"action":"run","command":"printf executed > command-must-not-run.txt","timeout_ms":30000}}}\n\n' +
           'data: {"type":"finish","finishReason":{"unified":"","raw":"provider_error"}}\n\n' +
           "data: [DONE]\n\n",
       ),

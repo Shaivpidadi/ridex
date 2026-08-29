@@ -954,8 +954,8 @@ function startFakeCodexAutoReview() {
       mainRequests += 1;
       if (mainRequests === 1) {
         return new Response(
-          'data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call_terminal","name":"terminal"}}\n\n' +
-            'data: {"type":"response.function_call_arguments.done","output_index":0,"arguments":"{\\"action\\":\\"exec\\",\\"command\\":\\"pwd\\",\\"timeout_ms\\":600000}"}\n\n' +
+          'data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call_shell","name":"shell"}}\n\n' +
+            'data: {"type":"response.function_call_arguments.done","output_index":0,"arguments":"{\\"request\\":{\\"action\\":\\"run\\",\\"command\\":\\"printf reviewed > provider-review-existing.txt\\",\\"yield_time_ms\\":30000,\\"timeout_ms\\":600000}}"}\n\n' +
             'data: {"type":"response.completed","response":{"id":"gen_main_1","status":"completed","usage":{"input_tokens":5,"output_tokens":2}}}\n\n',
           { headers: { "content-type": "text/event-stream" } },
         );
@@ -1020,8 +1020,8 @@ function startFakeGrokAutoReview() {
       mainRequests += 1;
       if (mainRequests === 1) {
         return new Response(
-          'data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call_terminal","name":"terminal"}}\n\n' +
-            'data: {"type":"response.function_call_arguments.done","output_index":0,"arguments":"{\\"action\\":\\"exec\\",\\"command\\":\\"pwd\\",\\"timeout_ms\\":600000}"}\n\n' +
+          'data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call_shell","name":"shell"}}\n\n' +
+            'data: {"type":"response.function_call_arguments.done","output_index":0,"arguments":"{\\"request\\":{\\"action\\":\\"run\\",\\"command\\":\\"printf reviewed > provider-review-existing.txt\\",\\"yield_time_ms\\":30000,\\"timeout_ms\\":600000}}"}\n\n' +
             'data: {"type":"response.completed","response":{"id":"gen_main_1","status":"completed","usage":{"input_tokens":5,"output_tokens":2}}}\n\n',
           { headers: { "content-type": "text/event-stream" } },
         );
@@ -3189,6 +3189,7 @@ test(
   "Codex automatic review uses gpt-5.4-mini while Gateway review stays untouched",
   async () => {
     home = mkdtempSync(join(tmpdir(), "fx-codex-auto-review-"));
+    writeFileSync(join(home, "provider-review-existing.txt"), "before\n");
     gateway = startFakeGateway([]);
     const codex = startFakeCodexAutoReview();
     try {
@@ -3199,8 +3200,14 @@ test(
         { mode: 0o600 },
       );
       const result = await runFx(
-        ["ask", "--json", "--auto", "Run pwd, then finish."],
+        [
+          "ask",
+          "--json",
+          "--auto",
+          "Update provider-review-existing.txt, then finish.",
+        ],
         {
+          cwd: home,
           env: {
             HOME: home,
             AI_GATEWAY_API_KEY: "gateway-auto-review-sentinel",
@@ -3217,11 +3224,12 @@ test(
       );
       expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
       expect(result.stdout).toContain("CODEX_AUTO_REVIEW_OK");
+      expect(readFileSync(join(home, "provider-review-existing.txt"), "utf8")).toBe("reviewed");
       expect(codex.bodies.map((body) => (JSON.parse(body) as { model: string }).model))
         .toEqual(["gpt-5.6-sol", "gpt-5.4-mini", "gpt-5.6-sol"]);
       expect(codex.bodies[1]).toContain('"name":"permission_decision"');
       expect(codex.bodies[2]).toContain('"type":"function_call_output"');
-      expect(codex.bodies[2]).toContain("exit_code=0");
+      expect(codex.bodies[2]).toContain('\\"exit_code\\":0');
       for (const request of gateway.requests) {
         expect(request.body).not.toContain("permission_decision");
       }
@@ -3250,6 +3258,7 @@ test(
   "Grok automatic review reuses the admitted Grok model and never reaches Gateway",
   async () => {
     home = mkdtempSync(join(tmpdir(), "fx-grok-auto-review-"));
+    writeFileSync(join(home, "provider-review-existing.txt"), "before\n");
     gateway = startFakeGateway([]);
     const grok = startFakeGrokAutoReview();
     try {
@@ -3260,8 +3269,14 @@ test(
         { mode: 0o600 },
       );
       const result = await runFx(
-        ["ask", "--json", "--auto", "Run pwd, then finish."],
+        [
+          "ask",
+          "--json",
+          "--auto",
+          "Update provider-review-existing.txt, then finish.",
+        ],
         {
+          cwd: home,
           env: {
             HOME: home,
             AI_GATEWAY_API_KEY: "gateway-grok-auto-review-sentinel",
@@ -3279,11 +3294,12 @@ test(
       );
       expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
       expect(result.stdout).toContain("GROK_AUTO_REVIEW_OK");
+      expect(readFileSync(join(home, "provider-review-existing.txt"), "utf8")).toBe("reviewed");
       expect(grok.bodies.map((body) => (JSON.parse(body) as { model: string }).model))
         .toEqual(["grok-4.20", "grok-4.20", "grok-4.20"]);
       expect(grok.bodies[1]).toContain('"name":"permission_decision"');
       expect(grok.bodies[2]).toContain('"type":"function_call_output"');
-      expect(grok.bodies[2]).toContain("exit_code=0");
+      expect(grok.bodies[2]).toContain('\\"exit_code\\":0');
       expect(grok.headers).toHaveLength(3);
       for (const headers of grok.headers) {
         expect(headers.tokenAuth).toBe("xai-grok-cli");
