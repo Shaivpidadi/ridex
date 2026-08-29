@@ -1308,7 +1308,7 @@ async function runCanonicalLifecycleFixture(
     reachedFinal = settled.matched;
     if (reachedFinal) {
       await session.sendText("/help");
-      const help = await waitForPaneOrDone(session, "Commands 36", donePath);
+      const help = await waitForPaneOrDone(session, "Commands 35", donePath);
       helpVisible = help.matched;
       requestCountAfterHelp = queuedGateway.requests.length;
       if (helpVisible) {
@@ -7399,7 +7399,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(gateway.requestCount()).toBe(1);
 
       await session.sendText("/help");
-      await session.waitForText("Commands 36", TIMEOUT);
+      await session.waitForText("Commands 35", TIMEOUT);
       expect(gateway.requestCount()).toBe(1);
       await session.sendKeys("Escape");
     },

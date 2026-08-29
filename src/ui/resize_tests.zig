@@ -5968,7 +5968,7 @@ test "slash main page renders header categories selection range and contextual c
 
     try expectGridContains(&h, "ask");
     try expectGridContains(&h, "test-model");
-    try expectGridNotContains(&h, "Commands 36");
+    try expectGridNotContains(&h, "Commands 35");
     try expectGridNotContains(&h, "↑↓ Navigate");
 }
 
