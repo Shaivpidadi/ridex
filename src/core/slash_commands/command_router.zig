@@ -17,10 +17,6 @@ pub const ParsedCommand = union(enum) {
     logout: []const u8,
     setup,
     status,
-    background,
-    background_stop: []const u8,
-    background_open: []const u8,
-    background_logs: []const u8,
     image: []const u8,
     images: []const u8,
     model: []const u8,
@@ -60,10 +56,6 @@ pub const CommandHandlers = struct {
     logout: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     setup: *const fn (ctx: *anyopaque) anyerror!void,
     show_status: *const fn (ctx: *anyopaque) anyerror!void,
-    show_background: *const fn (ctx: *anyopaque) anyerror!void,
-    stop_background: *const fn (ctx: *anyopaque, target: []const u8) anyerror!void,
-    open_background: *const fn (ctx: *anyopaque, target: []const u8) anyerror!void,
-    show_background_logs: *const fn (ctx: *anyopaque, target: []const u8) anyerror!void,
     attach_image: *const fn (ctx: *anyopaque, path: []const u8) anyerror!void,
     manage_images: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     handle_model: *const fn (ctx: *anyopaque, query: []const u8) anyerror!void,
@@ -109,10 +101,6 @@ fn parsedCommand(kind: SlashKind, payload: []const u8) ParsedCommand {
         .logout => .{ .logout = payload },
         .setup => .setup,
         .status => .status,
-        .background => .background,
-        .background_stop => .{ .background_stop = payload },
-        .background_open => .{ .background_open = payload },
-        .background_logs => .{ .background_logs = payload },
         .images => .{ .images = payload },
         .image => .{ .image = payload },
         .model => .{ .model = payload },
@@ -166,10 +154,6 @@ pub fn route(registry: SlashRegistry, handlers: *const CommandHandlers, cmd: []c
         .logout => |rest| try handlers.logout(handlers.ctx, rest),
         .setup => try handlers.setup(handlers.ctx),
         .status => try handlers.show_status(handlers.ctx),
-        .background => try handlers.show_background(handlers.ctx),
-        .background_stop => |target| try handlers.stop_background(handlers.ctx, target),
-        .background_open => |target| try handlers.open_background(handlers.ctx, target),
-        .background_logs => |target| try handlers.show_background_logs(handlers.ctx, target),
         .image => |path| try handlers.attach_image(handlers.ctx, path),
         .images => |rest| try handlers.manage_images(handlers.ctx, rest),
         .model => |query| try handlers.handle_model(handlers.ctx, query),
@@ -270,25 +254,7 @@ test "parse rejects removed slash commands" {
     try std.testing.expectEqual(ParsedCommand.unknown, parse(testSlashRegistry(), "/review"));
     try std.testing.expectEqual(ParsedCommand.unknown, parse(testSlashRegistry(), "/history"));
     try std.testing.expectEqual(ParsedCommand.unknown, parse(testSlashRegistry(), "/rules"));
-}
-
-test "parse extracts background stop target" {
-    const parsed = parse(testSlashRegistry(), "/background stop last");
-    switch (parsed) {
-        .background_stop => |target| try std.testing.expectEqualStrings("last", target),
-        else => return error.TestExpectedEqual,
-    }
-}
-
-test "parse extracts background open and logs targets" {
-    switch (parse(testSlashRegistry(), "/background open 3")) {
-        .background_open => |target| try std.testing.expectEqualStrings("3", target),
-        else => return error.TestExpectedEqual,
-    }
-    switch (parse(testSlashRegistry(), "/background logs last")) {
-        .background_logs => |target| try std.testing.expectEqualStrings("last", target),
-        else => return error.TestExpectedEqual,
-    }
+    try std.testing.expectEqual(ParsedCommand.unknown, parse(testSlashRegistry(), "/background"));
 }
 
 test "parse extracts image commands" {
@@ -504,10 +470,6 @@ fn testHandlers(ctx: *TestContext) CommandHandlers {
         .logout = unexpectedPayload,
         .setup = unexpectedNoPayload,
         .show_status = unexpectedNoPayload,
-        .show_background = unexpectedNoPayload,
-        .stop_background = unexpectedPayload,
-        .open_background = unexpectedPayload,
-        .show_background_logs = unexpectedPayload,
         .attach_image = unexpectedPayload,
         .manage_images = unexpectedPayload,
         .handle_model = unexpectedPayload,

@@ -147,7 +147,7 @@ async function runTtyPromptPermissionsCase(
       expect(json.exit_code).toBe(0);
       expect(json.tool_calls).toContainEqual(
         expect.objectContaining({
-          name: "terminal",
+          name: "shell",
           status: decision === "approve" ? "success" : "error",
         }),
       );
@@ -210,7 +210,7 @@ describe("generic permission typed errors", () => {
         });
         const json = parseFxJson(result);
         expect(result.stderr).toBe('Running touch "./denied-marker.txt"\n');
-        expect(json.tool_calls).toContainEqual({ name: "terminal", status: "error" });
+        expect(json.tool_calls).toContainEqual({ name: "shell", status: "error" });
         expect(existsSync(marker)).toBe(false);
         expect(gateway.requests).toHaveLength(2);
 
@@ -219,7 +219,7 @@ describe("generic permission typed errors", () => {
         ) as { error: PermissionEcho };
         const echo = toolResult.error;
         expect(echo.type).toBe("tool_permission_denied");
-        expect(echo.tool_name).toBe("terminal");
+        expect(echo.tool_name).toBe("shell");
         expect(echo.message).toBe("Tool access was denied by configured policy");
         expect(echo.reason).toBe("policy_denied");
         expect(echo.denied).toBe(true);

@@ -20,7 +20,6 @@ pub const TopLevelKind = enum {
     models,
     provider,
     doctor,
-    background,
     teams,
     session,
     sessions,
@@ -45,10 +44,6 @@ pub const SlashKind = enum {
     logout,
     setup,
     status,
-    background,
-    background_stop,
-    background_open,
-    background_logs,
     image,
     images,
     model,
@@ -1782,7 +1777,7 @@ test "slash completion categories follow canonical entries" {
 test "help catalog groups visible commands and searches all command metadata" {
     const registry = testSlashRegistry();
 
-    try std.testing.expectEqual(@as(usize, 36), helpCatalogCount(registry, ""));
+    try std.testing.expectEqual(@as(usize, 35), helpCatalogCount(registry, ""));
     try std.testing.expectEqualStrings("/help", helpCatalogSpecAt(registry, "", 0).?.command);
     try std.testing.expectEqual(@as(usize, 5), helpCatalogCategoryCount(registry, "", .general));
     try std.testing.expectEqual(@as(usize, 3), helpCatalogCount(registry, "appearance"));
@@ -1935,14 +1930,6 @@ test "slash completion prefix yields to no-argument command submission" {
     try std.testing.expect(slashCompletionPrefix(registry, "/resume ") == null);
     try std.testing.expect(slashCompletionPrefix(registry, "\n\t/resume\nignored") == null);
     try std.testing.expect(slashCompletionPrefix(registry, "/exit\t") == null);
-}
-
-test "slash completions skip hidden subcommands" {
-    try std.testing.expectEqual(@as(usize, 1), slashCompletionCount(testSlashRegistry(), "/background"));
-    try std.testing.expectEqualStrings("/background", nthSlashCompletion(testSlashRegistry(), "/background", 0).?);
-    try std.testing.expect(nthSlashCompletion(testSlashRegistry(), "/background", 1) == null);
-    try std.testing.expectEqual(@as(usize, 0), slashCompletionCount(testSlashRegistry(), "/background s"));
-    try std.testing.expect(nthSlashCompletion(testSlashRegistry(), "/background s", 0) == null);
 }
 
 test "slash completions include allowlist staged arguments" {
@@ -2103,7 +2090,7 @@ test "slash completion descriptions follow completion matches" {
     try std.testing.expectEqual(@as(usize, 1), slashCompletionCount(testSlashRegistry(), "/mo"));
     try std.testing.expectEqualStrings("/model", nthSlashCompletion(testSlashRegistry(), "/mo", 0).?);
     try std.testing.expectEqualStrings("choose what model and reasoning effort to use", nthSlashCompletionDescription(testSlashRegistry(), "/mo", 0).?);
-    try std.testing.expectEqualStrings("start a fresh session and keep background processes", nthSlashCompletionDescription(testSlashRegistry(), "/cl", 0).?);
+    try std.testing.expectEqualStrings("start a fresh conversation while keeping managed processes", nthSlashCompletionDescription(testSlashRegistry(), "/cl", 0).?);
     try std.testing.expectEqualStrings("undo the latest tracked file operation", nthSlashCompletionDescription(testSlashRegistry(), "/un", 0).?);
     try std.testing.expectEqualStrings("open the fx feedback form", nthSlashCompletionDescription(testSlashRegistry(), "/fee", 0).?);
     try std.testing.expectEqualStrings("copy a private diagnostic trace", nthSlashCompletionDescription(testSlashRegistry(), "/tr", 0).?);
@@ -2113,11 +2100,10 @@ test "slash completion descriptions follow completion matches" {
 }
 
 test "slash completion aliases participate in ranked order" {
-    try std.testing.expectEqualStrings("/background", firstSlashCompletion(testSlashRegistry(), "/ba").?);
-    try std.testing.expectEqual(@as(usize, 3), slashCompletionCount(testSlashRegistry(), "/ba"));
-    try std.testing.expectEqualStrings("/background", nthSlashCompletion(testSlashRegistry(), "/ba", 0).?);
-    try std.testing.expectEqualStrings("/balance", nthSlashCompletion(testSlashRegistry(), "/ba", 1).?);
-    try std.testing.expectEqualStrings("/feedback", nthSlashCompletion(testSlashRegistry(), "/ba", 2).?);
+    try std.testing.expectEqualStrings("/balance", firstSlashCompletion(testSlashRegistry(), "/ba").?);
+    try std.testing.expectEqual(@as(usize, 2), slashCompletionCount(testSlashRegistry(), "/ba"));
+    try std.testing.expectEqualStrings("/balance", nthSlashCompletion(testSlashRegistry(), "/ba", 0).?);
+    try std.testing.expectEqualStrings("/feedback", nthSlashCompletion(testSlashRegistry(), "/ba", 1).?);
     try std.testing.expectEqualStrings("/balance", firstSlashCompletion(testSlashRegistry(), "/bal").?);
 }
 
@@ -2130,7 +2116,7 @@ test "rendered slash welcome excludes non-welcome help entries" {
     try std.testing.expect(std.mem.find(u8, welcome_text, "/clear") != null);
     try std.testing.expect(std.mem.find(u8, welcome_text, "/new") != null);
     try std.testing.expect(std.mem.find(u8, welcome_text, "/status") != null);
-    try std.testing.expect(std.mem.find(u8, welcome_text, "/background") != null);
+    try std.testing.expect(std.mem.find(u8, welcome_text, "/background") == null);
     try std.testing.expect(std.mem.find(u8, welcome_text, "/pr") == null);
     try std.testing.expect(std.mem.find(u8, welcome_text, "/issue") == null);
     try std.testing.expect(std.mem.find(u8, welcome_text, "/permissions") != null);

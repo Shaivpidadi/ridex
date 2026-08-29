@@ -1,4 +1,5 @@
 const std = @import("std");
+const managed_execution = @import("../core/execution/managed_execution.zig");
 const acp_runner = @import("../core/cli/acp_runner.zig");
 const config_runtime = @import("../core/config/config_runtime.zig");
 const io_mod = @import("../core/shared/io.zig");
@@ -29,7 +30,6 @@ const session_log = @import("../core/session/session_log.zig");
 const session_store = @import("../core/session/session_store.zig");
 const session_runtime = @import("../core/session/session.zig");
 const worker_runtime = @import("../core/agent/worker_runtime.zig");
-const background_runtime = @import("../core/background/background_runtime.zig");
 const terminal_client_runtime = @import("../core/terminal/client.zig");
 const subagent_tool_host = @import("../core/subagent/tool_host.zig");
 const subagent_authority = @import("../core/subagent/authority.zig");
@@ -238,8 +238,8 @@ pub const ServerState = struct {
     skills: skill_runtime.Runtime = .{},
     context_snapshot: context_contract.GatheredContextSnapshot = .{},
     worker: worker_runtime.WorkerRuntime = .{},
-    background: background_runtime.BackgroundRuntime = .{},
     terminal_client: terminal_client_runtime.Runtime = .{},
+    managed_executions: managed_execution.Runtime = managed_execution.Runtime.init(std.heap.c_allocator),
     subagent_store: ?session_store.Store = null,
     subagent_host: ?*subagent_tool_host.Runtime = null,
     capability_resolver: gateway_provider.CapabilityResolver = .{},
@@ -257,6 +257,7 @@ pub const ServerState = struct {
 
     pub fn deinit(self: *ServerState) void {
         reapActivePrompt(self, true);
+        self.managed_executions.deinit();
         self.terminal_client.deinit();
         closeActiveSession(self) catch |err| {
             debug_trace.logf(
@@ -273,7 +274,6 @@ pub const ServerState = struct {
         if (self.selected_model.len > 0) self.alloc.free(self.selected_model);
         if (self.configured_model.len > 0) self.alloc.free(self.configured_model);
         self.permission_rules.deinit(self.alloc);
-        self.background.deinit(std.heap.c_allocator);
         self.skills.deinit(self.alloc);
         self.context_snapshot.deinit(self.alloc);
         self.worker.deinit(std.heap.c_allocator);
@@ -469,10 +469,6 @@ fn closeActiveSession(state: *ServerState) !void {
 
 fn destroyActiveSession(state: *ServerState) void {
     const active = if (state.active_session) |*session| session else return;
-    state.background.detachManagedPersistence(
-        std.heap.c_allocator,
-        active.session_id,
-    );
     state.alloc.free(active.session_id);
     state.alloc.free(active.model);
     types.freePermissionGrantSlice(state.alloc, active.session_grants);
@@ -658,12 +654,10 @@ pub fn runWithTransport(
         .web_search_runtime = web_search_runtime.Runtime.init(.{
             .provider = cfg.provider_set.gateway.fx_search.?,
         }),
-        .background = background_runtime.BackgroundRuntime.init(
-            cfg.background_process_provider,
-        ),
         .terminal_client = terminal_client_runtime.Runtime.init(
-            cfg.background_process_provider,
+            cfg.process_provider,
         ),
+        .managed_executions = managed_execution.Runtime.init(alloc),
         .lifecycle_runtime = lifecycle_runtime,
         .lifecycle_view = lifecycle_view,
     };

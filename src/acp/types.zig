@@ -270,14 +270,14 @@ test "writeToolCallUpdate can include structured command result" {
         "call_002",
         .completed,
         "exit_code=0\n<stdout>\nok\n</stdout>\n",
-        "{\"kind\":\"foreground\",\"command\":\"printf ok\",\"cwd\":\"/tmp\",\"exit_code\":0,\"signal\":null,\"timed_out\":false,\"stdout_bytes\":2,\"stderr_bytes\":0,\"truncated\":false}",
+        "{\"kind\":\"command\",\"command\":\"printf ok\",\"cwd\":\"/tmp\",\"exit_code\":0,\"signal\":null,\"timed_out\":false,\"stdout_bytes\":2,\"stderr_bytes\":0,\"truncated\":false}",
     );
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, out.writer.buffered(), .{});
     defer parsed.deinit();
 
     try std.testing.expectEqualStrings("tool_call_update", parsed.value.object.get("sessionUpdate").?.string);
     const command_result = parsed.value.object.get("command_result").?.object;
-    try std.testing.expectEqualStrings("foreground", command_result.get("kind").?.string);
+    try std.testing.expectEqualStrings("command", command_result.get("kind").?.string);
     try std.testing.expectEqual(@as(i64, 0), command_result.get("exit_code").?.integer);
     try std.testing.expect(parsed.value.object.get("content") != null);
 }

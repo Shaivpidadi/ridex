@@ -4,12 +4,8 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const command_contract = @import("command_contract.zig");
 const command_environment = @import("command_environment.zig");
 const process_tree = @import("process_tree.zig");
-const background_process_provider = @import(
-    "background_process_provider.zig",
-);
 const io_mod = @import("../shared/io.zig");
 const self_exe = @import("../shared/self_exe.zig");
-const background_launch_output = @import("../background/background_launch_output.zig");
 const config_runtime = @import("../config/config_runtime.zig");
 const session_child_store = @import("../session/session_child_store.zig");
 const artifact_digest = @import("../session/artifact_digest.zig");
@@ -28,6 +24,7 @@ pub const CommandExecutionResult = command_contract.RunCommandResult;
 pub const Config = struct {
     max_command_output_bytes: usize,
     cancel_flag: ?*std.atomic.Value(bool) = null,
+    force_cancel_flag: ?*std.atomic.Value(bool) = null,
     output_chunk_lifecycle_id: ?types.ToolLifecycleId = null,
     output_chunk_ctx: ?*anyopaque = null,
     on_output_chunk: ?CommandOutputCallback = null,
@@ -38,8 +35,6 @@ pub const Config = struct {
     timeout_started_ms: ?i64 = null,
     command_artifact_capability: ?*session_child_store.SessionChildCapability = null,
     command_artifact_dir: ?[]const u8 = null,
-    background_process_provider: background_process_provider.Provider =
-        background_process_provider.unavailable_provider,
 };
 
 pub const CallbackProjection = enum {
@@ -589,26 +584,6 @@ pub fn executeCommandInEnvironment(
     );
 }
 
-pub fn spawnPreparedBackground(
-    cfg: Config,
-    arena: Allocator,
-    cwd: []const u8,
-    output: *const background_launch_output.Output,
-) !background_process_provider.PreparedProcess {
-    var effective_cfg = cfg;
-    if (effective_cfg.timeout_started_ms == null) {
-        effective_cfg.timeout_started_ms = io_mod.milliTimestamp();
-    }
-    try ExecutionControl.init(effective_cfg).check();
-    return effective_cfg.background_process_provider.spawnPrepared(
-        arena,
-        .{
-            .cwd = cwd,
-            .output = output.providerCapability(),
-            .isolation = .none,
-        },
-    );
-}
 const ExecutionControl = struct {
     cancel_flag: ?*std.atomic.Value(bool),
     timeout_ms: ?usize,
@@ -660,7 +635,7 @@ fn emitAcceptedOutputChunk(
 }
 
 const CollectedProcess = struct {
-    status: command_contract.ForegroundCommandStatus,
+    status: command_contract.CommandStatus,
     stdout: []const u8,
     stderr: []const u8,
     stdout_bytes: usize,
@@ -912,7 +887,7 @@ const OutputCollector = struct {
 
     fn finish(
         self: *OutputCollector,
-        status: command_contract.ForegroundCommandStatus,
+        status: command_contract.CommandStatus,
     ) !CollectedProcess {
         if (self.artifact) |*artifact| {
             try artifact.sync();
@@ -969,7 +944,7 @@ const OutputCollector = struct {
 
 fn finishCollectedProcess(
     output: *OutputCollector,
-    status: command_contract.ForegroundCommandStatus,
+    status: command_contract.CommandStatus,
     duration_ms: u64,
     source: TerminationSource,
 ) !CollectedProcess {
@@ -1302,7 +1277,7 @@ fn cleanupForegroundSessionChild(
 }
 
 fn foregroundSessionReplacementError(
-    status: command_contract.ForegroundCommandStatus,
+    status: command_contract.CommandStatus,
     probe: ForegroundLaunchFailureProbe,
 ) ?(std.process.ReplaceError || error{CommandLaunchFailed}) {
     switch (status) {
@@ -1714,7 +1689,7 @@ test "zsh user profile reports natural SIGTERM after alias-safe startup" {
         .{ .user = wrapper_path },
     );
     try std.testing.expect(std.mem.startsWith(u8, signaled.output, "signal=15\n"));
-    const foreground = signaled.command_result.?.foreground;
+    const foreground = signaled.command_result.?;
     try std.testing.expectEqual(@as(?i64, null), foreground.exit_code);
     try std.testing.expectEqual(@as(?u32, @intFromEnum(std.posix.SIG.TERM)), foreground.signal);
 
@@ -1729,12 +1704,12 @@ test "zsh user profile reports natural SIGTERM after alias-safe startup" {
         workspace,
         .{ .user = wrapper_path },
     );
-    try std.testing.expectEqual(@as(?i64, 42), trapped.command_result.?.foreground.exit_code);
-    try std.testing.expectEqual(@as(?u32, null), trapped.command_result.?.foreground.signal);
+    try std.testing.expectEqual(@as(?i64, 42), trapped.command_result.?.exit_code);
+    try std.testing.expectEqual(@as(?u32, null), trapped.command_result.?.signal);
 }
 
 fn formatExitOutput(alloc: Allocator, command: []const u8, cwd: []const u8, exit_code: i64, stdout_raw: []const u8, stderr_raw: []const u8, duration_ms: ?u64) !command_contract.RunCommandResult {
-    return command_contract.formatForegroundCommandResult(alloc, .{
+    return command_contract.formatCommandResult(alloc, .{
         .command = command,
         .cwd = cwd,
         .status = .{ .exit_code = exit_code },
@@ -1751,7 +1726,7 @@ fn formatOutput(alloc: Allocator, command: []const u8, cwd: []const u8, term: st
         alloc,
         command,
         cwd,
-        foregroundCommandStatusFromTerm(term),
+        commandStatusFromTerm(term),
         stdout_raw,
         stderr_raw,
         duration_ms,
@@ -1762,12 +1737,12 @@ fn formatOutputWithStatus(
     alloc: Allocator,
     command: []const u8,
     cwd: []const u8,
-    status: command_contract.ForegroundCommandStatus,
+    status: command_contract.CommandStatus,
     stdout_raw: []const u8,
     stderr_raw: []const u8,
     duration_ms: ?u64,
 ) !command_contract.RunCommandResult {
-    return command_contract.formatForegroundCommandResult(alloc, .{
+    return command_contract.formatCommandResult(alloc, .{
         .command = command,
         .cwd = cwd,
         .status = status,
@@ -1779,7 +1754,7 @@ fn formatOutputWithStatus(
     });
 }
 
-fn foregroundCommandStatusFromTerm(term: std.process.Child.Term) command_contract.ForegroundCommandStatus {
+fn commandStatusFromTerm(term: std.process.Child.Term) command_contract.CommandStatus {
     return switch (term) {
         .exited => |code| .{ .exit_code = @intCast(code) },
         .signal => |sig| .{ .signal = @intFromEnum(sig) },
@@ -1808,7 +1783,7 @@ fn formatCollectedOutputValue(alloc: Allocator, command: []const u8, cwd: []cons
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-    try command_contract.writeForegroundStatusLine(&out.writer, result.status);
+    try command_contract.writeStatusLine(&out.writer, result.status);
     try out.writer.print("truncated={s}\n", .{if (result.truncated) "true" else "false"});
     try out.writer.print("stdout_bytes={d}\n", .{result.stdout_bytes});
     try out.writer.print("stderr_bytes={d}\n", .{result.stderr_bytes});
@@ -1820,11 +1795,11 @@ fn formatCollectedOutputValue(alloc: Allocator, command: []const u8, cwd: []cons
         try writePreviewEnvelope(alloc, &out.writer, "stderr", result.stderr_preview);
     }
     const output = try out.toOwnedSlice();
-    const status = command_contract.projectForegroundStatus(result.status);
+    const status = command_contract.projectStatus(result.status);
     return .{
         .output = output,
         .cancelled = result.cancelled,
-        .command_result = .{ .foreground = .{
+        .command_result = .{
             .command = command,
             .cwd = cwd,
             .exit_code = status.exit_code,
@@ -1837,7 +1812,7 @@ fn formatCollectedOutputValue(alloc: Allocator, command: []const u8, cwd: []cons
             .output_file = metadataField(output, "output_file="),
             .stdout_file = metadataField(output, "stdout_file="),
             .stderr_file = metadataField(output, "stderr_file="),
-        } },
+        },
     };
 }
 
@@ -2183,7 +2158,7 @@ const ProcessObserver = struct {
         try self.waiter.start();
     }
 
-    fn observe(self: *ProcessObserver) ?command_contract.ForegroundCommandStatus {
+    fn observe(self: *ProcessObserver) ?command_contract.CommandStatus {
         if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) return null;
         if (!self.waiter.isReady()) return null;
         const term = self.waiter.awaitReady() catch |err| {
@@ -2195,7 +2170,7 @@ const ProcessObserver = struct {
     fn awaitTermination(
         self: *ProcessObserver,
         source: TerminationSource,
-    ) !command_contract.ForegroundCommandStatus {
+    ) !command_contract.CommandStatus {
         if (comptime builtin.os.tag != .windows and builtin.os.tag != .wasi) {
             self.waiter.awaitDiscard();
             return self.observe().?;
@@ -2218,7 +2193,7 @@ const ProcessObserver = struct {
 
     fn statusFromTerm(
         term: std.process.Child.Term,
-    ) command_contract.ForegroundCommandStatus {
+    ) command_contract.CommandStatus {
         if (io_mod.getenv("FX_COMMAND_TEST_INDETERMINATE_AFTER_EXIT") != null) {
             debug_trace.logf(
                 "core",
@@ -2227,12 +2202,12 @@ const ProcessObserver = struct {
             );
             return .indeterminate;
         }
-        return foregroundCommandStatusFromTerm(term);
+        return commandStatusFromTerm(term);
     }
 
     fn indeterminateStatus(
         err: anyerror,
-    ) command_contract.ForegroundCommandStatus {
+    ) command_contract.CommandStatus {
         debug_trace.logf(
             "core",
             "command termination became indeterminate err={s}",
@@ -2289,7 +2264,7 @@ fn collectOutput(
     launch_failure_probe: ?*ForegroundLaunchFailureProbe,
     process_group_id: ?std.posix.pid_t,
     termination_protocol: TerminationProtocol,
-    leader_status: *?command_contract.ForegroundCommandStatus,
+    leader_status: *?command_contract.CommandStatus,
 ) !TerminationSource {
     const zio = io_mod.getIo();
     var multi_reader_buffer: std.Io.File.MultiReader.Buffer(2) = undefined;
@@ -2403,7 +2378,7 @@ fn collectOutputForProcess(
     launch_failure_probe: ?*ForegroundLaunchFailureProbe,
     process_group_id: ?std.posix.pid_t,
     termination_protocol: TerminationProtocol,
-    leader_status: *?command_contract.ForegroundCommandStatus,
+    leader_status: *?command_contract.CommandStatus,
 ) !TerminationSource {
     var source: TerminationSource = .natural;
     return collectOutput(
@@ -2424,8 +2399,8 @@ fn waitForCollectedProcess(
     observer: *ProcessObserver,
     source: TerminationSource,
     process_group_id: ?std.posix.pid_t,
-    leader_status: ?command_contract.ForegroundCommandStatus,
-) !command_contract.ForegroundCommandStatus {
+    leader_status: ?command_contract.CommandStatus,
+) !command_contract.CommandStatus {
     if (leader_status) |status| {
         if (comptime builtin.os.tag != .windows and builtin.os.tag != .wasi) {
             observer.waiter.awaitDiscard();
@@ -2441,7 +2416,7 @@ fn waitForCollectedProcess(
 
 const CollectedTermination = struct {
     source: TerminationSource,
-    status: command_contract.ForegroundCommandStatus,
+    status: command_contract.CommandStatus,
 };
 
 fn collectSpawnedProcess(
@@ -2474,7 +2449,7 @@ fn collectSpawnedProcess(
     var wait_pending = true;
     defer if (wait_pending) observer.abort(process_group_id);
 
-    var leader_status: ?command_contract.ForegroundCommandStatus = null;
+    var leader_status: ?command_contract.CommandStatus = null;
     const source = try collectOutputForProcess(
         arena,
         &observer,
@@ -2544,8 +2519,18 @@ fn updateTerminationSignal(
         switch (source.*) {
             .natural => {},
             .cancelled => {
-                try observer.signal(process_group_id, termination_protocol, .cooperative);
-                debug_trace.logf("core", "command termination requested source=cancelled", .{});
+                const force = cancelRequested(cfg.force_cancel_flag);
+                try observer.signal(
+                    process_group_id,
+                    termination_protocol,
+                    if (force) .force else .cooperative,
+                );
+                force_kill_sent.* = force;
+                debug_trace.logf(
+                    "core",
+                    "command termination requested source=cancelled force={s}",
+                    .{if (force) "true" else "false"},
+                );
                 signal_started_ms.* = now_ms;
             },
             .timed_out => {
@@ -2687,7 +2672,7 @@ test "raw process execution returns foreground output" {
 
     try std.testing.expect(std.mem.find(u8, result.output, "exit_code=0\n") != null);
     try std.testing.expect(std.mem.find(u8, result.output, "<stdout>\nhello\n</stdout>\n") != null);
-    const command_result = result.command_result.?.foreground;
+    const command_result = result.command_result.?;
     try std.testing.expectEqualStrings("printf 'hello'", command_result.command);
     try std.testing.expectEqualStrings("/tmp", command_result.cwd);
     try std.testing.expectEqual(@as(?i64, 0), command_result.exit_code);
@@ -2815,7 +2800,7 @@ test "captured foreground command runs beneath a detached session supervisor" {
     }, std.testing.allocator, command, "/tmp");
     defer std.testing.allocator.free(result.output);
 
-    try std.testing.expectEqual(@as(?i64, 0), result.command_result.?.foreground.exit_code);
+    try std.testing.expectEqual(@as(?i64, 0), result.command_result.?.exit_code);
 }
 
 test "foreground session bootstrap waits for release before executing target" {
@@ -2876,7 +2861,7 @@ test "foreground session protocol bytes do not enter captured output" {
     }, std.testing.allocator, "printf 'stdout-bytes'; printf 'stderr-bytes' >&2", "/tmp");
     defer std.testing.allocator.free(result.output);
 
-    const foreground = result.command_result.?.foreground;
+    const foreground = result.command_result.?;
     try std.testing.expectEqual(stdout_text.len, foreground.stdout_bytes);
     try std.testing.expectEqual(stderr_text.len, foreground.stderr_bytes);
     try std.testing.expect(std.mem.findScalar(u8, result.output, foreground_session_ready_byte) == null);
@@ -2895,7 +2880,7 @@ test "target replacement marker prefix remains ordinary stderr" {
     }, std.testing.allocator, "printf '\\000FX_FOREGROUND_EXEC_FAILED:target-data\\n' >&2; exit 125", "/tmp");
     defer std.testing.allocator.free(result.output);
 
-    const foreground = result.command_result.?.foreground;
+    const foreground = result.command_result.?;
     try std.testing.expectEqual(@as(?i64, 125), foreground.exit_code);
     try std.testing.expectEqual(@as(usize, 0), foreground.stdout_bytes);
     try std.testing.expectEqual(stderr_text.len, foreground.stderr_bytes);
@@ -2920,7 +2905,7 @@ test "target cannot recover replacement nonce from supervisor" {
     }, std.testing.allocator, command, "/tmp");
     defer std.testing.allocator.free(result.output);
 
-    const foreground = result.command_result.?.foreground;
+    const foreground = result.command_result.?;
     try std.testing.expectEqual(@as(?i64, 125), foreground.exit_code);
     try std.testing.expect(std.mem.find(
         u8,
@@ -3623,7 +3608,7 @@ test "cap-crossing cancellation returns a synchronized bounded result" {
 
     try std.testing.expect(trigger.seen);
     try std.testing.expect(result.cancelled);
-    const foreground = result.command_result.?.foreground;
+    const foreground = result.command_result.?;
     try std.testing.expect(foreground.truncated);
     try std.testing.expectEqual(expected.len, foreground.stdout_bytes);
     try std.testing.expectEqual(@as(usize, 0), foreground.stderr_bytes);
@@ -3700,7 +3685,7 @@ test "cancelled managed command confirms an indeterminate artifact target" {
 
     try std.testing.expect(trigger.seen);
     try std.testing.expect(result.cancelled);
-    const foreground = result.command_result.?.foreground;
+    const foreground = result.command_result.?;
     const output_path = foreground.output_file orelse
         return error.TestExpectedEqual;
     const output_handle = std.fs.path.basename(output_path);
@@ -3772,7 +3757,7 @@ test "below-cap cancellation retains complete artifact and non-truncated metadat
     try std.testing.expect(std.mem.find(u8, result.output, "bytes truncated") == null);
     try std.testing.expect(std.mem.find(u8, result.output, "truncated=false\n") != null);
 
-    const foreground = result.command_result.?.foreground;
+    const foreground = result.command_result.?;
     try std.testing.expect(!foreground.truncated);
     try std.testing.expectEqual(expected.len, foreground.stdout_bytes);
     try std.testing.expectEqual(@as(usize, 0), foreground.stderr_bytes);
@@ -3900,7 +3885,7 @@ test "artifact write failure after cancellation remains a bare error" {
     defer observer.deinit();
     try observer.start();
     defer observer.abort(process_group_id);
-    var leader_status: ?command_contract.ForegroundCommandStatus = null;
+    var leader_status: ?command_contract.CommandStatus = null;
     try std.testing.expectError(error.Cancelled, collectOutputForProcess(
         alloc,
         &observer,
@@ -4298,7 +4283,7 @@ test "natural command completion terminates background child inheriting pipes" {
         .timeout_ms = 2000,
     }, alloc, command, workspace);
     defer alloc.free(result.output);
-    try std.testing.expectEqual(@as(?i64, 0), result.command_result.?.foreground.exit_code);
+    try std.testing.expectEqual(@as(?i64, 0), result.command_result.?.exit_code);
 
     const pid_text = try readAbsoluteFile(alloc, pid_path, 64);
     defer alloc.free(pid_text);
@@ -4334,7 +4319,7 @@ test "natural command completion terminates background child with redirected str
         .timeout_ms = 2000,
     }, alloc, command, workspace);
     defer alloc.free(result.output);
-    try std.testing.expectEqual(@as(?i64, 0), result.command_result.?.foreground.exit_code);
+    try std.testing.expectEqual(@as(?i64, 0), result.command_result.?.exit_code);
 
     const pid_text = try readAbsoluteFile(alloc, pid_path, 64);
     defer alloc.free(pid_text);
@@ -4377,7 +4362,7 @@ test "natural command completion terminates redirected descendant after setsid" 
         .timeout_ms = 2000,
     }, alloc, command, workspace);
     defer alloc.free(result.output);
-    try std.testing.expectEqual(@as(?i64, 0), result.command_result.?.foreground.exit_code);
+    try std.testing.expectEqual(@as(?i64, 0), result.command_result.?.exit_code);
 
     const pid_text = try readAbsoluteFile(alloc, pid_path, 64);
     defer alloc.free(pid_text);

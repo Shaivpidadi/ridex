@@ -789,7 +789,6 @@ pub const TerminalFailurePresentation = enum {
     lease_conflict,
     cursor_gap,
     screen_unavailable,
-    monitor_unavailable,
     protocol_incompatible,
     capacity_exceeded,
     cancelled,
@@ -811,7 +810,6 @@ pub const TerminalFailurePresentation = enum {
             .lease_conflict => "terminal control lease conflict",
             .cursor_gap => "terminal output cursor gap",
             .screen_unavailable => "terminal screen is unavailable",
-            .monitor_unavailable => "terminal monitor is unavailable",
             .protocol_incompatible => "terminal protocol is incompatible",
             .capacity_exceeded => "terminal capacity exceeded",
             .cancelled => "terminal action was cancelled",
@@ -1518,18 +1516,6 @@ pub const AssistantHistoryTurn = struct {
     execution: ExecutionMemory = .{},
 };
 
-pub const StableBackgroundRecordId = [16]u8;
-
-pub const BackgroundCommandHistoryTurn = struct {
-    user: UserTurn,
-    assistant: ?[]u8 = null,
-    execution: ExecutionMemory = .{},
-    log_path: []u8,
-    expect_url: bool,
-    url: ?[]u8 = null,
-    background_record_id: ?StableBackgroundRecordId = null,
-};
-
 pub const InterruptedTerminalReason = enum {
     cancelled,
     failed,
@@ -1564,7 +1550,6 @@ pub const CompactedSummaryHistoryTurn = struct {
 pub const HistoryTurn = union(enum) {
     compacted_summary: CompactedSummaryHistoryTurn,
     assistant: AssistantHistoryTurn,
-    background_command: BackgroundCommandHistoryTurn,
     interrupted: InterruptedHistoryTurn,
 };
 
@@ -1842,13 +1827,6 @@ pub fn freeHistoryTurn(alloc: std.mem.Allocator, turn: HistoryTurn) void {
             alloc.free(entry.assistant);
             freeExecutionMemory(alloc, entry.execution);
         },
-        .background_command => |entry| {
-            freeUserTurn(alloc, entry.user);
-            if (entry.assistant) |assistant| alloc.free(assistant);
-            freeExecutionMemory(alloc, entry.execution);
-            alloc.free(entry.log_path);
-            if (entry.url) |url| alloc.free(url);
-        },
         .interrupted => |entry| {
             freeUserTurn(alloc, entry.user);
             if (entry.assistant) |assistant| alloc.free(assistant);
@@ -1910,32 +1888,6 @@ pub fn dupeHistoryTurn(alloc: std.mem.Allocator, turn: HistoryTurn) !HistoryTurn
                 .user = user,
                 .assistant = assistant,
                 .execution = execution,
-            } };
-        },
-        .background_command => |entry| blk: {
-            const user = try dupeUserTurn(alloc, entry.user);
-            errdefer freeUserTurn(alloc, user);
-
-            const assistant = if (entry.assistant) |text| try alloc.dupe(u8, text) else null;
-            errdefer if (assistant) |text| alloc.free(text);
-
-            const execution = try dupeExecutionMemory(alloc, entry.execution);
-            errdefer freeExecutionMemory(alloc, execution);
-
-            const log_path = try alloc.dupe(u8, entry.log_path);
-            errdefer alloc.free(log_path);
-
-            const url = if (entry.url) |src| try alloc.dupe(u8, src) else null;
-            errdefer if (url) |owned| alloc.free(owned);
-
-            break :blk .{ .background_command = .{
-                .user = user,
-                .assistant = assistant,
-                .execution = execution,
-                .log_path = log_path,
-                .expect_url = entry.expect_url,
-                .url = url,
-                .background_record_id = entry.background_record_id,
             } };
         },
         .interrupted => |entry| blk: {
@@ -2696,37 +2648,6 @@ test "HistoryTurn helpers duplicate and free owned turns" {
     try std.testing.expect(summary_copy.compacted_summary.summary.ptr != summary_original.compacted_summary.summary.ptr);
     freeHistoryTurn(alloc, summary_copy);
     freeHistoryTurn(alloc, summary_original);
-
-    const background_original: HistoryTurn = .{ .background_command = .{
-        .user = .{ .text = try alloc.dupe(u8, "run dev") },
-        .assistant = try alloc.dupe(u8, "Starting the server."),
-        .execution = .{ .files = blk: {
-            const files = try alloc.alloc(FileEvidence, 1);
-            files[0] = .{
-                .path = try alloc.dupe(u8, "src/main.zig"),
-                .tool_call_id = try alloc.dupe(u8, "call_1"),
-                .tool_name = try alloc.dupe(u8, "read_file"),
-                .action = .read,
-                .status = .success,
-                .model_view_covers_full_file = true,
-            };
-            break :blk files;
-        } },
-        .log_path = try alloc.dupe(u8, "/tmp/fx.log"),
-        .expect_url = true,
-        .url = try alloc.dupe(u8, "http://localhost:3000"),
-    } };
-    const background_copy = try dupeHistoryTurn(alloc, background_original);
-    try std.testing.expectEqualStrings("run dev", background_copy.background_command.user.text);
-    try std.testing.expectEqualStrings("/tmp/fx.log", background_copy.background_command.log_path);
-    try std.testing.expectEqualStrings("http://localhost:3000", background_copy.background_command.url.?);
-    try std.testing.expectEqualStrings("Starting the server.", background_copy.background_command.assistant.?);
-    try std.testing.expectEqualStrings("src/main.zig", background_copy.background_command.execution.files[0].path);
-    try std.testing.expect(background_copy.background_command.log_path.ptr != background_original.background_command.log_path.ptr);
-    try std.testing.expect(background_copy.background_command.assistant.?.ptr != background_original.background_command.assistant.?.ptr);
-    try std.testing.expect(background_copy.background_command.execution.files[0].path.ptr != background_original.background_command.execution.files[0].path.ptr);
-    freeHistoryTurn(alloc, background_copy);
-    freeHistoryTurn(alloc, background_original);
 
     const interrupted_original: HistoryTurn = .{ .interrupted = .{
         .user = .{ .text = try alloc.dupe(u8, "stop") },

@@ -12,7 +12,7 @@ pub const TerminalSupport = enum {
 };
 
 pub const Capabilities = struct {
-    background_processes: bool,
+    process_control: bool,
     url_open: bool,
     native_url_open: bool,
     terminal: TerminalSupport,
@@ -224,7 +224,7 @@ fn capabilitiesForTarget(
 ) Capabilities {
     if (wasm.isTarget(arch)) {
         return .{
-            .background_processes = wasm.background_processes,
+            .process_control = wasm.process_control,
             .url_open = false,
             .native_url_open = false,
             .terminal = terminalSupportForOs(os_tag),
@@ -242,7 +242,7 @@ pub fn terminalSupportForOs(os_tag: std.Target.Os.Tag) TerminalSupport {
 
 pub fn nativeForOs(os_tag: std.Target.Os.Tag) Capabilities {
     return .{
-        .background_processes = os_tag != .windows and os_tag != .wasi,
+        .process_control = os_tag != .windows and os_tag != .wasi,
         .url_open = os_tag == .macos or os_tag == .linux,
         .native_url_open = os_tag == .macos,
         .terminal = terminalSupportForOs(os_tag),
@@ -309,25 +309,25 @@ test "unavailable terminal title accepts set and clear" {
 
 test "native host capabilities expose process and URL support" {
     const macos = nativeForOs(.macos);
-    try std.testing.expect(macos.background_processes);
+    try std.testing.expect(macos.process_control);
     try std.testing.expect(macos.url_open);
     try std.testing.expect(macos.native_url_open);
     try std.testing.expectEqual(TerminalSupport.supported, macos.terminal);
 
     const linux = nativeForOs(.linux);
-    try std.testing.expect(linux.background_processes);
+    try std.testing.expect(linux.process_control);
     try std.testing.expect(linux.url_open);
     try std.testing.expect(!linux.native_url_open);
     try std.testing.expectEqual(TerminalSupport.supported, linux.terminal);
 
     const windows = nativeForOs(.windows);
-    try std.testing.expect(!windows.background_processes);
+    try std.testing.expect(!windows.process_control);
     try std.testing.expect(!windows.url_open);
     try std.testing.expect(!windows.native_url_open);
     try std.testing.expectEqual(TerminalSupport.unsupported, windows.terminal);
 
     const wasi = nativeForOs(.wasi);
-    try std.testing.expect(!wasi.background_processes);
+    try std.testing.expect(!wasi.process_control);
     try std.testing.expect(!wasi.url_open);
     try std.testing.expect(!wasi.native_url_open);
     try std.testing.expectEqual(TerminalSupport.unsupported, wasi.terminal);
@@ -340,13 +340,13 @@ test "native host capabilities expose process and URL support" {
 
 test "host boundary routes WebAssembly targets to WASM capabilities" {
     const emscripten = capabilitiesForTarget(.wasm32, .emscripten);
-    try std.testing.expect(!emscripten.background_processes);
+    try std.testing.expect(!emscripten.process_control);
     try std.testing.expect(!emscripten.url_open);
     try std.testing.expect(!emscripten.native_url_open);
     try std.testing.expectEqual(TerminalSupport.unsupported, emscripten.terminal);
 
     const wasi = capabilitiesForTarget(.wasm64, .wasi);
-    try std.testing.expect(!wasi.background_processes);
+    try std.testing.expect(!wasi.process_control);
     try std.testing.expect(!wasi.url_open);
     try std.testing.expect(!wasi.native_url_open);
     try std.testing.expectEqual(TerminalSupport.unsupported, wasi.terminal);

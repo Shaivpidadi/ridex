@@ -86,7 +86,7 @@ pub fn executeRunCommand(
         error.OutOfMemory => return error.OutOfMemory,
         else => return .{ .failure = try tool_result_errors.formatToolExecutionErrorJson(
             ctx.allocator,
-            "terminal",
+            "shell",
             err,
         ) },
     };

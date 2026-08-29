@@ -2127,7 +2127,7 @@ test "approval footer composition hides cursor while rendering command prompt" {
 
     var approval = ApprovalPrompt{};
     defer approval.deinit(alloc);
-    try std.testing.expect(try approval.syncRequest(alloc, .{ .label = "terminal.exec echo permission test" }));
+    try std.testing.expect(try approval.syncRequest(alloc, .{ .label = "shell.run echo permission test" }));
 
     var shell = TranscriptRuntime{
         .layout = .{

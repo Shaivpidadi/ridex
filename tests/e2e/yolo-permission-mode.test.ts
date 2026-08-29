@@ -130,7 +130,7 @@ describe("yolo permission mode", () => {
       expect(output.output).toContain("YOLO_HEADLESS_DONE");
       expect(
         output.tool_calls.some(
-          (call) => call.name === "terminal" && call.status === "success",
+          (call) => call.name === "shell" && call.status === "success",
         ),
       ).toBe(true);
       expect(readFileSync(markerPath, "utf8")).toBe("YOLO_COMMAND_OK\n");
@@ -375,7 +375,7 @@ describe.skipIf(!tmuxAvailable())("yolo interactive mode", () => {
       expect(readFileSync(markerPath, "utf8")).toBe("LIVE_AUTO_OK\n");
       expect(fake.classifierRequests).toHaveLength(1);
       expect(readFileSync(tracePath, "utf8")).toContain(
-        "tool_name=terminal permission_mode=auto",
+        "tool_name=shell permission_mode=auto",
       );
       expect(JSON.parse(readFileSync(fixture.settingsPath, "utf8"))).toMatchObject({
         permission_mode: "auto",
@@ -456,7 +456,7 @@ describe.skipIf(!tmuxAvailable())("yolo interactive mode", () => {
       expect(existsSync(markerPath)).toBe(false);
       expect(fake.classifierRequests).toHaveLength(0);
       expect(readFileSync(tracePath, "utf8")).toContain(
-        "tool_name=terminal permission_mode=ask",
+        "tool_name=shell permission_mode=ask",
       );
 
       await session.sendKeys("3");

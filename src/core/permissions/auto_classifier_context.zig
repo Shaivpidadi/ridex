@@ -110,10 +110,6 @@ pub fn buildCanonicalRootUserContext(
                 try turns.append(alloc, entry.user.text);
                 try appendExecutionPermissionFeedback(alloc, &permission_feedback, entry.execution);
             },
-            .background_command => |entry| {
-                try turns.append(alloc, entry.user.text);
-                try appendExecutionPermissionFeedback(alloc, &permission_feedback, entry.execution);
-            },
             .interrupted => |entry| {
                 try turns.append(alloc, entry.user.text);
                 try appendExecutionPermissionFeedback(alloc, &permission_feedback, entry.execution);
@@ -146,7 +142,6 @@ pub fn refreshQueuedRootUserContext(
     };
     const finished: Finished = switch (finished_turn) {
         .assistant => |entry| .{ .user = entry.user.text, .execution = entry.execution },
-        .background_command => |entry| .{ .user = entry.user.text, .execution = entry.execution },
         .interrupted => |entry| .{ .user = entry.user.text, .execution = entry.execution },
         .compacted_summary => return alloc.dupe(u8, existing_context),
     };

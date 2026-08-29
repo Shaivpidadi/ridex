@@ -207,11 +207,9 @@ test "buildGatewayMessages preserves one system prefix for projected session his
             .removed_turn_count = 1,
             .compaction_count = 2,
         } },
-        .{ .background_command = .{
+        .{ .assistant = .{
             .user = .{ .text = @constCast("run portable server") },
-            .assistant = @constCast("server started"),
-            .log_path = @constCast("/tmp/portable.log"),
-            .expect_url = false,
+            .assistant = @constCast("server history is inert"),
         } },
         .{ .interrupted = .{
             .user = .{ .text = @constCast("stop portable work") },
@@ -244,7 +242,6 @@ test "buildGatewayMessages preserves one system prefix for projected session his
     var leading_summary_count: usize = 0;
     var late_summary_count: usize = 0;
     var file_evidence_count: usize = 0;
-    var background_count: usize = 0;
     var interruption_count: usize = 0;
     for (messages.items) |entry| {
         if (entry.role == .system) {
@@ -267,10 +264,6 @@ test "buildGatewayMessages preserves one system prefix for projected session his
             try std.testing.expectEqual(types.ChatRole.user, entry.role);
             file_evidence_count += 1;
         }
-        if (std.mem.find(u8, content, "/tmp/portable.log") != null) {
-            try std.testing.expectEqual(types.ChatRole.user, entry.role);
-            background_count += 1;
-        }
         if (std.mem.find(u8, content, "<turn_aborted>") != null) {
             try std.testing.expectEqual(types.ChatRole.user, entry.role);
             interruption_count += 1;
@@ -279,7 +272,6 @@ test "buildGatewayMessages preserves one system prefix for projected session his
     try std.testing.expectEqual(@as(usize, 1), leading_summary_count);
     try std.testing.expectEqual(@as(usize, 1), late_summary_count);
     try std.testing.expectEqual(@as(usize, 1), file_evidence_count);
-    try std.testing.expectEqual(@as(usize, 1), background_count);
     try std.testing.expectEqual(@as(usize, 1), interruption_count);
     try std.testing.expectEqualStrings("current portable prompt", messages.items[messages.items.len - 2].content.?);
     try std.testing.expectEqualStrings("within-turn suffix", messages.items[messages.items.len - 1].content.?);

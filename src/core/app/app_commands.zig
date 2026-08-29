@@ -5,7 +5,6 @@ const app_session_runtime = @import("app_session_runtime.zig");
 const io_mod = @import("../shared/io.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
-const background_commands = @import("../background/background_commands.zig");
 const gateway_provider = @import("../gateway/gateway_provider.zig");
 const host = @import("../hosts/host.zig");
 const change_tracker_mod = @import("../workspace/change_tracker.zig");
@@ -356,10 +355,6 @@ pub fn Handlers(comptime App: type) type {
                 .logout = commandLogout,
                 .setup = commandSetup,
                 .show_status = commandShowStatus,
-                .show_background = commandShowBackground,
-                .stop_background = commandStopBackground,
-                .open_background = commandOpenBackground,
-                .show_background_logs = commandShowBackgroundLogs,
                 .attach_image = commandAttachImage,
                 .manage_images = commandManageImages,
                 .handle_model = commandHandleModel,
@@ -732,26 +727,6 @@ pub fn Handlers(comptime App: type) type {
         fn commandShowStatus(ctx: *anyopaque) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             try session_commands.Commands(App).showStatus(app);
-        }
-
-        fn commandShowBackground(ctx: *anyopaque) !void {
-            const app: *App = @ptrCast(@alignCast(ctx));
-            try background_commands.Commands(App).show(app);
-        }
-
-        fn commandStopBackground(ctx: *anyopaque, target: []const u8) !void {
-            const app: *App = @ptrCast(@alignCast(ctx));
-            try background_commands.Commands(App).stop(app, target);
-        }
-
-        fn commandOpenBackground(ctx: *anyopaque, target: []const u8) !void {
-            const app: *App = @ptrCast(@alignCast(ctx));
-            try background_commands.Commands(App).open(app, target);
-        }
-
-        fn commandShowBackgroundLogs(ctx: *anyopaque, target: []const u8) !void {
-            const app: *App = @ptrCast(@alignCast(ctx));
-            try background_commands.Commands(App).logs(app, target);
         }
 
         fn commandAttachImage(ctx: *anyopaque, path: []const u8) !void {
@@ -2458,29 +2433,6 @@ fn writeRuntimeContextSummary(writer: *std.Io.Writer, app: anytype, alloc: std.m
     try writer.print("TERM: {s}\n", .{io_mod.getenv("TERM") orelse "(unset)"});
     try writer.print("TERM_PROGRAM: {s}\n", .{io_mod.getenv("TERM_PROGRAM") orelse "(unset)"});
     try writer.print("LANG: {s}\n", .{io_mod.getenv("LANG") orelse "(unset)"});
-
-    const tasks = app.background.snapshotTasks(alloc) catch null;
-    if (tasks) |snapshot| {
-        defer snapshot.deinit(alloc);
-        if (snapshot.items.len == 0) {
-            try writer.writeAll("background_tasks: none\n");
-        } else {
-            try writer.print("background_tasks ({d}):\n", .{snapshot.items.len});
-            for (snapshot.items) |task| {
-                try writer.print("  - id={d} state={s} pid={s} cwd=", .{ task.id, @tagName(task.state), task.pid });
-                try writeMaskedInline(writer, alloc, task.cwd);
-                try writer.writeAll(" command=");
-                try writeMaskedInline(writer, alloc, task.command);
-                try writer.writeAll(" log=");
-                try writeMaskedInline(writer, alloc, task.log_path);
-                if (task.server_url) |url| {
-                    try writer.writeAll(" url=");
-                    try writeMaskedInline(writer, alloc, url);
-                }
-                try writer.writeByte('\n');
-            }
-        }
-    }
 
     var mcp_lease = if (comptime @hasDecl(@TypeOf(app.*), "acquireMcpRuntime"))
         app.acquireMcpRuntime()

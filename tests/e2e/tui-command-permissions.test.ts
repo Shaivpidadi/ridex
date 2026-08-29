@@ -96,8 +96,34 @@ afterEach(async () => {
 });
 
 function sse(events: object[]) {
+  const projected = events.map((event) => {
+    const candidate = event as {
+      type?: string;
+      toolName?: string;
+      input?: Record<string, unknown>;
+    };
+    if (candidate.toolName !== "terminal") return event;
+    if (candidate.type === "tool-input-start") {
+      return { ...candidate, toolName: "shell" };
+    }
+    if (candidate.type !== "tool-call" || candidate.input?.action !== "exec") {
+      return event;
+    }
+    const { action: _, ...fields } = candidate.input;
+    return {
+      ...candidate,
+      toolName: "shell",
+      input: {
+        request: {
+          action: "run",
+          yield_time_ms: 30_000,
+          ...fields,
+        },
+      },
+    };
+  });
   return new Response(
-    `${events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join("")}data: [DONE]\n\n`,
+    `${projected.map((event) => `data: ${JSON.stringify(event)}\n\n`).join("")}data: [DONE]\n\n`,
     { headers: { "content-type": "text/event-stream" } },
   );
 }
@@ -118,11 +144,19 @@ function gatewayToolCall(toolName: string, input: object, toolCallId: string) {
 }
 
 function toolCall(
-  command: string,
-  options: Record<string, unknown> = {},
-  toolCallId = "command_1",
+    command: string,
+    options: Record<string, unknown> = {},
+    toolCallId = "command_1",
 ) {
-  return gatewayToolCall("terminal", { action: "exec", timeout_ms: 600_000, command, ...options }, toolCallId);
+  return gatewayToolCall("shell", {
+    request: {
+      action: "run",
+      yield_time_ms: 30_000,
+      timeout_ms: 600_000,
+      command,
+      ...options,
+    },
+  }, toolCallId);
 }
 
 function permissionDecision(
@@ -436,7 +470,7 @@ async function waitForPendingSubagentApproval(
   const id = await waitForPersistedDeliveryId(
     root,
     childId,
-    "terminal.exec /usr/bin/touch",
+    "shell.run /usr/bin/touch",
   );
   const communicationPath = join(
     root.home,
@@ -1045,7 +1079,7 @@ async function launchPermissionResumeHarness(initialResponses: Response[]) {
 function expectUserProfileTrace(tracePath: string) {
   const trace = readFileSync(tracePath, "utf8");
   expect(trace).toContain(
-    "terminal.exec authority=shell_allowed source=yolo " +
+    "shell.run authority=shell_allowed source=yolo " +
       "route=approved_shell environment=user",
   );
   expect(trace).toContain("command runner explicit environment=user shell=");
@@ -1109,9 +1143,9 @@ async function expectSavedTerminalExec(
   const detail = JSON.parse(result.stdout) as any;
   const step = detail.history
     .flatMap((turn: any) => turn.execution?.tool_steps ?? [])
-    .find((entry: any) => entry.tool_calls?.some((call: any) => call.name === "terminal"));
+    .find((entry: any) => entry.tool_calls?.some((call: any) => call.name === "shell"));
   expect(step).toBeDefined();
-  const call = step.tool_calls.find((entry: any) => entry.name === "terminal");
+  const call = step.tool_calls.find((entry: any) => entry.name === "shell");
   expect(JSON.parse(call.arguments_json)).toEqual(
     expect.objectContaining({
       action: "exec",
@@ -1121,7 +1155,7 @@ async function expectSavedTerminalExec(
     }),
   );
   expect(step.tool_results).toContainEqual(
-    expect.objectContaining({ tool_call_id: call.id, tool_name: "terminal", status }),
+    expect.objectContaining({ tool_call_id: call.id, tool_name: "shell", status }),
   );
 }
 
@@ -1130,13 +1164,16 @@ function normalizeVolatileStatusRows(grid: string[]): string[] {
     /^• Streaming \([^)]*\)$/.test(line) ||
       isVolatileTokenStatusRow(line)
       ? "<status>"
-      : line
+      : line.replace(/\s+YOLO enabled: fx permission checks disabled$/, "")
   );
 }
 
 test("volatile token status rows normalize before transcript grid comparison", () => {
   expect(normalizeVolatileStatusRows(["  (↑10 ↓5)"])).toEqual(["<status>"]);
   expect(normalizeVolatileStatusRows(["  0s (↑10 ↓5)"])).toEqual(["<status>"]);
+  expect(normalizeVolatileStatusRows([
+    "YOLO · gpt-5                 YOLO enabled: fx permission checks disabled",
+  ])).toEqual(["YOLO · gpt-5"]);
 });
 
 describe("effect-aware command permissions", () => {
@@ -1717,8 +1754,8 @@ describe("effect-aware command permissions", () => {
         "direct_printf_lossy",
       );
       expect(lossyModelResult).toContain(lossyRows[1]!);
-      expect(lossyModelResult).not.toContain("  DIRECT_PADDED  ");
-      expect(lossyModelResult).not.toContain("DIRECT_TRAILING   ");
+      expect(lossyModelResult).toContain("  DIRECT_PADDED  ");
+      expect(lossyModelResult).toContain("DIRECT_TRAILING   ");
       expect(lossyModelResult).not.toContain("command_output_replay");
       expectUserProfileTrace(tracePath);
       expect(existsSync(root.profileMarker)).toBe(true);
@@ -1736,7 +1773,8 @@ describe("effect-aware command permissions", () => {
       expect(publicSession.stdout).not.toContain("command_replay");
       expect(publicSession.stdout).not.toContain("command_process_presentation");
       expect(publicSession.stdout).not.toContain("process_presentation");
-      expect(publicSession.stdout).toContain("<command_output_handle>fx-command-replay-");
+      expect(publicSession.stdout).toContain("full_output_handle");
+      expect(publicSession.stdout).toContain("fx-command-replay-");
 
       await activeSession.sendText("/quit");
       expect(await activeSession.waitForSessionEnd(TIMEOUT)).toBe(true);
@@ -2448,7 +2486,7 @@ describe("effect-aware command permissions", () => {
 
         const trace = readFileSync(tracePath, "utf8");
         expect(trace).toContain(
-          "terminal.exec authority=shell_allowed source=auto_classifier " +
+          "shell.run authority=shell_allowed source=auto_classifier " +
             "route=approved_shell environment=user",
         );
         expect(trace).toContain("command runner explicit environment=user shell=");
@@ -2540,7 +2578,7 @@ describe("effect-aware command permissions", () => {
       expect(permissionResultRequest).toContain("review_caution");
       expect(permissionResultRequest).not.toContain("user_denied");
       const trace = readFileSync(tracePath, "utf8");
-      expect(trace).toContain("auto_review_result tool_name=terminal decision=caution");
+      expect(trace).toContain("auto_review_result tool_name=shell decision=caution");
       expect(trace).toContain("decision=deny approval_source=denied");
       expect(readFileSync(stderrPath, "utf8")).toBe("");
 
@@ -2888,8 +2926,8 @@ describe("effect-aware command permissions", () => {
             activity.tool_name,
             activity.phase,
           ])).toEqual([
-            ["terminal", "started"],
-            ["terminal", "succeeded"],
+            ["shell", "started"],
+            ["shell", "succeeded"],
           ]);
           return finalText("parent inspected canonical child");
         }
@@ -5513,7 +5551,7 @@ describe("effect-aware command permissions", () => {
       expect(result.stderr.toLowerCase()).not.toContain("error");
       const json = JSON.parse(result.stdout.trim()) as any;
       expect(json.tool_calls).toHaveLength(1);
-      expect(json.tool_calls[0].name).toBe("terminal");
+      expect(json.tool_calls[0].name).toBe("shell");
       expect(json.tool_calls[0].status).toBe("success");
       expect(json.tool_calls[0].command_result.command).toBe("pwd");
       expect(json.tool_calls[0].command_result.cwd).toBe(root.workspace);
@@ -5558,7 +5596,7 @@ describe("effect-aware command permissions", () => {
       const json = JSON.parse(result.stdout.trim()) as any;
       expect(json.output).toContain("classifier accept complete");
       expect(json.tool_calls).toContainEqual(
-        expect.objectContaining({ name: "terminal", status: "success" }),
+        expect.objectContaining({ name: "shell", status: "success" }),
       );
       expect(gateway.requests).toHaveLength(2);
       expect(gateway.classifierRequests).toHaveLength(1);
@@ -5848,7 +5886,7 @@ describe("effect-aware command permissions", () => {
       const json = JSON.parse(result.stdout.trim()) as any;
       expect(json.output).toContain("delegated classifier complete");
       expect(json.tool_calls).toContainEqual(
-        expect.objectContaining({ name: "terminal", status: "success" }),
+        expect.objectContaining({ name: "shell", status: "success" }),
       );
       expect(gateway.requests).toHaveLength(2);
       expect(gateway.classifierRequests).toHaveLength(1);
@@ -5936,7 +5974,7 @@ describe("effect-aware command permissions", () => {
       expect(cliJson.output).toContain("large CLI complete");
       expect(cliJson.tool_calls).toHaveLength(1);
       expect(cliJson.tool_calls).toContainEqual(
-        expect.objectContaining({ name: "terminal", status: "success" }),
+        expect.objectContaining({ name: "shell", status: "success" }),
       );
       expect(existsSync(join(cliRoot.workspace, cliMarker))).toBe(true);
       expect(cliGateway.requests).toHaveLength(2);

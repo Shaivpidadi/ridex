@@ -223,16 +223,16 @@ const test_web_search = blk: {
     break :blk spec;
 };
 
-const test_terminal = blk: {
+const test_shell = blk: {
     var spec = test_read_file;
-    spec.name = "terminal";
-    spec.description = "Test terminal. When to use: exercise registered terminal projection. When NOT to use: assert product-specific terminal behavior.";
+    spec.name = "shell";
+    spec.description = "Test shell. When to use: exercise registered shell projection. When NOT to use: assert product-specific shell behavior.";
     spec.model_schema = .{
-        .name = "terminal",
+        .name = "shell",
         .description = spec.description,
         .input_schema = .{
             .properties = &.{
-                .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{"exec"} } },
+                .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{"run"} } },
                 .{ .name = "command", .json_type = .string },
             },
             .required = &.{ "action", "command" },
@@ -242,8 +242,8 @@ const test_terminal = blk: {
     spec.executor_kind = .terminal;
     spec.activity_kind = .command;
     spec.requires_approval = true;
-    spec.action_label = "Using terminal";
-    spec.completed_action_label = "Used terminal";
+    spec.action_label = "Running shell";
+    spec.completed_action_label = "Ran shell";
     spec.label_arg_kind = .action;
     spec.label_arg_default = "session";
     spec.permission_target_kind = .none;
@@ -509,7 +509,7 @@ const test_all_tools = [_]tool_dispatch.Tool{
     test_edit_file,
     test_web_fetch,
     test_web_search,
-    test_terminal,
+    test_shell,
     test_capability_search,
     test_skill,
     test_install_skill,
@@ -526,7 +526,7 @@ const test_order = [_][]const u8{
     "grep_files",
     "edit_file",
     "write_file",
-    "terminal",
+    "shell",
     "subagent",
     "capability_search",
     "skill",
@@ -858,7 +858,7 @@ test "yolo advertisement ignores permission filtering" {
         .permission_rules = .{ .rules = &rules },
     });
     defer projection.deinit(std.testing.allocator);
-    try expectContainsName(projection.advertised_names, "terminal");
+    try expectContainsName(projection.advertised_names, "shell");
     try expectContainsName(projection.advertised_names, "write_file");
     try expectContainsName(projection.advertised_names, "web_search");
 }
@@ -934,12 +934,12 @@ test "MCP tools stay deferred and base selection is stable across catalog churn"
     }
 }
 
-test "subagent and terminal selection follow host capability" {
+test "subagent and shell selection follow host capability" {
     var unavailable = try buildTestModelToolProjection(std.testing.allocator, .{});
     defer unavailable.deinit(std.testing.allocator);
     try expectNotContainsName(unavailable.advertised_names, "subagent");
     try expectNotContainsName(unavailable.advertised_names, "task");
-    try expectContainsName(unavailable.advertised_names, "terminal");
+    try expectContainsName(unavailable.advertised_names, "shell");
 
     var available = try buildTestModelToolProjection(std.testing.allocator, .{
         .subagent_available = true,
@@ -947,5 +947,5 @@ test "subagent and terminal selection follow host capability" {
     defer available.deinit(std.testing.allocator);
     try expectContainsName(available.advertised_names, "subagent");
     try expectNotContainsName(available.advertised_names, "task");
-    try expectContainsName(available.advertised_names, "terminal");
+    try expectContainsName(available.advertised_names, "shell");
 }

@@ -83,24 +83,20 @@ function gatewayEnv(
 }
 
 function commandCall(command: string, id: string) {
-  return fakeGatewayToolCall(id, "terminal", { action: "exec", timeout_ms: 600_000, command });
+  return fakeGatewayToolCall(id, "shell", {
+    request: { action: "run", command, yield_time_ms: 30_000 },
+  });
 }
 
 function userCommandCall(command: string, id: string) {
-  return fakeGatewayToolCall(id, "terminal", {
-    action: "exec",
-    timeout_ms: 600_000,
-    command,
-    profile: "user",
+  return fakeGatewayToolCall(id, "shell", {
+    request: { action: "run", command, profile: "user", yield_time_ms: 30_000 },
   });
 }
 
 function cleanCommandCall(command: string, id: string) {
-  return fakeGatewayToolCall(id, "terminal", {
-    action: "exec",
-    timeout_ms: 600_000,
-    command,
-    profile: "clean",
+  return fakeGatewayToolCall(id, "shell", {
+    request: { action: "run", command, profile: "clean", yield_time_ms: 30_000 },
   });
 }
 
@@ -208,7 +204,7 @@ describe("lean auto mode reliability", () => {
         tool_calls: Array<{ name: string; status: string }>;
       };
       expect(json.tool_calls).toContainEqual(
-        expect.objectContaining({ name: "terminal", status: "success" }),
+        expect.objectContaining({ name: "shell", status: "success" }),
       );
     },
     TIMEOUT,
@@ -306,7 +302,7 @@ describe("lean auto mode reliability", () => {
         tool_calls: Array<{ name: string; status: string }>;
       };
       expect(json.tool_calls).toContainEqual(
-        expect.objectContaining({ name: "terminal", status: "success" }),
+        expect.objectContaining({ name: "shell", status: "success" }),
       );
     },
     TIMEOUT,
@@ -325,29 +321,33 @@ describe("lean auto mode reliability", () => {
             {
               type: "tool-call",
               toolCallId: "clean_direct_pwd",
-              toolName: "terminal",
-              input: { action: "exec", timeout_ms: 600_000, command: "pwd", profile: "clean" },
+              toolName: "shell",
+              input: { request: { action: "run", command: "pwd", profile: "clean", yield_time_ms: 30_000 } },
             },
             {
               type: "tool-call",
               toolCallId: "clean_direct_git_status",
-              toolName: "terminal",
+              toolName: "shell",
               input: {
-                action: "exec",
-                timeout_ms: 600_000,
-                command: "git status --short",
-                profile: "clean",
+                request: {
+                  action: "run",
+                  command: "git status --short",
+                  profile: "clean",
+                  yield_time_ms: 30_000,
+                },
               },
             },
             {
               type: "tool-call",
               toolCallId: "clean_blocked_reset",
-              toolName: "terminal",
+              toolName: "shell",
               input: {
-                action: "exec",
-                timeout_ms: 600_000,
-                command: "git reset --hard",
-                profile: "clean",
+                request: {
+                  action: "run",
+                  command: "git reset --hard",
+                  profile: "clean",
+                  yield_time_ms: 30_000,
+                },
               },
             },
             {
@@ -390,7 +390,7 @@ describe("lean auto mode reliability", () => {
         tool_calls: Array<{ name: string; status: string }>;
       };
       const terminalStatuses = json.tool_calls
-        .filter(({ name }) => name === "terminal")
+        .filter(({ name }) => name === "shell")
         .map(({ status }) => status);
       expect(terminalStatuses.filter((status) => status === "success")).toHaveLength(2);
       expect(terminalStatuses.filter((status) => status === "error")).toHaveLength(1);
@@ -1136,14 +1136,14 @@ describe("lean auto mode reliability", () => {
             {
               type: "tool-call",
               toolCallId: "mixed_block_3",
-              toolName: "terminal",
-              input: { action: "exec", timeout_ms: 600_000, command: `touch ${JSON.stringify(markers[2]!)}` },
+              toolName: "shell",
+              input: { request: { action: "run", yield_time_ms: 30_000, command: `touch ${JSON.stringify(markers[2]!)}` } },
             },
             {
               type: "tool-call",
               toolCallId: "mixed_safe_pwd",
-              toolName: "terminal",
-              input: { action: "exec", timeout_ms: 600_000, command: "pwd" },
+              toolName: "shell",
+              input: { request: { action: "run", yield_time_ms: 30_000, command: "pwd" } },
             },
             {
               type: "finish",

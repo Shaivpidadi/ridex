@@ -83,7 +83,6 @@ pub const Failure = struct {
 
 pub const InspectedHistoryKind = enum {
     conversation,
-    background_command,
     interrupted,
     compacted_summary,
 };
@@ -4004,12 +4003,6 @@ fn historyTurnView(turn: types.HistoryTurn) HistoryTurnView {
     return switch (turn) {
         .assistant => |value| .{
             .kind = .conversation,
-            .work_id = value.user.work_id,
-            .user = value.user.text,
-            .assistant = value.assistant,
-        },
-        .background_command => |value| .{
-            .kind = .background_command,
             .work_id = value.user.work_id,
             .user = value.user.text,
             .assistant = value.assistant,

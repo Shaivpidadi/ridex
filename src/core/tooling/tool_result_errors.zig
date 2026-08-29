@@ -181,7 +181,8 @@ fn permissionDeniedMessage(tool_name: []const u8, reason: types.ToolPermissionDe
         else
             "Tool access was denied by configured policy",
         .permission_required => if (std.mem.eql(u8, tool_name, "run_command") or
-            std.mem.eql(u8, tool_name, "terminal"))
+            std.mem.eql(u8, tool_name, "terminal") or
+            std.mem.eql(u8, tool_name, "shell"))
             "Shell command approval is required before this tool can run"
         else if (is_network_tool(tool_name))
             "Network or browser approval is required before this tool can run"

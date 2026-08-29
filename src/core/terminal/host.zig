@@ -10,10 +10,10 @@ const host_capabilities = @import("../hosts/host.zig");
 const io_mod = @import("../shared/io.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
-const background_process_provider = @import(
-    "../execution/background_process_provider.zig",
+const process_provider_mod = @import(
+    "../execution/process_provider.zig",
 );
-const process_supervisor = @import("../background/process_supervisor.zig");
+const process_identity = @import("../execution/process_identity.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -158,8 +158,8 @@ fn resolveEndpointSelection(
 }
 
 pub const Config = struct {
-    process_provider: background_process_provider.Provider =
-        background_process_provider.unavailable_provider,
+    process_provider: process_provider_mod.Provider =
+        process_provider_mod.unavailable_provider,
     hello: contracts.ProtocolHello = .{
         .range = contracts.local_protocol_range,
         .capabilities = contracts.known_protocol_capabilities,
@@ -167,7 +167,7 @@ pub const Config = struct {
     idle_grace_ms: u64 = default_idle_grace_ms,
 
     pub fn fromEnvironment(
-        process_provider: background_process_provider.Provider,
+        process_provider: process_provider_mod.Provider,
     ) !Config {
         var config: Config = .{ .process_provider = process_provider };
         if (io_mod.getenv("FX_TERMINAL_HOST_PROTOCOL_MIN")) |value| {
@@ -450,7 +450,6 @@ fn runSupported(alloc: Allocator, config: Config) !void {
     var registry = try native_session.Registry.init(alloc, .{
         .context = &state,
         .update_fn = updateLiveWork,
-        .monitor_update_fn = updateMonitorWork,
     }, &persistent_store, &host_instance, paths.authority_root_path, paths.transport_root_path);
     defer if (clients_drained) registry.deinit();
     defer {
@@ -532,7 +531,6 @@ const HostState = struct {
     connected_clients: std.atomic.Value(usize) = .init(0),
     pending_requests: std.atomic.Value(usize) = .init(0),
     live_work: std.atomic.Value(usize) = .init(0),
-    monitor_required: std.atomic.Value(usize) = .init(0),
     generation: std.atomic.Value(u64) = .init(0),
     stopping: std.atomic.Value(bool) = .init(false),
     changed: std.Io.Event = .unset,
@@ -546,7 +544,6 @@ const HostState = struct {
             .connected_clients = self.connected_clients.load(.acquire),
             .pending_requests = self.pending_requests.load(.acquire),
             .live_work = self.live_work.load(.acquire),
-            .monitor_required = self.monitor_required.load(.acquire) != 0,
         };
     }
 
@@ -594,17 +591,6 @@ fn updateLiveWork(raw: ?*anyopaque, live: bool) void {
         _ = state.live_work.fetchAdd(1, .acq_rel);
     } else {
         const previous = state.live_work.fetchSub(1, .acq_rel);
-        std.debug.assert(previous > 0);
-    }
-    state.noteChanged();
-}
-
-fn updateMonitorWork(raw: ?*anyopaque, required: bool) void {
-    const state: *HostState = @ptrCast(@alignCast(raw.?));
-    if (required) {
-        _ = state.monitor_required.fetchAdd(1, .acq_rel);
-    } else {
-        const previous = state.monitor_required.fetchSub(1, .acq_rel);
         std.debug.assert(previous > 0);
     }
     state.noteChanged();
@@ -685,7 +671,7 @@ fn listenerReady(handle: std.Io.net.Socket.Handle) !bool {
 fn clientMain(
     alloc: Allocator,
     stream: std.Io.net.Stream,
-    process_provider: background_process_provider.Provider,
+    process_provider: process_provider_mod.Provider,
     host_hello: contracts.ProtocolHello,
     state: *HostState,
     registry: *native_session.Registry,
@@ -713,7 +699,7 @@ fn clientMain(
 fn handleClient(
     alloc: Allocator,
     stream: std.Io.net.Stream,
-    process_provider: background_process_provider.Provider,
+    process_provider: process_provider_mod.Provider,
     host_hello: contracts.ProtocolHello,
     state: *HostState,
     registry: *native_session.Registry,
@@ -1272,7 +1258,7 @@ fn peerMatchesCurrentUser(handle: std.Io.net.Socket.Handle) bool {
 
 fn peerProcessOwner(
     alloc: Allocator,
-    process_provider: background_process_provider.Provider,
+    process_provider: process_provider_mod.Provider,
     handle: std.Io.net.Socket.Handle,
 ) !contracts.ProcessOwner {
     const pid: std.c.pid_t = if (comptime builtin.os.tag == .macos) blk: {
@@ -1320,7 +1306,7 @@ fn peerProcessOwner(
 
 fn writeIdentity(
     alloc: Allocator,
-    process_provider: background_process_provider.Provider,
+    process_provider: process_provider_mod.Provider,
     host_dir: *io_mod.VerifiedDir,
     range: contracts.ProtocolRange,
     instance: []const u8,
@@ -1351,7 +1337,7 @@ fn writeIdentity(
 
 pub fn identityEvidence(
     alloc: Allocator,
-    process_provider: background_process_provider.Provider,
+    process_provider: process_provider_mod.Provider,
     host_dir: *io_mod.VerifiedDir,
 ) policy.IdentityEvidence {
     var file = host_dir.dir.openFile(io_mod.getIo(), identity_name, .{
@@ -1378,7 +1364,7 @@ pub fn identityEvidence(
         .{ .allocate = .alloc_always },
     ) catch return .unverifiable;
     defer parsed.deinit();
-    const token = process_supervisor.ProcessInstanceToken.parse(
+    const token = process_identity.ProcessInstanceToken.parse(
         parsed.value.process_token,
     ) catch return .unverifiable;
     return switch (process_provider.matchToken(
@@ -1466,34 +1452,25 @@ test "host identity capture and reconciliation use the injected provider" {
     const Fake = struct {
         captures: usize = 0,
         matches: usize = 0,
-        match_result: process_supervisor.TokenMatch = .matched,
+        match_result: process_identity.TokenMatch = .matched,
 
-        fn provider(self: *@This()) background_process_provider.Provider {
+        fn provider(self: *@This()) process_provider_mod.Provider {
             return .{
                 .context = self,
-                .spawn_prepared_fn = spawnPrepared,
                 .capture_token_fn = captureToken,
                 .match_token_fn = matchToken,
                 .signal_process_fn = signalProcess,
             };
         }
 
-        fn spawnPrepared(
-            _: ?*anyopaque,
-            _: Allocator,
-            _: background_process_provider.SpawnRequest,
-        ) background_process_provider.ProviderError!background_process_provider.PreparedProcess {
-            return error.Unsupported;
-        }
-
         fn captureToken(
             raw: ?*anyopaque,
             _: Allocator,
             _: []const u8,
-        ) background_process_provider.ProviderError!process_supervisor.ProcessInstanceToken {
+        ) process_provider_mod.ProviderError!process_identity.ProcessInstanceToken {
             const self: *@This() = @ptrCast(@alignCast(raw.?));
             self.captures += 1;
-            return process_supervisor.ProcessInstanceToken.parse(
+            return process_identity.ProcessInstanceToken.parse(
                 "macos:00000000000000000000000000000000:1:2",
             ) catch unreachable;
         }
@@ -1502,8 +1479,8 @@ test "host identity capture and reconciliation use the injected provider" {
             raw: ?*anyopaque,
             _: Allocator,
             _: []const u8,
-            _: process_supervisor.ProcessInstanceToken,
-        ) process_supervisor.TokenMatch {
+            _: process_identity.ProcessInstanceToken,
+        ) process_identity.TokenMatch {
             const self: *@This() = @ptrCast(@alignCast(raw.?));
             self.matches += 1;
             return self.match_result;
@@ -1513,8 +1490,8 @@ test "host identity capture and reconciliation use the injected provider" {
             _: ?*anyopaque,
             _: Allocator,
             _: []const u8,
-            _: process_supervisor.ProcessInstanceToken,
-        ) background_process_provider.ProviderError!void {
+            _: process_identity.ProcessInstanceToken,
+        ) process_provider_mod.ProviderError!void {
             return error.Unsupported;
         }
     };
@@ -1562,7 +1539,7 @@ test "host identity capture and reconciliation use the injected provider" {
         error.Unsupported,
         writeIdentity(
             std.testing.allocator,
-            background_process_provider.unavailable_provider,
+            process_provider_mod.unavailable_provider,
             &host_dir,
             contracts.local_protocol_range,
             "test-instance",

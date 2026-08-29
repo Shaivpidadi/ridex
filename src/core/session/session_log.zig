@@ -6835,17 +6835,10 @@ test "specialized history survives event replacement checkpoint and canonical co
         .tool_calls = calls[0..],
         .tool_results = results[0..],
     }};
-    const record_id = session.StableBackgroundRecordId{
-        0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
-        0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
-    };
-    const background_template = session.HistoryTurn{ .background_command = .{
+    const historical_template = session.HistoryTurn{ .assistant = .{
         .user = .{ .text = @constCast("run dev") },
-        .assistant = @constCast("The server is starting."),
+        .assistant = @constCast("The historical command is inert."),
         .execution = .{ .tool_steps = steps[0..] },
-        .log_path = @constCast("/tmp/server.log"),
-        .expect_url = true,
-        .background_record_id = record_id,
     } };
     const interrupted_template = session.HistoryTurn{ .interrupted = .{
         .user = .{ .text = @constCast("inspect") },
@@ -6858,7 +6851,7 @@ test "specialized history survives event replacement checkpoint and canonical co
     const append_history = try alloc.alloc(session.HistoryTurn, 1);
     var owns_append_history = true;
     errdefer if (owns_append_history) alloc.free(append_history);
-    append_history[0] = try session.dupeHistoryTurn(alloc, background_template);
+    append_history[0] = try session.dupeHistoryTurn(alloc, historical_template);
     var append_history_initialized = true;
     errdefer if (owns_append_history and append_history_initialized) {
         session.freeHistoryTurn(alloc, append_history[0]);
@@ -6876,8 +6869,8 @@ test "specialized history survives event replacement checkpoint and canonical co
         .{},
     );
     try std.testing.expectEqualStrings(
-        "The server is starting.",
-        loaded.state.history[0].background_command.assistant.?,
+        "The historical command is inert.",
+        loaded.state.history[0].assistant.assistant,
     );
 
     var replacement = try loaded.state.dupe(alloc);
@@ -6891,7 +6884,7 @@ test "specialized history survives event replacement checkpoint and canonical co
         }
         alloc.free(replacement_history);
     };
-    replacement_history[0] = try session.dupeHistoryTurn(alloc, background_template);
+    replacement_history[0] = try session.dupeHistoryTurn(alloc, historical_template);
     copied_replacement_turns += 1;
     replacement_history[1] = try session.dupeHistoryTurn(alloc, interrupted_template);
     copied_replacement_turns += 1;
@@ -6915,11 +6908,10 @@ test "specialized history survives event replacement checkpoint and canonical co
     var replayed = try temp.root.loadReadOnly(alloc, initial.id, .{});
     defer replayed.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 2), replayed.history.len);
-    const background = replayed.history[0].background_command;
-    try std.testing.expectEqualStrings("The server is starting.", background.assistant.?);
-    try std.testing.expectEqual(@as(usize, 1), background.execution.tool_steps.len);
-    try std.testing.expectEqual(.failure, background.execution.tool_steps[0].tool_results[0].status);
-    try std.testing.expectEqualSlices(u8, &record_id, &background.background_record_id.?);
+    const historical = replayed.history[0].assistant;
+    try std.testing.expectEqualStrings("The historical command is inert.", historical.assistant);
+    try std.testing.expectEqual(@as(usize, 1), historical.execution.tool_steps.len);
+    try std.testing.expectEqual(.failure, historical.execution.tool_steps[0].tool_results[0].status);
     const interrupted = replayed.history[1].interrupted;
     try std.testing.expectEqualStrings("I inspected the entry point.", interrupted.assistant.?);
     try std.testing.expectEqual(@as(usize, 1), interrupted.execution.tool_steps.len);

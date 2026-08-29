@@ -1501,7 +1501,7 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
         "Would you like to run the following command?",
         TIMEOUT,
       );
-      expect(pane).toContain("# terminal.exec profile=user shell=");
+      expect(pane).toContain("# shell.run profile=user shell=");
       expect(pane).toContain("touch generic-preview-accepted.txt");
       expectApprovalSelection(pane, 1, COMMAND_YES_CHOICE);
 

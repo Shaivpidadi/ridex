@@ -46,7 +46,7 @@ fn fallbackToolDisplay(
     tool_name: []const u8,
 ) []const u8 {
     const lookup_name = if (std.mem.eql(u8, tool_name, "run_command"))
-        "terminal"
+        "shell"
     else
         tool_name;
     return if (registry.lookup(lookup_name) != null) "tool call" else tool_name;
@@ -93,7 +93,7 @@ pub const ProvisionalToolStatuses = struct {
             } };
         }
         const lookup_name = if (std.mem.eql(u8, tool_name, "run_command"))
-            "terminal"
+            "shell"
         else
             tool_name;
         const spec = registry.lookup(lookup_name) orelse return null;
@@ -938,7 +938,7 @@ pub fn finishExecutedToolStatus(
         try commandOutcomeDecision(arena, result_memory.command_process_presentation)
     else
         null;
-    const terminal_action_decision = if (std.mem.eql(u8, call.name, "terminal"))
+    const terminal_action_decision = if (std.mem.eql(u8, call.name, "shell"))
         try terminalActionOutcomeDecision(arena, result_memory.terminal_action_presentation)
     else
         null;
@@ -976,7 +976,7 @@ pub fn finishExecutedToolStatus(
                 "Failed",
                 advertised_dynamic_tool_names,
             );
-            if (std.mem.eql(u8, call.name, "terminal")) {
+            if (std.mem.eql(u8, call.name, "shell")) {
                 if (try tool_result_errors.inspectTerminalActionFieldCorrection(
                     arena,
                     safe_result,
@@ -1199,7 +1199,8 @@ fn commandArtifactHandle(
         .string => |value| value,
         else => return null,
     };
-    if (!std.mem.eql(u8, kind, "foreground")) return null;
+    if (!std.mem.eql(u8, kind, "command") and
+        !std.mem.eql(u8, kind, "foreground")) return null;
     const output_file = switch (object.get("output_file") orelse return null) {
         .string => |value| value,
         else => return null,
@@ -1310,7 +1311,7 @@ const test_tools = [_]tool_dispatch.Tool{
     test_builtin_tools.read_file,
     test_builtin_tools.write_file,
     test_builtin_tools.edit_file,
-    test_builtin_tools.terminal,
+    test_builtin_tools.shell,
     test_builtin_tools.ask_user_question,
 };
 const test_tool_registry = tool_dispatch.Registry{ .tools = test_tools[0..] };
@@ -1439,7 +1440,7 @@ test "formatToolStatusWithStats accents the +/- counts and falls back to neutral
 test "provisional lifecycle preflight distinguishes unknown eligible and ineligible tools" {
     try std.testing.expect(ProvisionalToolStatuses.preflight(test_tool_registry, "unknown_tool") == null);
 
-    for ([_][]const u8{ "ask_user_question", "write_file", "edit_file", "terminal", "run_command" }) |name| {
+    for ([_][]const u8{ "ask_user_question", "write_file", "edit_file", "shell", "run_command" }) |name| {
         const preflight = ProvisionalToolStatuses.preflight(test_tool_registry, name) orelse return error.TestExpectedEqual;
         switch (preflight) {
             .ineligible => {},
@@ -2105,7 +2106,7 @@ test "terminal path scope failure appends the exact status detail" {
         5,
         .{
             .id = "terminal_path_scope",
-            .name = "terminal",
+            .name = "shell",
             .arguments_json = "{\"action\":\"start\"}",
         },
         true,
@@ -2149,7 +2150,7 @@ test "command completion publishes its combined artifact handle" {
         .{
             .model_output = "truncated command preview",
             .command_result_json =
-            \\{"kind":"foreground","output_file":"/tmp/fx-command-combined.log"}
+            \\{"kind":"command","output_file":"/tmp/fx-command-combined.log"}
             ,
         },
         "truncated command preview",
@@ -2258,7 +2259,7 @@ test "command timeout and output capture failure name their actual cause" {
     defer capture.deinit();
     const hooks = capture.hooks();
 
-    const timeout = try command_result_mapping.Foreground.timeoutFailure(
+    const timeout = try command_result_mapping.Command.timeoutFailure(
         arena,
         "sleep 5",
         "/tmp",
@@ -2279,7 +2280,7 @@ test "command timeout and output capture failure name their actual cause" {
         &.{},
     );
 
-    const capture_failure = try command_result_mapping.Foreground.outputCaptureFailure(arena);
+    const capture_failure = try command_result_mapping.Command.outputCaptureFailure(arena);
     try finishExecutedToolStatus(
         &hooks,
         arena,

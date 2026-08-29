@@ -377,6 +377,9 @@ pub fn SubagentRuntime(comptime App: type) type {
             if (comptime @hasDecl(@TypeOf(app.subagents), "selectedTerminalId") and
                 @hasDecl(App, "requestTerminalOpen"))
             {
+                if (comptime @hasDecl(@TypeOf(app.subagents), "selectedTerminalAttachable")) {
+                    if (!app.subagents.selectedTerminalAttachable()) return;
+                }
                 const session_id = app.subagents.selectedTerminalId() orelse return;
                 switch (app.requestTerminalOpen(session_id)) {
                     .accepted, .occupied, .rejected => {},

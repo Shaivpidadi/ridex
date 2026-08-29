@@ -9,6 +9,7 @@ const server = @import("server.zig");
 const session_test_controls = @import("session_test_controls.zig");
 const session_codec = @import("../core/session/session_codec.zig");
 const session_store = @import("../core/session/session_store.zig");
+const legacy_background_migration = @import("../core/session/legacy_background_migration.zig");
 const js_host_session_store = @import("../core/session/js_host_session_store.zig");
 const session_runtime = @import("../core/session/session.zig");
 const mcp_runtime = @import("../core/mcp/mcp_runtime.zig");
@@ -910,27 +911,27 @@ fn activateSession(
     } else {
         state.active_session.?.session_rt.usage.clearReconciliationCredential();
     }
-    activateManagedBackground(state, store);
-}
-
-fn activateManagedBackground(
-    state: *server.ServerState,
-    store: session_store.Store,
-) void {
-    const active = if (state.active_session) |*session| session else return;
-    const writable = if (active.writable) |*value| value else return;
-    state.background.restoreWorkspaceFromStore(
-        std.heap.c_allocator,
-        store,
-        state.workspace_root,
-        writable.active_id,
-    ) catch {};
-    state.background.restoreFromManagedPersistence(
-        std.heap.c_allocator,
-        writable.childCapability() catch return,
-        writable.active_id,
-        state.workspace_root,
-    ) catch {};
+    if (state.active_session.?.writable) |*writable| {
+        if (writable.childCapability()) |capability| {
+            _ = legacy_background_migration.migrate(
+                state.alloc,
+                capability,
+                state.cfg.process_provider,
+            ) catch |err| {
+                debug_trace.logf(
+                    "session",
+                    "legacy process migration deferred session={s} err={s}",
+                    .{ writable.active_id, @errorName(err) },
+                );
+            };
+        } else |err| {
+            debug_trace.logf(
+                "session",
+                "legacy process migration unavailable session={s} err={s}",
+                .{ writable.active_id, @errorName(err) },
+            );
+        }
+    }
 }
 
 fn handleLoadFailure(
@@ -1132,7 +1133,6 @@ fn parseListCursor(raw: []const u8) !session_store.ResumableSessionContinuation 
 fn sendHistoryTurnAsUpdates(state: *server.ServerState, alloc: Allocator, session_id: []const u8, turn: types.HistoryTurn) !void {
     const user_text: []const u8 = switch (turn) {
         .assistant => |a| a.user.text,
-        .background_command => |b| b.user.text,
         .interrupted => |i| i.user.text,
         .compacted_summary => |c| c.summary,
     };
@@ -1143,15 +1143,6 @@ fn sendHistoryTurnAsUpdates(state: *server.ServerState, alloc: Allocator, sessio
         .assistant => |assistant| {
             try sendExecutionHistory(state, alloc, session_id, assistant.execution);
             try sendAgentHistoryChunk(state, alloc, session_id, assistant.assistant);
-        },
-        .background_command => |background| {
-            try sendExecutionHistory(state, alloc, session_id, background.execution);
-            if (background.assistant) |assistant| {
-                if (assistant.len > 0) {
-                    try sendAgentHistoryChunk(state, alloc, session_id, assistant);
-                }
-            }
-            try sendAgentHistoryChunk(state, alloc, session_id, "[background command]");
         },
         .interrupted => |i| {
             try sendExecutionHistory(state, alloc, session_id, i.execution);

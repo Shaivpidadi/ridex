@@ -171,20 +171,6 @@ pub const top_level_specs = [_]TopLevelSpec{
         .options = &.{json_option},
     },
     .{
-        .kind = .background,
-        .token = "background",
-        .usage = "background [last|<id>] [--json]",
-        .summary = "List or inspect background commands",
-        .options = &.{
-            .{ .flag = "last", .description = "Inspect the most recent background command" },
-            .{ .flag = "<id>", .description = "Inspect a background command by id" },
-            json_option,
-        },
-        .details = &.{
-            "With no target, lists the persisted background command history.",
-        },
-    },
-    .{
         .kind = .teams,
         .token = "teams",
         .usage = "teams",
@@ -304,7 +290,6 @@ pub const top_level_help_groups = [_]TopLevelHelpGroup{
     .{ .entries = &.{
         .{ .kind = .pr, .usage = "pr [context]" },
         .{ .kind = .issue, .usage = "issue [context]" },
-        .{ .kind = .background, .usage = "background [last|<id>]" },
     } },
     .{ .entries = &.{
         .{ .kind = .sessions, .usage = "sessions" },
@@ -432,7 +417,7 @@ pub fn topLevelUsage(kind: TopLevelKind) []const u8 {
 
 pub const slash_specs = [_]SlashSpec{
     .{ .kind = .help, .command = "/help", .help_entry = "/help", .completion_description = "show available slash commands", .presentation_category = .general, .show_in_welcome = true },
-    .{ .kind = .clear_screen, .command = "/clear", .help_entry = "/clear", .completion_description = "start a fresh session and keep background processes", .presentation_category = .general, .show_in_welcome = true },
+    .{ .kind = .clear_screen, .command = "/clear", .help_entry = "/clear", .completion_description = "start a fresh conversation while keeping managed processes", .presentation_category = .general, .show_in_welcome = true },
     .{ .kind = .new_session, .command = "/new", .help_entry = "/new", .completion_description = "start a fresh session", .presentation_category = .session, .show_in_welcome = true },
     .{ .kind = .reset_session, .command = "/reset", .help_entry = "/reset", .completion_description = "reset the current session context", .presentation_category = .session },
     .{ .kind = .resume_session, .command = "/resume", .help_entry = "/resume", .completion_description = "resume a saved session", .presentation_category = .session },
@@ -444,10 +429,6 @@ pub const slash_specs = [_]SlashSpec{
     .{ .kind = .stats, .command = "/stats", .help_entry = "/stats", .completion_description = "show token and turn statistics", .presentation_category = .account },
     .{ .kind = .usage, .command = "/usage", .aliases = &.{"/cost"}, .help_entry = "/usage (/cost)", .completion_description = "show local fx tokens, models, and spend", .presentation_category = .account },
     .{ .kind = .status, .command = "/status", .help_entry = "/status", .completion_description = "show runtime configuration", .presentation_category = .general, .show_in_welcome = true },
-    .{ .kind = .background, .command = "/background", .help_entry = "/background [open|logs|stop <id|last>]", .completion_description = "inspect background command history", .presentation_category = .agents, .show_in_welcome = true, .has_args = true },
-    .{ .kind = .background_stop, .command = "/background stop", .accepts_payload = true },
-    .{ .kind = .background_open, .command = "/background open", .accepts_payload = true },
-    .{ .kind = .background_logs, .command = "/background logs", .accepts_payload = true },
     .{ .kind = .image, .command = "/image", .aliases = &.{"/img"}, .help_entry = "/image <path> (/img)", .completion_description = "attach an image by path", .presentation_category = .media, .has_args = true, .accepts_payload = true },
     .{ .kind = .images, .command = "/images", .help_entry = "/images [clear]", .completion_description = "manage pending image attachments", .presentation_category = .media, .has_args = true, .accepts_payload = true },
     .{ .kind = .model, .command = "/model", .help_entry = "/model <id-or-query>", .completion_description = "choose what model and reasoning effort to use", .presentation_category = .model, .has_args = true, .accepts_payload = true },
@@ -544,10 +525,6 @@ test "built-in slash commands register exact active order" {
         "/stats",
         "/usage",
         "/status",
-        "/background",
-        "/background stop",
-        "/background open",
-        "/background logs",
         "/image",
         "/images",
         "/model",

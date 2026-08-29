@@ -461,8 +461,8 @@ describe("filesystem path handling", () => {
           },
           {
             id: "added_cwd_1",
-            name: "terminal",
-            input: { action: "exec", timeout_ms: 600_000, command: "pwd", cwd: root.external },
+            name: "shell",
+            input: { request: { action: "run", yield_time_ms: 30_000, command: "pwd", cwd: root.external } },
             expected: root.external,
           },
         ];
@@ -672,7 +672,7 @@ describe("filesystem path handling", () => {
         const json = parseFxJson(result);
         expect(readFileSync(marker, "utf8")).toBe("COMMAND_ADDED_WRITE");
         expect(json.tool_calls.map(({ name, status }) => ({ name, status }))).toEqual([
-          { name: "terminal", status: "success" },
+          { name: "shell", status: "success" },
         ]);
         expect(gateway.classifierRequests).toHaveLength(1);
       } finally {
@@ -829,7 +829,7 @@ describe("filesystem path handling", () => {
             expect(readFileSync(marker, "utf8")).toBe(scenario.id);
             expect(
               json.tool_calls.map(({ name, status }) => ({ name, status })),
-            ).toEqual([{ name: "terminal", status: "success" }]);
+            ).toEqual([{ name: "shell", status: "success" }]);
           } finally {
             gateway.stop();
           }
@@ -1437,7 +1437,7 @@ describe("filesystem path handling", () => {
         expect(gateway.classifierRequests).toHaveLength(1);
         expect(gateway.remainingResponseCount()).toBe(0);
         expect(json.tool_calls).toEqual([
-          expect.objectContaining({ name: "terminal", status: "success" }),
+          expect.objectContaining({ name: "shell", status: "success" }),
         ]);
       } finally {
         gateway.stop();
@@ -1482,7 +1482,7 @@ describe("filesystem path handling", () => {
         const json = parseFxJson(result);
         expect(json.output).toContain(completion);
         expect(json.tool_calls.some(({ name, status }) =>
-          name === "terminal" && status === "success"
+          name === "shell" && status === "success"
         )).toBe(true);
         for (const removed of REMOVED_FILESYSTEM_TOOLS) {
           expect(json.tool_calls.some(({ name }) => name === removed)).toBe(false);

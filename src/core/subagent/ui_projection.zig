@@ -1528,7 +1528,7 @@ test "approval command projection preserves content beyond summary bounds" {
     const tail = "COMMAND_TAIL_MUST_REMAIN_VISIBLE";
     const command = try std.fmt.allocPrint(
         alloc,
-        "# terminal.exec profile=user shell=/bin/zsh\n{s}{s}",
+        "# shell.run profile=user shell=/bin/zsh\n{s}{s}",
         .{ "x" ** max_summary_bytes, tail },
     );
     defer alloc.free(command);
@@ -1542,7 +1542,7 @@ test "approval command projection preserves content beyond summary bounds" {
         .root_id = "root",
         .work_id = "work",
         .prepared_fingerprint = [_]u8{7} ** 32,
-        .label = "terminal.exec long command",
+        .label = "shell.run long command",
         .explanation = null,
         .command = command,
         .grants = &.{},

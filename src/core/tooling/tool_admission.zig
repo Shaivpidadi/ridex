@@ -1,7 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const debug_trace = @import("../shared/debug_trace.zig");
-const background_runtime = @import("../background/background_runtime.zig");
 const vision_contracts = @import("../agent/runtime/vision_contracts.zig");
 const command_admission = @import("../permissions/command_admission.zig");
 const command_environment = @import("../execution/command_environment.zig");
@@ -39,7 +38,6 @@ const ToolCall = types.ToolCall;
 const PermissionGrant = types.PermissionGrant;
 const PermissionMode = types.PermissionMode;
 const ToolPermissionDecision = types.ToolPermissionDecision;
-const BackgroundRuntime = background_runtime.BackgroundRuntime;
 const WorkerRuntime = worker_runtime.WorkerRuntime;
 
 pub const HostSandboxDefault = enum {
@@ -76,7 +74,6 @@ pub const Input = struct {
     tool_registry: tool_dispatch.Registry,
     worker: *WorkerRuntime,
     permission_prompter: ?permission_prompter.Prompter = null,
-    background: *BackgroundRuntime,
     advertised_dynamic_tool_names: []const []const u8,
     mcp_runtime: tool_mcp_runtime.RuntimeCapabilities,
     context_limits: context_limits.Values = .{},
@@ -157,7 +154,9 @@ fn isRunCommandCall(input: Input, arena: Allocator, call: ToolCall) !bool {
 }
 
 fn permissionNameForCall(input: Input, arena: Allocator, call: ToolCall) ![]const u8 {
-    return if (try isRunCommandCall(input, arena, call)) "run_command" else call.name;
+    const command_call = try isRunCommandCall(input, arena, call);
+    if (command_call) return "run_command";
+    return if (std.mem.eql(u8, call.name, "shell")) "terminal" else call.name;
 }
 
 fn permissionTargetKindForCall(
@@ -767,7 +766,7 @@ fn reviewRequestForCall(
             break :blk .{ .command = .{
                 .command = command.command,
                 .resolved_cwd = command.resolved_cwd,
-                .background = command.background,
+                .background = false,
                 .target_os = command.target_os,
             } };
         } else blk: {
@@ -1107,7 +1106,7 @@ fn resolveOrdinaryPermissionOutcome(
             if (try command_effect.knownReversibleAutoCommand(
                 arena,
                 command.command,
-                command.background,
+                false,
             )) {
                 return shellPermissionOutcome(
                     command,
@@ -2068,7 +2067,6 @@ pub fn runCommandContext(
     return .{
         .command = command,
         .resolved_cwd = cwd,
-        .background = false,
         .target_os = builtin.os.tag,
         .environment = environment_value,
     };
@@ -2088,7 +2086,7 @@ pub fn permissionStateKeyForCall(
             arena,
             command.command,
             command.resolved_cwd,
-            if (command.background) "background" else "foreground",
+            "foreground",
             @tagName(command.target_os),
         );
     }
@@ -2363,10 +2361,14 @@ fn permissionTargetsForCall(input: Input, arena: Allocator, call: ToolCall) !per
         };
         return .{ .items = items };
     }
+    var permission_call = call;
+    if (std.mem.eql(u8, permission_call.name, "shell")) {
+        permission_call.name = "shell";
+    }
     return permissions.permissionTargetsForCallInScope(
         arena,
         accessScope(input),
-        call,
+        permission_call,
         tool.permission_target_kind,
     );
 }
@@ -2476,23 +2478,20 @@ test "interactive terminal exec approval permits command amendments" {
     defer arena_state.deinit();
     var worker: WorkerRuntime = .{};
     defer worker.deinit(std.testing.allocator);
-    var background: BackgroundRuntime = .{};
-    defer background.deinit(std.testing.allocator);
     const input: Input = .{
         .workspace_root = "/tmp/workspace",
         .permission_grants = &.{},
         .permission_rules = .{},
         .tool_registry = test_admission_registry,
         .worker = &worker,
-        .background = &background,
         .advertised_dynamic_tool_names = &.{},
         .mcp_runtime = .{},
     };
 
     const foreground = try interactivePermissionRequest(input, arena_state.allocator(), .{
         .id = "foreground",
-        .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"printf foreground\"}",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"printf foreground\"}",
     }, null);
     try std.testing.expect(foreground.amendment_allowed);
 }
@@ -2503,23 +2502,20 @@ test "interactive command approval keeps activity projection out of permission r
     const arena = arena_state.allocator();
     var worker: WorkerRuntime = .{};
     defer worker.deinit(std.testing.allocator);
-    var background: BackgroundRuntime = .{};
-    defer background.deinit(std.testing.allocator);
     const input: Input = .{
         .workspace_root = "/tmp/workspace",
         .permission_grants = &.{},
         .permission_rules = .{},
         .tool_registry = test_admission_registry,
         .worker = &worker,
-        .background = &background,
         .advertised_dynamic_tool_names = &.{},
         .mcp_runtime = .{},
     };
     const raw_command = "cat <<'EOF'\nline one\nEOF";
     const call: ToolCall = .{
         .id = "multiline",
-        .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"cat <<'EOF'\\nline one\\nEOF\"}",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"cat <<'EOF'\\nline one\\nEOF\"}",
     };
 
     const activity = (try tool_presentation.formatRunCommandActivity(
@@ -2533,14 +2529,14 @@ test "interactive command approval keeps activity projection out of permission r
 
     const request = try interactivePermissionRequest(input, arena, call, null);
     try std.testing.expectEqualStrings(
-        "terminal.exec cat <<'EOF'\\x0aline one\\x0aEOF",
+        "shell.run cat <<'EOF'\\x0aline one\\x0aEOF",
         request.label,
     );
     const approval_command = request.command orelse return error.TestExpectedEqual;
     try std.testing.expect(std.mem.startsWith(
         u8,
         approval_command,
-        "# terminal.exec profile=user shell=",
+        "# shell.run profile=user shell=",
     ));
     try std.testing.expect(std.mem.endsWith(u8, approval_command, "\n" ++ raw_command));
 }
@@ -2551,31 +2547,28 @@ test "terminal exec timeout and profile omission share user grants while clean s
     const arena = arena_state.allocator();
     var worker: WorkerRuntime = .{};
     defer worker.deinit(std.testing.allocator);
-    var background: BackgroundRuntime = .{};
-    defer background.deinit(std.testing.allocator);
     const input = testInputWithClassifier(
         &worker,
-        &background,
         permission_auto_classifier.Classifier.disabled(),
     );
 
     const omitted = try permissionTargetForCall(input, arena, .{
         .id = "omitted",
-        .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"printf scoped\",\"timeout_ms\":1}",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"printf scoped\",\"timeout_ms\":1}",
     });
     const clean = permissionTargetForCall(input, arena, .{
         .id = "clean",
-        .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"printf scoped\",\"profile\":\"clean\",\"timeout_ms\":5000}",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"printf scoped\",\"profile\":\"clean\",\"timeout_ms\":5000}",
     }) catch |err| switch (err) {
         error.MissingLoginShell, error.UnsupportedShell => return error.SkipZigTest,
         else => return err,
     };
     const user = try permissionTargetForCall(input, arena, .{
         .id = "user",
-        .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"printf scoped\",\"profile\":\"user\",\"timeout_ms\":600000}",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"printf scoped\",\"profile\":\"user\",\"timeout_ms\":600000}",
     });
 
     try std.testing.expectEqualStrings(omitted, user);
@@ -2594,14 +2587,14 @@ test "terminal exec timeout and profile omission share user grants while clean s
 
     const request = try interactivePermissionRequest(input, arena, .{
         .id = "user-prompt",
-        .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"printf scoped\",\"profile\":\"user\"}",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"printf scoped\",\"profile\":\"user\"}",
     }, null);
     const approval_command = request.command orelse return error.TestExpectedEqual;
     try std.testing.expect(std.mem.startsWith(
         u8,
         approval_command,
-        "# terminal.exec profile=user shell=",
+        "# shell.run profile=user shell=",
     ));
     try std.testing.expect(std.mem.endsWith(
         u8,
@@ -2615,23 +2608,20 @@ test "interactive command approval keeps dangerous-command guidance" {
     defer arena_state.deinit();
     var worker: WorkerRuntime = .{};
     defer worker.deinit(std.testing.allocator);
-    var background: BackgroundRuntime = .{};
-    defer background.deinit(std.testing.allocator);
     const input: Input = .{
         .workspace_root = "/tmp/workspace",
         .permission_grants = &.{},
         .permission_rules = .{},
         .tool_registry = test_admission_registry,
         .worker = &worker,
-        .background = &background,
         .advertised_dynamic_tool_names = &.{},
         .mcp_runtime = .{},
     };
 
     const request = try interactivePermissionRequest(input, arena_state.allocator(), .{
         .id = "dangerous",
-        .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"git reset --hard\"}",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"git reset --hard\"}",
     }, null);
 
     try std.testing.expect(std.mem.indexOf(u8, request.label, "risk: command may discard version-control state") != null);
@@ -2657,11 +2647,8 @@ test "interactive Vision path approval names every canonical image" {
     defer arena_state.deinit();
     var worker: WorkerRuntime = .{};
     defer worker.deinit(alloc);
-    var background: BackgroundRuntime = .{};
-    defer background.deinit(alloc);
     var input = testInputWithClassifier(
         &worker,
-        &background,
         permission_auto_classifier.Classifier.disabled(),
     );
     input.workspace_root = workspace;
@@ -2704,11 +2691,8 @@ test "Vision path admission returns a tool failure for directories" {
     defer arena_state.deinit();
     var worker: WorkerRuntime = .{};
     defer worker.deinit(alloc);
-    var background: BackgroundRuntime = .{};
-    defer background.deinit(alloc);
     var input = testInputWithClassifier(
         &worker,
-        &background,
         permission_auto_classifier.Classifier.disabled(),
     );
     input.workspace_root = workspace;
@@ -2755,11 +2739,8 @@ test "Vision path admission retains the canonical execution targets" {
     defer arena_state.deinit();
     var worker: WorkerRuntime = .{};
     defer worker.deinit(alloc);
-    var background: BackgroundRuntime = .{};
-    defer background.deinit(alloc);
     var input = testInputWithClassifier(
         &worker,
-        &background,
         permission_auto_classifier.Classifier.disabled(),
     );
     input.workspace_root = workspace;
@@ -2847,8 +2828,6 @@ test "dynamic MCP admission checks built-in and advertised names before runtime 
 
     var worker: WorkerRuntime = .{};
     defer worker.deinit(std.testing.allocator);
-    var background: BackgroundRuntime = .{};
-    defer background.deinit(std.testing.allocator);
     var mcp = CountingMcp{};
     const advertised = [_][]const u8{"mcp_example"};
     const input: Input = .{
@@ -2856,7 +2835,6 @@ test "dynamic MCP admission checks built-in and advertised names before runtime 
         .permission_grants = &.{},
         .permission_rules = .{},
         .worker = &worker,
-        .background = &background,
         .tool_registry = test_admission_registry,
         .advertised_dynamic_tool_names = &advertised,
         .mcp_runtime = .{
@@ -2884,8 +2862,6 @@ test "interactive dynamic MCP approval projects bounded terminal-safe arguments 
     const arena = arena_state.allocator();
     var worker: WorkerRuntime = .{};
     defer worker.deinit(std.testing.allocator);
-    var background: BackgroundRuntime = .{};
-    defer background.deinit(std.testing.allocator);
     var mcp: u8 = 0;
     const advertised = [_][]const u8{"mcp_example"};
     const input: Input = .{
@@ -2893,7 +2869,6 @@ test "interactive dynamic MCP approval projects bounded terminal-safe arguments 
         .permission_grants = &.{},
         .permission_rules = .{},
         .worker = &worker,
-        .background = &background,
         .tool_registry = test_admission_registry,
         .advertised_dynamic_tool_names = &advertised,
         .mcp_runtime = .{
@@ -2973,11 +2948,8 @@ test "prepared file mutation admission decodes and resolves exactly once without
     const arena = arena_state.allocator();
     var worker: WorkerRuntime = .{};
     defer worker.deinit(alloc);
-    var background: BackgroundRuntime = .{};
-    defer background.deinit(alloc);
     var input = testInputWithClassifier(
         &worker,
-        &background,
         permission_auto_classifier.Classifier.disabled(),
     );
     input.workspace_root = workspace;
@@ -3510,14 +3482,14 @@ const FakeAutoClassifier = struct {
 
 const test_admission_registry = tool_dispatch.Registry{ .tools = &.{
     test_builtin_tools.glob_files,
-    test_builtin_tools.terminal,
+    test_builtin_tools.shell,
+    test_builtin_tools.shell,
     test_builtin_tools.write_file,
     test_builtin_tools.edit_file,
 } };
 
 fn testInputWithClassifier(
     worker: *WorkerRuntime,
-    background: *BackgroundRuntime,
     classifier: permission_auto_classifier.Classifier,
 ) Input {
     return .{
@@ -3526,7 +3498,6 @@ fn testInputWithClassifier(
         .permission_rules = .{},
         .tool_registry = test_admission_registry,
         .worker = worker,
-        .background = background,
         .advertised_dynamic_tool_names = &.{},
         .mcp_runtime = .{},
         .auto_classifier = classifier,
@@ -3541,17 +3512,14 @@ test "exact command approval remains valid across live authority revalidation" {
     const arena = arena_state.allocator();
     var worker: WorkerRuntime = .{};
     defer worker.deinit(alloc);
-    var background: BackgroundRuntime = .{};
-    defer background.deinit(alloc);
     const input = testInputWithClassifier(
         &worker,
-        &background,
         permission_auto_classifier.Classifier.disabled(),
     );
     const call: ToolCall = .{
         .id = "exact-command-revalidation",
-        .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"printf approved > marker.txt\"}",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"printf approved > marker.txt\"}",
     };
     const grants = try exactApprovalLocalGrants(
         input,
@@ -3576,7 +3544,7 @@ test "exact command approval remains valid across live authority revalidation" {
 }
 
 const test_review_tool_calls = [_]ToolCall{
-    .{ .id = "test-review", .name = "terminal", .arguments_json = "{\"action\":\"exec\",\"command\":\"printf test\"}" },
+    .{ .id = "test-review", .name = "shell", .arguments_json = "{\"action\":\"run\",\"command\":\"printf test\"}" },
 };
 const test_review_root_messages = [_][]const u8{"test root request"};
 
@@ -3627,20 +3595,17 @@ test "interactive admission routes prompts through the supplied prompter" {
     defer arena_state.deinit();
     var worker: WorkerRuntime = .{};
     defer worker.deinit(std.testing.allocator);
-    var background: BackgroundRuntime = .{};
-    defer background.deinit(std.testing.allocator);
     var recording = RecordingPrompter{};
     var input = testInputWithClassifier(
         &worker,
-        &background,
         permission_auto_classifier.Classifier.disabled(),
     );
     input.permission_prompter = recording.prompter();
 
     const call = ToolCall{
         .id = "cmd",
-        .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"touch generated.txt\"}",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"touch generated.txt\"}",
     };
     const outcome = try requestPermissionOutcome(input, arena_state.allocator(), call, .ask, &.{});
     try std.testing.expectEqual(@as(usize, 1), recording.calls);
@@ -3682,12 +3647,9 @@ test "interactive file admission passes its canonical grant offer to the prompte
     const arena = arena_state.allocator();
     var worker: WorkerRuntime = .{};
     defer worker.deinit(alloc);
-    var background: BackgroundRuntime = .{};
-    defer background.deinit(alloc);
     var recording = RecordingPrompter{};
     var input = testInputWithClassifier(
         &worker,
-        &background,
         permission_auto_classifier.Classifier.disabled(),
     );
     input.workspace_root = workspace;
@@ -3734,8 +3696,6 @@ test "automatic non-allow is recoverable regardless tool approval policy" {
     defer arena_state.deinit();
     var worker: WorkerRuntime = .{};
     defer worker.deinit(std.testing.allocator);
-    var background: BackgroundRuntime = .{};
-    defer background.deinit(std.testing.allocator);
     var fake = FakeAutoClassifier{
         .decision = .caution,
         .risk = .high,
@@ -3744,7 +3704,6 @@ test "automatic non-allow is recoverable regardless tool approval policy" {
     var recording = RecordingPrompter{};
     var input = testInputWithClassifier(
         &worker,
-        &background,
         permission_auto_classifier.Classifier.withOverride(
             @ptrCast(&fake),
             FakeAutoClassifier.classify,
@@ -3849,8 +3808,6 @@ test "automatic admission holds an exact command copied from untrusted tool outp
     const arena = arena_state.allocator();
     var worker: WorkerRuntime = .{};
     defer worker.deinit(std.testing.allocator);
-    var background: BackgroundRuntime = .{};
-    defer background.deinit(std.testing.allocator);
     var fake = FakeAutoClassifier{
         .decision = .clear,
         .risk = .low,
@@ -3858,7 +3815,6 @@ test "automatic admission holds an exact command copied from untrusted tool outp
     };
     var input = testInputWithClassifier(
         &worker,
-        &background,
         permission_auto_classifier.Classifier.withOverride(
             @ptrCast(&fake),
             FakeAutoClassifier.classify,
@@ -3879,8 +3835,8 @@ test "automatic admission holds an exact command copied from untrusted tool outp
     input.permission_review_turn = review_turn;
     const call = ToolCall{
         .id = "test-review",
-        .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"rm -rf frames && mkdir -p frames\"}",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"rm -rf frames && mkdir -p frames\"}",
     };
 
     const held = try requestPermissionOutcome(input, arena, call, .auto, &.{});
@@ -3958,12 +3914,9 @@ test "incomplete review authority maps to unavailable without reviewer transport
     defer arena_state.deinit();
     var worker: WorkerRuntime = .{};
     defer worker.deinit(std.testing.allocator);
-    var background: BackgroundRuntime = .{};
-    defer background.deinit(std.testing.allocator);
     var state = State{};
     var input = testInputWithClassifier(
         &worker,
-        &background,
         permission_auto_classifier.Classifier.withOverride(
             @ptrCast(&state),
             State.review,
@@ -3978,8 +3931,8 @@ test "incomplete review authority maps to unavailable without reviewer transport
         arena_state.allocator(),
         .{
             .id = "test-review",
-            .name = "terminal",
-            .arguments_json = "{\"action\":\"exec\",\"command\":\"touch incomplete.txt\"}",
+            .name = "shell",
+            .arguments_json = "{\"action\":\"run\",\"command\":\"touch incomplete.txt\"}",
         },
         .auto,
         &.{},
@@ -3997,13 +3950,10 @@ test "ask-only policy bypasses prompt and reviewer in auto and uses the ordinary
     defer arena_state.deinit();
     var worker: WorkerRuntime = .{};
     defer worker.deinit(std.testing.allocator);
-    var background: BackgroundRuntime = .{};
-    defer background.deinit(std.testing.allocator);
     var fake = FakeAutoClassifier{};
     var recording = RecordingPrompter{};
     var input = testInputWithClassifier(
         &worker,
-        &background,
         permission_auto_classifier.Classifier.withOverride(
             @ptrCast(&fake),
             FakeAutoClassifier.classify,
@@ -4070,12 +4020,9 @@ test "automatic terminal admission reviews only sensitive typed input" {
     const arena = arena_state.allocator();
     var worker: WorkerRuntime = .{};
     defer worker.deinit(std.testing.allocator);
-    var background: BackgroundRuntime = .{};
-    defer background.deinit(std.testing.allocator);
     var fake = FakeAutoClassifier{};
     var input = testInputWithClassifier(
         &worker,
-        &background,
         permission_auto_classifier.Classifier.withOverride(
             @ptrCast(&fake),
             FakeAutoClassifier.classify,
@@ -4083,7 +4030,7 @@ test "automatic terminal admission reviews only sensitive typed input" {
     );
     const list_call = ToolCall{
         .id = "terminal-list",
-        .name = "terminal",
+        .name = "shell",
         .arguments_json = "{\"action\":\"list\"}",
     };
 
@@ -4093,9 +4040,9 @@ test "automatic terminal admission reviews only sensitive typed input" {
     try std.testing.expectEqual(@as(usize, 0), fake.calls);
 
     const start = try requestPermissionOutcome(input, arena, .{
-        .id = "terminal-start",
-        .name = "terminal",
-        .arguments_json = "{\"action\":\"start\"}",
+        .id = "shell-run",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"touch generated.txt\",\"profile\":\"clean\"}",
     }, .auto, &.{});
     try std.testing.expectEqual(ToolPermissionDecision.once, start.decision);
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
@@ -4106,7 +4053,7 @@ test "automatic terminal admission reviews only sensitive typed input" {
 
     var rules = [_]types.PermissionRule{.{
         .permission = @constCast("terminal"),
-        .pattern = @constCast("terminal"),
+        .pattern = @constCast("shell"),
         .action = .deny,
     }};
     input.permission_rules = .{ .rules = &rules };
@@ -4123,11 +4070,55 @@ test "automatic terminal admission reviews only sensitive typed input" {
         error.UnexpectedEndOfInput,
         requestPermissionOutcome(input, arena, .{
             .id = "malformed-terminal-list",
-            .name = "terminal",
+            .name = "shell",
             .arguments_json = "{",
         }, .auto, &.{}),
     );
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
+}
+
+test "shell admission reuses terminal rules and command authority" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(std.testing.allocator);
+    var classifier = FakeAutoClassifier{};
+    var input = testInputWithClassifier(
+        &worker,
+        permission_auto_classifier.Classifier.withOverride(
+            @ptrCast(&classifier),
+            FakeAutoClassifier.classify,
+        ),
+    );
+    const list_call = ToolCall{
+        .id = "shell-list",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"list\"}",
+    };
+    const list = try requestPermissionOutcome(input, arena, list_call, .auto, &.{});
+    try std.testing.expectEqual(ToolPermissionDecision.once, list.decision);
+    try std.testing.expectEqual(@as(usize, 0), classifier.calls);
+
+    var rules = [_]types.PermissionRule{.{
+        .permission = @constCast("terminal"),
+        .pattern = @constCast("shell"),
+        .action = .deny,
+    }};
+    input.permission_rules = .{ .rules = &rules };
+    const denied = try requestPermissionOutcome(input, arena, list_call, .auto, &.{});
+    try std.testing.expectEqual(ToolPermissionDecision.policy_denied, denied.decision);
+    try std.testing.expectEqual(@as(usize, 0), classifier.calls);
+
+    input.permission_rules = .{};
+    const run = try requestPermissionOutcome(input, arena, .{
+        .id = "shell-run",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"touch generated.txt\",\"profile\":\"clean\"}",
+    }, .auto, &.{});
+    try std.testing.expectEqual(ToolPermissionDecision.once, run.decision);
+    try std.testing.expect(run.execution_authority != null);
+    try std.testing.expectEqual(@as(usize, 1), classifier.calls);
 }
 
 test "existing tool approval policies retain the standard default" {
@@ -4141,13 +4132,10 @@ test "yolo admission bypasses policy prompts and review after structural validat
     defer arena_state.deinit();
     var worker: WorkerRuntime = .{};
     defer worker.deinit(std.testing.allocator);
-    var background: BackgroundRuntime = .{};
-    defer background.deinit(std.testing.allocator);
     var classifier = FakeAutoClassifier{};
     var prompter = RecordingPrompter{};
     var input = testInputWithClassifier(
         &worker,
-        &background,
         permission_auto_classifier.Classifier.withOverride(
             @ptrCast(&classifier),
             FakeAutoClassifier.classify,
@@ -4166,8 +4154,8 @@ test "yolo admission bypasses policy prompts and review after structural validat
         arena_state.allocator(),
         .{
             .id = "yolo-command",
-            .name = "terminal",
-            .arguments_json = "{\"action\":\"exec\",\"command\":\"touch generated.txt\"}",
+            .name = "shell",
+            .arguments_json = "{\"action\":\"run\",\"command\":\"touch generated.txt\"}",
         },
         .yolo,
         &.{},
@@ -4187,7 +4175,7 @@ test "yolo admission bypasses policy prompts and review after structural validat
             arena_state.allocator(),
             .{
                 .id = "malformed-yolo-command",
-                .name = "terminal",
+                .name = "shell",
                 .arguments_json = "{",
             },
             .yolo,
@@ -4209,13 +4197,10 @@ test "yolo file admission preserves canonical mutation authority" {
     const arena = arena_state.allocator();
     var worker: WorkerRuntime = .{};
     defer worker.deinit(alloc);
-    var background: BackgroundRuntime = .{};
-    defer background.deinit(alloc);
     var classifier = FakeAutoClassifier{};
     var prompter = RecordingPrompter{};
     var input = testInputWithClassifier(
         &worker,
-        &background,
         permission_auto_classifier.Classifier.withOverride(
             @ptrCast(&classifier),
             FakeAutoClassifier.classify,
@@ -4296,18 +4281,15 @@ test "admission registration follows the supplied registry" {
     defer arena_state.deinit();
     var worker: WorkerRuntime = .{};
     defer worker.deinit(std.testing.allocator);
-    var background: BackgroundRuntime = .{};
-    defer background.deinit(std.testing.allocator);
     var input = testInputWithClassifier(
         &worker,
-        &background,
         permission_auto_classifier.Classifier.disabled(),
     );
 
     const call = ToolCall{
         .id = "cmd",
-        .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"touch generated.txt\"}",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"touch generated.txt\"}",
     };
     input.tool_registry = .{};
     try std.testing.expect(!try callUsesCommandAuthority(
@@ -4319,7 +4301,7 @@ test "admission registration follows the supplied registry" {
     try std.testing.expectEqual(ToolPermissionDecision.once, unregistered.decision);
     try std.testing.expectEqual(command_admission.ToolExecutionAuthority.ordinary, unregistered.execution_authority.?);
 
-    input.tool_registry = tool_dispatch.Registry{ .tools = &.{test_builtin_tools.terminal} };
+    input.tool_registry = tool_dispatch.Registry{ .tools = &.{test_builtin_tools.shell} };
     try std.testing.expect(try callUsesCommandAuthority(
         input.tool_registry,
         arena_state.allocator(),
@@ -4335,11 +4317,8 @@ test "registered subagent commands do not require generic tool approval" {
     defer arena_state.deinit();
     var worker: WorkerRuntime = .{};
     defer worker.deinit(std.testing.allocator);
-    var background: BackgroundRuntime = .{};
-    defer background.deinit(std.testing.allocator);
     var input = testInputWithClassifier(
         &worker,
-        &background,
         permission_auto_classifier.Classifier.disabled(),
     );
     var subagent = test_builtin_tools.read_file;
@@ -4365,11 +4344,8 @@ test "web search permission target follows registered tool metadata" {
     defer arena_state.deinit();
     var worker: WorkerRuntime = .{};
     defer worker.deinit(std.testing.allocator);
-    var background: BackgroundRuntime = .{};
-    defer background.deinit(std.testing.allocator);
     var input = testInputWithClassifier(
         &worker,
-        &background,
         permission_auto_classifier.Classifier.disabled(),
     );
 
@@ -4394,11 +4370,8 @@ test "permission target kind follows supplied registry metadata" {
     defer arena_state.deinit();
     var worker: WorkerRuntime = .{};
     defer worker.deinit(std.testing.allocator);
-    var background: BackgroundRuntime = .{};
-    defer background.deinit(std.testing.allocator);
     var input = testInputWithClassifier(
         &worker,
-        &background,
         permission_auto_classifier.Classifier.disabled(),
     );
 
@@ -4436,11 +4409,8 @@ test "live authority resolves a missing read target without changing ordinary ad
     defer arena_state.deinit();
     var worker: WorkerRuntime = .{};
     defer worker.deinit(alloc);
-    var background: BackgroundRuntime = .{};
-    defer background.deinit(alloc);
     var input = testInputWithClassifier(
         &worker,
-        &background,
         permission_auto_classifier.Classifier.disabled(),
     );
     input.workspace_root = workspace;
@@ -4497,11 +4467,8 @@ test "live authority preserves a non-directory read failure for tool execution" 
     defer arena_state.deinit();
     var worker: WorkerRuntime = .{};
     defer worker.deinit(alloc);
-    var background: BackgroundRuntime = .{};
-    defer background.deinit(alloc);
     var input = testInputWithClassifier(
         &worker,
-        &background,
         permission_auto_classifier.Classifier.disabled(),
     );
     input.workspace_root = workspace;
@@ -4532,11 +4499,8 @@ test "permission rule display follows supplied registry metadata" {
     defer arena_state.deinit();
     var worker: WorkerRuntime = .{};
     defer worker.deinit(std.testing.allocator);
-    var background: BackgroundRuntime = .{};
-    defer background.deinit(std.testing.allocator);
     var input = testInputWithClassifier(
         &worker,
-        &background,
         permission_auto_classifier.Classifier.disabled(),
     );
 
@@ -4565,15 +4529,12 @@ test "automatic review receives exact command and mints matching one-call author
     defer arena_state.deinit();
     var worker: WorkerRuntime = .{};
     defer worker.deinit(std.testing.allocator);
-    var background: BackgroundRuntime = .{};
-    defer background.deinit(std.testing.allocator);
     const command = "touch automatic.txt && printf dangerous-tail";
     var fake = FakeAutoClassifier{
         .rationale = "The exact requested command is authorized.",
     };
     const input = testInputWithClassifier(
         &worker,
-        &background,
         permission_auto_classifier.Classifier.withOverride(
             @ptrCast(&fake),
             FakeAutoClassifier.classify,
@@ -4584,8 +4545,8 @@ test "automatic review receives exact command and mints matching one-call author
         arena_state.allocator(),
         .{
             .id = "automatic",
-            .name = "terminal",
-            .arguments_json = "{\"action\":\"exec\",\"command\":\"touch automatic.txt && printf dangerous-tail\"}",
+            .name = "shell",
+            .arguments_json = "{\"action\":\"run\",\"command\":\"touch automatic.txt && printf dangerous-tail\"}",
         },
         .auto,
         &.{},
@@ -4643,12 +4604,9 @@ test "automatic review includes only matching host-proven branch for direct git 
     defer arena_state.deinit();
     var worker: WorkerRuntime = .{};
     defer worker.deinit(alloc);
-    var background: BackgroundRuntime = .{};
-    defer background.deinit(alloc);
     var fake = FakeAutoClassifier{};
     var input = testInputWithClassifier(
         &worker,
-        &background,
         permission_auto_classifier.Classifier.withOverride(
             @ptrCast(&fake),
             FakeAutoClassifier.classify,
@@ -4661,8 +4619,8 @@ test "automatic review includes only matching host-proven branch for direct git 
         arena_state.allocator(),
         .{
             .id = "matching-push",
-            .name = "terminal",
-            .arguments_json = "{\"action\":\"exec\",\"command\":\"git push origin feature/media-ui\"}",
+            .name = "shell",
+            .arguments_json = "{\"action\":\"run\",\"command\":\"git push origin feature/media-ui\"}",
         },
         .auto,
         &.{},
@@ -4678,8 +4636,8 @@ test "automatic review includes only matching host-proven branch for direct git 
         arena_state.allocator(),
         .{
             .id = "mismatched-push",
-            .name = "terminal",
-            .arguments_json = "{\"action\":\"exec\",\"command\":\"git push origin feature/other\"}",
+            .name = "shell",
+            .arguments_json = "{\"action\":\"run\",\"command\":\"git push origin feature/other\"}",
         },
         .auto,
         &.{},
@@ -4692,8 +4650,6 @@ test "automatic destructive command reaches reviewer without human prompter" {
     defer arena_state.deinit();
     var worker: WorkerRuntime = .{};
     defer worker.deinit(std.testing.allocator);
-    var background: BackgroundRuntime = .{};
-    defer background.deinit(std.testing.allocator);
     var fake = FakeAutoClassifier{
         .decision = .caution,
         .risk = .high,
@@ -4702,7 +4658,6 @@ test "automatic destructive command reaches reviewer without human prompter" {
     var recording = RecordingPrompter{};
     var input = testInputWithClassifier(
         &worker,
-        &background,
         permission_auto_classifier.Classifier.withOverride(
             @ptrCast(&fake),
             FakeAutoClassifier.classify,
@@ -4715,8 +4670,8 @@ test "automatic destructive command reaches reviewer without human prompter" {
         arena_state.allocator(),
         .{
             .id = "asked",
-            .name = "terminal",
-            .arguments_json = "{\"action\":\"exec\",\"command\":\"rm -rf public\"}",
+            .name = "shell",
+            .arguments_json = "{\"action\":\"run\",\"command\":\"rm -rf public\"}",
         },
         .auto,
         &.{},
@@ -4738,12 +4693,9 @@ test "configured allow remains authoritative for a destructive command" {
     defer arena_state.deinit();
     var worker: WorkerRuntime = .{};
     defer worker.deinit(std.testing.allocator);
-    var background: BackgroundRuntime = .{};
-    defer background.deinit(std.testing.allocator);
     var fake = FakeAutoClassifier{};
     var input = testInputWithClassifier(
         &worker,
-        &background,
         permission_auto_classifier.Classifier.withOverride(
             @ptrCast(&fake),
             FakeAutoClassifier.classify,
@@ -4761,8 +4713,8 @@ test "configured allow remains authoritative for a destructive command" {
         arena_state.allocator(),
         .{
             .id = "configured-destructive",
-            .name = "terminal",
-            .arguments_json = "{\"action\":\"exec\",\"command\":\"rm -rf public\"}",
+            .name = "shell",
+            .arguments_json = "{\"action\":\"run\",\"command\":\"rm -rf public\"}",
         },
         .auto,
         &.{},
@@ -4781,12 +4733,9 @@ test "delegated command effects remain reviewer owned" {
     defer arena_state.deinit();
     var worker: WorkerRuntime = .{};
     defer worker.deinit(std.testing.allocator);
-    var background: BackgroundRuntime = .{};
-    defer background.deinit(std.testing.allocator);
     var fake = FakeAutoClassifier{ .decision = .caution };
     const input = testInputWithClassifier(
         &worker,
-        &background,
         permission_auto_classifier.Classifier.withOverride(
             @ptrCast(&fake),
             FakeAutoClassifier.classify,
@@ -4811,7 +4760,7 @@ test "delegated command effects remain reviewer owned" {
     }) |command| {
         const arguments_json = try std.fmt.allocPrint(
             arena_state.allocator(),
-            "{{\"action\":\"exec\",\"command\":{f}}}",
+            "{{\"action\":\"run\",\"command\":{f}}}",
             .{std.json.fmt(command, .{})},
         );
         const outcome = try requestPermissionOutcome(
@@ -4819,7 +4768,7 @@ test "delegated command effects remain reviewer owned" {
             arena_state.allocator(),
             .{
                 .id = command,
-                .name = "terminal",
+                .name = "shell",
                 .arguments_json = arguments_json,
             },
             .auto,
@@ -4836,8 +4785,6 @@ test "automatic reviewer caution returns a recoverable hold without a prompter" 
     defer arena_state.deinit();
     var worker: WorkerRuntime = .{};
     defer worker.deinit(std.testing.allocator);
-    var background: BackgroundRuntime = .{};
-    defer background.deinit(std.testing.allocator);
     var fake = FakeAutoClassifier{
         .decision = .caution,
         .risk = .high,
@@ -4845,7 +4792,6 @@ test "automatic reviewer caution returns a recoverable hold without a prompter" 
     };
     const input = testInputWithClassifier(
         &worker,
-        &background,
         permission_auto_classifier.Classifier.withOverride(
             @ptrCast(&fake),
             FakeAutoClassifier.classify,
@@ -4857,8 +4803,8 @@ test "automatic reviewer caution returns a recoverable hold without a prompter" 
         arena_state.allocator(),
         .{
             .id = "asked",
-            .name = "terminal",
-            .arguments_json = "{\"action\":\"exec\",\"command\":\"touch public\"}",
+            .name = "shell",
+            .arguments_json = "{\"action\":\"run\",\"command\":\"touch public\"}",
         },
         .auto,
         &.{},
@@ -4882,13 +4828,10 @@ test "invalid automatic review returns to the agent before prompting" {
     defer arena_state.deinit();
     var worker: WorkerRuntime = .{};
     defer worker.deinit(std.testing.allocator);
-    var background: BackgroundRuntime = .{};
-    defer background.deinit(std.testing.allocator);
     var fake = FakeAutoClassifier{ .invalid = true };
     var recording = RecordingPrompter{};
     var input = testInputWithClassifier(
         &worker,
-        &background,
         permission_auto_classifier.Classifier.withOverride(
             @ptrCast(&fake),
             FakeAutoClassifier.classify,
@@ -4901,8 +4844,8 @@ test "invalid automatic review returns to the agent before prompting" {
         arena_state.allocator(),
         .{
             .id = "invalid",
-            .name = "terminal",
-            .arguments_json = "{\"action\":\"exec\",\"command\":\"touch invalid.txt\"}",
+            .name = "shell",
+            .arguments_json = "{\"action\":\"run\",\"command\":\"touch invalid.txt\"}",
         },
         .auto,
         &.{},
@@ -4921,12 +4864,9 @@ test "invalid automatic review returns a recoverable denial without a prompter" 
     defer arena_state.deinit();
     var worker: WorkerRuntime = .{};
     defer worker.deinit(std.testing.allocator);
-    var background: BackgroundRuntime = .{};
-    defer background.deinit(std.testing.allocator);
     var fake = FakeAutoClassifier{ .invalid = true };
     const input = testInputWithClassifier(
         &worker,
-        &background,
         permission_auto_classifier.Classifier.withOverride(
             @ptrCast(&fake),
             FakeAutoClassifier.classify,
@@ -4938,8 +4878,8 @@ test "invalid automatic review returns a recoverable denial without a prompter" 
         arena_state.allocator(),
         .{
             .id = "invalid",
-            .name = "terminal",
-            .arguments_json = "{\"action\":\"exec\",\"command\":\"touch invalid.txt\"}",
+            .name = "shell",
+            .arguments_json = "{\"action\":\"run\",\"command\":\"touch invalid.txt\"}",
         },
         .auto,
         &.{},
@@ -4957,13 +4897,10 @@ test "configured command authority skips automatic review" {
     defer arena_state.deinit();
     var worker: WorkerRuntime = .{};
     defer worker.deinit(std.testing.allocator);
-    var background: BackgroundRuntime = .{};
-    defer background.deinit(std.testing.allocator);
     var fake = FakeAutoClassifier{};
     var recording = RecordingPrompter{};
     var input = testInputWithClassifier(
         &worker,
-        &background,
         permission_auto_classifier.Classifier.withOverride(
             @ptrCast(&fake),
             FakeAutoClassifier.classify,
@@ -4975,8 +4912,8 @@ test "configured command authority skips automatic review" {
         arena_state.allocator(),
         .{
             .id = "direct",
-            .name = "terminal",
-            .arguments_json = "{\"action\":\"exec\",\"command\":\"pwd\"}",
+            .name = "shell",
+            .arguments_json = "{\"action\":\"run\",\"command\":\"pwd\"}",
         },
         .auto,
         &.{},
@@ -4999,8 +4936,8 @@ test "configured command authority skips automatic review" {
         arena_state.allocator(),
         .{
             .id = "configured",
-            .name = "terminal",
-            .arguments_json = "{\"action\":\"exec\",\"command\":\"touch configured.txt\"}",
+            .name = "shell",
+            .arguments_json = "{\"action\":\"run\",\"command\":\"touch configured.txt\"}",
         },
         .auto,
         &.{},
@@ -5017,8 +4954,8 @@ test "configured command authority skips automatic review" {
         arena_state.allocator(),
         .{
             .id = "compound",
-            .name = "terminal",
-            .arguments_json = "{\"action\":\"exec\",\"command\":\"touch configured.txt && printf bypass\"}",
+            .name = "shell",
+            .arguments_json = "{\"action\":\"run\",\"command\":\"touch configured.txt && printf bypass\"}",
         },
         .auto,
         &.{},
@@ -5036,12 +4973,9 @@ test "automatic clean direct command bypasses the reviewer" {
     defer arena_state.deinit();
     var worker: WorkerRuntime = .{};
     defer worker.deinit(std.testing.allocator);
-    var background: BackgroundRuntime = .{};
-    defer background.deinit(std.testing.allocator);
     var fake = FakeAutoClassifier{ .decision = .caution };
     const input = testInputWithClassifier(
         &worker,
-        &background,
         permission_auto_classifier.Classifier.withOverride(
             @ptrCast(&fake),
             FakeAutoClassifier.classify,
@@ -5053,8 +4987,8 @@ test "automatic clean direct command bypasses the reviewer" {
         arena_state.allocator(),
         .{
             .id = "clean-direct",
-            .name = "terminal",
-            .arguments_json = "{\"action\":\"exec\",\"command\":\"pwd\",\"profile\":\"clean\"}",
+            .name = "shell",
+            .arguments_json = "{\"action\":\"run\",\"command\":\"pwd\",\"profile\":\"clean\"}",
         },
         .auto,
         &.{},
@@ -5080,12 +5014,9 @@ test "known reversible auto commands bypass the reviewer" {
     defer arena_state.deinit();
     var worker: WorkerRuntime = .{};
     defer worker.deinit(std.testing.allocator);
-    var background: BackgroundRuntime = .{};
-    defer background.deinit(std.testing.allocator);
     var fake = FakeAutoClassifier{};
     const input = testInputWithClassifier(
         &worker,
-        &background,
         permission_auto_classifier.Classifier.withOverride(
             @ptrCast(&fake),
             FakeAutoClassifier.classify,
@@ -5101,13 +5032,13 @@ test "known reversible auto commands bypass the reviewer" {
     }) |command| {
         const arguments = try std.fmt.allocPrint(
             arena_state.allocator(),
-            "{{\"action\":\"exec\",\"command\":{f}}}",
+            "{{\"action\":\"run\",\"command\":{f}}}",
             .{std.json.fmt(command, .{})},
         );
         const outcome = try requestPermissionOutcome(
             input,
             arena_state.allocator(),
-            .{ .id = "ordinary", .name = "terminal", .arguments_json = arguments },
+            .{ .id = "ordinary", .name = "shell", .arguments_json = arguments },
             .auto,
             &.{},
         );
@@ -5127,11 +5058,8 @@ test "session deny narrows configured command allow" {
     const arena = arena_state.allocator();
     var worker: WorkerRuntime = .{};
     defer worker.deinit(alloc);
-    var background: BackgroundRuntime = .{};
-    defer background.deinit(alloc);
     var input = testInputWithClassifier(
         &worker,
-        &background,
         permission_auto_classifier.Classifier.disabled(),
     );
     var recording = RecordingPrompter{};
@@ -5144,8 +5072,8 @@ test "session deny narrows configured command allow" {
     input.permission_rules = .{ .rules = &rules };
     const call = ToolCall{
         .id = "configured-session-deny",
-        .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"touch configured.txt\"}",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"touch configured.txt\"}",
     };
     const key = try permissionStateKeyForCall(input, arena, call);
     try std.testing.expect(std.mem.find(u8, key.canonical, "fx-permission-state-v2") != null);
@@ -5187,11 +5115,8 @@ test "prepared session deny blocks local file mutation without setup effects" {
     const arena = arena_state.allocator();
     var worker: WorkerRuntime = .{};
     defer worker.deinit(alloc);
-    var background: BackgroundRuntime = .{};
-    defer background.deinit(alloc);
     var input = testInputWithClassifier(
         &worker,
-        &background,
         permission_auto_classifier.Classifier.disabled(),
     );
     input.workspace_root = workspace;
@@ -5231,18 +5156,15 @@ test "js host workspace sandbox default is lowest priority and prompt disables i
     defer arena_state.deinit();
     var worker: WorkerRuntime = .{};
     defer worker.deinit(std.testing.allocator);
-    var background: BackgroundRuntime = .{};
-    defer background.deinit(std.testing.allocator);
     var input = testInputWithClassifier(
         &worker,
-        &background,
         permission_auto_classifier.Classifier.disabled(),
     );
     input.host_sandbox_default = .allow_sandboxed;
     const call = ToolCall{
         .id = "browser-command",
-        .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"touch created.txt\"}",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"touch created.txt\"}",
     };
 
     const allowed = try requestPermissionOutcome(
@@ -5318,12 +5240,9 @@ test "built-in structured review sends exact arguments without redundant schema"
     defer arena_state.deinit();
     var worker: WorkerRuntime = .{};
     defer worker.deinit(std.testing.allocator);
-    var background: BackgroundRuntime = .{};
-    defer background.deinit(std.testing.allocator);
     var fake = FakeAutoClassifier{};
     var input = testInputWithClassifier(
         &worker,
-        &background,
         permission_auto_classifier.Classifier.withOverride(
             @ptrCast(&fake),
             FakeAutoClassifier.classify,
@@ -5337,7 +5256,7 @@ test "built-in structured review sends exact arguments without redundant schema"
         arena_state.allocator(),
         .{
             .id = "terminal-start-review",
-            .name = "terminal",
+            .name = "shell",
             .arguments_json = arguments,
         },
         .auto,
@@ -5376,14 +5295,11 @@ test "selected dynamic MCP review receives exact arguments and advertised schema
     defer arena_state.deinit();
     var worker: WorkerRuntime = .{};
     defer worker.deinit(std.testing.allocator);
-    var background: BackgroundRuntime = .{};
-    defer background.deinit(std.testing.allocator);
     var marker: u8 = 0;
     var fake = FakeAutoClassifier{};
     const advertised = [_][]const u8{"mcp_example_write"};
     var input = testInputWithClassifier(
         &worker,
-        &background,
         permission_auto_classifier.Classifier.withOverride(
             @ptrCast(&fake),
             FakeAutoClassifier.classify,
@@ -5443,12 +5359,9 @@ test "external prepared file review carries frozen path and diff authority" {
     const arena = arena_state.allocator();
     var worker: WorkerRuntime = .{};
     defer worker.deinit(alloc);
-    var background: BackgroundRuntime = .{};
-    defer background.deinit(alloc);
     var fake = FakeAutoClassifier{};
     var input = testInputWithClassifier(
         &worker,
-        &background,
         permission_auto_classifier.Classifier.withOverride(
             @ptrCast(&fake),
             FakeAutoClassifier.classify,
@@ -5567,12 +5480,9 @@ test "automatic workspace write uses reversible admission without reviewer" {
     const arena = arena_state.allocator();
     var worker: WorkerRuntime = .{};
     defer worker.deinit(alloc);
-    var background: BackgroundRuntime = .{};
-    defer background.deinit(alloc);
     var fake = FakeAutoClassifier{};
     var input = testInputWithClassifier(
         &worker,
-        &background,
         permission_auto_classifier.Classifier.withOverride(
             @ptrCast(&fake),
             FakeAutoClassifier.classify,
@@ -5650,12 +5560,9 @@ test "automatic added-root write bypasses reviewer while untrusted external writ
     const arena = arena_state.allocator();
     var worker: WorkerRuntime = .{};
     defer worker.deinit(alloc);
-    var background: BackgroundRuntime = .{};
-    defer background.deinit(alloc);
     var fake = FakeAutoClassifier{};
     var input = testInputWithClassifier(
         &worker,
-        &background,
         permission_auto_classifier.Classifier.withOverride(
             @ptrCast(&fake),
             FakeAutoClassifier.classify,
@@ -5723,12 +5630,9 @@ test "automatic trusted-root write keeps persistence targets on reviewer path" {
     const arena = arena_state.allocator();
     var worker: WorkerRuntime = .{};
     defer worker.deinit(alloc);
-    var background: BackgroundRuntime = .{};
-    defer background.deinit(alloc);
     var fake = FakeAutoClassifier{};
     var input = testInputWithClassifier(
         &worker,
-        &background,
         permission_auto_classifier.Classifier.withOverride(
             @ptrCast(&fake),
             FakeAutoClassifier.classify,
@@ -5785,12 +5689,9 @@ test "automatic trusted-root overwrite preserves configured read disclosure revi
     const arena = arena_state.allocator();
     var worker: WorkerRuntime = .{};
     defer worker.deinit(alloc);
-    var background: BackgroundRuntime = .{};
-    defer background.deinit(alloc);
     var fake = FakeAutoClassifier{};
     var input = testInputWithClassifier(
         &worker,
-        &background,
         permission_auto_classifier.Classifier.withOverride(
             @ptrCast(&fake),
             FakeAutoClassifier.classify,

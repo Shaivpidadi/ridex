@@ -95,31 +95,6 @@ fn writeHistoryTurnJson(writer: *std.Io.Writer, turn: session.HistoryTurn) !void
             }
             try writer.writeByte('}');
         },
-        .background_command => |entry| {
-            try writer.writeAll("{\"kind\":\"background_command\",\"user\":");
-            try writeUserTurnJson(writer, entry.user);
-            if (entry.assistant) |assistant| {
-                try writer.writeAll(",\"assistant\":");
-                try std.json.Stringify.value(assistant, .{}, writer);
-            }
-            if (!entry.execution.isEmpty()) {
-                try writer.writeAll(",\"execution\":");
-                try writeExecutionMemoryJson(writer, entry.execution);
-            }
-            try writer.writeAll(",\"log_path\":");
-            try std.json.Stringify.value(entry.log_path, .{}, writer);
-            try writer.print(",\"expect_url\":{s},\"url\":", .{if (entry.expect_url) "true" else "false"});
-            if (entry.url) |url| {
-                try std.json.Stringify.value(url, .{}, writer);
-            } else {
-                try writer.writeAll("null");
-            }
-            if (entry.background_record_id) |record_id| {
-                try writer.writeAll(",\"background_record_id\":");
-                try writeHexString(writer, &record_id);
-            }
-            try writer.writeByte('}');
-        },
         .interrupted => |entry| {
             try writer.writeAll("{\"kind\":\"interrupted\",\"user\":");
             try writeUserTurnJson(writer, entry.user);
@@ -607,6 +582,29 @@ pub fn parseLegacySchemaVersion(
     return legacySchemaVersion(try requireI64(root, "schema_version"));
 }
 
+fn formatLegacyBackgroundAssistant(
+    alloc: Allocator,
+    assistant: ?[]const u8,
+    log_path: []const u8,
+    url: ?[]const u8,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    if (assistant) |text| {
+        if (text.len != 0) {
+            try out.writer.writeAll(text);
+            if (!std.mem.endsWith(u8, text, "\n")) try out.writer.writeByte('\n');
+        }
+    }
+    try out.writer.writeAll(
+        "[Historical command record: fx no longer owns or controls this process",
+    );
+    if (log_path.len != 0) try out.writer.print("; former log={s}", .{log_path});
+    if (url) |value| try out.writer.print("; recorded url={s}", .{value});
+    try out.writer.writeByte(']');
+    return out.toOwnedSlice();
+}
+
 fn parseLegacyHistoryTurn(alloc: Allocator, value: std.json.Value) !session.HistoryTurn {
     const object = try requireObject(value);
     const kind = try requireString(object, "kind");
@@ -664,24 +662,28 @@ fn parseLegacyHistoryTurn(alloc: Allocator, value: std.json.Value) !session.Hist
     if (std.mem.eql(u8, kind, "background_command")) {
         const user = try parseUserTurn(alloc, object.get("user") orelse return error.InvalidSessionFormat);
         errdefer session.freeUserTurn(alloc, user);
-        const assistant = try optionalStringDup(alloc, object.get("assistant"));
-        errdefer if (assistant) |text| alloc.free(text);
+        const legacy_assistant = try optionalStringDup(alloc, object.get("assistant"));
+        defer if (legacy_assistant) |text| alloc.free(text);
         const execution = try parseOptionalExecutionMemory(alloc, object.get("execution"));
         errdefer session.freeExecutionMemory(alloc, execution);
         const log_path = try alloc.dupe(u8, try requireString(object, "log_path"));
-        errdefer alloc.free(log_path);
+        defer alloc.free(log_path);
         const url = try optionalStringDup(alloc, object.get("url"));
-        errdefer if (url) |value_copy| alloc.free(value_copy);
-        return .{ .background_command = .{
+        defer if (url) |value_copy| alloc.free(value_copy);
+        _ = try requireBool(object, "expect_url");
+        _ = try parseOptionalBackgroundRecordId(
+            object.get("background_record_id"),
+        );
+        const assistant = try formatLegacyBackgroundAssistant(
+            alloc,
+            legacy_assistant,
+            log_path,
+            url,
+        );
+        return .{ .assistant = .{
             .user = user,
             .assistant = assistant,
             .execution = execution,
-            .log_path = log_path,
-            .expect_url = try requireBool(object, "expect_url"),
-            .url = url,
-            .background_record_id = try parseOptionalBackgroundRecordId(
-                object.get("background_record_id"),
-            ),
         } };
     }
     if (std.mem.eql(u8, kind, "interrupted")) {
@@ -1291,11 +1293,11 @@ fn freeToken(alloc: Allocator, token: std.json.Token) void {
 
 fn parseOptionalBackgroundRecordId(
     maybe_value: ?std.json.Value,
-) !?session.StableBackgroundRecordId {
+) !?[16]u8 {
     const value = maybe_value orelse return null;
     if (value == .null) return null;
     if (value != .string or value.string.len != 32) return error.InvalidSessionFormat;
-    var id: session.StableBackgroundRecordId = undefined;
+    var id: [16]u8 = undefined;
     _ = std.fmt.hexToBytes(&id, value.string) catch return error.InvalidSessionFormat;
     const canonical = std.fmt.bytesToHex(id, .lower);
     if (!std.mem.eql(u8, &canonical, value.string)) return error.InvalidSessionFormat;
@@ -1417,137 +1419,6 @@ test "parseWorkspaceRoot probes workspace without requiring supported schema" {
 test "parseWorkspaceRoot rejects non-object and non-string workspace root" {
     try std.testing.expectError(error.InvalidSessionFormat, parseWorkspaceRoot(std.testing.allocator, "[]"));
     try std.testing.expectError(error.InvalidSessionFormat, parseWorkspaceRoot(std.testing.allocator, "{\"workspace_root\":123}"));
-}
-
-test "session JSON round-trips images summaries and background commands" {
-    const alloc = std.testing.allocator;
-
-    var images = [_]session.ImageAttachment{.{
-        .path = @constCast("/tmp/core.png"),
-        .media_type = @constCast("image/png"),
-        .snapshot_path = @constCast("/tmp/fx-session/images/image-1.bin"),
-        .snapshot_sha256 = @constCast("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
-    }};
-    var completed_tool_names = [_][]u8{ @constCast("glob_files"), @constCast("glob_files") };
-    var root_user_messages = [_][]u8{ @constCast("first exact request"), @constCast("second exact request") };
-    const history = [_]session.HistoryTurn{
-        .{ .assistant = .{
-            .user = .{ .text = @constCast("hello"), .images = &images },
-            .assistant = @constCast("world"),
-        } },
-        .{ .compacted_summary = .{
-            .summary = @constCast("summary text"),
-            .removed_turn_count = 5,
-            .compaction_count = 2,
-            .root_user_messages = &root_user_messages,
-        } },
-        .{ .background_command = .{
-            .user = .{ .text = @constCast("run dev") },
-            .log_path = @constCast("/tmp/server.log"),
-            .expect_url = true,
-            .url = @constCast("http://localhost:3000"),
-        } },
-        .{ .interrupted = .{
-            .user = .{ .text = @constCast("browse") },
-            .assistant = @constCast("Opening the browser."),
-            .tool_call = .{
-                .id = "call_browser",
-                .name = "browser_click",
-                .arguments_json = "{\"selector\":\"button\"}",
-            },
-        } },
-        .{ .interrupted = .{
-            .user = .{ .text = @constCast("create test.md") },
-        } },
-        .{ .interrupted = .{
-            .user = .{ .text = @constCast("test tools") },
-            .completed_tool_names = completed_tool_names[0..],
-        } },
-    };
-
-    const json = try renderSessionJson(
-        alloc,
-        "core-json",
-        123,
-        456,
-        session.ConversationLanguage.literal("und-Latn"),
-        "/tmp/workspace",
-        &history,
-        .{},
-    );
-    defer alloc.free(json);
-
-    var loaded = try parseStoredSession(TestStoredSession, alloc, json);
-    defer loaded.deinit(alloc);
-    try std.testing.expectEqualStrings("core-json", loaded.id);
-    try std.testing.expectEqualStrings("/tmp/workspace", loaded.workspace_root.?);
-    try std.testing.expectEqual(@as(i64, 123), loaded.created_at_ms);
-    try std.testing.expectEqual(@as(i64, 456), loaded.updated_at_ms);
-    try std.testing.expectEqualStrings("und-Latn", loaded.conversation_language.view());
-    try std.testing.expectEqual(@as(usize, 6), loaded.history.len);
-    try std.testing.expectEqualStrings("hello", loaded.history[0].assistant.user.text);
-    try std.testing.expectEqualStrings("/tmp/core.png", loaded.history[0].assistant.user.images[0].path);
-    try std.testing.expectEqualStrings("image/png", loaded.history[0].assistant.user.images[0].media_type);
-    try std.testing.expectEqualStrings(
-        "images/image-1.bin",
-        loaded.history[0].assistant.user.images[0].snapshot_path.?,
-    );
-    try std.testing.expectEqualStrings(
-        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-        loaded.history[0].assistant.user.images[0].snapshot_sha256.?,
-    );
-    try std.testing.expectEqualStrings("world", loaded.history[0].assistant.assistant);
-    try std.testing.expectEqualStrings("summary text", loaded.history[1].compacted_summary.summary);
-    try std.testing.expectEqual(@as(usize, 5), loaded.history[1].compacted_summary.removed_turn_count);
-    try std.testing.expectEqual(@as(usize, 2), loaded.history[1].compacted_summary.compaction_count);
-    try std.testing.expect(!loaded.history[1].compacted_summary.root_user_messages_complete);
-    try std.testing.expectEqual(@as(usize, 0), loaded.history[1].compacted_summary.root_user_messages.len);
-    try std.testing.expectEqualStrings("run dev", loaded.history[2].background_command.user.text);
-    try std.testing.expectEqualStrings("/tmp/server.log", loaded.history[2].background_command.log_path);
-    try std.testing.expect(loaded.history[2].background_command.expect_url);
-    try std.testing.expectEqualStrings("http://localhost:3000", loaded.history[2].background_command.url.?);
-    try std.testing.expectEqualStrings("browse", loaded.history[3].interrupted.user.text);
-    try std.testing.expectEqualStrings("Opening the browser.", loaded.history[3].interrupted.assistant.?);
-    try std.testing.expectEqualStrings("call_browser", loaded.history[3].interrupted.tool_call.?.id);
-    try std.testing.expectEqualStrings("browser_click", loaded.history[3].interrupted.tool_call.?.name);
-    try std.testing.expectEqualStrings("{\"selector\":\"button\"}", loaded.history[3].interrupted.tool_call.?.arguments_json);
-    try std.testing.expectEqualStrings("create test.md", loaded.history[4].interrupted.user.text);
-    try std.testing.expect(loaded.history[4].interrupted.assistant == null);
-    try std.testing.expect(loaded.history[4].interrupted.tool_call == null);
-    try std.testing.expectEqualStrings("test tools", loaded.history[5].interrupted.user.text);
-    try std.testing.expectEqual(@as(usize, 2), loaded.history[5].interrupted.completed_tool_names.len);
-    try std.testing.expectEqualStrings("glob_files", loaded.history[5].interrupted.completed_tool_names[0]);
-    try std.testing.expectEqualStrings("glob_files", loaded.history[5].interrupted.completed_tool_names[1]);
-
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var projected: std.ArrayList(types.ChatMessage) = .empty;
-    defer projected.deinit(arena);
-    try session.appendHistoryChatMessages(arena, &projected, loaded.history[0..4]);
-
-    var summary_count: usize = 0;
-    var background_count: usize = 0;
-    var interruption_count: usize = 0;
-    for (projected.items) |entry| {
-        try std.testing.expect(entry.role != .system);
-        const content = entry.content orelse continue;
-        if (std.mem.find(u8, content, "summary text") != null) {
-            try std.testing.expectEqual(types.ChatRole.user, entry.role);
-            summary_count += 1;
-        }
-        if (std.mem.find(u8, content, "/tmp/server.log") != null) {
-            try std.testing.expectEqual(types.ChatRole.user, entry.role);
-            background_count += 1;
-        }
-        if (std.mem.find(u8, content, "<turn_aborted>") != null) {
-            try std.testing.expectEqual(types.ChatRole.user, entry.role);
-            interruption_count += 1;
-        }
-    }
-    try std.testing.expectEqual(@as(usize, 1), summary_count);
-    try std.testing.expectEqual(@as(usize, 1), background_count);
-    try std.testing.expectEqual(@as(usize, 1), interruption_count);
 }
 
 test "legacy session migration keeps missing compacted authority incomplete" {
@@ -1765,69 +1636,6 @@ test "session JSON persists malformed argument recovery as a safe failed pair" {
     try std.testing.expectEqual(.valid, execution.tool_steps[0].tool_calls[0].argument_integrity);
     try std.testing.expectEqual(session.PersistedToolStatus.failure, execution.tool_steps[0].tool_results[0].status);
     try std.testing.expectEqualStrings(failure_output, execution.tool_steps[0].tool_results[0].output);
-}
-
-test "session JSON round-trips extended background and interrupted history" {
-    const alloc = std.testing.allocator;
-    var files = [_]session.FileEvidence{.{
-        .path = @constCast("src/main.zig"),
-        .tool_call_id = @constCast("call_read"),
-        .tool_name = @constCast("read_file"),
-        .action = .read,
-        .status = .success,
-        .model_view_covers_full_file = true,
-    }};
-    const record_id = session.StableBackgroundRecordId{
-        0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
-        0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
-    };
-    const history = [_]session.HistoryTurn{
-        .{ .background_command = .{
-            .user = .{ .text = @constCast("run dev") },
-            .assistant = @constCast("The server is starting."),
-            .execution = .{ .files = files[0..] },
-            .log_path = @constCast("/tmp/server.log"),
-            .expect_url = true,
-            .background_record_id = record_id,
-        } },
-        .{ .interrupted = .{
-            .user = .{ .text = @constCast("inspect") },
-            .assistant = @constCast("I inspected the entry point."),
-            .execution = .{ .files = files[0..] },
-        } },
-    };
-
-    const json = try renderSessionJson(
-        alloc,
-        "extended-history",
-        1,
-        2,
-        session.ConversationLanguage.literal("en"),
-        "/tmp/workspace",
-        &history,
-        .{},
-    );
-    defer alloc.free(json);
-    try std.testing.expect(std.mem.find(u8, json, "\"assistant\":\"The server is starting.\"") != null);
-    try std.testing.expect(std.mem.find(u8, json, "\"background_record_id\":\"00112233445566778899aabbccddeeff\"") != null);
-
-    var loaded = try parseStoredSession(TestStoredSession, alloc, json);
-    defer loaded.deinit(alloc);
-    try std.testing.expectEqualStrings(
-        "The server is starting.",
-        loaded.history[0].background_command.assistant.?,
-    );
-    try std.testing.expectEqual(@as(usize, 1), loaded.history[0].background_command.execution.files.len);
-    try std.testing.expectEqualSlices(
-        u8,
-        &record_id,
-        &loaded.history[0].background_command.background_record_id.?,
-    );
-    try std.testing.expectEqualStrings(
-        "I inspected the entry point.",
-        loaded.history[1].interrupted.assistant.?,
-    );
-    try std.testing.expectEqual(@as(usize, 1), loaded.history[1].interrupted.execution.files.len);
 }
 
 test "old assistant session JSON without execution parses as empty memory" {
@@ -2161,7 +1969,7 @@ test "legacy summary streaming structurally skips externally reordered history" 
     try std.testing.expectEqual(@as(usize, 1), summary.history_len);
 }
 
-test "schema v2 legacy exact reader preserves stable background and image identifiers" {
+test "schema v2 legacy exact reader migrates background ownership to inert history" {
     const alloc = std.testing.allocator;
     const json =
         "{\"schema_version\":2,\"id\":\"legacy-v2\",\"created_at_ms\":1,\"updated_at_ms\":2," ++
@@ -2174,15 +1982,17 @@ test "schema v2 legacy exact reader preserves stable background and image identi
     var loaded = try parseLegacyExact(TestStoredSession, alloc, json);
     defer loaded.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 7), loaded.history[0].assistant.user.images[0].id);
-    const expected = [_]u8{
-        0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
-        0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
-    };
-    try std.testing.expectEqualSlices(
+    try std.testing.expect(loaded.history[1] == .assistant);
+    try std.testing.expect(std.mem.find(
         u8,
-        &expected,
-        &loaded.history[1].background_command.background_record_id.?,
-    );
+        loaded.history[1].assistant.assistant,
+        "fx no longer owns or controls this process",
+    ) != null);
+    try std.testing.expect(std.mem.find(
+        u8,
+        loaded.history[1].assistant.assistant,
+        "former log=/tmp/log",
+    ) != null);
 }
 
 test "legacy exact reader rejects durable byte objects in string fields" {

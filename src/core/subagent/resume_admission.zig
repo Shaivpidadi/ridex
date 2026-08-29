@@ -308,7 +308,6 @@ pub fn retainExternalRootUserTurn(
     }
     const prompt = switch (turn) {
         .assistant => |entry| entry.user.text,
-        .background_command => |entry| entry.user.text,
         .interrupted => |entry| entry.user.text,
         .compacted_summary => return,
     };

@@ -211,7 +211,6 @@ const SnapshotFileOwnershipState = struct {
 fn historyTurnImages(turn: types.HistoryTurn) []const types.ImageAttachment {
     return switch (turn) {
         .assistant => |value| value.user.images,
-        .background_command => |value| value.user.images,
         .interrupted => |value| value.user.images,
         .compacted_summary => &.{},
     };
@@ -4583,7 +4582,7 @@ test "submitted text only queues while a prompt is active" {
     runtime.pending_permission_request_shared =
         try permission_request.OwnedPermissionRequest.dupe(
             alloc,
-            .{ .id = 1, .label = "terminal.exec launch chrome" },
+            .{ .id = 1, .label = "shell.run launch chrome" },
         );
     const question_options = [_]types.QuestionOption{.{ .label = "Wait", .description = null }};
     const question_entries = [_]types.QuestionBatchEntry{.{

@@ -7,7 +7,6 @@ const file_mutation_contract = @import("../tooling/file_mutation_contract.zig");
 const command_output_content = @import("../tooling/command_output_content.zig");
 const io_mod = @import("../shared/io.zig");
 const permission_request = @import("../permissions/permission_request.zig");
-const task_helpers = @import("../tasks/task_helpers.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const types = @import("../shared/types.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
@@ -530,12 +529,9 @@ pub fn Runtime(comptime App: type) type {
 
         pub fn tick(
             app: *App,
-            on_task_completion: *const fn (*anyopaque, task_helpers.TaskCompletion) void,
             event_handlers: WorkerEventHandlers,
         ) !void {
             if (!try authorizeInteractiveAdmission(app)) return;
-            app.background.pruneWatchers(std.heap.c_allocator, false);
-            app.background.refreshTasks(std.heap.c_allocator, @ptrCast(app), on_task_completion);
             try drainEvents(app, event_handlers);
             syncState(app, event_handlers.tool_lifecycle);
             if (comptime @hasDecl(App, "refreshSubagentManagerProjection")) {
@@ -1546,29 +1542,6 @@ const FakeSubagents = struct {
     }
 };
 
-const FakeBackground = struct {
-    prune_count: usize = 0,
-    refresh_count: usize = 0,
-
-    fn pruneWatchers(self: *FakeBackground, alloc: std.mem.Allocator, join_all: bool) void {
-        _ = alloc;
-        _ = join_all;
-        self.prune_count += 1;
-    }
-
-    fn refreshTasks(
-        self: *FakeBackground,
-        alloc: std.mem.Allocator,
-        callback_ctx: *anyopaque,
-        on_completion: *const fn (*anyopaque, task_helpers.TaskCompletion) void,
-    ) void {
-        _ = alloc;
-        _ = callback_ctx;
-        _ = on_completion;
-        self.refresh_count += 1;
-    }
-};
-
 const FakeApp = struct {
     alloc: std.mem.Allocator,
     session_persistence: app_session_runtime.Persistence = .{},
@@ -1581,7 +1554,6 @@ const FakeApp = struct {
     shell: FakeShell = .{},
     pacer: FakePacer = .{},
     subagents: FakeSubagents = .{},
-    background: FakeBackground = .{},
     should_exit: bool = false,
     frame_commits: usize = 0,
     transcript: std.ArrayList(u8) = .empty,
@@ -1677,11 +1649,6 @@ const FakeApp = struct {
         self.last_attention_kind = kind;
     }
 };
-
-fn noopTaskCompletion(ctx: *anyopaque, completion: task_helpers.TaskCompletion) void {
-    _ = ctx;
-    _ = completion;
-}
 
 const NoopBridge = struct {
     fn user(_: *anyopaque, _: types.UserTurn) !void {}
@@ -1880,7 +1847,7 @@ const PacedTranscriptBridge = struct {
 };
 
 fn tickNoop(app: *FakeApp) !void {
-    try Runtime(FakeApp).tick(app, noopTaskCompletion, NoopBridge.handlers(app));
+    try Runtime(FakeApp).tick(app, NoopBridge.handlers(app));
 }
 
 fn test_awake_timestamp(milliseconds: i64) std.Io.Clock.Timestamp {
@@ -1987,7 +1954,6 @@ test "core.app_worker_runtime fatal admission rejects tick before work" {
     );
 
     try std.testing.expect(app.should_exit);
-    try std.testing.expectEqual(@as(usize, 0), app.background.refresh_count);
     try std.testing.expectEqual(@as(usize, 1), app.worker.events.items.len);
 }
 
@@ -2509,7 +2475,7 @@ test "core.app_worker_runtime summary append clears recovered route status witho
     var handlers = NoopBridge.handlers(&app);
     handlers.ctx = @ptrCast(&app);
     handlers.append_history_turn = Capture.history;
-    try Runtime(FakeApp).tick(&app, noopTaskCompletion, handlers);
+    try Runtime(FakeApp).tick(&app, handlers);
 
     try std.testing.expect(!app.stream.active);
     try std.testing.expect(app.shell.activityProjection() == .none);
@@ -2741,7 +2707,7 @@ test "core.app_worker_runtime queued command completion preserves three thousand
     handlers.command_output_complete = Capture.outputComplete;
 
     app.stream.active = true;
-    try Runtime(FakeApp).tick(&app, noopTaskCompletion, handlers);
+    try Runtime(FakeApp).tick(&app, handlers);
 
     try std.testing.expect(app.stream.active);
     try std.testing.expect(app.shell.command_output_display.touched);
@@ -2755,7 +2721,7 @@ test "core.app_worker_runtime queued command completion preserves three thousand
     try std.testing.expectEqualStrings("unterminated", block.lines.items[2_999].text);
     try std.testing.expect(!block.lines.items[2_999].terminated);
 
-    try Runtime(FakeApp).tick(&app, noopTaskCompletion, handlers);
+    try Runtime(FakeApp).tick(&app, handlers);
 
     block = &app.shell.lifecycle.command_output_blocks.items[0];
     try std.testing.expectEqual(@as(usize, 3_000), block.total_lines);
@@ -2872,7 +2838,7 @@ test "core.app_worker_runtime syncState clears a completed approval" {
     app.worker.processing = true;
     app.worker.pending_permission_request = .{
         .id = 42,
-        .label = "terminal.exec test",
+        .label = "shell.run test",
     };
     Runtime(FakeApp).syncState(&app, NoopBridge.lifecyclePresenter(&app));
     try std.testing.expect(app.approval_prompt.isActive());
@@ -2894,7 +2860,7 @@ test "core.app_worker_runtime syncState freezes the turn clock while an approval
     app.worker.processing = true;
     app.worker.pending_permission_request = .{
         .id = 7,
-        .label = "terminal.exec test",
+        .label = "shell.run test",
     };
     Runtime(FakeApp).syncState(&app, NoopBridge.lifecyclePresenter(&app));
     try std.testing.expect(app.approval_prompt.isActive());
@@ -2960,7 +2926,7 @@ test "core.app_worker_runtime emits question and route recovery attention only f
         try app.worker.pushEvent(std.heap.c_allocator, .question_requested);
         try app.worker.pushEvent(std.heap.c_allocator, .question_requested);
 
-        try Runtime(FakeApp).tick(&app, noopTaskCompletion, NoopBridge.handlers(&app));
+        try Runtime(FakeApp).tick(&app, NoopBridge.handlers(&app));
 
         try std.testing.expectEqual(@as(usize, 1), app.attention_count);
         try std.testing.expectEqual(@as(u64, 81), app.last_attention_turn_id);
@@ -2973,7 +2939,7 @@ test "core.app_worker_runtime emits question and route recovery attention only f
     invalid.worker.pending_question = true;
     invalid.question_prompt.activate_on_sync = false;
     try invalid.worker.pushEvent(std.heap.c_allocator, .question_requested);
-    try Runtime(FakeApp).tick(&invalid, noopTaskCompletion, NoopBridge.handlers(&invalid));
+    try Runtime(FakeApp).tick(&invalid, NoopBridge.handlers(&invalid));
     try std.testing.expectEqual(@as(usize, 0), invalid.attention_count);
 }
 
@@ -3125,7 +3091,7 @@ test "core.app_worker_runtime cancellation suppresses payloads but retains turn 
     handlers.append_text = Capture.text;
     handlers.append_history_turn = Capture.history;
 
-    try Runtime(FakeApp).tick(&app, noopTaskCompletion, handlers);
+    try Runtime(FakeApp).tick(&app, handlers);
 
     try std.testing.expectEqual(@as(usize, 0), capture.text_count);
     try std.testing.expectEqual(@as(usize, 1), capture.history_count);
@@ -3156,7 +3122,7 @@ test "core.app_worker_runtime cancellation snapshot stays coupled to detached ev
     handlers.ctx = @ptrCast(&capture);
     handlers.append_text = Capture.text;
 
-    try Runtime(FakeApp).tick(&app, noopTaskCompletion, handlers);
+    try Runtime(FakeApp).tick(&app, handlers);
 
     try std.testing.expect(!app.worker.worker_cancel_requested.load(.seq_cst));
     try std.testing.expectEqual(@as(usize, 0), capture.text_count);
@@ -3180,7 +3146,7 @@ test "core.app_worker_runtime publishes rendered block before opening tool entri
     } });
     try queueToolStart(&app, 1, "grep_b", "grep");
 
-    try Runtime(FakeApp).tick(&app, noopTaskCompletion, bridge.handlers());
+    try Runtime(FakeApp).tick(&app, bridge.handlers());
 
     try std.testing.expectEqual(@as(usize, 2), bridge.drain_count);
     try std.testing.expect(!bridge.pacer.hasPending());
@@ -3267,7 +3233,7 @@ test "core.app_worker_runtime lifecycle boundary survives an incomplete assistan
     });
     try queueToolStart(&app, 1, "read_a", "read_file");
 
-    try Runtime(FakeApp).tick(&app, noopTaskCompletion, bridge.handlers());
+    try Runtime(FakeApp).tick(&app, bridge.handlers());
 
     try std.testing.expectEqual(@as(usize, 1), bridge.drain_count);
     try std.testing.expectEqual(@as(usize, 2), app.shell.lifecycle.entries.items.len);
@@ -3289,7 +3255,7 @@ test "app worker drains prior paced batch without splitting assistant turn" {
     try app.worker.pushEvent(std.heap.c_allocator, .{
         .assistant_presentation = .{ .text = @constCast("paced before start") },
     });
-    try Runtime(FakeApp).tick(&app, noopTaskCompletion, bridge.handlers());
+    try Runtime(FakeApp).tick(&app, bridge.handlers());
     try bridge.tickPacer(0);
 
     try std.testing.expect(!bridge.pacer.hasPending());
@@ -3300,7 +3266,7 @@ test "app worker drains prior paced batch without splitting assistant turn" {
     );
 
     try queueToolStart(&app, 1, "later", "read_file");
-    try Runtime(FakeApp).tick(&app, noopTaskCompletion, bridge.handlers());
+    try Runtime(FakeApp).tick(&app, bridge.handlers());
 
     try std.testing.expectEqual(@as(usize, 1), bridge.drain_count);
     try std.testing.expectEqual(@as(usize, 2), app.shell.lifecycle.entries.items.len);
@@ -3326,13 +3292,13 @@ test "core.app_worker_runtime question boundary drains paced text before opening
     try app.worker.pushEvent(std.heap.c_allocator, .{
         .assistant_presentation = .{ .text = @constCast("paced before question") },
     });
-    try Runtime(FakeApp).tick(&app, noopTaskCompletion, bridge.handlers());
+    try Runtime(FakeApp).tick(&app, bridge.handlers());
     try bridge.tickPacer(0);
     try std.testing.expect(!bridge.pacer.hasPending());
 
     app.worker.pending_question = true;
     try app.worker.pushEvent(std.heap.c_allocator, .question_requested);
-    try Runtime(FakeApp).tick(&app, noopTaskCompletion, bridge.handlers());
+    try Runtime(FakeApp).tick(&app, bridge.handlers());
 
     try std.testing.expectEqual(@as(usize, 1), bridge.drain_count);
     try std.testing.expect(app.question_prompt.isActive());
@@ -3356,7 +3322,7 @@ test "core.app_worker_runtime prompt boundary drains paced text before writing t
     try app.worker.pushEvent(std.heap.c_allocator, .{
         .assistant_presentation = .{ .text = @constCast("paced before prompt") },
     });
-    try Runtime(FakeApp).tick(&app, noopTaskCompletion, bridge.handlers());
+    try Runtime(FakeApp).tick(&app, bridge.handlers());
     try bridge.tickPacer(0);
     try std.testing.expect(!bridge.pacer.hasPending());
 
@@ -3370,7 +3336,7 @@ test "core.app_worker_runtime prompt boundary drains paced text before writing t
             .images = &.{},
         }),
     });
-    try Runtime(FakeApp).tick(&app, noopTaskCompletion, bridge.handlers());
+    try Runtime(FakeApp).tick(&app, bridge.handlers());
 
     try std.testing.expectEqual(@as(usize, 1), bridge.drain_count);
     try std.testing.expectEqual(@as(usize, 1), bridge.user_prompt_count);
@@ -3421,7 +3387,7 @@ test "core.app_worker_runtime blocked prompt drain retains the prompt before res
     handlers.drain_assistant_text = Capture.drain;
     handlers.write_user_prompt = Capture.writeUserPrompt;
 
-    try Runtime(FakeApp).tick(&app, noopTaskCompletion, handlers);
+    try Runtime(FakeApp).tick(&app, handlers);
     try std.testing.expectEqual(@as(usize, 1), capture.drain_count);
     try std.testing.expectEqual(@as(usize, 0), capture.user_prompt_count);
     try std.testing.expectEqual(@as(u64, 10), app.stream.token_progress.input_tokens);
@@ -3429,7 +3395,7 @@ test "core.app_worker_runtime blocked prompt drain retains the prompt before res
     try std.testing.expectEqual(@as(usize, 1), app.worker.events.items.len);
     try std.testing.expect(app.worker.events.items[0] == .begin_prompt);
 
-    try Runtime(FakeApp).tick(&app, noopTaskCompletion, handlers);
+    try Runtime(FakeApp).tick(&app, handlers);
     try std.testing.expectEqual(@as(usize, 2), capture.drain_count);
     try std.testing.expectEqual(@as(usize, 1), capture.user_prompt_count);
     try std.testing.expect(app.stream.active);
@@ -3466,7 +3432,7 @@ test "core.app_worker_runtime lifecycle updates and turn finalization do not dra
     try queueToolTerminal(&app, 1, "call", .completed, "Read");
     try queueTurnFinished(&app, 1, .completed);
 
-    try Runtime(FakeApp).tick(&app, noopTaskCompletion, handlers);
+    try Runtime(FakeApp).tick(&app, handlers);
 
     try std.testing.expectEqual(@as(usize, 0), capture.drain_count);
     try std.testing.expectEqual(@as(usize, 0), app.shell.lifecyclePinCount());
@@ -3512,7 +3478,7 @@ test "core.app_worker_runtime blocked assistant drain retains current event and 
     handlers.drain_assistant_text = Capture.drain;
     handlers.semantic_notice = Capture.notice;
 
-    try Runtime(FakeApp).tick(&app, noopTaskCompletion, handlers);
+    try Runtime(FakeApp).tick(&app, handlers);
     try std.testing.expectEqual(@as(usize, 0), capture.notice_count);
     try std.testing.expectEqual(@as(usize, 0), capture.context_notice_count);
     try std.testing.expectEqual(@as(usize, 0), app.shell.toolActivityRecordCount());
@@ -3522,7 +3488,7 @@ test "core.app_worker_runtime blocked assistant drain retains current event and 
     try std.testing.expect(app.worker.events.items[2] == .semantic_notice);
     try std.testing.expectEqual(types.NoticeVisibility.full_only, app.worker.events.items[2].semantic_notice.visibility);
 
-    try Runtime(FakeApp).tick(&app, noopTaskCompletion, handlers);
+    try Runtime(FakeApp).tick(&app, handlers);
 
     try std.testing.expectEqual(@as(usize, 2), capture.notice_count);
     try std.testing.expectEqual(@as(usize, 1), capture.context_notice_count);
@@ -3559,13 +3525,13 @@ test "core.app_worker_runtime retains a thematic rule until paced text drains" {
     handlers.drain_assistant_text = Capture.drain;
     handlers.append_thematic_rule = Capture.appendThematicRule;
 
-    try Runtime(FakeApp).tick(&app, noopTaskCompletion, handlers);
+    try Runtime(FakeApp).tick(&app, handlers);
     try std.testing.expectEqual(@as(usize, 0), capture.rule_count);
     try std.testing.expectEqual(@as(usize, 1), app.worker.events.items.len);
     try std.testing.expect(app.worker.events.items[0] == .assistant_presentation);
     try std.testing.expect(app.worker.events.items[0].assistant_presentation == .thematic_rule);
 
-    try Runtime(FakeApp).tick(&app, noopTaskCompletion, handlers);
+    try Runtime(FakeApp).tick(&app, handlers);
     try std.testing.expectEqual(@as(usize, 1), capture.rule_count);
     try std.testing.expectEqual(@as(usize, 0), app.worker.events.items.len);
 }
@@ -3606,7 +3572,7 @@ test "core.app_worker_runtime model picker event drains before one callback and 
     handlers.open_model_picker = Capture.open;
     try app.worker.pushEvent(std.heap.c_allocator, .open_model_picker);
 
-    try Runtime(FakeApp).tick(&app, noopTaskCompletion, handlers);
+    try Runtime(FakeApp).tick(&app, handlers);
 
     try std.testing.expectEqualStrings("DO", capture.order[0..capture.order_len]);
     try std.testing.expectEqual(@as(usize, 1), capture.open_count);
@@ -3627,7 +3593,7 @@ test "core.app_worker_runtime assistant drain preserves callback errors before l
 
     try std.testing.expectError(
         error.InjectedPacerEmitFailure,
-        Runtime(FakeApp).tick(&app, noopTaskCompletion, handlers),
+        Runtime(FakeApp).tick(&app, handlers),
     );
     try std.testing.expectEqual(@as(usize, 0), app.shell.toolActivityRecordCount());
     try std.testing.expectEqual(@as(usize, 0), app.shell.lifecycle.entries.items.len);
@@ -3673,7 +3639,7 @@ test "core.app_worker_runtime semantic notice handler failure returns through dr
 
     try std.testing.expectError(
         error.InjectedSemanticNoticeTranscriptFailure,
-        Runtime(FakeApp).tick(&app, noopTaskCompletion, handlers),
+        Runtime(FakeApp).tick(&app, handlers),
     );
     try std.testing.expectEqual(@as(usize, 0), capture.suffix_count);
     try std.testing.expectEqual(@as(usize, 0), app.worker.events.items.len);
@@ -3699,7 +3665,7 @@ test "core.app_worker_runtime text turn finishes after its rendered block" {
         } },
     } });
 
-    try Runtime(FakeApp).tick(&app, noopTaskCompletion, bridge.handlers());
+    try Runtime(FakeApp).tick(&app, bridge.handlers());
 
     try std.testing.expectEqual(@as(usize, 0), bridge.drain_count);
     try std.testing.expectEqual(@as(usize, 1), bridge.history_count);
@@ -3745,7 +3711,7 @@ test "core.app_worker_runtime queued begin waits for deferred completed turn sum
         .begin_prompt = .{ .text = @constCast("queued prompt"), .images = &.{} },
     });
 
-    try Runtime(FakeApp).tick(&app, noopTaskCompletion, bridge.handlers());
+    try Runtime(FakeApp).tick(&app, bridge.handlers());
 
     try std.testing.expectEqualStrings("FU", bridge.orderSlice());
     try std.testing.expectEqual(@as(usize, 1), bridge.finish_count);
@@ -3794,7 +3760,7 @@ test "core.app_worker_runtime split batches finalize lifecycle before history" {
     handlers.ctx = @ptrCast(&capture);
     handlers.append_history_turn = Capture.history;
 
-    try Runtime(FakeApp).tick(&app, noopTaskCompletion, handlers);
+    try Runtime(FakeApp).tick(&app, handlers);
 
     try std.testing.expectEqual(@as(usize, 1), capture.history_count);
     try std.testing.expect(capture.saw_finalized_fence);
@@ -3837,7 +3803,7 @@ test "core.app_worker_runtime reset before drain fences interrupted prefix and k
     handlers.append_text = Capture.text;
 
     app.worker.worker_cancel_requested.store(false, .seq_cst);
-    try Runtime(FakeApp).tick(&app, noopTaskCompletion, handlers);
+    try Runtime(FakeApp).tick(&app, handlers);
 
     try std.testing.expect(!capture.late_text_seen);
     try std.testing.expect(capture.next_text_seen);
@@ -3961,7 +3927,7 @@ test "core.app_worker_runtime error text resets active stream and requests foote
         .body = "request failed",
     } });
 
-    try Runtime(FakeApp).tick(&app, noopTaskCompletion, handlers);
+    try Runtime(FakeApp).tick(&app, handlers);
 
     try std.testing.expectEqual(@as(usize, 1), capture.drain_count);
     try std.testing.expect(capture.error_saw_drain);
@@ -4020,7 +3986,7 @@ test "core.app_worker_runtime blocked error drain retains the error and suffix i
         .append_user_feedback = @constCast("after error"),
     });
 
-    try Runtime(FakeApp).tick(&app, noopTaskCompletion, handlers);
+    try Runtime(FakeApp).tick(&app, handlers);
 
     try std.testing.expectEqual(@as(usize, 1), capture.drain_count);
     try std.testing.expectEqual(@as(usize, 0), capture.error_count);
@@ -4030,7 +3996,7 @@ test "core.app_worker_runtime blocked error drain retains the error and suffix i
     try std.testing.expect(app.worker.events.items[0] == .error_text);
     try std.testing.expect(app.worker.events.items[1] == .append_user_feedback);
 
-    try Runtime(FakeApp).tick(&app, noopTaskCompletion, handlers);
+    try Runtime(FakeApp).tick(&app, handlers);
 
     try std.testing.expectEqual(@as(usize, 2), capture.drain_count);
     try std.testing.expectEqual(@as(usize, 1), capture.error_count);
@@ -4050,8 +4016,6 @@ test "core.app_worker_runtime tick drains events and updates thinking state" {
 
     try tickNoop(&app);
 
-    try std.testing.expectEqual(@as(usize, 1), app.background.prune_count);
-    try std.testing.expectEqual(@as(usize, 1), app.background.refresh_count);
     try std.testing.expectEqual(@as(usize, 1), app.subagent_manager_refreshes);
     try std.testing.expect(app.stream.active);
     try std.testing.expectEqual(@as(usize, 2), app.stream.chunks);
@@ -4090,7 +4054,7 @@ test "core.app_worker_runtime writes queued approval feedback after a tool termi
     var handlers = NoopBridge.handlers(&app);
     handlers.ctx = @ptrCast(&capture);
     handlers.write_user_prompt = Capture.user;
-    try Runtime(FakeApp).tick(&app, noopTaskCompletion, handlers);
+    try Runtime(FakeApp).tick(&app, handlers);
 
     try std.testing.expectEqual(@as(usize, 1), capture.user_count);
     try std.testing.expect(capture.saw_feedback);
@@ -4134,7 +4098,7 @@ test "core.app_worker_runtime drains diff block through bridge handler" {
     var capture = Capture{};
     defer capture.deinit(std.testing.allocator);
 
-    try Runtime(FakeApp).tick(&app, noopTaskCompletion, .{
+    try Runtime(FakeApp).tick(&app, .{
         .ctx = @ptrCast(&capture),
         .tool_lifecycle = NoopBridge.lifecyclePresenter(&app),
         .write_user_prompt = Capture.user,
@@ -4187,7 +4151,7 @@ test "core.app_worker_runtime failure before diff transfer leaves batch ownershi
 
     try std.testing.expectError(
         error.InjectedBeforeDiffTransfer,
-        Runtime(FakeApp).tick(&app, noopTaskCompletion, handlers),
+        Runtime(FakeApp).tick(&app, handlers),
     );
     try std.testing.expectEqual(@as(usize, 0), capture.diff_count);
 }
@@ -4230,7 +4194,7 @@ test "core.app_worker_runtime diff receiver cleans transferred payload on error"
 
     try std.testing.expectError(
         error.InjectedAfterDiffTransfer,
-        Runtime(FakeApp).tick(&app, noopTaskCompletion, handlers),
+        Runtime(FakeApp).tick(&app, handlers),
     );
     try std.testing.expectEqual(@as(usize, 1), capture.diff_count);
     try std.testing.expectEqual(@as(usize, 0), capture.suffix_count);
@@ -4289,7 +4253,7 @@ test "core.app_worker_runtime records accepted command output once and drops rej
     try Runtime(FakeApp).pushCommandOutput(&app, lifecycle_id, .stdout, "rejected\n");
     try std.testing.expectError(
         error.InjectedCommandOutputFailure,
-        Runtime(FakeApp).tick(&app, noopTaskCompletion, handlers),
+        Runtime(FakeApp).tick(&app, handlers),
     );
     try std.testing.expect(app.session_persistence.pending_cancelled_command == null);
 
@@ -4300,7 +4264,7 @@ test "core.app_worker_runtime records accepted command output once and drops rej
     try Runtime(FakeApp).pushCommandOutput(&app, lifecycle_id, .stdout, "stdout-two\n");
     try Runtime(FakeApp).pushCommandOutput(&app, lifecycle_id, .stderr, "stderr-two\n");
     try Runtime(FakeApp).pushCommandOutputComplete(&app, lifecycle_id);
-    try Runtime(FakeApp).tick(&app, noopTaskCompletion, handlers);
+    try Runtime(FakeApp).tick(&app, handlers);
 
     try std.testing.expectEqual(@as(usize, 4), capture.chunk_count);
     try std.testing.expectEqual(@as(usize, 1), capture.completion_count);
@@ -4315,7 +4279,7 @@ test "core.app_worker_runtime records accepted command output once and drops rej
     try queueToolTerminal(&app, lifecycle_id.turn_id, lifecycle_id.call_id, .cancelled, "Cancelled run_command");
     try Runtime(FakeApp).pushCommandOutputComplete(&app, lifecycle_id);
     try queueTurnFinished(&app, lifecycle_id.turn_id, .interrupted);
-    try Runtime(FakeApp).tick(&app, noopTaskCompletion, handlers);
+    try Runtime(FakeApp).tick(&app, handlers);
 
     try std.testing.expectEqual(@as(usize, 4), capture.chunk_count);
     try std.testing.expectEqual(@as(usize, 2), capture.completion_count);
@@ -4388,7 +4352,7 @@ test "core.app_worker_runtime finalizes open command output at the turn boundary
     handlers.ctx = @ptrCast(&capture);
     handlers.command_output_complete = Capture.outputComplete;
 
-    try Runtime(FakeApp).tick(&app, noopTaskCompletion, handlers);
+    try Runtime(FakeApp).tick(&app, handlers);
 
     try std.testing.expectEqual(@as(usize, 1), capture.completions);
     try std.testing.expect(app.shell.lifecycle.command_output_display.open_command_block == null);
@@ -4491,7 +4455,7 @@ test "core.app_worker_runtime blocks frame attempts until worker event batch set
     handlers.command_output_complete = Capture.outputComplete;
     handlers.error_text = Capture.err;
 
-    try Runtime(FakeApp).tick(&app, noopTaskCompletion, handlers);
+    try Runtime(FakeApp).tick(&app, handlers);
 
     try std.testing.expectEqual(@as(usize, 3), capture.reentrant_checks);
     try std.testing.expectEqual(capture.reentrant_checks, capture.blocked_checks);
@@ -4551,7 +4515,7 @@ test "core.app_worker_runtime cancelled drain skips diff block" {
     };
     var capture = Capture{};
 
-    try Runtime(FakeApp).tick(&app, noopTaskCompletion, .{
+    try Runtime(FakeApp).tick(&app, .{
         .ctx = @ptrCast(&capture),
         .tool_lifecycle = NoopBridge.lifecyclePresenter(&app),
         .write_user_prompt = Capture.user,

@@ -34,6 +34,11 @@ const ReturnReason = enum {
     failure,
 };
 
+pub const OpenAdmission = enum {
+    accepted,
+    occupied,
+};
+
 const SurfaceReturnAction = enum {
     handoff_to_manager,
     enter_manager,
@@ -164,6 +169,18 @@ pub const Controller = struct {
         self.* = .{};
     }
 
+    pub fn requestOpen(
+        self: *Controller,
+        comptime App: type,
+        app: *App,
+        session_id: []const u8,
+    ) !OpenAdmission {
+        if (self.phase != .inactive) return .occupied;
+        const owned = try app.alloc.dupe(u8, session_id);
+        try self.beginOpen(App, app, owned);
+        return .accepted;
+    }
+
     pub fn shutdown(self: *Controller, comptime App: type, app: *App) void {
         if (self.phase == .inactive) return;
         if (self.input.items.len != 0) {
@@ -288,13 +305,6 @@ pub const Controller = struct {
     }
 
     pub fn collect(self: *Controller, comptime App: type, app: *App) !void {
-        if (self.phase == .inactive) {
-            const session_id = app.terminal_direct.takeOpenIntent() orelse return;
-            self.beginOpen(App, app, session_id) catch |err| {
-                self.containFailure(App, app, "acquire_admission", err);
-            };
-        }
-
         self.collectAcquire(App, app) catch |err| {
             self.containFailure(App, app, "acquire", err);
         };
@@ -838,6 +848,15 @@ pub const Controller = struct {
         std.debug.assert(self.release_correlation == null);
         std.debug.assert(!self.blocksFxSurface(&app.terminal));
         const reason = self.return_reason;
+
+        if (comptime @hasField(App, "managed_executions")) {
+            if ((reason == .lost or reason == .failure) and
+                self.session_id != null)
+            {
+                const session_id = self.session_id.?;
+                app.managed_executions.observeTtyState(session_id, .lost);
+            }
+        }
 
         self.reset(app.alloc);
         if (reason != .detach) {

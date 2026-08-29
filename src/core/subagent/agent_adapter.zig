@@ -92,8 +92,6 @@ const Context = struct {
         result.interactive = false;
         result.output_chunk_ctx = self;
         result.on_output_chunk = pushLiveOutputChunk;
-        result.background_url_ctx = self;
-        result.on_background_url_ready = discardBackgroundUrl;
         result.web_search_progress_ctx = null;
         result.on_web_search_progress = null;
         result.web_fetch_progress_ctx = null;
@@ -414,8 +412,6 @@ fn appendRuntimeContext(raw: *anyopaque, arena: Allocator, messages: *std.ArrayL
         .interactive = false,
         .permission_mode = context.admission.permission_mode,
         .tracker = null,
-        .background = tool_ctx.background,
-        .session = context.turn.sessionRuntime(),
     }, arena, messages);
 }
 

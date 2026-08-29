@@ -6,6 +6,8 @@ const app_commands = @import("app_commands.zig");
 const app_lifecycle = @import("app_lifecycle.zig");
 const app_permission_runtime = @import("app_permission_runtime.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
+const app_terminal_runtime = @import("app_terminal_runtime.zig");
+const managed_execution = @import("../execution/managed_execution.zig");
 const terminal_ui_projection = @import("../terminal/ui_projection.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
@@ -2785,24 +2787,31 @@ pub fn Runtime(comptime App: type) type {
             force: bool,
             comptime count_only: bool,
         ) !void {
-            const host = app_session_runtime.Runtime(App).subagentHost(app) orelse {
+            const optional_host = app_session_runtime.Runtime(App).subagentHost(app);
+            const now_ms = io_mod.milliTimestamp();
+            const refresh_due = if (optional_host) |host|
+                if (comptime @hasDecl(
+                    @TypeOf(app.subagents),
+                    "projectionRefreshDue",
+                ))
+                    app.subagents.projectionRefreshDue(
+                        now_ms,
+                        force,
+                        host.approvals.pendingRevision(),
+                    )
+                else
+                    app.subagents.refreshDue(now_ms, force)
+            else
+                app.subagents.refreshDue(now_ms, force);
+            if (!refresh_due) return;
+            if (comptime !count_only) {
+                try refreshManagedExecutionProjection(app);
+            }
+            const host = optional_host orelse {
                 app.subagents.setDegraded(app.alloc, .store_failure);
                 requestSubagentSurfaceFrame(app, .subagent_panel);
                 return;
             };
-            const now_ms = io_mod.milliTimestamp();
-            const refresh_due = if (comptime @hasDecl(
-                @TypeOf(app.subagents),
-                "projectionRefreshDue",
-            ))
-                app.subagents.projectionRefreshDue(
-                    now_ms,
-                    force,
-                    host.approvals.pendingRevision(),
-                )
-            else
-                app.subagents.refreshDue(io_mod.milliTimestamp(), force);
-            if (!refresh_due) return;
             const source = subagent_projection.Source{
                 .root_id = host.root_id,
                 .manager = &host.manager,
@@ -2860,11 +2869,17 @@ pub fn Runtime(comptime App: type) type {
                     requestSubagentSurfaceFrame(app, .subagent_panel);
                 },
             }
-            if (comptime @hasField(App, "terminal_client") and
-                @hasDecl(@TypeOf(app.terminal_client), "terminalProjection") and
+        }
+
+        fn refreshManagedExecutionProjection(app: *App) !void {
+            if (comptime @hasField(App, "managed_executions") and
                 @hasDecl(@TypeOf(app.subagents), "replaceTerminalSnapshot"))
             {
-                const terminal_snapshot = try app.terminal_client.terminalProjection(app.alloc);
+                try app_terminal_runtime.Runtime(App).refreshManagedFacts(app);
+                const terminal_snapshot = try managedExecutionProjection(
+                    app.alloc,
+                    &app.managed_executions,
+                );
                 if (try app.subagents.replaceTerminalSnapshot(app.alloc, terminal_snapshot)) {
                     requestSubagentSurfaceFrame(app, .subagent_panel);
                 }
@@ -3241,6 +3256,45 @@ pub fn Runtime(comptime App: type) type {
             };
         }
     };
+}
+
+fn managedExecutionProjection(
+    alloc: std.mem.Allocator,
+    runtime: *managed_execution.Runtime,
+) !terminal_ui_projection.Snapshot {
+    const executions = try runtime.list(alloc);
+    defer {
+        for (executions) |*execution| execution.deinit(alloc);
+        alloc.free(executions);
+    }
+    const rows = try alloc.alloc(terminal_ui_projection.Row, executions.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (rows[0..initialized]) |*row| {
+            alloc.free(row.label);
+            alloc.free(row.session_id);
+        }
+        alloc.free(rows);
+    }
+    for (executions, rows) |execution, *row| {
+        const session_id = try alloc.dupe(u8, execution.execution_id);
+        errdefer alloc.free(session_id);
+        row.* = .{
+            .session_id = session_id,
+            .label = try alloc.dupe(u8, execution.command),
+            .lifecycle = switch (execution.state) {
+                .running => .running,
+                .completed => .exited,
+                .stopped => .closed,
+                .lost => .lost,
+            },
+            .attention = .{},
+            .backend = .native,
+            .attachable = execution.backend == .tty,
+        };
+        initialized += 1;
+    }
+    return .{ .alloc = alloc, .rows = rows };
 }
 
 fn renderReasonNames(
@@ -6271,7 +6325,7 @@ test "core.app_render_runtime generic approval exits the full transcript screen 
 
     try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{
         .id = 42,
-        .label = "terminal.exec sh -c 'printf approval'",
+        .label = "shell.run sh -c 'printf approval'",
     }));
     app.shell.render_requests.request(.modal);
     try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
@@ -6994,32 +7048,42 @@ test "child approval arrival closes full transcript depth before rendering" {
     defer debug_trace.resetForTest();
     try debug_trace.configureForTestWithScopes(alloc, trace_path, "full_transcript");
 
-    var app = ChildApprovalReconcileApp{
-        .alloc = alloc,
-        .subagents = .{ .depth = .full },
-    };
-    defer app.deinit();
-    try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{
-        .id = 91,
-        .label = "terminal.exec npm test",
-    }));
+    inline for (.{
+        transcript_presentation.Depth.review,
+        transcript_presentation.Depth.full,
+    }) |depth| {
+        var app = ChildApprovalReconcileApp{
+            .alloc = alloc,
+            .subagents = .{ .depth = depth },
+        };
+        defer app.deinit();
+        try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{
+            .id = 91,
+            .label = "shell.run npm test",
+        }));
 
-    try std.testing.expect(try Runtime(ChildApprovalReconcileApp)
-        .reconcileChildTranscriptForPresentedApproval(
-        &app,
-        "selected-child",
-    ));
+        try std.testing.expect(try Runtime(ChildApprovalReconcileApp)
+            .reconcileChildTranscriptForPresentedApproval(
+            &app,
+            "selected-child",
+        ));
 
-    try std.testing.expectEqual(
-        transcript_presentation.Depth.inline_mode,
-        app.subagents.depth,
-    );
-    try std.testing.expectEqual(@as(usize, 1), app.subagents.close_calls);
+        try std.testing.expectEqual(
+            transcript_presentation.Depth.inline_mode,
+            app.subagents.depth,
+        );
+        try std.testing.expectEqual(@as(usize, 1), app.subagents.close_calls);
+    }
 
     var trace_file = try std.Io.Dir.openFileAbsolute(std.testing.io, trace_path, .{});
     defer trace_file.close(std.testing.io);
     const trace = try io_mod.readFileToEnd(alloc, &trace_file, 4096);
     defer alloc.free(trace);
+    try std.testing.expect(std.mem.find(
+        u8,
+        trace,
+        "depth_transition from=review to=inline route=child trigger=approval_handoff",
+    ) != null);
     try std.testing.expect(std.mem.find(
         u8,
         trace,

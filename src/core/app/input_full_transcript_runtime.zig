@@ -438,7 +438,7 @@ test "selected child approval owns ctrl-o ahead of transcript depth" {
     defer app.deinit();
     try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{
         .id = 77,
-        .label = "terminal.exec npm test",
+        .label = "shell.run npm test",
     }));
 
     _ = try Runtime(ApprovalRoutingApp).routeAction(
@@ -460,7 +460,7 @@ test "approval for another child does not steal selected child transcript input"
     app.subagents.approval_child_id = "child-two";
     try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{
         .id = 77,
-        .label = "terminal.exec npm test",
+        .label = "shell.run npm test",
     }));
 
     try std.testing.expect(!Runtime(ApprovalRoutingApp).approvalOwnsCurrentSurface(&app));

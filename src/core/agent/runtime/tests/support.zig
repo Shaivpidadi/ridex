@@ -6,7 +6,6 @@ const permission_auto_classifier = @import("../../../permissions/auto_classifier
 const types = @import("../../../shared/types.zig");
 const permissions = @import("../../../permissions/permissions.zig");
 const worker_runtime = @import("../../worker_runtime.zig");
-const background_runtime = @import("../../../background/background_runtime.zig");
 const builtin_context = @import("../../../../builtins/context.zig");
 const builtin_gateway = @import("../../../../builtins/gateway.zig");
 const builtin_tools = @import("../../../../builtins/tools.zig");
@@ -70,12 +69,10 @@ pub const VisionAgentToolRuntime = struct {
     execution_count: usize = 0,
     result_count: usize = 0,
     worker: worker_runtime.WorkerRuntime = .{},
-    background: background_runtime.BackgroundRuntime = .{},
     session: session_runtime.SessionRuntime = .{ .max_history_turns = 8 },
 
     pub fn deinit(self: *VisionAgentToolRuntime) void {
         self.worker.deinit(self.alloc);
-        self.background.deinit(self.alloc);
         self.session.deinit(self.alloc);
     }
 
@@ -127,7 +124,6 @@ pub const VisionAgentToolRuntime = struct {
             .permission_grants = &.{},
             .permission_rules = .{},
             .worker = &self.worker,
-            .background = &self.background,
             .session = &self.session,
             .session_allocator = self.alloc,
             .context_limits = .{ .image_adapter_output_bytes = .{
@@ -142,8 +138,6 @@ pub const VisionAgentToolRuntime = struct {
             },
             .output_chunk_ctx = undefined,
             .on_output_chunk = discardVisionToolOutput,
-            .background_url_ctx = undefined,
-            .on_background_url_ready = discardVisionBackgroundUrl,
         };
     }
 };
@@ -155,8 +149,6 @@ fn discardVisionToolOutput(
     _: []const u8,
 ) anyerror!void {}
 
-fn discardVisionBackgroundUrl(_: *anyopaque, _: u64, _: []const u8) void {}
-
 const test_tools = [_]tool_dispatch.Tool{
     builtin_tools.glob_files,
     builtin_tools.grep_files,
@@ -165,7 +157,7 @@ const test_tools = [_]tool_dispatch.Tool{
     builtin_tools.edit_file,
     builtin_tools.web_fetch,
     builtin_tools.web_search,
-    builtin_tools.terminal,
+    builtin_tools.shell,
     builtin_tools.capability_search,
     builtin_tools.skill,
     builtin_tools.install_skill,
@@ -177,15 +169,14 @@ const test_tools = [_]tool_dispatch.Tool{
 const test_tool_registry = tool_dispatch.Registry{ .tools = test_tools[0..] };
 
 fn testExecutionAuthority(call: ToolCall) command_admission.ToolExecutionAuthority {
-    if (!std.mem.eql(u8, call.name, "terminal")) return .ordinary;
-    if (std.mem.find(u8, call.arguments_json, "\"action\":\"exec\"") == null) {
+    if (!std.mem.eql(u8, call.name, "shell")) return .ordinary;
+    if (std.mem.find(u8, call.arguments_json, "\"action\":\"run\"") == null) {
         return .ordinary;
     }
     return .{ .run_command = .{ .shell_allowed = .{
         .fingerprint = .{
             .command = call.arguments_json,
             .resolved_cwd = "",
-            .background = false,
             .target_os = builtin.os.tag,
         },
         .source = .interactive_once,
@@ -1529,11 +1520,6 @@ pub const FakeAgentRuntimeDeps = struct {
                 self.history_assistant_text = try self.alloc.dupe(u8, entry.assistant);
                 try self.record("history:assistant", .{});
             },
-            .background_command => |entry| {
-                if (self.background_history_log_path) |value| self.alloc.free(value);
-                self.background_history_log_path = try self.alloc.dupe(u8, entry.log_path);
-                try self.record("history:background", .{});
-            },
             .interrupted => |entry| {
                 self.interrupted_history_count += 1;
                 if (entry.tool_call) |tool_call| {
@@ -1574,10 +1560,6 @@ pub const FakeAgentRuntimeDeps = struct {
                     .assistant => |entry| {
                         if (self.finish_assistant_text) |value| self.alloc.free(value);
                         self.finish_assistant_text = try self.alloc.dupe(u8, entry.assistant);
-                    },
-                    .background_command => |entry| {
-                        if (self.background_event_log_path) |value| self.alloc.free(value);
-                        self.background_event_log_path = try self.alloc.dupe(u8, entry.log_path);
                     },
                     .interrupted => self.interrupted_event_count += 1,
                     .compacted_summary => {},

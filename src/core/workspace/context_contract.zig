@@ -1,7 +1,5 @@
 const std = @import("std");
-const background_runtime = @import("../background/background_runtime.zig");
 const change_tracker = @import("change_tracker.zig");
-const session_runtime = @import("../session/session.zig");
 const types = @import("../shared/types.zig");
 const context_limits = @import("../config/context_limits.zig");
 const workspace_access = @import("workspace_access.zig");
@@ -253,8 +251,6 @@ pub const TransientContextInput = struct {
     interactive: bool,
     permission_mode: types.PermissionMode,
     tracker: ?*change_tracker.ChangeTracker,
-    background: *background_runtime.BackgroundRuntime,
-    session: *session_runtime.SessionRuntime,
 };
 
 pub const Provider = struct {
@@ -762,10 +758,6 @@ test "context registry routes the default provider" {
     defer snapshot.deinit(alloc);
     const contribution = snapshot.contribution orelse return error.TestExpectedEqual;
 
-    var background: background_runtime.BackgroundRuntime = .{};
-    defer background.deinit(alloc);
-    var session: session_runtime.SessionRuntime = .{ .max_history_turns = 4 };
-    defer session.deinit(alloc);
     var tracker: change_tracker.ChangeTracker = .{};
     defer tracker.deinit(alloc);
     var arena_state = std.heap.ArenaAllocator.init(alloc);
@@ -780,8 +772,6 @@ test "context registry routes the default provider" {
         .interactive = true,
         .permission_mode = .ask,
         .tracker = &tracker,
-        .background = &background,
-        .session = &session,
     }, arena, &messages);
 
     try std.testing.expectEqual(@as(usize, 2), messages.items.len);

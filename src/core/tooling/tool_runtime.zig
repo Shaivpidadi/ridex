@@ -6,18 +6,14 @@ const oauth_transport = @import("../auth/oauth_transport.zig");
 const host_mod = @import("../hosts/host.zig");
 const command_contract = @import("../execution/command_contract.zig");
 const command_environment = @import("../execution/command_environment.zig");
-const background_process_provider = @import(
-    "../execution/background_process_provider.zig",
-);
+const managed_execution = @import("../execution/managed_execution.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const diagnostics = @import("../workspace/diagnostics.zig");
 const image_attachments = @import("../images/image_attachments.zig");
 const io_mod = @import("../shared/io.zig");
 const tool_contracts = @import("../agent/runtime/tool_contracts.zig");
+const result_commit = @import("result_commit.zig");
 const vision_executor = @import("../agent/runtime/vision_executor.zig");
-const background_runtime = @import("../background/background_runtime.zig");
-const background_launch_identity = @import("../background/background_launch_identity.zig");
-const process_supervisor = @import("../background/process_supervisor.zig");
 const change_tracker = @import("../workspace/change_tracker.zig");
 const diff_mod = @import("../output/diff.zig");
 const file_mutation = @import("file_mutation.zig");
@@ -42,7 +38,6 @@ const subagent_tool_result = @import("../subagent/tool_result.zig");
 const session_runtime = @import("../session/session.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
 const session_codec_mod = @import("../session/session_codec.zig");
-const task_helpers = @import("../tasks/task_helpers.zig");
 const session_child_store = @import("../session/session_child_store.zig");
 const command_replay_store = @import("../session/command_replay_store.zig");
 const session_store = @import("../session/session_store.zig");
@@ -62,7 +57,8 @@ const tool_mcp_runtime = @import("tool_mcp_runtime.zig");
 const capability_retrieval = @import("capability_retrieval.zig");
 const tool_mcp_feature_dispatch = @import("tool_mcp_feature_dispatch.zig");
 const tool_presentation = @import("tool_presentation.zig");
-const terminal_impl = @import("../../tools/terminal/terminal.zig");
+const shell_impl = @import("../../tools/shell/shell.zig");
+const shell_resolver = @import("../terminal/shell_resolver.zig");
 const web_fetch_runtime = @import("web_fetch_runtime.zig");
 const web_search_contract = @import("web_search_contract.zig");
 const web_fetch_artifacts = @import("../session/web_fetch_artifacts.zig");
@@ -100,7 +96,6 @@ const PermissionMode = types.PermissionMode;
 const ToolPermissionDecision = types.ToolPermissionDecision;
 const subagent_tool_name = "subagent";
 const ToolExecutionResult = tool_contracts.ToolExecutionResult;
-const BackgroundRuntime = background_runtime.BackgroundRuntime;
 const SessionRuntime = session_runtime.SessionRuntime;
 const WorkerRuntime = worker_runtime.WorkerRuntime;
 const max_file_mutation_success_bytes: usize = 8 * 1024;
@@ -174,7 +169,6 @@ pub const Context = struct {
     /// (e.g. ACP hosts prompt over JSON-RPC by setting this).
     permission_prompter: ?permission_prompter.Prompter = null,
     cancel_flag: ?*std.atomic.Value(bool) = null,
-    background: *BackgroundRuntime,
     session: *SessionRuntime,
     session_allocator: Allocator = std.heap.c_allocator,
     skills_dir: []const u8 = "",
@@ -184,13 +178,12 @@ pub const Context = struct {
     output_chunk_lifecycle_id: ?types.ToolLifecycleId = null,
     output_chunk_ctx: *anyopaque,
     on_output_chunk: command_contract.CommandOutputCallback,
-    background_url_ctx: *anyopaque,
-    on_background_url_ready: *const fn (*anyopaque, u64, []const u8) void,
     command_artifact_dir: ?[]const u8 = null,
     tool_result_dir: ?[]const u8 = null,
     session_child_capability: ?*session_child_store.SessionChildCapability = null,
     ephemeral_command_replay: ?*command_replay_store.EphemeralStore = null,
     terminal_client: ?*terminal_client_runtime.Runtime = null,
+    managed_executions: ?*managed_execution.Runtime = null,
     command_timeout_ms: ?usize = null,
     command_timeout_started_ms: ?i64 = null,
     command_replay_capture: ?*command_replay_store.Capture = null,
@@ -250,7 +243,6 @@ pub const Context = struct {
             .tool_registry = self.tool_registry,
             .worker = self.worker,
             .permission_prompter = self.permission_prompter,
-            .background = self.background,
             .advertised_dynamic_tool_names = self.advertised_dynamic_tool_names,
             .mcp_runtime = mcpRuntimeCapabilities(self),
             .context_limits = self.context_limits,
@@ -558,7 +550,7 @@ fn executeWorkspaceToolCallInner(
     const spec = registeredToolSpec(ctx, call.name) orelse
         return semanticFailure(try std.fmt.allocPrint(arena, "Unsupported tool: {s}", .{call.name}));
     if (ctx.tool_registry.tools.len != 1 or
-        !std.mem.eql(u8, spec.name, "terminal") or
+        !std.mem.eql(u8, spec.name, "shell") or
         spec.executor_kind != .run_command or
         spec.runtime_provider != .run_command)
     {
@@ -684,6 +676,8 @@ fn executeRegisteredTool(
     var dispatch_metadata: DispatchMetadata = .{};
     var dispatch_ctx = typedDispatchContextForCall(ctx, arena, call);
     dispatch_metadata.attach(&dispatch_ctx);
+    var result_commit_token: ?result_commit.Token = null;
+    dispatch_ctx.result_commit_sink = &result_commit_token;
     dispatch_ctx.execution_authority = authority;
     dispatch_ctx.mcp_call_options = .{
         .expected_runtime_generation = ctx.expected_mcp_runtime_generation,
@@ -758,6 +752,7 @@ fn executeRegisteredTool(
     execution.selected_dynamic_tool_name = selected_dynamic_tool_sink.name;
     execution.selected_dynamic_tool_schema_json = selected_dynamic_tool_sink.schema_json;
     execution.context_notices = context_notice_sink.notices.items;
+    execution.result_commit = result_commit_token;
     return execution;
 }
 
@@ -910,13 +905,15 @@ fn typedDispatchContext(ctx: Context, arena: Allocator) tool_dispatch.DispatchCo
         .session_child_capability = ctx.session_child_capability,
         .ephemeral_command_replay = ctx.ephemeral_command_replay,
         .terminal_client = ctx.terminal_client,
+        .managed_executions = ctx.managed_executions,
+        .command_artifact_dir = ctx.command_artifact_dir,
         .terminal_owner_session_id = ctx.lifecycle_scope.session_id,
         .terminal_transport_role = switch (ctx.lifecycle_scope.kind) {
             .interactive, .subagent => .interactive,
             .ask => .headless,
             .acp => .acp,
         },
-        .background_lifecycle_allocator = ctx.session_allocator,
+        .lifecycle_allocator = ctx.session_allocator,
         .cancel_flag = runtimeCancelFlag(ctx),
         .output_chunk_lifecycle_id = ctx.output_chunk_lifecycle_id,
         .output_chunk_ctx = ctx.output_chunk_ctx,
@@ -959,7 +956,7 @@ fn terminal_lease_cleanup_dispatch_context(
 pub fn release_agent_terminal_lease(ctx: Context, session_id: []const u8) !void {
     var arena_state = std.heap.ArenaAllocator.init(ctx.session_allocator);
     defer arena_state.deinit();
-    return terminal_impl.release_agent_write_lease(
+    return shell_impl.releaseAgentWriteLease(
         terminal_lease_cleanup_dispatch_context(ctx, arena_state.allocator()),
         session_id,
     );
@@ -1282,7 +1279,6 @@ fn toolRunCommand(
     const command_ctx = command_admission.CommandContext{
         .command = command,
         .resolved_cwd = cwd,
-        .background = false,
         .target_os = builtin.os.tag,
         .environment = request.environment,
     };
@@ -1363,7 +1359,7 @@ fn toolRunCommand(
                     false,
                     &transferred,
                     null,
-                    try command_result_mapping.Foreground.outputCaptureFailure(arena),
+                    try command_result_mapping.Command.outputCaptureFailure(arena),
                 );
             };
         }
@@ -1437,7 +1433,7 @@ fn toolRunCommand(
                     (ctx.command_replay_unavailable or replay_callback.had_accepted_output),
                 &replay_transferred,
                 null,
-                try command_result_mapping.Foreground.timeoutFailure(
+                try command_result_mapping.Command.timeoutFailure(
                     arena,
                     command,
                     cwd,
@@ -1452,7 +1448,7 @@ fn toolRunCommand(
             false,
             &replay_transferred,
             null,
-            try command_result_mapping.Foreground.outputCaptureFailure(arena),
+            try command_result_mapping.Command.outputCaptureFailure(arena),
         );
         if (err == error.Cancelled and runtimeCancelFlag(ctx).load(.seq_cst)) {
             return finishCommandToolResult(
@@ -1473,7 +1469,7 @@ fn toolRunCommand(
     };
     const result = routed.result;
 
-    if (try command_result_mapping.Foreground.cancelledFailure(arena, result)) |cancelled| {
+    if (try command_result_mapping.Command.cancelledFailure(arena, result)) |cancelled| {
         return finishCommandToolResult(
             arena,
             replay_capture,
@@ -1485,7 +1481,7 @@ fn toolRunCommand(
         );
     }
 
-    if (try command_result_mapping.Foreground.nonZeroFailure(arena, result)) |failure| {
+    if (try command_result_mapping.Command.nonZeroFailure(arena, result)) |failure| {
         return finishCommandToolResult(
             arena,
             replay_capture,
@@ -1539,7 +1535,7 @@ fn executeWorkspaceRunCommand(
         timeout_ms,
     ) catch |err| {
         if (err == error.WorkspaceDeadline) {
-            return command_result_mapping.Foreground.timeoutFailure(
+            return command_result_mapping.Command.timeoutFailure(
                 arena,
                 request.command,
                 request.resolved_cwd,
@@ -1550,7 +1546,7 @@ fn executeWorkspaceRunCommand(
         return err;
     };
     var replay_transferred = false;
-    if (try command_result_mapping.Foreground.cancelledFailure(arena, result)) |cancelled| {
+    if (try command_result_mapping.Command.cancelledFailure(arena, result)) |cancelled| {
         return finishCommandToolResult(
             arena,
             null,
@@ -1560,7 +1556,7 @@ fn executeWorkspaceRunCommand(
             cancelled,
         );
     }
-    if (try command_result_mapping.Foreground.nonZeroFailure(arena, result)) |failure| {
+    if (try command_result_mapping.Command.nonZeroFailure(arena, result)) |failure| {
         return finishCommandToolResult(
             arena,
             null,
@@ -1678,7 +1674,7 @@ fn finishCommandToolResult(
     var owned = result;
     if (capture) |candidate| switch (candidate.policy()) {
         .required => candidate.sealRequired(arena) catch {
-            owned = try command_result_mapping.Foreground.outputCaptureFailure(arena);
+            owned = try command_result_mapping.Command.outputCaptureFailure(arena);
         },
         .best_effort => {},
     };
@@ -1703,10 +1699,7 @@ fn commandProcessPresentation(
     result: command_contract.RunCommandResult,
 ) ?types.CommandProcessPresentation {
     const command_result = result.command_result orelse return null;
-    const foreground = switch (command_result) {
-        .foreground => |value| value,
-        .background => return null,
-    };
+    const foreground = command_result;
     if (foreground.timed_out) return .timed_out;
     if (foreground.signal) |signal| return .{ .signal = signal };
     if (foreground.exit_code) |exit_code| {
@@ -1922,7 +1915,6 @@ fn persistedSubagentIdentity(
         turn_index -= 1;
         const execution = switch (history[turn_index]) {
             .assistant => |entry| entry.execution,
-            .background_command => |entry| entry.execution,
             .interrupted => |entry| entry.execution,
             .compacted_summary => continue,
         };
@@ -2112,12 +2104,138 @@ fn persistedSubagentEpoch(
     return identity.epoch;
 }
 
-fn splitConversationLanguage(language: session_runtime.ConversationLanguage) task_helpers.ConversationLanguage {
-    return task_helpers.ConversationLanguage.fromSlice(language.view()) catch task_helpers.ConversationLanguage.default();
-}
-
 fn noopOutput(_: *anyopaque, _: ?types.ToolLifecycleId, _: command_contract.CommandOutputStream, _: []const u8) !void {}
 fn noopBackgroundReady(_: *anyopaque, _: u64, _: []const u8) void {}
+
+const TestCapturedShellInput = struct {
+    command: []u8,
+    profile: ?command_environment.Profile,
+    timeout_ms: u64,
+
+    fn deinit(self: *TestCapturedShellInput, alloc: Allocator) void {
+        alloc.free(self.command);
+        alloc.destroy(self);
+    }
+};
+
+fn decodeTestCapturedShell(
+    ctx: tool_dispatch.DispatchContext,
+    args_json: []const u8,
+) tool_dispatch.DispatchError!tool_dispatch.DecodeResult {
+    var parsed = std.json.parseFromSlice(std.json.Value, ctx.allocator, args_json, .{}) catch
+        return .{ .failure = try ctx.allocator.dupe(u8, "invalid captured shell input") };
+    defer parsed.deinit();
+    if (parsed.value != .object) {
+        return .{ .failure = try ctx.allocator.dupe(u8, "invalid captured shell input") };
+    }
+    for (parsed.value.object.keys()) |name| {
+        if (!std.mem.eql(u8, name, "action") and
+            !std.mem.eql(u8, name, "command") and
+            !std.mem.eql(u8, name, "profile") and
+            !std.mem.eql(u8, name, "timeout_ms"))
+        {
+            return .{ .failure = try ctx.allocator.dupe(u8, "invalid captured shell input") };
+        }
+    }
+    const action = parsed.value.object.get("action") orelse
+        return .{ .failure = try ctx.allocator.dupe(u8, "invalid captured shell input") };
+    const command = parsed.value.object.get("command") orelse
+        return .{ .failure = try ctx.allocator.dupe(u8, "invalid captured shell input") };
+    if (action != .string or !std.mem.eql(u8, action.string, "run") or
+        command != .string)
+    {
+        return .{ .failure = try ctx.allocator.dupe(u8, "invalid captured shell input") };
+    }
+    const profile: ?command_environment.Profile = if (parsed.value.object.get("profile")) |value| blk: {
+        if (value == .null) break :blk null;
+        if (value != .string) {
+            return .{ .failure = try ctx.allocator.dupe(u8, "invalid captured shell input") };
+        }
+        break :blk std.meta.stringToEnum(
+            command_environment.Profile,
+            value.string,
+        ) orelse return .{ .failure = try ctx.allocator.dupe(
+            u8,
+            "invalid captured shell input",
+        ) };
+    } else null;
+    const timeout_ms: u64 = if (parsed.value.object.get("timeout_ms")) |value| blk: {
+        if (value != .integer or value.integer <= 0) {
+            return .{ .failure = try ctx.allocator.dupe(u8, "invalid captured shell input") };
+        }
+        break :blk @intCast(value.integer);
+    } else 600_000;
+    const input = try ctx.allocator.create(TestCapturedShellInput);
+    errdefer ctx.allocator.destroy(input);
+    input.* = .{
+        .command = try ctx.allocator.dupe(u8, command.string),
+        .profile = profile,
+        .timeout_ms = timeout_ms,
+    };
+    return .{ .input = .{
+        .ptr = input,
+        .deinit_fn = struct {
+            fn deinit(raw: *anyopaque, alloc: Allocator) void {
+                const value: *TestCapturedShellInput = @ptrCast(@alignCast(raw));
+                value.deinit(alloc);
+            }
+        }.deinit,
+    } };
+}
+
+fn validateTestCapturedShell(
+    _: tool_dispatch.DispatchContext,
+    _: tool_dispatch.ToolInput,
+) tool_dispatch.DispatchError!?[]u8 {
+    return null;
+}
+
+fn testCapturedShellFalse(_: tool_dispatch.ToolInput) bool {
+    return false;
+}
+
+fn callTestCapturedShell(
+    ctx: tool_dispatch.DispatchContext,
+    erased: tool_dispatch.ToolInput,
+) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
+    const input = erased.as(TestCapturedShellInput);
+    const backend = ctx.run_command_backend orelse return .{
+        .failure = try ctx.allocator.dupe(u8, "captured shell backend unavailable"),
+    };
+    var shell_buffer: [4096]u8 = undefined;
+    const configured = shell_resolver.configuredLoginShellInto(&shell_buffer);
+    const environment = shell_resolver.environment(
+        ctx.allocator,
+        configured,
+        input.profile,
+    ) catch return .{
+        .failure = try ctx.allocator.dupe(u8, "captured shell profile unavailable"),
+    };
+    defer switch (environment) {
+        .clean, .user => |path| ctx.allocator.free(path),
+        .legacy, .workspace_clean => {},
+    };
+    return backend.execute(ctx, .{
+        .command = input.command,
+        .resolved_cwd = ctx.workspace_root,
+        .environment = environment,
+        .timeout_ms = input.timeout_ms,
+    });
+}
+
+const test_captured_shell = blk: {
+    var tool = test_builtin_tools.shell;
+    tool.executor_kind = .run_command;
+    tool.decode = decodeTestCapturedShell;
+    tool.validate = validateTestCapturedShell;
+    tool.call = callTestCapturedShell;
+    tool.captured_command_fn = null;
+    tool.process_local_fn = null;
+    tool.authorized_result_mapper = null;
+    tool.reads_only_fn = testCapturedShellFalse;
+    tool.irreversible_fn = testCapturedShellFalse;
+    break :blk tool;
+};
 
 const test_tool_registry = tool_dispatch.Registry{ .tools = &.{
     test_builtin_tools.glob_files,
@@ -2125,9 +2243,10 @@ const test_tool_registry = tool_dispatch.Registry{ .tools = &.{
     test_builtin_tools.read_file,
     test_builtin_tools.write_file,
     test_builtin_tools.edit_file,
+    test_builtin_tools.memory,
     test_builtin_tools.web_fetch,
     test_builtin_tools.web_search,
-    test_builtin_tools.terminal,
+    test_captured_shell,
     test_builtin_tools.capability_search,
     test_builtin_tools.skill,
     test_builtin_tools.install_skill,
@@ -2163,7 +2282,7 @@ fn executeFailingRunCommandCompatibility(
 ) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
     return .{ .failure = try tool_result_errors.formatToolExecutionErrorJson(
         ctx.allocator,
-        "terminal",
+        "shell",
         error.SkillInstallFailed,
     ) };
 }
@@ -2178,12 +2297,12 @@ const test_failing_compatible_tool = blk: {
 };
 
 const test_compatibility_registry = tool_dispatch.Registry{ .tools = &.{
-    test_builtin_tools.terminal,
+    test_captured_shell,
     test_compatible_tool,
 } };
 
 const test_failing_compatibility_registry = tool_dispatch.Registry{ .tools = &.{
-    test_builtin_tools.terminal,
+    test_captured_shell,
     test_failing_compatible_tool,
 } };
 
@@ -2204,7 +2323,7 @@ const test_context_registry = context_contract.Registry{ .default_provider = .{
 } };
 
 const test_review_calls = [_]ToolCall{
-    .{ .id = "test-review", .name = "terminal", .arguments_json = "{\"action\":\"exec\",\"command\":\"printf test\",\"timeout_ms\":600000}" },
+    .{ .id = "test-review", .name = "shell", .arguments_json = "{\"action\":\"run\",\"command\":\"printf test\",\"timeout_ms\":600000}" },
 };
 const test_review_root_messages = [_][]const u8{"test root request"};
 
@@ -2222,7 +2341,6 @@ const TestRuntime = struct {
     agent_stream_provider: agent_stream_provider.Provider = agent_stream_provider.unavailable_provider,
     tool_registry: tool_dispatch.Registry = test_tool_registry,
     worker: WorkerRuntime = .{},
-    background: BackgroundRuntime = .{},
     session: SessionRuntime = .{ .max_history_turns = 8 },
     subagent_host: ?*subagent_tool_host.Runtime = null,
     subagent_caller_id: ?[]const u8 = null,
@@ -2278,7 +2396,6 @@ const TestRuntime = struct {
 
     fn deinit(self: *TestRuntime, alloc: Allocator) void {
         self.worker.deinit(alloc);
-        self.background.deinit(alloc);
         self.session.deinit(alloc);
     }
 
@@ -2314,7 +2431,6 @@ const TestRuntime = struct {
             else
                 null,
             .cancel_flag = self.cancel_flag,
-            .background = &self.background,
             .session = &self.session,
             .session_allocator = self.session_allocator,
             .skills_dir = self.skills_dir,
@@ -2322,8 +2438,6 @@ const TestRuntime = struct {
             .context_limits = self.context_limits,
             .output_chunk_ctx = undefined,
             .on_output_chunk = noopOutput,
-            .background_url_ctx = undefined,
-            .on_background_url_ready = noopBackgroundReady,
             .command_artifact_dir = self.command_artifact_dir,
             .session_child_capability = self.session_child_capability,
             .ephemeral_command_replay = self.ephemeral_command_replay,
@@ -3360,7 +3474,7 @@ const TestCommandOutputCapture = struct {
 fn runCommandArgsForTest(alloc: Allocator, command: []const u8) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-    try out.writer.writeAll("{\"action\":\"exec\",\"command\":");
+    try out.writer.writeAll("{\"action\":\"run\",\"command\":");
     try std.json.Stringify.value(command, .{}, &out.writer);
     try out.writer.writeAll(",\"timeout_ms\":600000}");
     return out.toOwnedSlice();
@@ -3369,7 +3483,7 @@ fn runCommandArgsForTest(alloc: Allocator, command: []const u8) ![]u8 {
 fn runCommandArgsWithCleanProfileForTest(alloc: Allocator, command: []const u8) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-    try out.writer.writeAll("{\"action\":\"exec\",\"command\":");
+    try out.writer.writeAll("{\"action\":\"run\",\"command\":");
     try std.json.Stringify.value(command, .{}, &out.writer);
     try out.writer.writeAll(",\"profile\":\"clean\",\"timeout_ms\":600000}");
     return out.toOwnedSlice();
@@ -3397,7 +3511,7 @@ fn executeTestRunCommand(
 }
 
 fn terminalExecCallForTest(arena: Allocator, call: ToolCall) !ToolCall {
-    if (std.mem.eql(u8, call.name, "terminal")) return call;
+    if (std.mem.eql(u8, call.name, "shell")) return call;
     if (!std.mem.eql(u8, call.name, "run_command")) return call;
     var args = try std.json.parseFromSliceLeaky(
         std.json.Value,
@@ -3406,13 +3520,13 @@ fn terminalExecCallForTest(arena: Allocator, call: ToolCall) !ToolCall {
         .{ .allocate = .alloc_always },
     );
     if (args != .object) return error.InvalidToolArguments;
-    try args.object.put(arena, "action", .{ .string = "exec" });
+    try args.object.put(arena, "action", .{ .string = "run" });
     try args.object.put(arena, "timeout_ms", .{ .integer = 600_000 });
     var out: std.Io.Writer.Allocating = .init(arena);
     defer out.deinit();
     try std.json.Stringify.value(args, .{}, &out.writer);
     var migrated = call;
-    migrated.name = "terminal";
+    migrated.name = "shell";
     migrated.arguments_json = try out.toOwnedSlice();
     return migrated;
 }
@@ -3426,8 +3540,8 @@ test "registered terminal exec preserves invalid execution authority error" {
     const arena = arena_state.allocator();
     const call = ToolCall{
         .id = "invalid-authority",
-        .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"printf should-not-run\",\"timeout_ms\":600000}",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"printf should-not-run\",\"timeout_ms\":600000}",
     };
 
     try std.testing.expectError(
@@ -3498,7 +3612,7 @@ test "run command compatibility returns installer failure without shell fallback
 
     const failure = result.failure;
     try expectToolErrorField(failure, "type", "tool_execution_failed");
-    try expectToolErrorField(failure, "tool_name", "terminal");
+    try expectToolErrorField(failure, "tool_name", "shell");
     try expectToolErrorDetailString(failure, "error", "SkillInstallFailed");
 }
 
@@ -3775,14 +3889,6 @@ fn setTestHome(home: ?[]const u8) !void {
     io_mod.setEnvironMap(map);
 }
 
-test "background imports come from background and task modules" {
-    try std.testing.expect(BackgroundRuntime == @import("../background/background_runtime.zig").BackgroundRuntime);
-    try std.testing.expect(task_helpers.TaskState == @import("../tasks/task_helpers.zig").TaskState);
-
-    const language = splitConversationLanguage(session_runtime.ConversationLanguage.literal("es"));
-    try std.testing.expectEqualStrings("es", language.view());
-}
-
 test "tool runtime explicit cancellation source overrides worker fallback" {
     var cancel_flag = std.atomic.Value(bool).init(false);
     var rt = TestRuntime{ .cancel_flag = &cancel_flag };
@@ -3825,7 +3931,8 @@ test "read-only local runtime tools are registered in built-in registry" {
         const found = registry.lookup(case.name) orelse return error.TestExpectedEqual;
         try std.testing.expectEqual(case.kind, found.executor_kind);
     }
-    const terminal_tool = registry.lookup("terminal") orelse return error.TestExpectedEqual;
+    const terminal_tool = test_builtin_tools.registry.lookup("shell") orelse
+        return error.TestExpectedEqual;
     try std.testing.expectEqual(tool_specs.ExecutorKind.terminal, terminal_tool.executor_kind);
     try std.testing.expect(registry.lookup("run_command") == null);
 }
@@ -3858,16 +3965,16 @@ test "tool runtime validates and executes only tools from supplied registry" {
     try std.testing.expect((try validateToolCall(read_rt.context(), arena, call)) == .valid);
 }
 
-test "removed tool names are not callable" {
+test "legacy capability search tool names are not callable" {
     var rt = TestRuntime{};
     defer rt.deinit(std.testing.allocator);
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    for ([_][]const u8{ "memory", "skill_search", "mcp_search_tools" }) |name| {
+    for ([_][]const u8{ "skill_search", "mcp_search_tools" }) |name| {
         const result = try executeToolCall(rt.context(), arena, .{
-            .id = "removed-tool",
+            .id = "legacy-search",
             .name = name,
             .arguments_json = "{\"query\":\"review runtime\"}",
         });
@@ -3910,6 +4017,14 @@ fn registryOwnedAskQuestionCall(
         return error.InvalidToolArguments;
     }
     return .{ .success = try ctx.allocator.dupe(u8, "registry-owned ask_user_question") };
+}
+
+fn registryOwnedMemoryCall(
+    ctx: tool_dispatch.DispatchContext,
+    input: tool_dispatch.ToolInput,
+) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
+    _ = input;
+    return .{ .success = try ctx.allocator.dupe(u8, "registry-owned memory") };
 }
 
 fn registryOwnedSkillCall(
@@ -4109,14 +4224,14 @@ test "terminal exec execution uses supplied registry entry" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    var registered_run_command = test_builtin_tools.terminal;
+    var registered_run_command = test_builtin_tools.shell;
     registered_run_command.call = registryOwnedTerminalExecCall;
     const tools = [_]tool_dispatch.Tool{registered_run_command};
     const registry = tool_dispatch.Registry{ .tools = tools[0..] };
     const call = ToolCall{
         .id = "run-command-registry",
-        .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"printf bypassed\",\"timeout_ms\":600000}",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"printf bypassed\",\"timeout_ms\":600000}",
     };
 
     var rt = TestRuntime{ .tool_registry = registry };
@@ -4140,18 +4255,21 @@ test "terminal exec execution uses supplied registry entry" {
     try std.testing.expectEqualStrings("registry-owned terminal exec", result.model_output);
 }
 
-test "stateful skill tool execution uses supplied registry entries" {
+test "stateful local tool execution uses supplied registry entries" {
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
+    var registered_memory = test_builtin_tools.memory;
+    registered_memory.call = registryOwnedMemoryCall;
     var registered_skill = test_builtin_tools.skill;
     registered_skill.call = registryOwnedSkillCall;
     var registered_install_skill = test_builtin_tools.install_skill;
     registered_install_skill.call = registryOwnedInstallSkillCall;
 
     const tools = [_]tool_dispatch.Tool{
+        registered_memory,
         registered_skill,
         registered_install_skill,
     };
@@ -4165,6 +4283,7 @@ test "stateful skill tool execution uses supplied registry entries" {
         args: []const u8,
         expected: []const u8,
     }{
+        .{ .name = "memory", .args = "{\"action\":\"save\",\"fact\":\"likes registries\"}", .expected = "registry-owned memory" },
         .{ .name = "skill", .args = "{\"name\":\"workflow\"}", .expected = "registry-owned skill" },
         .{ .name = "install_skill", .args = "{\"source\":\"/tmp/skills\",\"skill\":\"workflow\"}", .expected = "registry-owned install_skill" },
     };
@@ -4274,8 +4393,8 @@ test "validateToolCall preserves the registered captured command host" {
 
     try std.testing.expect((try validateToolCall(rt.context(), arena_state.allocator(), .{
         .id = "workspace-terminal",
-        .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"printf ok\"}",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"printf ok\"}",
     })) == .valid);
 }
 
@@ -4612,16 +4731,16 @@ test "run_command default user profile requires configured or reviewed shell aut
 
     const direct = (try tool_admission.requestPermissionOutcome(rt.context().admissionInput(), arena, .{
         .id = "direct",
-        .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"pwd\"}",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"pwd\"}",
     }, .ask, &.{}));
     try std.testing.expectEqual(ToolPermissionDecision.permission_required, direct.decision);
     try std.testing.expect(direct.execution_authority == null);
 
     const blocked = (try tool_admission.requestPermissionOutcome(rt.context().admissionInput(), arena, .{
         .id = "blocked",
-        .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"touch blocked.txt\"}",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"touch blocked.txt\"}",
     }, .ask, &.{}));
     try std.testing.expectEqual(ToolPermissionDecision.permission_required, blocked.decision);
     try std.testing.expect(blocked.execution_authority == null);
@@ -4632,8 +4751,8 @@ test "run_command default user profile requires configured or reviewed shell aut
     rt.permission_rules = .{ .rules = &rules };
     const configured = (try tool_admission.requestPermissionOutcome(rt.context().admissionInput(), arena, .{
         .id = "configured",
-        .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"touch configured.txt\"}",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"touch configured.txt\"}",
     }, .ask, &.{}));
     switch ((configured.execution_authority orelse return error.TestExpectedEqual).run_command) {
         .direct_only => return error.TestExpectedShellAllowed,
@@ -4644,8 +4763,8 @@ test "run_command default user profile requires configured or reviewed shell aut
     rt.permission_rules = .{};
     const automatic = (try tool_admission.requestPermissionOutcome(rt.context().admissionInput(), arena, .{
         .id = "automatic",
-        .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"touch automatic.txt\"}",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"touch automatic.txt\"}",
     }, .auto, &.{}));
     switch ((automatic.execution_authority orelse return error.TestExpectedEqual).run_command) {
         .direct_only => return error.TestExpectedShellAllowed,
@@ -4674,8 +4793,8 @@ test "tool context projects immutable session permission state into admission" {
     const arena = arena_state.allocator();
     const call = ToolCall{
         .id = "runtime-session-deny",
-        .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"touch configured.txt\"}",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"touch configured.txt\"}",
     };
     const key = try tool_admission.permissionStateKeyForCall(
         rt.context().admissionInput(),
@@ -5862,8 +5981,8 @@ test "terminal exec request timeout reaches execution without an ambient timeout
 
     const result = try executeTestRunCommand(rt.context(), arena, .{
         .id = "request-timeout",
-        .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"sleep 1\",\"profile\":\"clean\",\"timeout_ms\":25}",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"sleep 1\",\"profile\":\"clean\",\"timeout_ms\":25}",
     });
 
     try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, result.status);
@@ -5910,8 +6029,8 @@ test "saved noninteractive terminal exec captures replay by capability" {
 
     const result = try executeTestRunCommand(rt.context(), arena_state.allocator(), .{
         .id = "saved-noninteractive",
-        .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"printf replay\",\"profile\":\"clean\",\"timeout_ms\":600000}",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"printf replay\",\"profile\":\"clean\",\"timeout_ms\":600000}",
     });
     defer if (result.command_replay_capture) |capture| {
         capture.abort(arena_state.allocator());
@@ -6005,8 +6124,8 @@ test "no-save terminal exec publishes one readable ephemeral replay" {
     const arena = arena_state.allocator();
     const tool_call = ToolCall{
         .id = "no-save-replay",
-        .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"printf ephemeral-needle\",\"profile\":\"clean\",\"timeout_ms\":600000}",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"printf ephemeral-needle\",\"profile\":\"clean\",\"timeout_ms\":600000}",
     };
 
     const result = try executeTestRunCommand(rt.context(), arena, tool_call);
@@ -6096,8 +6215,8 @@ test "required replay spill failure returns recoverable capture failure" {
 
     const result = try executeTestRunCommand(rt.context(), arena_state.allocator(), .{
         .id = "capture-failure",
-        .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"printf xx\",\"profile\":\"clean\",\"timeout_ms\":600000}",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"printf xx\",\"profile\":\"clean\",\"timeout_ms\":600000}",
     });
     defer if (result.command_replay_capture) |capture| {
         capture.abort(arena_state.allocator());
@@ -6145,8 +6264,8 @@ test "run_command timeout returns model-visible failure" {
     const arena = arena_state.allocator();
     const tool_call: ToolCall = .{
         .id = "cmd",
-        .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"printf 'PRE-TIMEOUT-OUT\\n'; printf 'PRE-TIMEOUT-ERR\\n' >&2; sleep 5\",\"profile\":\"clean\",\"timeout_ms\":5000}",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"printf 'PRE-TIMEOUT-OUT\\n'; printf 'PRE-TIMEOUT-ERR\\n' >&2; sleep 5\",\"profile\":\"clean\",\"timeout_ms\":5000}",
     };
 
     const result = try executeTestRunCommand(rt.context(), arena, tool_call);
@@ -6164,7 +6283,7 @@ test "run_command timeout returns model-visible failure" {
     try expectNotContains(result.model_output, "PRE-TIMEOUT-OUT");
     try expectNotContains(result.model_output, "PRE-TIMEOUT-ERR");
     const structured = result.command_result_json orelse return error.TestExpectedEqual;
-    try expectCommandResultField(structured, "kind", "foreground");
+    try expectCommandResultField(structured, "kind", "command");
     try expectCommandResultField(
         structured,
         "command",
@@ -6438,7 +6557,7 @@ test "run_command post-spawn cancellation returns structured evidence in every m
     interactive_ctx.on_output_chunk = CancelTestCommandOnOutput.onChunk;
     const interactive = try executeTestRunCommand(interactive_ctx, arena, .{
         .id = "cancel-interactive",
-        .name = "terminal",
+        .name = "shell",
         .arguments_json = interactive_args,
     });
 
@@ -6448,7 +6567,7 @@ test "run_command post-spawn cancellation returns structured evidence in every m
     try std.testing.expect(interactive.cancelled);
     try std.testing.expectEqualStrings("command cancelled\n", interactive.model_output);
     const structured = interactive.command_result_json orelse return error.TestExpectedEqual;
-    try expectCommandResultField(structured, "kind", "foreground");
+    try expectCommandResultField(structured, "kind", "command");
     try expectCommandResultBool(structured, "truncated", false);
     try expectCommandResultStringPrefix(structured, "output_file", artifact_dir);
 
@@ -6470,7 +6589,7 @@ test "run_command post-spawn cancellation returns structured evidence in every m
     headless_ctx.on_output_chunk = CancelTestCommandOnOutput.onChunk;
     const headless = try executeTestRunCommand(headless_ctx, arena, .{
         .id = "cancel-headless",
-        .name = "terminal",
+        .name = "shell",
         .arguments_json = headless_args,
     });
     try std.testing.expect(headless_trigger.seen);
@@ -6479,7 +6598,7 @@ test "run_command post-spawn cancellation returns structured evidence in every m
     try std.testing.expect(headless.cancelled);
     try std.testing.expectEqualStrings("command cancelled\n", headless.model_output);
     const headless_structured = headless.command_result_json orelse return error.TestExpectedEqual;
-    try expectCommandResultField(headless_structured, "kind", "foreground");
+    try expectCommandResultField(headless_structured, "kind", "command");
     try expectCommandResultField(headless_structured, "command", headless_command);
     try expectCommandResultBool(headless_structured, "truncated", false);
     try expectCommandResultStringPrefix(headless_structured, "output_file", artifact_dir);
@@ -6496,7 +6615,7 @@ test "run_command post-spawn cancellation returns structured evidence in every m
         arena,
         .{
             .id = "cancel-broader-retry",
-            .name = "terminal",
+            .name = "shell",
             .arguments_json = headless_args,
         },
     );
@@ -6505,7 +6624,7 @@ test "run_command post-spawn cancellation returns structured evidence in every m
         .result_allocator = arena,
         .call = .{
             .id = "cancel-broader-retry",
-            .name = "terminal",
+            .name = "shell",
             .arguments_json = headless_args,
         },
         .authority = .{ .run_command = .{ .shell_allowed = .{
@@ -6535,13 +6654,13 @@ test "run_command success exposes structured foreground metadata" {
 
     const result = try executeTestRunCommand(rt.context(), arena_state.allocator(), .{
         .id = "cmd",
-        .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"printf '\\\\150\\\\145\\\\154\\\\154\\\\157'\",\"timeout_ms\":600000}",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"printf '\\\\150\\\\145\\\\154\\\\154\\\\157'\",\"timeout_ms\":600000}",
     });
 
     try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.success, result.status);
     const structured = result.command_result_json orelse return error.TestExpectedEqual;
-    try expectCommandResultField(structured, "kind", "foreground");
+    try expectCommandResultField(structured, "kind", "command");
     try expectCommandResultField(structured, "command", "printf '\\150\\145\\154\\154\\157'");
     try expectCommandResultField(structured, "cwd", "/tmp");
     try expectCommandResultInt(structured, "exit_code", 0);
@@ -6560,7 +6679,7 @@ fn fakeWorkspaceNonzero(
     timeout_ms: u32,
 ) js_host_workspace.ExecuteError!command_contract.RunCommandResult {
     if (timeout_ms != js_host_workspace.max_timeout_ms) return error.InvalidWorkspaceResult;
-    return command_contract.formatForegroundCommandResult(alloc, .{
+    return command_contract.formatCommandResult(alloc, .{
         .command = command,
         .cwd = cwd,
         .status = .{ .exit_code = 7 },
@@ -6578,7 +6697,7 @@ fn fakeWorkspaceTruncated(
     cwd: []const u8,
     _: u32,
 ) js_host_workspace.ExecuteError!command_contract.RunCommandResult {
-    var result = try command_contract.formatForegroundCommandResult(alloc, .{
+    var result = try command_contract.formatCommandResult(alloc, .{
         .command = command,
         .cwd = cwd,
         .status = .{ .exit_code = 0 },
@@ -6588,9 +6707,9 @@ fn fakeWorkspaceTruncated(
         .stderr_bytes = 0,
         .duration_ms = 4,
     });
-    var metadata = result.command_result.?.foreground;
+    var metadata = result.command_result.?;
     metadata.truncated = true;
-    result.command_result = .{ .foreground = metadata };
+    result.command_result = metadata;
     return result;
 }
 
@@ -6603,11 +6722,11 @@ fn fakeWorkspaceCancelled(
     return .{
         .output = "",
         .cancelled = true,
-        .command_result = .{ .foreground = .{
+        .command_result = .{
             .command = command,
             .cwd = cwd,
             .duration_ms = 3,
-        } },
+        },
     };
 }
 
@@ -6634,8 +6753,8 @@ test "browser run_command uses only the admitted host executor for nonzero and t
 
     const failed = try executeTestRunCommand(rt.context(), arena, .{
         .id = "browser-failed",
-        .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"exit 7\"}",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"exit 7\"}",
     });
     try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, failed.status);
     try expectToolErrorDetailInt(failed.model_output, "exit_code", 7);
@@ -6647,8 +6766,8 @@ test "browser run_command uses only the admitted host executor for nonzero and t
     rt.workspace_executor = .{ .execute_fn = fakeWorkspaceTruncated };
     const truncated = try executeTestRunCommand(rt.context(), arena, .{
         .id = "browser-truncated",
-        .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"generate output\"}",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"generate output\"}",
     });
     try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.success, truncated.status);
     const truncated_json = truncated.command_result_json orelse return error.TestExpectedEqual;
@@ -6670,8 +6789,8 @@ test "browser run_command maps host cancellation and deadline without signal or 
 
     const cancelled = try executeTestRunCommand(rt.context(), arena, .{
         .id = "browser-cancelled",
-        .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"long command\"}",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"long command\"}",
     });
     try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, cancelled.status);
     try std.testing.expect(cancelled.cancelled);
@@ -6682,8 +6801,8 @@ test "browser run_command maps host cancellation and deadline without signal or 
     rt.workspace_executor = .{ .execute_fn = fakeWorkspaceDeadline };
     const timed_out = try executeTestRunCommand(rt.context(), arena, .{
         .id = "browser-timeout",
-        .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"long command\"}",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"long command\"}",
     });
     try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, timed_out.status);
     try expectContains(timed_out.model_output, "timeout=true\n");
@@ -6717,8 +6836,8 @@ test "run_command propagates output callback failure" {
         error.OutOfMemory,
         executeTestRunCommand(ctx, arena_state.allocator(), .{
             .id = "cmd",
-            .name = "terminal",
-            .arguments_json = "{\"action\":\"exec\",\"command\":\"printf 'handoff\\\\n'\",\"timeout_ms\":600000}",
+            .name = "shell",
+            .arguments_json = "{\"action\":\"run\",\"command\":\"printf 'handoff\\\\n'\",\"timeout_ms\":600000}",
         }),
     );
 }
@@ -6736,8 +6855,8 @@ test "run_command returns model output and structured metadata" {
 
     const result = try executeTestRunCommand(rt.context(), arena_state.allocator(), .{
         .id = "cmd",
-        .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"printf 'quiet-stdout\\\\n'; printf 'quiet-stderr\\\\n' >&2\",\"timeout_ms\":600000}",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"printf 'quiet-stdout\\\\n'; printf 'quiet-stderr\\\\n' >&2\",\"timeout_ms\":600000}",
     });
 
     try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.success, result.status);
@@ -6746,7 +6865,7 @@ test "run_command returns model output and structured metadata" {
     try expectContains(result.model_output, "<stderr>\nquiet-stderr\n</stderr>\n");
 
     const structured = result.command_result_json orelse return error.TestExpectedEqual;
-    try expectCommandResultField(structured, "kind", "foreground");
+    try expectCommandResultField(structured, "kind", "command");
     try expectCommandResultInt(structured, "exit_code", 0);
     try expectCommandResultInt(structured, "stdout_bytes", 13);
     try expectCommandResultInt(structured, "stderr_bytes", 13);
@@ -6767,13 +6886,13 @@ test "run_command nonzero exit returns structured masked failure" {
 
     const result = try executeTestRunCommand(rt.context(), arena_state.allocator(), .{
         .id = "cmd",
-        .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"printf 'bad AKIA0123456789ABCDEF\\\\n' >&2; exit 7\",\"timeout_ms\":600000}",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"printf 'bad AKIA0123456789ABCDEF\\\\n' >&2; exit 7\",\"timeout_ms\":600000}",
     });
 
     try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, result.status);
     try expectToolErrorField(result.model_output, "type", "tool_execution_failed");
-    try expectToolErrorField(result.model_output, "tool_name", "terminal");
+    try expectToolErrorField(result.model_output, "tool_name", "shell");
     try expectToolErrorDetailString(result.model_output, "command", "printf 'bad [redacted]\\n' >&2; exit 7");
     try expectToolErrorDetailString(result.model_output, "cwd", "/tmp");
     try expectToolErrorDetailInt(result.model_output, "exit_code", 7);
@@ -6781,7 +6900,7 @@ test "run_command nonzero exit returns structured masked failure" {
     try expectContains(result.model_output, "Inspect stderr");
     try expectNotContains(result.model_output, "AKIA0123456789ABCDEF");
     const structured = result.command_result_json orelse return error.TestExpectedEqual;
-    try expectCommandResultField(structured, "kind", "foreground");
+    try expectCommandResultField(structured, "kind", "command");
     try expectCommandResultInt(structured, "exit_code", 7);
     try expectCommandResultInt(structured, "stdout_bytes", 0);
     try expectCommandResultInt(structured, "stderr_bytes", 25);
@@ -6819,8 +6938,8 @@ test "run_command huge output exposes truncation and artifact paths without stdo
 
     const result = try executeTestRunCommand(rt.context(), arena_state.allocator(), .{
         .id = "cmd",
-        .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"printf %026d 0\",\"timeout_ms\":600000}",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"printf %026d 0\",\"timeout_ms\":600000}",
     });
 
     try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.success, result.status);
@@ -6834,24 +6953,21 @@ test "run_command huge output exposes truncation and artifact paths without stdo
     try std.testing.expect(std.mem.find(u8, structured, "00000000000000000000000000") == null);
 }
 
-test "terminal exec rejects legacy background input without creating state" {
-    var rt = TestRuntime{};
+test "shell run rejects legacy background input without creating state" {
+    var rt = TestRuntime{ .tool_registry = test_builtin_tools.registry };
     defer rt.deinit(std.testing.allocator);
 
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const result = try executeToolCall(rt.context(), arena_state.allocator(), .{
         .id = "cmd",
-        .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"printf row07-headless-bg\",\"background\":true}",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"printf row07-headless-bg\",\"background\":true}",
     });
 
     try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, result.status);
     try expectContains(result.model_output, "\"code\":\"invalid_action_fields\"");
     try expectContains(result.model_output, "\"invalid_fields\":[\"background\"]");
-    var tasks = try rt.background.snapshotTasks(std.testing.allocator);
-    defer tasks.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 0), tasks.items.len);
 }
 
 const PermissionThreadState = struct {
@@ -7425,74 +7541,82 @@ test "MCP unadvertised dynamic names do not receive permission targets" {
     try std.testing.expectEqual(ToolPermissionDecision.once, (try tool_admission.requestPermissionOutcome(ctx.admissionInput(), arena, .{ .id = "1", .name = "mcp_fs_write", .arguments_json = "{}" }, .auto, &.{})).decision);
 }
 
-test "terminal exec cannot reuse or replace a persisted legacy background task" {
+test "memory tool uses isolated HOME and preserves outputs" {
     const alloc = std.testing.allocator;
+    var no_home_rt = TestRuntime{};
+    defer no_home_rt.deinit(alloc);
+    try setTestHome(null);
+    try expectToolOutput(no_home_rt.context(), "memory", "{\"action\":\"list\"}", "memory unavailable: HOME not set");
+
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "background");
-    {
-        var file = try tmp.dir.createFile(io_mod.getIo(), "server.log", .{ .truncate = true });
+    try tmp.dir.createDirPath(io_mod.getIo(), "home");
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    try setTestHome(home);
+
+    var rt = TestRuntime{};
+    defer rt.deinit(alloc);
+    const ctx = rt.context();
+    try expectToolOutput(ctx, "memory", "{\"action\":\"list\"}", "No saved memories");
+
+    var rejected_arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer rejected_arena_state.deinit();
+    const rejected = try executeToolCall(ctx, rejected_arena_state.allocator(), .{
+        .id = "invalid-memory-action",
+        .name = "memory",
+        .arguments_json = "{\"action\":\"replace\",\"fact\":\"new value\"}",
+    });
+    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, rejected.status);
+    try std.testing.expectEqualStrings(
+        "memory field \"action\" must be one of: save, list, clear",
+        rejected.model_output,
+    );
+
+    try expectToolOutput(ctx, "memory", "{\"action\":\"save\",\"fact\":\"likes Zig\"}", "remembered");
+    try expectToolOutput(ctx, "memory", "{\"action\":\"save\",\"fact\":\"likes Zig\"}", "remembered");
+    try expectToolOutput(ctx, "memory", "{\"action\":\"list\"}", "- likes Zig\n");
+
+    const memories_path = try std.fs.path.join(alloc, &.{ home, ".fx", "memories.json" });
+    defer alloc.free(memories_path);
+    var file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), memories_path, .{});
+    const content = blk: {
         defer file.close(io_mod.getIo());
-        try file.writeStreamingAll(io_mod.getIo(), "ready on http://localhost:49123\n");
+        break :blk try io_mod.readFileToEnd(alloc, &file, 4096);
+    };
+    defer alloc.free(content);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, content, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.array.items.len);
+    try std.testing.expectEqualStrings("likes Zig", parsed.value.array.items[0].string);
+
+    try expectToolOutput(ctx, "memory", "{\"action\":\"clear\"}", "memories cleared");
+    try expectToolOutput(ctx, "memory", "{\"action\":\"clear\"}", "memories cleared");
+    try expectToolOutput(ctx, "memory", "{\"action\":\"list\"}", "No saved memories");
+
+    try std.Io.Dir.createDirAbsolute(io_mod.getIo(), memories_path, .default_dir);
+    const survivor_path = try std.fs.path.join(alloc, &.{ memories_path, "must-survive.txt" });
+    defer alloc.free(survivor_path);
+    {
+        var survivor = try std.Io.Dir.createFileAbsolute(io_mod.getIo(), survivor_path, .{});
+        survivor.close(io_mod.getIo());
     }
 
-    const background_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "background");
-    defer alloc.free(background_dir);
-    const log_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "server.log");
-    defer alloc.free(log_path);
-
-    const Stub = struct {
-        fn match(
-            pid_text: []const u8,
-            _: process_supervisor.ProcessInstanceToken,
-        ) process_supervisor.TokenMatch {
-            return if (std.mem.eql(u8, pid_text, "12345"))
-                .matched
-            else
-                .missing;
-        }
-    };
-    process_supervisor.process_token_match_for_test = Stub.match;
-    defer process_supervisor.process_token_match_for_test = null;
-    const token = try process_supervisor.ProcessInstanceToken.parse(
-        "linux:00112233445566778899aabbccddeeff:12345",
+    var failed_clear_arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer failed_clear_arena_state.deinit();
+    const failed_clear = try executeToolCall(ctx, failed_clear_arena_state.allocator(), .{
+        .id = "failed-memory-clear",
+        .name = "memory",
+        .arguments_json = "{\"action\":\"clear\"}",
+    });
+    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, failed_clear.status);
+    try std.testing.expectEqualStrings(
+        "memory clear failed: saved memories were not removed; ensure ~/.fx/memories.json is a removable file and retry",
+        failed_clear.model_output,
     );
-    const pid_text = "12345";
 
-    var rt = TestRuntime{
-        .workspace_root = "/tmp/fx",
-        .interactive = false,
-        .background = BackgroundRuntime.init(
-            background_process_provider.process_supervisor_test_provider,
-        ),
-    };
-    defer rt.deinit(alloc);
-    try rt.background.enablePersistence(alloc, background_dir);
-    const task_id = try rt.background.registerBackgroundDurably(alloc, .{
-        .pid = pid_text,
-        .process_token = token,
-        .command = "npm run dev",
-        .cwd = "/tmp/fx",
-        .log_path = log_path,
-        .expect_url = true,
-        .url = "http://localhost:49123",
-    });
-
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const result = try executeToolCall(rt.context(), arena_state.allocator(), .{
-        .id = "1",
-        .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"npm run dev\",\"background\":true}",
-    });
-
-    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, result.status);
-    try expectContains(result.model_output, "\"code\":\"invalid_action_fields\"");
-    try expectContains(result.model_output, "\"invalid_fields\":[\"background\"]");
-    var tasks = try rt.background.snapshotTasks(alloc);
-    defer tasks.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 1), tasks.items.len);
-    try std.testing.expectEqual(task_id, tasks.items[0].id);
+    var survivor = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), survivor_path, .{});
+    survivor.close(io_mod.getIo());
 }
 
 test "install_skill explicit tool installs local skill source" {

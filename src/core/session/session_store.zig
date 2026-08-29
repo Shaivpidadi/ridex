@@ -4225,7 +4225,6 @@ fn copyRecoveredImageSnapshots(
         const images = switch (turn.*) {
             .compacted_summary => continue,
             .assistant => |*entry| entry.user.images,
-            .background_command => |*entry| entry.user.images,
             .interrupted => |*entry| entry.user.images,
         };
         for (images) |*image| {
@@ -4264,7 +4263,6 @@ fn rebaseRecoveredImageSnapshots(
         const images = switch (turn.*) {
             .compacted_summary => continue,
             .assistant => |*entry| entry.user.images,
-            .background_command => |*entry| entry.user.images,
             .interrupted => |*entry| entry.user.images,
         };
         for (images) |*image| {
@@ -4296,7 +4294,6 @@ fn copyRecoveredManagedChildren(
         const execution = switch (turn.*) {
             .compacted_summary => continue,
             .assistant => |*entry| &entry.execution,
-            .background_command => |*entry| &entry.execution,
             .interrupted => |*entry| &entry.execution,
         };
         for (execution.tool_steps) |*step| {
@@ -4602,7 +4599,6 @@ fn resolveSessionSnapshotLocators(
         const images = switch (turn.*) {
             .compacted_summary => continue,
             .assistant => |*entry| entry.user.images,
-            .background_command => |*entry| entry.user.images,
             .interrupted => |*entry| entry.user.images,
         };
         for (images) |*image| {
@@ -4623,13 +4619,11 @@ fn deleteSnapshotFilesAddedByMigration(
         const candidate_images = switch (candidate_turn) {
             .compacted_summary => &.{},
             .assistant => |entry| entry.user.images,
-            .background_command => |entry| entry.user.images,
             .interrupted => |entry| entry.user.images,
         };
         const original_images = switch (original_turn) {
             .compacted_summary => &.{},
             .assistant => |entry| entry.user.images,
-            .background_command => |entry| entry.user.images,
             .interrupted => |entry| entry.user.images,
         };
         image_attachments.deleteUnreferencedImageSnapshots(
@@ -13748,12 +13742,9 @@ test "history page preserves specialized canonical turns and deep-copy ownership
             .assistant = @constCast("assistant λ"),
             .execution = .{ .tool_steps = &steps },
         } },
-        .{ .background_command = .{
+        .{ .assistant = .{
             .user = .{ .text = @constCast("background") },
-            .assistant = @constCast("started"),
-            .log_path = @constCast("/tmp/background.log"),
-            .expect_url = true,
-            .url = @constCast("https://example.test"),
+            .assistant = @constCast("historical command"),
         } },
         .{ .interrupted = .{
             .user = .{ .text = @constCast("interrupted") },
@@ -13772,7 +13763,7 @@ test "history page preserves specialized canonical turns and deep-copy ownership
     defer first.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 4), first.turns.len);
     try std.testing.expectEqualStrings("tool output", first.turns[0].assistant.execution.tool_steps[0].tool_results[0].output);
-    try std.testing.expectEqualStrings("/tmp/background.log", first.turns[1].background_command.log_path);
+    try std.testing.expectEqualStrings("historical command", first.turns[1].assistant.assistant);
     try std.testing.expectEqualStrings("partial", first.turns[2].interrupted.assistant.?);
     try std.testing.expectEqualStrings("compacted λ", first.turns[3].compacted_summary.summary);
     first.turns[0].assistant.assistant[0] = 'X';

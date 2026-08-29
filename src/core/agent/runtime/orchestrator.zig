@@ -27,7 +27,6 @@ const tooling_tool_admission = @import("../../tooling/tool_admission.zig");
 const tool_args = @import("../../tooling/tool_args.zig");
 const hooks = @import("../../hooks/hooks.zig");
 const command_environment = @import("../../execution/command_environment.zig");
-const terminal_contracts = @import("../../terminal/contracts.zig");
 const context_contract = @import("../../workspace/context_contract.zig");
 const tool_preparation = @import("../tool_preparation.zig");
 const command_admission = @import("../../permissions/command_admission.zig");
@@ -47,7 +46,6 @@ const image_attachments = @import("../../images/image_attachments.zig");
 const runtime_assistant_stream = @import("assistant_stream.zig");
 const runtime_tool_presentation = @import("tool_presentation.zig");
 const runtime_execution_memory = @import("execution_memory.zig");
-const runtime_stop_policy = @import("stop_policy.zig");
 const runtime_tool_admission = @import("tool_admission.zig");
 const runtime_interruption = @import("interruption.zig");
 const runtime_parallel_execution = @import("parallel_execution.zig");
@@ -70,7 +68,7 @@ const http_error_detail_max_bytes: usize = 4096;
 const post_tool_decision_prompt =
     "Continue the original task. If work remains and you can proceed, briefly tell the user what you are doing next, then perform that action with the appropriate tool. Do not end the turn with only a progress update. If the task is complete, respond with the result. If a genuine blocker prevents further action, explain the blocker and what is needed to continue.";
 const repeated_terminal_validation_notice =
-    "Repeated terminal validation failures stopped the tool loop. The invalid terminal calls were not executed and produced no terminal effect.";
+    "Repeated shell validation failures stopped the tool loop. The invalid shell calls were not executed and produced no shell effect.";
 const repeated_malformed_arguments_notice =
     "Repeated malformed tool arguments stopped the agent loop. The invalid calls were not executed. Continue with a follow-up prompt if needed.";
 const Config = runtime_config.Config;
@@ -118,7 +116,7 @@ fn terminal_request_schema_advertised(
     advertised_functions: []const model_tool_schema.FunctionSchema,
 ) bool {
     for (advertised_functions) |function| {
-        if (!std.mem.eql(u8, function.name, "terminal")) continue;
+        if (!std.mem.eql(u8, function.name, "shell")) continue;
         return model_tool_schema.isSingleRequiredObjectUnionField(
             function.input_schema,
             "request",
@@ -263,16 +261,118 @@ fn free_terminal_request_projection(
     projected: []const ChatMessage,
 ) void {
     if (source.ptr == projected.ptr) return;
-    for (projected, source) |message, original| {
-        if (message.tool_calls.ptr == original.tool_calls.ptr) continue;
-        for (message.tool_calls, original.tool_calls) |call, original_call| {
-            if (call.arguments_json.ptr != original_call.arguments_json.ptr) {
-                alloc.free(@constCast(call.arguments_json));
-            }
+    for (projected) |message| {
+        if (message.content) |content| alloc.free(@constCast(content));
+        for (message.tool_calls) |call| {
+            alloc.free(@constCast(call.arguments_json));
         }
-        alloc.free(@constCast(message.tool_calls));
+        if (message.tool_calls.len != 0) {
+            alloc.free(@constCast(message.tool_calls));
+        }
     }
     alloc.free(@constCast(projected));
+}
+
+const LegacyTerminalCall = struct {
+    id: []const u8,
+    action: []const u8,
+    mapped: bool,
+};
+
+fn legacyTerminalAction(arguments_json: []const u8) ?[]const u8 {
+    var parsed = std.json.parseFromSlice(
+        std.json.Value,
+        std.heap.page_allocator,
+        arguments_json,
+        .{},
+    ) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const action = parsed.value.object.get("action") orelse return null;
+    if (action != .string) return null;
+    for ([_][]const u8{
+        "exec",
+        "start",
+        "read",
+        "screen",
+        "write",
+        "wait",
+        "monitor",
+        "inspect",
+        "list",
+        "resize",
+        "signal",
+        "close",
+    }) |known| {
+        if (std.mem.eql(u8, action.string, known)) return known;
+    }
+    return "unknown";
+}
+
+fn projectLegacyTerminalExecArguments(
+    alloc: Allocator,
+    arguments_json: []const u8,
+) Allocator.Error!?[]u8 {
+    var parsed = std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        arguments_json,
+        .{},
+    ) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => null,
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const action = parsed.value.object.get("action") orelse return null;
+    if (action != .string or !std.mem.eql(u8, action.string, "exec")) return null;
+    const command = parsed.value.object.get("command") orelse return null;
+    if (command != .string) return null;
+    var request = std.json.Value{ .object = .empty };
+    errdefer request.object.deinit(alloc);
+    try request.object.put(alloc, "action", .{ .string = "run" });
+    try request.object.put(alloc, "command", command);
+    for ([_][]const u8{ "cwd", "profile", "timeout_ms" }) |name| {
+        if (parsed.value.object.get(name)) |value| {
+            try request.object.put(alloc, name, value);
+        }
+    }
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    std.json.Stringify.value(.{ .request = request }, .{}, &out.writer) catch
+        return error.OutOfMemory;
+    return try out.toOwnedSlice();
+}
+
+fn findLegacyCall(
+    calls: []const LegacyTerminalCall,
+    id: []const u8,
+) ?LegacyTerminalCall {
+    for (calls) |call| {
+        if (std.mem.eql(u8, call.id, id)) return call;
+    }
+    return null;
+}
+
+fn legacyToolSummary(
+    alloc: Allocator,
+    action: []const u8,
+    content: ?[]const u8,
+) Allocator.Error![]u8 {
+    const body = content orelse "";
+    const bounded = text_utils.utf8PrefixByBytes(body, 4096);
+    return if (bounded.len == 0)
+        std.fmt.allocPrint(
+            alloc,
+            "[Prior terminal {s} action completed.]",
+            .{action},
+        )
+    else
+        std.fmt.allocPrint(
+            alloc,
+            "[Prior terminal {s} action completed. Stored result follows.]\n{s}",
+            .{ action, bounded },
+        );
 }
 
 fn project_terminal_request_messages(
@@ -282,39 +382,138 @@ fn project_terminal_request_messages(
     source: []const ChatMessage,
 ) Allocator.Error![]const ChatMessage {
     if (!attempt_eligible) return source;
+    if (registry.lookup("shell") == null) return source;
 
-    var projected: ?[]ChatMessage = null;
-    errdefer if (projected) |messages| {
-        free_terminal_request_projection(alloc, source, messages);
-    };
-
-    for (source, 0..) |message, message_index| {
+    var legacy_calls: std.ArrayList(LegacyTerminalCall) = .empty;
+    defer legacy_calls.deinit(alloc);
+    var needs_projection = false;
+    for (source) |message| {
         if (message.role != .assistant) continue;
-        for (message.tool_calls, 0..) |call, call_index| {
+        for (message.tool_calls) |call| {
             if (call.argument_integrity != .valid) continue;
+            if (std.mem.eql(u8, call.name, "terminal")) {
+                const action = legacyTerminalAction(call.arguments_json) orelse "unknown";
+                try legacy_calls.append(alloc, .{
+                    .id = call.id,
+                    .action = action,
+                    .mapped = std.mem.eql(u8, action, "exec"),
+                });
+                needs_projection = true;
+                continue;
+            }
             const tool = registry.lookup(call.name) orelse continue;
             if (tool.executor_kind != .terminal) continue;
-            const arguments_json = try projected_terminal_request_arguments(
-                alloc,
-                call.arguments_json,
-            ) orelse continue;
-
-            if (projected == null) {
-                projected = alloc.dupe(ChatMessage, source) catch |err| {
-                    alloc.free(arguments_json);
-                    return err;
-                };
+            if (try projected_terminal_request_arguments(alloc, call.arguments_json)) |arguments| {
+                alloc.free(arguments);
+                needs_projection = true;
             }
-            if (projected.?[message_index].tool_calls.ptr == message.tool_calls.ptr) {
-                projected.?[message_index].tool_calls = alloc.dupe(ToolCall, message.tool_calls) catch |err| {
-                    alloc.free(arguments_json);
-                    return err;
-                };
-            }
-            @constCast(projected.?[message_index].tool_calls)[call_index].arguments_json = arguments_json;
         }
     }
-    return projected orelse source;
+    if (!needs_projection) return source;
+
+    const projected = try alloc.alloc(ChatMessage, source.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (projected[0..initialized]) |message| {
+            if (message.content) |content| alloc.free(@constCast(content));
+            for (message.tool_calls) |call| {
+                alloc.free(@constCast(call.arguments_json));
+            }
+            if (message.tool_calls.len != 0) {
+                alloc.free(@constCast(message.tool_calls));
+            }
+        }
+        alloc.free(projected);
+    }
+    for (source, projected) |message, *target| {
+        target.* = message;
+        target.content = null;
+        target.tool_calls = &.{};
+        initialized += 1;
+        target.content = if (message.content) |content|
+            try alloc.dupe(u8, content)
+        else
+            null;
+
+        if (message.role == .tool and message.tool_call_id != null) {
+            if (findLegacyCall(legacy_calls.items, message.tool_call_id.?)) |legacy| {
+                if (legacy.mapped) {
+                    target.tool_name = "shell";
+                } else {
+                    if (target.content) |content| {
+                        alloc.free(@constCast(content));
+                        target.content = null;
+                    }
+                    target.role = .assistant;
+                    target.content = try legacyToolSummary(
+                        alloc,
+                        legacy.action,
+                        message.content,
+                    );
+                    target.tool_call_id = null;
+                    target.tool_name = null;
+                }
+            }
+        }
+
+        if (message.tool_calls.len != 0) {
+            var calls: std.ArrayList(ToolCall) = .empty;
+            errdefer {
+                for (calls.items) |call| alloc.free(@constCast(call.arguments_json));
+                calls.deinit(alloc);
+            }
+            for (message.tool_calls) |call| {
+                if (call.argument_integrity == .valid and
+                    std.mem.eql(u8, call.name, "terminal"))
+                {
+                    const legacy = findLegacyCall(legacy_calls.items, call.id) orelse continue;
+                    if (!legacy.mapped) continue;
+                    const arguments = try projectLegacyTerminalExecArguments(
+                        alloc,
+                        call.arguments_json,
+                    ) orelse continue;
+                    var mapped = call;
+                    mapped.name = "shell";
+                    mapped.arguments_json = arguments;
+                    calls.append(alloc, mapped) catch |err| {
+                        alloc.free(arguments);
+                        return err;
+                    };
+                    continue;
+                }
+                const registered_terminal = if (registry.lookup(call.name)) |tool|
+                    tool.executor_kind == .terminal
+                else
+                    false;
+                const arguments = if (call.argument_integrity == .valid and
+                    registered_terminal)
+                    (try projected_terminal_request_arguments(
+                        alloc,
+                        call.arguments_json,
+                    )) orelse try alloc.dupe(u8, call.arguments_json)
+                else
+                    try alloc.dupe(u8, call.arguments_json);
+                var copied = call;
+                copied.arguments_json = arguments;
+                calls.append(alloc, copied) catch |err| {
+                    alloc.free(arguments);
+                    return err;
+                };
+            }
+            target.tool_calls = try calls.toOwnedSlice(alloc);
+        }
+        if (message.role == .assistant and
+            message.tool_calls.len != 0 and
+            target.tool_calls.len == 0 and
+            target.content == null)
+        {
+            target.content = try alloc.dupe(
+                u8,
+                "Prior terminal actions are represented as completed history summaries below.",
+            );
+        }
+    }
+    return projected;
 }
 
 fn normalized_terminal_request_arguments(
@@ -340,19 +539,14 @@ fn normalized_terminal_request_arguments(
     return try out.toOwnedSlice();
 }
 
-const AgentTerminalLeaseTransition = union(enum) {
-    track: []const u8,
-    remove: []const u8,
-    atomic: []const u8,
-};
-
-fn agent_terminal_lease_transition(
+fn agentShellWriteLeaseSessionId(
     alloc: Allocator,
     registry: tool_dispatch.Registry,
     call: ToolCall,
-) !?AgentTerminalLeaseTransition {
+) !?[]const u8 {
     const tool = registry.lookup(call.name) orelse return null;
-    if (tool.executor_kind != .terminal) return null;
+    if (tool.executor_kind != .terminal or
+        !std.mem.eql(u8, tool.name, "shell")) return null;
     const parsed = std.json.parseFromSliceLeaky(
         std.json.Value,
         alloc,
@@ -365,125 +559,44 @@ fn agent_terminal_lease_transition(
     if (parsed != .object) return error.InvalidTerminalLeaseTrackingInput;
     const action = parsed.object.get("action") orelse return error.InvalidTerminalLeaseTrackingInput;
     if (action != .string) return error.InvalidTerminalLeaseTrackingInput;
-    const is_write = std.mem.eql(u8, action.string, "write");
-    const is_close = std.mem.eql(u8, action.string, "close");
-    if (!is_write and !is_close) return null;
+    if (!std.mem.eql(u8, action.string, "write")) return null;
     const session_id = parsed.object.get("session_id") orelse
         return error.InvalidTerminalLeaseTrackingInput;
-    if (session_id != .string) {
+    if (session_id != .string or session_id.string.len == 0) {
         return error.InvalidTerminalLeaseTrackingInput;
     }
-    if (is_close) return .{ .remove = session_id.string };
-    const lease_value = parsed.object.get("lease");
-    const lease_absent = lease_value == null or terminal_lease_is_absent(lease_value.?);
-    if (lease_absent) {
-        const write = parsed.object.get("write") orelse
-            return error.InvalidTerminalLeaseTrackingInput;
-        if (write == .null) return error.InvalidTerminalLeaseTrackingInput;
-        return .{ .atomic = session_id.string };
-    }
-    const concrete_lease = lease_value.?;
-    if (concrete_lease != .string) return error.InvalidTerminalLeaseTrackingInput;
-    const lease = std.meta.stringToEnum(
-        terminal_contracts.WriteLeaseIntent,
-        concrete_lease.string,
-    ) orelse return error.InvalidTerminalLeaseTrackingInput;
-    return switch (lease) {
-        .acquire, .use => .{ .track = session_id.string },
-        .release, .revoke => .{ .remove = session_id.string },
-    };
+    return session_id.string;
 }
 
-test "agent terminal lease transitions derive from normalized validated actions" {
+test "shell write retains one internal finalization lease safety edge" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const terminal_tool = tool_dispatch.Tool{
-        .name = "terminal",
-        .description = "terminal",
-        .model_schema = .{ .name = "terminal", .description = "terminal" },
+    const shell_tool = tool_dispatch.Tool{
+        .name = "shell",
+        .description = "shell",
+        .model_schema = .{ .name = "shell", .description = "shell" },
         .executor_kind = .terminal,
         .decode = undefined,
         .call = undefined,
         .reads_only_fn = undefined,
         .irreversible_fn = undefined,
     };
-    const registry = tool_dispatch.Registry{ .tools = &.{terminal_tool} };
-    const cases = [_]struct {
-        lease: []const u8,
-        track: bool,
-    }{
-        .{ .lease = "acquire", .track = true },
-        .{ .lease = "use", .track = true },
-        .{ .lease = "release", .track = false },
-        .{ .lease = "revoke", .track = false },
-    };
-    for (cases) |case| {
-        const arguments_json = try std.fmt.allocPrint(
-            arena,
-            "{{\"action\":\"write\",\"session_id\":\"terminal-one\",\"lease\":\"{s}\",\"write\":null}}",
-            .{case.lease},
-        );
-        const transition = (try agent_terminal_lease_transition(
-            arena,
-            registry,
-            .{ .id = "call", .name = "terminal", .arguments_json = arguments_json },
-        )).?;
-        switch (transition) {
-            .track => |session_id| {
-                try std.testing.expect(case.track);
-                try std.testing.expectEqualStrings("terminal-one", session_id);
-            },
-            .remove => |session_id| {
-                try std.testing.expect(!case.track);
-                try std.testing.expectEqualStrings("terminal-one", session_id);
-            },
-            .atomic => unreachable,
-        }
-    }
-    const atomic_arguments = [_][]const u8{
-        "{\"action\":\"write\",\"session_id\":\"terminal-one\",\"write\":{\"kind\":\"text\",\"text\":\"input\"}}",
-        "{\"action\":\"write\",\"session_id\":\"terminal-one\",\"lease\":null,\"write\":{\"kind\":\"text\",\"text\":\"input\"}}",
-        "{\"action\":\"write\",\"session_id\":\"terminal-one\",\"lease\":\"null\",\"write\":{\"kind\":\"text\",\"text\":\"input\"}}",
-    };
-    for (atomic_arguments) |arguments_json| {
-        const atomic = (try agent_terminal_lease_transition(
-            arena,
-            registry,
-            .{
-                .id = "atomic",
-                .name = "terminal",
-                .arguments_json = arguments_json,
-            },
-        )).?;
-        switch (atomic) {
-            .atomic => |session_id| try std.testing.expectEqualStrings(
-                "terminal-one",
-                session_id,
-            ),
-            .track, .remove => unreachable,
-        }
-    }
-    const close = (try agent_terminal_lease_transition(
+    const registry = tool_dispatch.Registry{ .tools = &.{shell_tool} };
+    const session_id = (try agentShellWriteLeaseSessionId(
         arena,
         registry,
         .{
-            .id = "close",
-            .name = "terminal",
-            .arguments_json = "{\"action\":\"close\",\"session_id\":\"terminal-one\",\"close_policy\":\"force\"}",
+            .id = "write",
+            .name = "shell",
+            .arguments_json = "{\"action\":\"write\",\"session_id\":\"shell-one\",\"input\":{\"kind\":\"text\",\"text\":\"input\"}}",
         },
     )).?;
-    switch (close) {
-        .remove => |session_id| try std.testing.expectEqualStrings(
-            "terminal-one",
-            session_id,
-        ),
-        .track, .atomic => unreachable,
-    }
-    try std.testing.expect((try agent_terminal_lease_transition(
+    try std.testing.expectEqualStrings("shell-one", session_id);
+    try std.testing.expect((try agentShellWriteLeaseSessionId(
         arena,
         registry,
-        .{ .id = "list", .name = "terminal", .arguments_json = "{\"action\":\"list\"}" },
+        .{ .id = "list", .name = "shell", .arguments_json = "{\"action\":\"list\"}" },
     )) == null);
 }
 
@@ -524,13 +637,13 @@ fn normalize_terminal_request_tool_calls(
     return normalized orelse source;
 }
 
-test "terminal request normalization follows effective attempt advertisement" {
+test "shell request normalization follows effective attempt advertisement" {
     const nested = tool_dispatch.Tool{
-        .name = "terminal",
-        .description = "terminal",
+        .name = "shell",
+        .description = "shell",
         .model_schema = .{
-            .name = "terminal",
-            .description = "terminal",
+            .name = "shell",
+            .description = "shell",
             .input_schema = .{
                 .properties = &.{.{
                     .name = "request",
@@ -547,9 +660,9 @@ test "terminal request normalization follows effective attempt advertisement" {
         .irreversible_fn = undefined,
     };
     const flat = tool_dispatch.Tool{
-        .name = "terminal",
-        .description = "terminal",
-        .model_schema = .{ .name = "terminal", .description = "terminal" },
+        .name = "shell",
+        .description = "shell",
+        .model_schema = .{ .name = "shell", .description = "shell" },
         .decode = undefined,
         .call = undefined,
         .reads_only_fn = undefined,
@@ -604,15 +717,15 @@ test "terminal inferred model input round trips every atomic write payload" {
     }
 }
 
-test "terminal request projection wraps eligible flat objects without changing source messages" {
+test "shell request projection wraps eligible flat objects without changing source messages" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
     const terminal_tool = tool_dispatch.Tool{
-        .name = "terminal",
-        .description = "terminal",
-        .model_schema = .{ .name = "terminal", .description = "terminal" },
+        .name = "shell",
+        .description = "shell",
+        .model_schema = .{ .name = "shell", .description = "shell" },
         .executor_kind = .terminal,
         .decode = undefined,
         .call = undefined,
@@ -646,21 +759,21 @@ test "terminal request projection wraps eligible flat objects without changing s
     };
     var calls: [cases.len + 3]ToolCall = undefined;
     for (cases, 0..) |case, index| {
-        calls[index] = .{ .id = case.id, .name = "terminal", .arguments_json = case.input };
+        calls[index] = .{ .id = case.id, .name = "shell", .arguments_json = case.input };
     }
-    calls[cases.len] = .{ .id = "malformed", .name = "terminal", .arguments_json = "{", .argument_integrity = .malformed_json };
+    calls[cases.len] = .{ .id = "malformed", .name = "shell", .arguments_json = "{", .argument_integrity = .malformed_json };
     calls[cases.len + 1] = .{ .id = "unknown-tool", .name = "missing", .arguments_json = "{}" };
     calls[cases.len + 2] = .{ .id = "other-executor", .name = "browser_terminal", .arguments_json = "{}" };
     const messages = [_]ChatMessage{
         .{ .role = .user, .content = "keep user message", .tool_calls = calls[0..1] },
         .{ .role = .assistant, .content = "assistant", .tool_calls = &calls, .provider_state_json = "[]", .cache_policy = .no_cache },
-        .{ .role = .tool, .content = "keep result", .tool_call_id = "valid-action", .tool_name = "terminal" },
+        .{ .role = .tool, .content = "keep result", .tool_call_id = "valid-action", .tool_name = "shell" },
     };
 
     const projected = try project_terminal_request_messages(arena, registry, true, &messages);
     try std.testing.expect(projected.ptr != messages[0..].ptr);
     try std.testing.expectEqualStrings("keep user message", projected[0].content.?);
-    try std.testing.expectEqual(messages[0].tool_calls.ptr, projected[0].tool_calls.ptr);
+    try std.testing.expect(messages[0].tool_calls.ptr != projected[0].tool_calls.ptr);
     try std.testing.expectEqualStrings("assistant", projected[1].content.?);
     try std.testing.expectEqualStrings("[]", projected[1].provider_state_json.?);
     try std.testing.expectEqual(.no_cache, projected[1].cache_policy);
@@ -679,11 +792,87 @@ test "terminal request projection wraps eligible flat objects without changing s
     try std.testing.expectEqual(messages[0..].ptr, ineligible.ptr);
 }
 
+test "legacy terminal history maps exec and makes removed actions inert" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const shell_tool = tool_dispatch.Tool{
+        .name = "shell",
+        .description = "shell",
+        .model_schema = .{ .name = "shell", .description = "shell" },
+        .executor_kind = .terminal,
+        .decode = undefined,
+        .call = undefined,
+        .reads_only_fn = undefined,
+        .irreversible_fn = undefined,
+    };
+    const registry = tool_dispatch.Registry{ .tools = &.{shell_tool} };
+    const calls = [_]ToolCall{
+        .{
+            .id = "legacy-exec",
+            .name = "terminal",
+            .arguments_json = "{\"action\":\"exec\",\"command\":\"printf ok\",\"timeout_ms\":1000}",
+        },
+        .{
+            .id = "legacy-start",
+            .name = "terminal",
+            .arguments_json = "{\"action\":\"start\",\"command\":\"sleep 5\"}",
+        },
+    };
+    const messages = [_]ChatMessage{
+        .{ .role = .assistant, .tool_calls = &calls },
+        .{
+            .role = .tool,
+            .tool_call_id = "legacy-exec",
+            .tool_name = "terminal",
+            .content = "exit_code=0",
+        },
+        .{
+            .role = .tool,
+            .tool_call_id = "legacy-start",
+            .tool_name = "terminal",
+            .content = "session started",
+        },
+    };
+
+    const projected = try project_terminal_request_messages(
+        arena,
+        registry,
+        true,
+        &messages,
+    );
+    try std.testing.expectEqual(@as(usize, 1), projected[0].tool_calls.len);
+    try std.testing.expectEqualStrings("shell", projected[0].tool_calls[0].name);
+    try std.testing.expectEqualStrings(
+        "{\"request\":{\"action\":\"run\",\"command\":\"printf ok\",\"timeout_ms\":1000}}",
+        projected[0].tool_calls[0].arguments_json,
+    );
+    try std.testing.expectEqual(types.ChatRole.tool, projected[1].role);
+    try std.testing.expectEqualStrings("shell", projected[1].tool_name.?);
+    try std.testing.expectEqual(types.ChatRole.assistant, projected[2].role);
+    try std.testing.expect(projected[2].tool_call_id == null);
+    try std.testing.expect(projected[2].tool_name == null);
+    try std.testing.expect(std.mem.find(
+        u8,
+        projected[2].content.?,
+        "Prior terminal start action completed",
+    ) != null);
+    try std.testing.expectEqualStrings("terminal", messages[0].tool_calls[0].name);
+
+    const idempotent = try project_terminal_request_messages(
+        arena,
+        registry,
+        true,
+        projected,
+    );
+    try std.testing.expectEqual(projected.ptr, idempotent.ptr);
+}
+
 fn check_terminal_request_projection_allocation_failures(alloc: Allocator) !void {
     const terminal_tool = tool_dispatch.Tool{
-        .name = "terminal",
-        .description = "terminal",
-        .model_schema = .{ .name = "terminal", .description = "terminal" },
+        .name = "shell",
+        .description = "shell",
+        .model_schema = .{ .name = "shell", .description = "shell" },
         .executor_kind = .terminal,
         .decode = undefined,
         .call = undefined,
@@ -693,12 +882,12 @@ fn check_terminal_request_projection_allocation_failures(alloc: Allocator) !void
     const tools = [_]tool_dispatch.Tool{terminal_tool};
     const registry = tool_dispatch.Registry{ .tools = &tools };
     const first_calls = [_]ToolCall{
-        .{ .id = "one", .name = "terminal", .arguments_json = "{}" },
-        .{ .id = "two", .name = "terminal", .arguments_json = "{\"action\":null}" },
-        .{ .id = "atomic", .name = "terminal", .arguments_json = "{\"action\":\"write\",\"session_id\":\"terminal-a\",\"write\":{\"kind\":\"text\",\"text\":\"input\"}}" },
+        .{ .id = "one", .name = "shell", .arguments_json = "{}" },
+        .{ .id = "two", .name = "shell", .arguments_json = "{\"action\":null}" },
+        .{ .id = "atomic", .name = "shell", .arguments_json = "{\"action\":\"write\",\"session_id\":\"terminal-a\",\"write\":{\"kind\":\"text\",\"text\":\"input\"}}" },
     };
     const second_calls = [_]ToolCall{
-        .{ .id = "three", .name = "terminal", .arguments_json = "{\"action\":\"list\"}" },
+        .{ .id = "three", .name = "shell", .arguments_json = "{\"action\":\"list\"}" },
     };
     const source = [_]ChatMessage{
         .{ .role = .assistant, .tool_calls = &first_calls },
@@ -5338,7 +5527,6 @@ fn processQueuedPromptLoop(
                         .idempotent = prepareNoIdempotentTerminal,
                         .validation = prepareValidationTerminal,
                         .availability = prepareAvailabilityTerminal,
-                        .stop_policy = prepareNoIdempotentTerminal,
                         .deferred_dynamic = prepareDeferredDynamicCandidate,
                     },
                 }) catch |err| {
@@ -6210,49 +6398,6 @@ fn processQueuedPromptLoop(
                                     .{ .increment_error = true },
                                 );
                             },
-                            .stop_policy => {
-                                const defer_auto_lifecycle = try runtime_tool_admission.deferCapturedCommandLifecycleForAutoPermissionNotice(
-                                    deps.tool_registry,
-                                    arena,
-                                    tool_call,
-                                    root_action_permission_mode,
-                                    lifecycle.scope.kind == .interactive,
-                                );
-                                const status_started = if (runtime_tool_admission.deferVisibleLifecycleUntilAfterPermission(tool_call.name) and
-                                    !defer_auto_lifecycle)
-                                    false
-                                else
-                                    try runtime_tool_presentation.startToolVisibleLifecycle(
-                                        deps,
-                                        arena,
-                                        turn_id,
-                                        stream_ctx.provisional_statuses.presentation_group_id,
-                                        tool_call,
-                                        tool_display_target,
-                                        advertised_dynamic_tool_names,
-                                    );
-                                _ = try stream_ctx.provisional_statuses.finishDeniedCall(
-                                    deps,
-                                    stream_ctx.alloc,
-                                    arena,
-                                    turn_id,
-                                    tool_call,
-                                    status_started,
-                                    tool_display_target,
-                                    "Blocked",
-                                    advertised_dynamic_tool_names,
-                                );
-                                try runtime_tool_batch.appendToolResultContent(
-                                    arena,
-                                    &within_turn_suffix,
-                                    &completed_tool_names,
-                                    &step_batch,
-                                    tool_call,
-                                    safe_output,
-                                    null,
-                                    .{ .increment_error = true },
-                                );
-                            },
                             .file_mutation_failure => {
                                 const status_started = try runtime_tool_presentation.startToolVisibleLifecycle(
                                     deps,
@@ -6665,43 +6810,6 @@ fn processQueuedPromptLoop(
                 !defer_auto_command_lifecycle)
             {
                 status_started = try runtime_tool_presentation.startToolVisibleLifecycle(deps, arena, turn_id, stream_ctx.provisional_statuses.presentation_group_id, tool_call, tool_display_target, advertised_dynamic_tool_names);
-            }
-
-            if (try runtime_stop_policy.blockedNonLiveBackgroundRestart(
-                arena,
-                successful_source_messages,
-                tool_call,
-                job.prompt,
-            )) |blocked_output| {
-                _ = try stream_ctx.provisional_statuses.finishDeniedCall(
-                    deps,
-                    stream_ctx.alloc,
-                    arena,
-                    turn_id,
-                    tool_call,
-                    status_started,
-                    tool_display_target,
-                    "Blocked",
-                    advertised_dynamic_tool_names,
-                );
-                debug_trace.eventf(
-                    "tool",
-                    "execution_result",
-                    step_ctx,
-                    "call_id={s} name={s} result_kind=blocked_non_live_background_restart model_output_bytes={d}",
-                    .{ tool_call.id, tool_call.name, blocked_output.len },
-                );
-                try runtime_tool_batch.appendToolResultContent(
-                    arena,
-                    &within_turn_suffix,
-                    &completed_tool_names,
-                    &step_batch,
-                    tool_call,
-                    blocked_output,
-                    null,
-                    .{ .increment_error = true },
-                );
-                continue;
             }
 
             var file_call_arena_state: std.heap.ArenaAllocator = undefined;
@@ -7216,16 +7324,14 @@ fn processQueuedPromptLoop(
             else
                 null;
 
-            const terminal_lease_transition = try agent_terminal_lease_transition(
+            const terminal_write_lease_session_id = try agentShellWriteLeaseSessionId(
                 arena,
                 deps.tool_registry,
                 execution_call,
             );
-            if (terminal_lease_transition) |transition| switch (transition) {
-                .track => |session_id| try finalization.track_agent_terminal_lease(session_id),
-                .atomic => |session_id| try finalization.track_agent_terminal_lease(session_id),
-                .remove => {},
-            };
+            if (terminal_write_lease_session_id) |session_id| {
+                try finalization.track_agent_terminal_lease(session_id);
+            }
 
             debug_trace.eventf("tool", "before_tool_execution", step_ctx, "call_id={s} name={s}", .{ tool_call.id, tool_call.name });
             debug_trace.eventf("tool", "execution_start", step_ctx, "call_id={s} name={s}", .{ tool_call.id, tool_call.name });
@@ -7278,6 +7384,10 @@ fn processQueuedPromptLoop(
                 }
                 execution_error = err;
                 break :blk ToolExecutionResult{ .status = .failure, .model_output = try deps.format_tool_execution_error(deps.ctx, arena, tool_call.name, err) };
+            };
+            var result_commit_pending = execution.result_commit != null;
+            defer if (result_commit_pending) {
+                execution.result_commit.?.cancel();
             };
 
             if (execution.cancelled and config.cancel_flag.load(.seq_cst)) {
@@ -7360,11 +7470,9 @@ fn processQueuedPromptLoop(
             }
 
             if (execution.status == .success) {
-                if (terminal_lease_transition) |transition| switch (transition) {
-                    .track => {},
-                    .atomic => |session_id| finalization.remove_agent_terminal_lease(session_id),
-                    .remove => |session_id| finalization.remove_agent_terminal_lease(session_id),
-                };
+                if (terminal_write_lease_session_id) |session_id| {
+                    finalization.remove_agent_terminal_lease(session_id);
+                }
             }
 
             if (deps.tool_activity_recorder) |recorder| {
@@ -7459,7 +7567,7 @@ fn processQueuedPromptLoop(
                 execution.command_replay_capture,
             ) catch |err| switch (err) {
                 error.CommandOutputCaptureFailed => {
-                    const capture_failure = try command_result_mapping.Foreground.outputCaptureFailure(arena);
+                    const capture_failure = try command_result_mapping.Command.outputCaptureFailure(arena);
                     execution.status = .failure;
                     execution.model_output = capture_failure.model_output;
                     prepared.model_output = capture_failure.model_output;
@@ -7513,6 +7621,10 @@ fn processQueuedPromptLoop(
                         ),
                     },
                 );
+                if (execution.result_commit) |commit| {
+                    try commit.commit();
+                    result_commit_pending = false;
+                }
                 replay_handed_off = true;
                 if (permission_outcome.feedback) |feedback| {
                     try appendPermissionFeedbackAfterToolResult(
@@ -7586,6 +7698,10 @@ fn processQueuedPromptLoop(
                 prepared.memory,
                 execution,
             );
+            if (execution.result_commit) |commit| {
+                try commit.commit();
+                result_commit_pending = false;
+            }
             replay_handed_off = true;
             if (execution.system_notice) |notice| {
                 try within_turn_suffix.append(arena, .{ .role = .system, .content = notice });

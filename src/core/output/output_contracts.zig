@@ -1,7 +1,6 @@
 const std = @import("std");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
-const background_store = @import("../background/background_store.zig");
 const doctor_runtime = @import("../cli/doctor_runtime.zig");
 const model_provider = @import("../config/model_provider.zig");
 const mcp_contract = @import("../mcp/mcp_contract.zig");
@@ -1408,147 +1407,6 @@ pub const DoctorSnapshot = struct {
     }
 };
 
-pub const BackgroundListSnapshot = struct {
-    records: []const background_store.Record,
-
-    pub fn render(self: BackgroundListSnapshot, alloc: Allocator, format: OutputFormat) ![]u8 {
-        return switch (format) {
-            .text => self.renderText(alloc),
-            .json => self.renderJson(alloc),
-        };
-    }
-
-    pub fn renderText(self: BackgroundListSnapshot, alloc: Allocator) ![]u8 {
-        if (self.records.len == 0) {
-            return std.fmt.allocPrint(alloc, "[background] no persisted background records\n", .{});
-        }
-
-        var out: std.Io.Writer.Allocating = .init(alloc);
-        defer out.deinit();
-
-        try out.writer.print("[background] {d} saved\n", .{self.records.len});
-        for (self.records) |entry| {
-            try out.writer.print(" - #{d} [{s}] {s}\n", .{ entry.id, @tagName(entry.state), entry.command });
-            try out.writer.print("   cwd: {s}\n", .{entry.cwd});
-            try out.writer.print("   log: {s}\n", .{entry.log_path});
-            if (entry.server_url) |url| {
-                try out.writer.print("   url: {s}\n", .{url});
-            }
-            if (entry.diagnostic) |diagnostic| {
-                try out.writer.print("   diagnostic: {s}\n", .{diagnostic});
-            }
-        }
-
-        return try out.toOwnedSlice();
-    }
-
-    pub fn renderJson(self: BackgroundListSnapshot, alloc: Allocator) ![]u8 {
-        var out: std.Io.Writer.Allocating = .init(alloc);
-        defer out.deinit();
-
-        try out.writer.print("{{\"kind\":\"background\",\"count\":{d},\"records\":[", .{self.records.len});
-        for (self.records, 0..) |entry, i| {
-            if (i > 0) try out.writer.writeByte(',');
-            try out.writer.print("{{\"id\":{d},\"started_at_ms\":{d},\"updated_at_ms\":{d}", .{ entry.id, entry.started_at_ms, entry.updated_at_ms });
-            try out.writer.writeAll(",\"pid\":");
-            try std.json.Stringify.value(entry.pid, .{}, &out.writer);
-            try out.writer.writeAll(",\"command\":");
-            try std.json.Stringify.value(entry.command, .{}, &out.writer);
-            try out.writer.writeAll(",\"cwd\":");
-            try std.json.Stringify.value(entry.cwd, .{}, &out.writer);
-            try out.writer.writeAll(",\"log_path\":");
-            try std.json.Stringify.value(entry.log_path, .{}, &out.writer);
-            try out.writer.writeAll(",\"state\":");
-            try std.json.Stringify.value(@tagName(entry.state), .{}, &out.writer);
-            try out.writer.writeAll(",\"server_url\":");
-            if (entry.server_url) |url| {
-                try std.json.Stringify.value(url, .{}, &out.writer);
-            } else {
-                try out.writer.writeAll("null");
-            }
-            try out.writer.writeAll(",\"diagnostic\":");
-            if (entry.diagnostic) |diagnostic| {
-                try std.json.Stringify.value(diagnostic, .{}, &out.writer);
-            } else {
-                try out.writer.writeAll("null");
-            }
-            try out.writer.writeAll("}");
-        }
-        try out.writer.writeAll("]}");
-        return try out.toOwnedSlice();
-    }
-};
-
-pub const BackgroundDetailSnapshot = struct {
-    record: background_store.Record,
-
-    pub fn render(self: BackgroundDetailSnapshot, alloc: Allocator, format: OutputFormat) ![]u8 {
-        return switch (format) {
-            .text => self.renderText(alloc),
-            .json => self.renderJson(alloc),
-        };
-    }
-
-    pub fn renderText(self: BackgroundDetailSnapshot, alloc: Allocator) ![]u8 {
-        var out: std.Io.Writer.Allocating = .init(alloc);
-        defer out.deinit();
-
-        try out.writer.print("[background] #{d} [{s}] {s}\n", .{ self.record.id, @tagName(self.record.state), self.record.command });
-        try out.writer.print("pid: {s}\n", .{self.record.pid});
-        try out.writer.print("cwd: {s}\n", .{self.record.cwd});
-        try out.writer.print("log: {s}\n", .{self.record.log_path});
-        try out.writer.print("started_at_ms: {d}\n", .{self.record.started_at_ms});
-        try out.writer.print("updated_at_ms: {d}\n", .{self.record.updated_at_ms});
-        try out.writer.print("expect_url: {s}\n", .{if (self.record.expect_url) "true" else "false"});
-        try out.writer.print("server_url: {s}\n", .{self.record.server_url orelse "(none)"});
-        try out.writer.print("diagnostic: {s}\n", .{self.record.diagnostic orelse "(none)"});
-        if (self.record.exit_code) |code| {
-            try out.writer.print("exit_code: {d}\n", .{code});
-        } else {
-            try out.writer.writeAll("exit_code: (none)\n");
-        }
-        return try out.toOwnedSlice();
-    }
-
-    pub fn renderJson(self: BackgroundDetailSnapshot, alloc: Allocator) ![]u8 {
-        var out: std.Io.Writer.Allocating = .init(alloc);
-        defer out.deinit();
-
-        try out.writer.print("{{\"kind\":\"background_detail\",\"id\":{d},\"started_at_ms\":{d},\"updated_at_ms\":{d}", .{ self.record.id, self.record.started_at_ms, self.record.updated_at_ms });
-        try out.writer.writeAll(",\"pid\":");
-        try std.json.Stringify.value(self.record.pid, .{}, &out.writer);
-        try out.writer.writeAll(",\"command\":");
-        try std.json.Stringify.value(self.record.command, .{}, &out.writer);
-        try out.writer.writeAll(",\"cwd\":");
-        try std.json.Stringify.value(self.record.cwd, .{}, &out.writer);
-        try out.writer.writeAll(",\"log_path\":");
-        try std.json.Stringify.value(self.record.log_path, .{}, &out.writer);
-        try out.writer.writeAll(",\"state\":");
-        try std.json.Stringify.value(@tagName(self.record.state), .{}, &out.writer);
-        try out.writer.print(",\"expect_url\":{s}", .{if (self.record.expect_url) "true" else "false"});
-        try out.writer.writeAll(",\"server_url\":");
-        if (self.record.server_url) |url| {
-            try std.json.Stringify.value(url, .{}, &out.writer);
-        } else {
-            try out.writer.writeAll("null");
-        }
-        try out.writer.writeAll(",\"diagnostic\":");
-        if (self.record.diagnostic) |diagnostic| {
-            try std.json.Stringify.value(diagnostic, .{}, &out.writer);
-        } else {
-            try out.writer.writeAll("null");
-        }
-        try out.writer.writeAll(",\"exit_code\":");
-        if (self.record.exit_code) |code| {
-            try out.writer.print("{d}", .{code});
-        } else {
-            try out.writer.writeAll("null");
-        }
-        try out.writer.writeByte('}');
-        return try out.toOwnedSlice();
-    }
-};
-
 pub const CreditsSnapshot = struct {
     balance: ?[]const u8 = null,
     used: ?[]const u8 = null,
@@ -1854,23 +1712,6 @@ fn writeSessionHistoryTurnText(writer: *std.Io.Writer, turn: types.HistoryTurn) 
             try writer.writeAll("[assistant]\n");
             try writeTextBlock(writer, entry.assistant);
         },
-        .background_command => |entry| {
-            try writeSessionUserTurnText(writer, entry.user);
-            try writeSessionExecutionText(writer, entry.execution);
-            if (entry.assistant) |assistant| {
-                try writer.writeAll("[assistant]\n");
-                try writeTextBlock(writer, assistant);
-            }
-            try writer.writeAll("[background]\n");
-            try writer.print("log: {s}\n", .{entry.log_path});
-            try writer.print("expect_url: {s}\n", .{if (entry.expect_url) "true" else "false"});
-            try writer.print("url: {s}\n", .{entry.url orelse "(none)"});
-            if (entry.background_record_id) |record_id| {
-                try writer.writeAll("record_id: ");
-                try writeHexBytes(writer, &record_id);
-                try writer.writeByte('\n');
-            }
-        },
         .interrupted => |entry| {
             try writeSessionUserTurnText(writer, entry.user);
             try writeSessionExecutionText(writer, entry.execution);
@@ -1964,33 +1805,6 @@ fn writeSessionHistoryTurnJson(writer: *std.Io.Writer, turn: types.HistoryTurn) 
             try std.json.Stringify.value(entry.assistant, .{}, writer);
             try writer.writeAll(",\"execution\":");
             try session_json.writeExecutionMemoryJson(writer, entry.execution);
-            try writer.writeByte('}');
-        },
-        .background_command => |entry| {
-            try writer.writeAll("{\"kind\":\"background_command\",\"user\":");
-            try writeSessionUserTurnJson(writer, entry.user);
-            if (entry.assistant) |assistant| {
-                try writer.writeAll(",\"assistant\":");
-                try std.json.Stringify.value(assistant, .{}, writer);
-            }
-            if (!entry.execution.isEmpty()) {
-                try writer.writeAll(",\"execution\":");
-                try session_json.writeExecutionMemoryJson(writer, entry.execution);
-            }
-            try writer.writeAll(",\"log_path\":");
-            try std.json.Stringify.value(entry.log_path, .{}, writer);
-            try writer.print(",\"expect_url\":{s}", .{if (entry.expect_url) "true" else "false"});
-            try writer.writeAll(",\"url\":");
-            if (entry.url) |url| {
-                try std.json.Stringify.value(url, .{}, writer);
-            } else {
-                try writer.writeAll("null");
-            }
-            if (entry.background_record_id) |record_id| {
-                try writer.writeAll(",\"background_record_id\":\"");
-                try writeHexBytes(writer, &record_id);
-                try writer.writeByte('"');
-            }
             try writer.writeByte('}');
         },
         .interrupted => |entry| {
@@ -2649,10 +2463,6 @@ test "core session detail snapshot preserves history variant shapes" {
         .action = .read,
         .status = .success,
     }};
-    const record_id = types.StableBackgroundRecordId{
-        0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
-        0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
-    };
     const history = [_]types.HistoryTurn{
         .{ .compacted_summary = .{
             .summary = @constCast("summary"),
@@ -2663,14 +2473,10 @@ test "core session detail snapshot preserves history variant shapes" {
             .user = .{ .text = @constCast("hola"), .images = @constCast(&images) },
             .assistant = @constCast("que tal"),
         } },
-        .{ .background_command = .{
+        .{ .assistant = .{
             .user = .{ .text = @constCast("npm run dev") },
-            .assistant = @constCast("The server is starting."),
+            .assistant = @constCast("The historical command is no longer owned."),
             .execution = .{ .files = files[0..] },
-            .log_path = @constCast("/tmp/server.log"),
-            .expect_url = true,
-            .url = @constCast("http://localhost:3000"),
-            .background_record_id = record_id,
         } },
         .{ .interrupted = .{
             .user = .{ .text = @constCast("inspect") },
@@ -2710,20 +2516,18 @@ test "core session detail snapshot preserves history variant shapes" {
     defer std.testing.allocator.free(text);
     try std.testing.expect(std.mem.find(u8, text, "[compacted] removed_turns=3 compactions=1") != null);
     try std.testing.expect(std.mem.find(u8, text, "[user]\nhola\n[images] 1\n - /tmp/a.png (image/png)\n[assistant]\nque tal\n") != null);
-    try std.testing.expect(std.mem.find(u8, text, "[execution]\nfile: read success src/main.zig\n[assistant]\nThe server is starting.\n") != null);
-    try std.testing.expect(std.mem.find(u8, text, "[background]\nlog: /tmp/server.log\nexpect_url: true\nurl: http://localhost:3000\n") != null);
-    try std.testing.expect(std.mem.find(u8, text, "record_id: 00112233445566778899aabbccddeeff") != null);
+    try std.testing.expect(std.mem.find(u8, text, "[execution]\nfile: read success src/main.zig\n[assistant]\nThe historical command is no longer owned.\n") != null);
+    try std.testing.expect(std.mem.find(u8, text, "[background]") == null);
     try std.testing.expect(std.mem.find(u8, text, "[assistant]\nI inspected the entry point.\n[interrupted]") != null);
 
     const json = try (SessionDetailSnapshot{ .detail = detail }).renderJson(std.testing.allocator);
     defer std.testing.allocator.free(json);
     try std.testing.expect(std.mem.find(u8, json, "\"kind\":\"compacted_summary\"") != null);
     try std.testing.expect(std.mem.find(u8, json, "\"kind\":\"assistant\"") != null);
-    try std.testing.expect(std.mem.find(u8, json, "\"kind\":\"background_command\"") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"kind\":\"background_command\"") == null);
     try std.testing.expect(std.mem.find(u8, json, "\"kind\":\"interrupted\"") != null);
     try std.testing.expect(std.mem.find(u8, json, "{\"path\":\"/tmp/a.png\",\"media_type\":\"image/png\"}") != null);
-    try std.testing.expect(std.mem.find(u8, json, "\"assistant\":\"The server is starting.\"") != null);
-    try std.testing.expect(std.mem.find(u8, json, "\"background_record_id\":\"00112233445566778899aabbccddeeff\"") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"assistant\":\"The historical command is no longer owned.\"") != null);
     try std.testing.expect(std.mem.count(u8, json, "\"execution\"") >= 2);
 }
 
@@ -2955,48 +2759,6 @@ test "doctor text escapes hostile check details while json preserves data" {
         json,
         "\"detail\":\"warning key=bad\\n\\u001b]0;pwn\\u0007\"",
     ) != null);
-}
-
-test "background output contracts import background store" {
-    try std.testing.expect(background_store.Record == @import("../background/background_store.zig").Record);
-    try std.testing.expect(background_store.TaskState == @import("../background/background_store.zig").TaskState);
-}
-
-test "core background list and detail snapshots preserve persisted fields" {
-    const records = [_]background_store.Record{
-        .{
-            .id = 7,
-            .pid = @constCast("100"),
-            .command = @constCast("npm run dev"),
-            .cwd = @constCast("/tmp/fx"),
-            .log_path = @constCast("/tmp/fx.log"),
-            .expect_url = false,
-            .server_url = @constCast("http://localhost:3000"),
-            .started_at_ms = 1,
-            .updated_at_ms = 2,
-            .state = .running,
-        },
-    };
-
-    const list_json = try (BackgroundListSnapshot{ .records = &records }).renderJson(std.testing.allocator);
-    defer std.testing.allocator.free(list_json);
-    try std.testing.expectEqualStrings(
-        "{\"kind\":\"background\",\"count\":1,\"records\":[{\"id\":7,\"started_at_ms\":1,\"updated_at_ms\":2,\"pid\":\"100\",\"command\":\"npm run dev\",\"cwd\":\"/tmp/fx\",\"log_path\":\"/tmp/fx.log\",\"state\":\"running\",\"server_url\":\"http://localhost:3000\",\"diagnostic\":null}]}",
-        list_json,
-    );
-
-    const detail_text = try (BackgroundDetailSnapshot{ .record = records[0] }).renderText(std.testing.allocator);
-    defer std.testing.allocator.free(detail_text);
-    try std.testing.expect(std.mem.find(u8, detail_text, "expect_url: false\n") != null);
-    try std.testing.expect(std.mem.find(u8, detail_text, "server_url: http://localhost:3000\n") != null);
-    try std.testing.expect(std.mem.find(u8, detail_text, "exit_code: (none)\n") != null);
-
-    const detail_json = try (BackgroundDetailSnapshot{ .record = records[0] }).renderJson(std.testing.allocator);
-    defer std.testing.allocator.free(detail_json);
-    try std.testing.expectEqualStrings(
-        "{\"kind\":\"background_detail\",\"id\":7,\"started_at_ms\":1,\"updated_at_ms\":2,\"pid\":\"100\",\"command\":\"npm run dev\",\"cwd\":\"/tmp/fx\",\"log_path\":\"/tmp/fx.log\",\"state\":\"running\",\"expect_url\":false,\"server_url\":\"http://localhost:3000\",\"diagnostic\":null,\"exit_code\":null}",
-        detail_json,
-    );
 }
 
 test "core credits snapshot renders error output" {

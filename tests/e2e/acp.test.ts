@@ -1469,7 +1469,7 @@ describe("acp: model-independent", () => {
         expect(toolNames).toEqual(
           AUTO_EXA_SERIALIZED_TOOL_NAMES,
         );
-        expect(toolNames.filter((name) => name === "terminal")).toHaveLength(1);
+        expect(toolNames.filter((name) => name === "shell")).toHaveLength(1);
         expect(toolNames.filter((name) => name === "exa_search"))
           .toHaveLength(1);
         expect(findUnavailableCapabilityReferences(oracleRequest)).toEqual([]);
@@ -1752,26 +1752,26 @@ describe("acp: model-independent", () => {
   );
 
   test(
-    "ACP executes the shared public terminal tool through the native backend",
+    "ACP executes the shared managed shell TTY path",
     async () => {
       const root = createShortIsolatedRoot("fx-acp-terminal-");
-      const toolCallId = "acp_terminal_native_1";
+      const toolCallId = "acp_shell_tty_1";
       const gateway = startFakeGateway([
-        fakeGatewayToolCall(toolCallId, "terminal", {
-          action: "start",
-          cwd: root.workspace,
-          command: "printf ACP_PUBLIC_TERMINAL_NATIVE",
-          shell: {
-            kind: "executable",
-            path: TERMINAL_FIXTURE_SHELL,
-            clean_start: true,
+        fakeGatewayToolCall(toolCallId, "shell", {
+          request: {
+            action: "run",
+            cwd: root.workspace,
+            command: "printf ACP_PUBLIC_SHELL_TTY",
+            shell: {
+              kind: "executable",
+              path: TERMINAL_FIXTURE_SHELL,
+              clean_start: true,
+            },
+            tty: true,
+            yield_time_ms: 30_000,
           },
-          backend: "native",
-          return_when: { kind: "exit" },
-          wait_ceiling_ms: 5_000,
-          dimensions: { rows: 24, columns: 80 },
         }),
-        finalText("ACP public terminal complete"),
+        finalText("ACP public shell complete"),
       ]);
       try {
         client = await AcpClient.create({
@@ -1786,7 +1786,7 @@ describe("acp: model-independent", () => {
         await client.request("session/set_mode", { modeId: "ask" }, 4);
         const result = await runPrompt(
           client,
-          "Run the native public terminal fixture.",
+          "Run the managed shell TTY fixture.",
           TIMEOUT,
         );
 
@@ -1796,9 +1796,9 @@ describe("acp: model-independent", () => {
           gateway.requests[1]!.body,
           toolCallId,
         );
-        expect(toolResult).toContain('"success":{"start"');
-        expect(toolResult).toContain('"backend":"native"');
-        expect(toolResult).toContain('"exited":0');
+        expect(toolResult).toContain('"state":"completed"');
+        expect(toolResult).toContain('"backend":"tty"');
+        expect(toolResult).toContain('"exit_code":0');
         expect(toolResult).not.toContain("owner_authority");
         expect(toolResult).not.toContain("proof");
         expect(client.stderr).toBe("");

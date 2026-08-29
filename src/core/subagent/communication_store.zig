@@ -1197,7 +1197,7 @@ test "schema v5 approvals without file projection remain compatible" {
         .root_id = "root",
         .work_id = "work",
         .prepared_fingerprint = [_]u8{5} ** 32,
-        .label = "terminal.exec printf ok",
+        .label = "shell.run printf ok",
         .explanation = null,
         .command = "printf legacy",
         .grants = &grants,

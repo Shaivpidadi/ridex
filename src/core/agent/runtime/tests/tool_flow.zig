@@ -78,9 +78,9 @@ const PostEffectTerminalFailure = struct {
 };
 
 const read_file_advertised_names = [_][]const u8{"read_file"};
-const terminal_advertised_names = [_][]const u8{"terminal"};
+const terminal_advertised_names = [_][]const u8{"shell"};
 const read_file_advertised_functions = [_]model_tool_schema.FunctionSchema{builtin_tools.read_file.model_schema};
-const terminal_advertised_functions = [_]model_tool_schema.FunctionSchema{builtin_tools.terminal.model_schema};
+const terminal_advertised_functions = [_]model_tool_schema.FunctionSchema{builtin_tools.shell.model_schema};
 
 fn makeOwnedVisionCatalog(
     alloc: std.mem.Allocator,
@@ -1027,11 +1027,11 @@ test "accepted automatic review remains internal before ordinary tool execution"
 
 test "borrowed nested terminal completion is flat before authority execution and memory" {
     const alloc = std.testing.allocator;
-    const flat_arguments = "{\"action\":\"exec\",\"command\":\"printf done\"}";
+    const flat_arguments = "{\"action\":\"run\",\"command\":\"printf done\"}";
     const calls = [_]ToolCall{toolCall(
         "call_nested_terminal",
-        "terminal",
-        "{\"request\":{\"action\":\"exec\",\"command\":\"printf done\"}}",
+        "shell",
+        "{\"request\":{\"action\":\"run\",\"command\":\"printf done\"}}",
     )};
     const completions = [_]FakeCompletion{
         .{ .tool_calls = &calls },
@@ -1050,7 +1050,7 @@ test "borrowed nested terminal completion is flat before authority execution and
     try runFakePrompt(&gateway, &hooks, config, fixture.job());
 
     try std.testing.expectEqual(@as(usize, 1), hooks.executed_names.items.len);
-    try std.testing.expectEqualStrings("terminal", hooks.executed_names.items[0]);
+    try std.testing.expectEqualStrings("shell", hooks.executed_names.items[0]);
     try std.testing.expectEqualStrings(flat_arguments, hooks.last_validated_arguments.?);
     try std.testing.expectEqualStrings(flat_arguments, hooks.last_permission_arguments.?);
     try std.testing.expectEqualStrings(flat_arguments, hooks.last_executed_arguments.?);
@@ -1063,69 +1063,12 @@ test "borrowed nested terminal completion is flat before authority execution and
     );
 }
 
-test "terminal acquire stays tracked when execution fails after its effect" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDir(
-        io_mod.getIo(),
-        "session",
-        std.Io.File.Permissions.fromMode(0o700),
-    );
-    var session_dir = try tmp.dir.openDir(io_mod.getIo(), "session", .{
-        .iterate = true,
-        .follow_symlinks = false,
-    });
-    defer session_dir.close(io_mod.getIo());
-    const session_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "session");
-    defer alloc.free(session_path);
-    var capability = try session_child_store.SessionChildCapability.initForTesting(
-        alloc,
-        session_dir,
-        session_path,
-        .writable,
-        .{},
-    );
-    defer capability.deinit();
-
-    const calls = [_]ToolCall{toolCall(
-        "terminal_acquire",
-        "terminal",
-        "{\"action\":\"write\",\"session_id\":\"terminal-one\",\"write\":null,\"lease\":\"acquire\"}",
-    )};
-    var gateway = FakeGateway.init(alloc, &.{.{ .tool_calls = &calls }});
-    defer gateway.deinit();
-    var post_effect = PostEffectTerminalFailure{};
-    var hooks = FakeAgentRuntimeDeps.init(alloc);
-    hooks.permission_decisions = &.{.once};
-    hooks.tool_execution_override = .{
-        .context = &post_effect,
-        .execute_fn = PostEffectTerminalFailure.execute,
-    };
-    defer hooks.deinit();
-    var fixture = PromptFixture{};
-    var config = fixture.config();
-    config.session_child_capability = &capability;
-
-    try std.testing.expectError(
-        error.OutOfMemory,
-        runFakePrompt(&gateway, &hooks, config, fixture.job()),
-    );
-
-    try std.testing.expectEqual(@as(usize, 1), post_effect.effect_count);
-    try std.testing.expectEqual(@as(usize, 1), hooks.terminal_lease_cleanup_ids.items.len);
-    try std.testing.expectEqualStrings(
-        "terminal-one",
-        hooks.terminal_lease_cleanup_ids.items[0],
-    );
-}
-
-test "terminal lifecycle resolves one display target before execution" {
+test "shell lifecycle resolves one display target before execution" {
     const alloc = std.testing.allocator;
     const calls = [_]ToolCall{toolCall(
         "inspect_call",
-        "terminal",
-        "{\"action\":\"inspect\",\"session_id\":\"terminal-cold-session\"}",
+        "shell",
+        "{\"request\":{\"action\":\"wait\",\"session_id\":\"terminal-cold-session\"}}",
     )};
     const completions = [_]FakeCompletion{
         .{ .tool_calls = &calls },
@@ -1179,7 +1122,7 @@ test "terminal lifecycle resolves one display target before execution" {
         .progress => |progress| {
             if (!std.mem.eql(u8, progress.id.call_id, "inspect_call")) continue;
             try std.testing.expectEqualStrings(
-                "start terminal session terminal-cold-session",
+                "start shell session terminal-cold-session",
                 progress.text,
             );
             active_count += 1;
@@ -1187,7 +1130,7 @@ test "terminal lifecycle resolves one display target before execution" {
         .terminal => |terminal| {
             if (!std.mem.eql(u8, terminal.id.call_id, "inspect_call")) continue;
             try std.testing.expectEqualStrings(
-                "done terminal session terminal-cold-session",
+                "done shell session terminal-cold-session",
                 terminal.outcome.summary,
             );
             completed_count += 1;
@@ -2617,7 +2560,7 @@ test "same-batch missing target defers newly resolvable scope until reissue" {
     defer alloc.free(link_path);
 
     const first_calls = [_]ToolCall{
-        toolCall("resolve_scope", "terminal", "{\"action\":\"exec\",\"command\":\"true\"}"),
+        toolCall("resolve_scope", "shell", "{\"action\":\"run\",\"command\":\"true\"}"),
         toolCall("initial_missing", "read_file", "{\"path\":\"link/secret.txt\"}"),
     };
     const scoped_reissue_calls = [_]ToolCall{
@@ -2634,7 +2577,7 @@ test "same-batch missing target defers newly resolvable scope until reissue" {
     defer hooks.deinit();
     hooks.context_enabled = true;
     hooks.context_registry = FreshnessApplicableContext.registry;
-    hooks.swap_link_on_execute_name = "terminal";
+    hooks.swap_link_on_execute_name = "shell";
     hooks.swap_link_on_execute = link_path;
     hooks.swap_link_target_on_execute = new_directory;
     hooks.exec_plans = &.{
@@ -2918,8 +2861,8 @@ test "modern context delta does not defer unrelated effectful call" {
         ),
         toolCall(
             "root_create",
-            "terminal",
-            "{\"action\":\"exec\",\"command\":\"mkdir -p root-output\"}",
+            "shell",
+            "{\"action\":\"run\",\"command\":\"mkdir -p root-output\"}",
         ),
     };
     const completions = [_]FakeCompletion{
@@ -3928,7 +3871,7 @@ test "processQueuedPrompt denied registered run command compatibility never reac
         .matches = Compatibility.matches,
         .execute = Compatibility.execute,
     };
-    const tools = [_]tool_dispatch.Tool{ builtin_tools.terminal, compatible_install };
+    const tools = [_]tool_dispatch.Tool{ builtin_tools.shell, compatible_install };
     const calls = [_]ToolCall{toolCall(
         "call_1",
         "terminal",
@@ -4623,7 +4566,7 @@ test "processQueuedPrompt returns ordinary results for repeated calls" {
 test "processQueuedPrompt stops repeated distinct terminal corrections after the complete second batch" {
     const alloc = std.testing.allocator;
     const correction_s = try tool_result_errors.terminalActionFieldCorrectionJson(alloc, .{
-        .action = "start",
+        .action = "run",
         .invalid_fields = &.{"session_id"},
         .missing_fields = &.{},
         .allowed_fields = &.{ "action", "command" },
@@ -4631,21 +4574,21 @@ test "processQueuedPrompt stops repeated distinct terminal corrections after the
     });
     defer alloc.free(correction_s);
     const correction_t = try tool_result_errors.terminalActionFieldCorrectionJson(alloc, .{
-        .action = "read",
+        .action = "wait",
         .invalid_fields = &.{"command"},
         .missing_fields = &.{},
-        .allowed_fields = &.{ "action", "session_id", "cursor_segment" },
+        .allowed_fields = &.{ "action", "session_id", "wait_ceiling_ms" },
         .conflicts = &.{},
     });
     defer alloc.free(correction_t);
 
     const first_calls = [_]ToolCall{
-        toolCall("terminal_s_1", "terminal", "{\"action\":\"start\",\"session_id\":\"terminal-a\"}"),
-        toolCall("terminal_t_1", "terminal", "{\"action\":\"read\",\"command\":\"wrong\"}"),
+        toolCall("terminal_s_1", "shell", "{\"request\":{\"action\":\"run\",\"session_id\":\"terminal-a\"}}"),
+        toolCall("terminal_t_1", "shell", "{\"request\":{\"action\":\"wait\",\"command\":\"wrong\"}}"),
     };
     const second_calls = [_]ToolCall{
-        toolCall("terminal_s_2", "terminal", "{\"action\":\"start\",\"session_id\":\"terminal-b\"}"),
-        toolCall("terminal_t_2", "terminal", "{\"action\":\"read\",\"command\":\"still wrong\"}"),
+        toolCall("terminal_s_2", "shell", "{\"request\":{\"action\":\"run\",\"session_id\":\"terminal-b\"}}"),
+        toolCall("terminal_t_2", "shell", "{\"request\":{\"action\":\"wait\",\"command\":\"still wrong\"}}"),
     };
     const completions = [_]FakeCompletion{
         .{ .tool_calls = &first_calls },
@@ -4659,8 +4602,11 @@ test "processQueuedPrompt stops repeated distinct terminal corrections after the
     deps.validation_results = &.{ correction_s, correction_t, correction_s, correction_t };
     defer deps.deinit();
     var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.advertised_tool_names = &terminal_advertised_names;
+    config.advertised_functions = &terminal_advertised_functions;
 
-    try runFakePrompt(&gateway, &deps, fixture.config(), fixture.job());
+    try runFakePrompt(&gateway, &deps, config, fixture.job());
 
     try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
     try std.testing.expectEqual(@as(usize, 4), deps.rejected_names.items.len);
@@ -4675,14 +4621,14 @@ test "processQueuedPrompt stops repeated distinct terminal corrections after the
     }
     try std.testing.expectEqual(@as(usize, 1), deps.system_notices.items.len);
     try std.testing.expect(
-        std.mem.find(u8, deps.system_notices.items[0], "no terminal effect") != null,
+        std.mem.find(u8, deps.system_notices.items[0], "no shell effect") != null,
     );
 }
 
 test "processQueuedPrompt retains a terminal correction across valid neighboring calls" {
     const alloc = std.testing.allocator;
     const correction = try tool_result_errors.terminalActionFieldCorrectionJson(alloc, .{
-        .action = "start",
+        .action = "run",
         .invalid_fields = &.{"session_id"},
         .missing_fields = &.{},
         .allowed_fields = &.{ "action", "command" },
@@ -4691,12 +4637,12 @@ test "processQueuedPrompt retains a terminal correction across valid neighboring
     defer alloc.free(correction);
 
     const first_calls = [_]ToolCall{
-        toolCall("terminal_s_1", "terminal", "{\"action\":\"start\",\"session_id\":\"terminal-a\"}"),
-        toolCall("terminal_valid_1", "terminal", "{\"action\":\"exec\",\"command\":\"true\"}"),
+        toolCall("terminal_s_1", "shell", "{\"request\":{\"action\":\"run\",\"session_id\":\"terminal-a\"}}"),
+        toolCall("terminal_valid_1", "shell", "{\"request\":{\"action\":\"run\",\"command\":\"true\"}}"),
     };
     const second_calls = [_]ToolCall{
-        toolCall("terminal_s_2", "terminal", "{\"action\":\"start\",\"session_id\":\"terminal-b\"}"),
-        toolCall("terminal_valid_2", "terminal", "{\"action\":\"exec\",\"command\":\"true\"}"),
+        toolCall("terminal_s_2", "shell", "{\"request\":{\"action\":\"run\",\"session_id\":\"terminal-b\"}}"),
+        toolCall("terminal_valid_2", "shell", "{\"request\":{\"action\":\"run\",\"command\":\"true\"}}"),
     };
     const completions = [_]FakeCompletion{
         .{ .tool_calls = &first_calls },
@@ -4709,8 +4655,11 @@ test "processQueuedPrompt retains a terminal correction across valid neighboring
     deps.validation_results = &.{ correction, null, correction, null };
     defer deps.deinit();
     var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.advertised_tool_names = &terminal_advertised_names;
+    config.advertised_functions = &terminal_advertised_functions;
 
-    try runFakePrompt(&gateway, &deps, fixture.config(), fixture.job());
+    try runFakePrompt(&gateway, &deps, config, fixture.job());
 
     try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
     try std.testing.expectEqual(@as(usize, 2), deps.rejected_names.items.len);
@@ -5814,73 +5763,6 @@ test "processQueuedPrompt finish_turn notice preserves execution without final a
         turn.execution.tool_steps[0].tool_results[0].permission_feedback[0],
     );
     try std.testing.expectEqual(@as(usize, 0), countText(&deps, "\n"));
-}
-
-test "processQueuedPrompt delivers semantic notice when the host supports it" {
-    const alloc = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const execution = try command_result_mapping.Background.launchPreparationFailure(
-        arena_state.allocator(),
-        error.TestFailure,
-    );
-    const plans = [_]test_support.FakeExecPlan{.{ .result = execution }};
-    const calls = [_]ToolCall{toolCall("call_1", "read_file", "{\"path\":\"a\"}")};
-    const completions = [_]FakeCompletion{.{ .tool_calls = &calls }};
-    var gateway = FakeGateway.init(alloc, &completions);
-    defer gateway.deinit();
-    var deps = FakeAgentRuntimeDeps.init(alloc);
-    deps.enable_interactive_notices = true;
-    deps.exec_plans = &plans;
-    defer deps.deinit();
-    var fixture = PromptFixture{};
-
-    try runFakePrompt(&gateway, &deps, fixture.config(), fixture.job());
-
-    try std.testing.expectEqual(@as(usize, 0), deps.system_notices.items.len);
-    try std.testing.expectEqual(@as(usize, 1), deps.interactive_notices.items.len);
-    const notice = deps.interactive_notices.items[0];
-    try std.testing.expectEqualStrings("background", notice.topic);
-    try std.testing.expectEqual(types.NoticeTone.@"error", notice.tone);
-    try std.testing.expectEqualStrings(
-        "Command launch preparation failed (TestFailure).",
-        notice.body,
-    );
-}
-
-test "processQueuedPrompt preserves raw fallback without semantic notice capability" {
-    const alloc = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const execution = try command_result_mapping.Background.persistenceSaveFailure(
-        arena_state.allocator(),
-        error.BackgroundPersistenceRequired,
-        "",
-    );
-    const plans = [_]test_support.FakeExecPlan{.{ .result = execution }};
-    const calls = [_]ToolCall{toolCall("call_1", "read_file", "{\"path\":\"a\"}")};
-    const completions = [_]FakeCompletion{.{ .tool_calls = &calls }};
-    var gateway = FakeGateway.init(alloc, &completions);
-    defer gateway.deinit();
-    var deps = FakeAgentRuntimeDeps.init(alloc);
-    deps.exec_plans = &plans;
-    defer deps.deinit();
-    var fixture = PromptFixture{};
-
-    try runFakePrompt(&gateway, &deps, fixture.config(), fixture.job());
-
-    try std.testing.expectEqual(@as(usize, 1), deps.system_notices.items.len);
-    try std.testing.expectEqualStrings(
-        "mode=headless\n" ++
-            "error=BackgroundPersistenceRequired\n" ++
-            "background_persistence_required=true\n" ++
-            "background_started=true\n" ++
-            "background_stopped=true\n" ++
-            "reason=metadata_persist_failed\n" ++
-            "message=headless background command metadata could not be confirmed, so the launched job was stopped instead of being reported as manageable.\n",
-        deps.system_notices.items[0],
-    );
-    try std.testing.expectEqual(@as(usize, 0), deps.interactive_notices.items.len);
 }
 
 test "processQueuedPrompt emits context notice for a continuing tool" {

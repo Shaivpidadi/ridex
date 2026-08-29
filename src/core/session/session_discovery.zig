@@ -1,5 +1,4 @@
 const std = @import("std");
-const background_store = @import("../background/background_store.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const session = @import("session.zig");
@@ -480,8 +479,6 @@ fn inspectDoctorManagedChildren(
     defer capability.deinit();
 
     const child_kinds = [_]session_child_store.ManagedChildKind{
-        .background_records,
-        .background_logs,
         .command_artifacts,
         .browser_artifacts,
         .tool_results,
@@ -495,11 +492,6 @@ fn inspectDoctorManagedChildren(
         };
         entries.deinit();
     }
-    background_store.validateAllManagedRecords(alloc, &capability) catch |err| {
-        if (err == error.OutOfMemory) return err;
-        try appendDoctorDiagnostic(diagnostics, alloc, session_id, .canonical_state_invalid, null);
-        return;
-    };
     subagent_control_store.validateManagedRecord(
         alloc,
         &capability,

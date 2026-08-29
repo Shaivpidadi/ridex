@@ -402,7 +402,7 @@ export function assertNoTerminalExecMatches(
 function recordedTerminalExecCommands(result: EvalResult): string[] {
   const commands = new Set<string>();
   for (const tc of result.json.tool_calls ?? []) {
-    if (tc.name !== "terminal") continue;
+    if (tc.name !== "shell") continue;
     const command = tc.command_result?.command;
     if (command) commands.add(command);
   }
@@ -418,7 +418,7 @@ export function assertFirstTerminalExecMatches(
   pattern: RegExp,
 ): void {
   const first = result.json.tool_calls?.[0];
-  expect(first?.name).toBe("terminal");
+  expect(first?.name).toBe("shell");
   expect(pattern.test(first?.command_result?.command ?? "")).toBe(true);
 }
 

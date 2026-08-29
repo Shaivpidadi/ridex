@@ -1,4 +1,5 @@
 const std = @import("std");
+const managed_execution = @import("../execution/managed_execution.zig");
 const builtin = @import("builtin");
 const agent_runtime = @import("../agent/agent_runtime.zig");
 const permission_request = @import("../permissions/permission_request.zig");
@@ -23,7 +24,6 @@ const session_store = @import("../session/session_store.zig");
 const permissions = @import("../permissions/permissions.zig");
 const tooling_tool_admission = @import("../tooling/tool_admission.zig");
 const shell_resolver = @import("../terminal/shell_resolver.zig");
-const background_runtime = @import("../background/background_runtime.zig");
 const tool_dispatch = @import("../tooling/tool_dispatch.zig");
 const types = @import("../shared/types.zig");
 const control_store = @import("control_store.zig");
@@ -529,6 +529,7 @@ pub const TurnContext = struct {
     alloc: Allocator,
     runtime: session.SessionRuntime,
     worker: worker_runtime.WorkerRuntime = .{},
+    managed_executions: managed_execution.Runtime,
     loaded: *session_store.LoadedWritableSession,
     live_authority: ?*authority_mod.Resolver = null,
     approval_registry: ?*approval_registry_mod.Registry = null,
@@ -553,11 +554,17 @@ pub const TurnContext = struct {
             loaded.state.context_history_start,
             loaded.state.permission_state,
         );
-        return .{ .alloc = alloc, .runtime = runtime, .loaded = loaded };
+        return .{
+            .alloc = alloc,
+            .runtime = runtime,
+            .managed_executions = managed_execution.Runtime.init(alloc),
+            .loaded = loaded,
+        };
     }
 
     fn deinit(self: *TurnContext) void {
         if (self.failure_diagnostic) |diagnostic| self.alloc.free(diagnostic);
+        self.managed_executions.deinit();
         self.worker.deinit(self.alloc);
         self.runtime.deinit(self.alloc);
         self.* = undefined;
@@ -609,6 +616,12 @@ pub const TurnContext = struct {
 
     pub fn workerRuntime(self: *TurnContext) *worker_runtime.WorkerRuntime {
         return &self.worker;
+    }
+
+    pub fn managedExecutionRuntime(
+        self: *TurnContext,
+    ) *managed_execution.Runtime {
+        return &self.managed_executions;
     }
 
     /// Presentation-only output. Allocation pressure never changes execution
@@ -3428,7 +3441,6 @@ fn reconcileToolActivityLocked(
 fn historyExecution(turn: types.HistoryTurn) ?types.ExecutionMemory {
     return switch (turn) {
         .assistant => |value| value.execution,
-        .background_command => |value| value.execution,
         .interrupted => |value| value.execution,
         .compacted_summary => null,
     };
@@ -3485,7 +3497,6 @@ fn assistantTextForWork(
         if (!std.mem.eql(u8, candidate_work_id, work_id)) continue;
         return switch (candidate) {
             .assistant => |value| value.assistant,
-            .background_command => |value| value.assistant orelse "",
             .interrupted => |value| value.assistant orelse "",
             .compacted_summary => null,
         };
@@ -6592,8 +6603,6 @@ test "canonical approval wait refreshes revoked authority and races reject relat
     var initial_authority = try turn.resolveLiveAuthority(alloc);
     const initial_authority_generation = initial_authority.generation;
     initial_authority.deinit(alloc);
-    var background: background_runtime.BackgroundRuntime = .{};
-    defer background.deinit(alloc);
     var rules = [_]types.PermissionRule{.{
         .permission = @constCast("bash"),
         .pattern = @constCast("*"),
@@ -6615,8 +6624,8 @@ test "canonical approval wait refreshes revoked authority and races reject relat
                 arena_state.allocator(),
                 .{
                     .id = "canonical-call",
-                    .name = "terminal",
-                    .arguments_json = "{\"action\":\"exec\",\"command\":\"git status\"}",
+                    .name = "shell",
+                    .arguments_json = "{\"action\":\"run\",\"command\":\"git status\"}",
                 },
                 .auto,
                 &.{},
@@ -6656,10 +6665,9 @@ test "canonical approval wait refreshes revoked authority and races reject relat
         .workspace_root = "/tmp/workspace",
         .permission_grants = &.{},
         .permission_rules = .{ .rules = &rules },
-        .tool_registry = .{ .tools = &.{test_builtin_tools.terminal} },
+        .tool_registry = .{ .tools = &.{test_builtin_tools.shell} },
         .worker = &turn.worker,
         .permission_prompter = turn.permissionPrompter(),
-        .background = &background,
         .advertised_dynamic_tool_names = &.{},
         .mcp_runtime = .{},
     }, .start = &registration_start, .ready = &registration_ready };
@@ -6799,8 +6807,8 @@ test "canonical approval wait refreshes revoked authority and races reject relat
         refreshed_arena.allocator(),
         .{
             .id = "canonical-call",
-            .name = "terminal",
-            .arguments_json = "{\"action\":\"exec\",\"command\":\"git status\"}",
+            .name = "shell",
+            .arguments_json = "{\"action\":\"run\",\"command\":\"git status\"}",
         },
         "/tmp/workspace",
         "/tmp/workspace",

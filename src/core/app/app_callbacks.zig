@@ -26,7 +26,6 @@ const session_runtime = @import("../session/session.zig");
 const session_codec = @import("../session/session_codec.zig");
 const session_usage = @import("../session/session_usage.zig");
 const parent_delivery_projector = @import("../subagent/parent_delivery_projector.zig");
-const task_helpers = @import("../tasks/task_helpers.zig");
 const types = @import("../shared/types.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const assistant_presentation = @import("../agent/assistant_presentation.zig");
@@ -530,20 +529,6 @@ pub fn Bindings(comptime App: type) type {
 
         pub fn onInnerToolUsage(ctx: *anyopaque, tool_name: []const u8, usage: types.ToolUsage) void {
             agentReportInnerToolUsage(ctx, tool_name, usage);
-        }
-
-        pub fn onBackgroundUrlReady(ctx: *anyopaque, task_id: u64, url: []const u8) void {
-            const app: *App = @ptrCast(@alignCast(ctx));
-            const notice = task_helpers.backgroundServerReadyNotice(std.heap.c_allocator, task_id, url, app.session.languageSnapshot()) catch return;
-            defer std.heap.c_allocator.free(notice.body);
-            app_worker_runtime.Runtime(App).pushSemanticNotice(app, notice) catch {};
-        }
-
-        pub fn onTaskCompletion(ctx: *anyopaque, completion: task_helpers.TaskCompletion) void {
-            const app: *App = @ptrCast(@alignCast(ctx));
-            const notice = task_helpers.backgroundCompletionNotice(std.heap.c_allocator, completion, app.session.languageSnapshot()) catch return;
-            defer std.heap.c_allocator.free(notice.body);
-            app_worker_runtime.Runtime(App).pushSemanticNotice(app, notice) catch {};
         }
 
         fn agentAppendRuntimeContext(ctx: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) !void {
@@ -2101,39 +2086,6 @@ test "MCP progress callback publishes the owning tool lifecycle" {
         lifecycle.progress.text,
         "● MCP fixture halfway",
     ) != null);
-}
-
-test "background callbacks publish ready success failure and cancellation semantics" {
-    var app = FakeApp.init(std.testing.allocator);
-    defer app.deinit();
-
-    Bindings(FakeApp).onBackgroundUrlReady(&app, 7, "http://localhost:3000");
-    Bindings(FakeApp).onTaskCompletion(&app, .{ .id = 7, .state = .exited, .exit_code = 0 });
-    Bindings(FakeApp).onTaskCompletion(&app, .{ .id = 8, .state = .failed, .exit_code = 2 });
-    Bindings(FakeApp).onTaskCompletion(&app, .{ .id = 9, .state = .stopped, .exit_code = null });
-
-    try std.testing.expectEqual(@as(usize, 4), app.worker.events.items.len);
-    const ready = app.worker.events.items[0].semantic_notice;
-    try std.testing.expectEqualStrings("background", ready.topic);
-    try std.testing.expectEqual(types.NoticeTone.neutral, ready.tone);
-    try std.testing.expectEqualStrings("Command #7 server ready at http://localhost:3000.", ready.body);
-    const succeeded = app.worker.events.items[1].semantic_notice;
-    try std.testing.expectEqualStrings("background", succeeded.topic);
-    try std.testing.expectEqual(types.NoticeTone.neutral, succeeded.tone);
-    try std.testing.expectEqualStrings("Command #7 completed successfully.", succeeded.body);
-    const failed = app.worker.events.items[2].semantic_notice;
-    try std.testing.expectEqualStrings("background", failed.topic);
-    try std.testing.expectEqual(types.NoticeTone.@"error", failed.tone);
-    try std.testing.expectEqualStrings("Command #8 failed (exit 2).", failed.body);
-    const cancelled = app.worker.events.items[3].semantic_notice;
-    try std.testing.expectEqualStrings("background", cancelled.topic);
-    try std.testing.expectEqual(types.NoticeTone.cancelled, cancelled.tone);
-    try std.testing.expectEqualStrings("Command #9 stopped.", cancelled.body);
-
-    for (app.worker.events.items) |event| {
-        const notice = event.semantic_notice;
-        try std.testing.expect(std.mem.find(u8, notice.body, "Background") == null);
-    }
 }
 
 test "agent context and system notices share semantic transport with distinct fields" {

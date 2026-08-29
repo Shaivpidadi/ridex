@@ -72,8 +72,6 @@ pub const ToolCall = core_types.ToolCall;
 /// Stored assistant response paired with the user turn that produced it.
 pub const AssistantHistoryTurn = core_types.AssistantHistoryTurn;
 /// Stored background command metadata paired with the user turn that produced it.
-pub const BackgroundCommandHistoryTurn = core_types.BackgroundCommandHistoryTurn;
-pub const StableBackgroundRecordId = core_types.StableBackgroundRecordId;
 pub const CancelledCommandPresentation = core_types.CancelledCommandPresentation;
 /// Stored interrupted turn marker, optionally paired with the active tool call.
 pub const InterruptedHistoryTurn = core_types.InterruptedHistoryTurn;
@@ -139,7 +137,6 @@ pub fn validateWorkId(work_id: []const u8) WorkIdError!void {
 pub fn historyTurnWorkId(turn: HistoryTurn) ?[]const u8 {
     return switch (turn) {
         .assistant => |entry| entry.user.work_id,
-        .background_command => |entry| entry.user.work_id,
         .interrupted => |entry| entry.user.work_id,
         .compacted_summary => null,
     };
@@ -177,7 +174,6 @@ pub fn copyWorkIdToTurn(
     const owned = try alloc.dupe(u8, work_id);
     switch (turn.*) {
         .assistant => |*entry| entry.user.work_id = owned,
-        .background_command => |*entry| entry.user.work_id = owned,
         .interrupted => |*entry| entry.user.work_id = owned,
         .compacted_summary => unreachable,
     }
@@ -400,7 +396,6 @@ fn images_for_history_turn(turn: HistoryTurn) []const ImageAttachment {
     return switch (turn) {
         .compacted_summary => &.{},
         .assistant => |entry| entry.user.images,
-        .background_command => |entry| entry.user.images,
         .interrupted => |entry| entry.user.images,
     };
 }
@@ -409,7 +404,6 @@ fn mutable_images_for_history_turn(turn: *HistoryTurn) []ImageAttachment {
     return switch (turn.*) {
         .compacted_summary => &.{},
         .assistant => |*entry| entry.user.images,
-        .background_command => |*entry| entry.user.images,
         .interrupted => |*entry| entry.user.images,
     };
 }
@@ -418,7 +412,6 @@ fn mutable_images_slice_for_history_turn(turn: *HistoryTurn) ?*[]ImageAttachment
     return switch (turn.*) {
         .compacted_summary => null,
         .assistant => |*entry| &entry.user.images,
-        .background_command => |*entry| &entry.user.images,
         .interrupted => |*entry| &entry.user.images,
     };
 }
@@ -427,7 +420,6 @@ fn user_text_for_history_turn(turn: HistoryTurn) []const u8 {
     return switch (turn) {
         .compacted_summary => "",
         .assistant => |entry| entry.user.text,
-        .background_command => |entry| entry.user.text,
         .interrupted => |entry| entry.user.text,
     };
 }
@@ -565,7 +557,6 @@ fn mutable_user_for_history_turn(turn: *HistoryTurn) ?*UserTurn {
     return switch (turn.*) {
         .compacted_summary => null,
         .assistant => |*entry| &entry.user,
-        .background_command => |*entry| &entry.user,
         .interrupted => |*entry| &entry.user,
     };
 }
@@ -1048,10 +1039,9 @@ test "legacy image repair rewrites three repeated ordinals across persisted turn
             .user = .{ .text = assistant_text, .images = &assistant_images },
             .assistant = @constCast("answer"),
         } },
-        .{ .background_command = .{
+        .{ .assistant = .{
             .user = .{ .text = background_text, .images = &background_images },
-            .log_path = @constCast("/tmp/background.log"),
-            .expect_url = false,
+            .assistant = @constCast("historical command"),
         } },
         .{ .interrupted = .{
             .user = .{ .text = interrupted_text, .images = &interrupted_images },
@@ -1059,7 +1049,7 @@ test "legacy image repair rewrites three repeated ordinals across persisted turn
         } },
     };
     defer alloc.free(history[0].assistant.user.text);
-    defer alloc.free(history[1].background_command.user.text);
+    defer alloc.free(history[1].assistant.user.text);
     defer alloc.free(history[2].interrupted.user.text);
     assistant_text_owned = false;
     background_text_owned = false;
@@ -1073,7 +1063,7 @@ test "legacy image repair rewrites three repeated ordinals across persisted turn
     try std.testing.expectEqualStrings("assistant [Image #1]", history[0].assistant.user.text);
     try std.testing.expectEqualStrings(
         "background [Image #2]",
-        history[1].background_command.user.text,
+        history[1].assistant.user.text,
     );
     try std.testing.expectEqualStrings(
         "interrupted [Image #3]",
@@ -1930,39 +1920,6 @@ pub const SessionRuntime = struct {
         owns_turn = false;
     }
 
-    pub fn appendBackgroundCommandHistoryTurn(self: *SessionRuntime, alloc: Allocator, user: []const u8, background: command_contract.BackgroundCommand) !void {
-        const user_text = try alloc.dupe(u8, user);
-        var owns_user_text = true;
-        errdefer if (owns_user_text) alloc.free(user_text);
-
-        const log_path = try alloc.dupe(u8, background.log_path);
-        var owns_log_path = true;
-        errdefer if (owns_log_path) alloc.free(log_path);
-
-        const url: ?[]u8 = if (background.url) |url_text| try alloc.dupe(u8, url_text) else null;
-        var owns_url = url != null;
-        errdefer if (owns_url) {
-            if (url) |url_text| alloc.free(url_text);
-        };
-
-        const turn = HistoryTurn{ .background_command = .{
-            .user = .{ .text = user_text, .images = &.{} },
-            .log_path = log_path,
-            .expect_url = background.expect_url,
-            .url = url,
-            .background_record_id = background.background_record_id,
-        } };
-        owns_user_text = false;
-        owns_log_path = false;
-        owns_url = false;
-
-        var owns_turn = true;
-        errdefer if (owns_turn) freeHistoryTurn(alloc, turn);
-
-        try self.history.append(alloc, turn);
-        owns_turn = false;
-    }
-
     pub fn appendHistoryMessages(
         alloc: Allocator,
         messages: *std.ArrayList(message.Message),
@@ -2172,26 +2129,6 @@ pub fn dupeHistoryTurn(alloc: Allocator, turn: HistoryTurn) !HistoryTurn {
                 .user = user,
                 .assistant = assistant_copy,
                 .execution = execution,
-            } };
-        },
-        .background_command => |entry| {
-            const user = try dupeUserTurn(alloc, entry.user);
-            errdefer freeUserTurn(alloc, user);
-            const assistant = if (entry.assistant) |text| try alloc.dupe(u8, text) else null;
-            errdefer if (assistant) |text| alloc.free(text);
-            const execution = try core_types.dupeExecutionMemory(alloc, entry.execution);
-            errdefer core_types.freeExecutionMemory(alloc, execution);
-            const log_path = try alloc.dupe(u8, entry.log_path);
-            errdefer alloc.free(log_path);
-            const url: ?[]u8 = if (entry.url) |url_bytes| try alloc.dupe(u8, url_bytes) else null;
-            return .{ .background_command = .{
-                .user = user,
-                .assistant = assistant,
-                .execution = execution,
-                .log_path = log_path,
-                .expect_url = entry.expect_url,
-                .url = url,
-                .background_record_id = entry.background_record_id,
             } };
         },
         .interrupted => |entry| {
@@ -2631,22 +2568,6 @@ fn appendHistoryMessagesImpl(
                     try messages.append(alloc, message.Message.assistantBorrowed(entry.assistant, &.{}));
                 }
             },
-            .background_command => |entry| {
-                try messages.append(alloc, .{
-                    .role = .user,
-                    .content = .{ .text = entry.user.text },
-                    .images = entry.user.images,
-                });
-                try appendExecutionMemoryMessages(alloc, messages, entry.execution);
-                if (entry.assistant) |assistant| {
-                    if (assistant.len > 0) {
-                        try messages.append(alloc, message.Message.assistantBorrowed(assistant, &.{}));
-                    }
-                }
-                const text = try formatBackgroundHistoryContext(alloc, entry);
-                errdefer alloc.free(text);
-                try messages.append(alloc, message.Message.userOwned(text));
-            },
             .interrupted => |entry| {
                 try messages.append(alloc, .{
                     .role = .user,
@@ -2800,18 +2721,6 @@ fn appendHistoryChatMessagesImpl(
                     try messages.append(alloc, .{ .role = .assistant, .content = entry.assistant });
                 }
             },
-            .background_command => |entry| {
-                try messages.append(alloc, .{ .role = .user, .content = entry.user.text, .images = entry.user.images });
-                try appendExecutionMemoryChatMessages(alloc, messages, entry.execution);
-                if (entry.assistant) |assistant| {
-                    if (assistant.len > 0) {
-                        try messages.append(alloc, .{ .role = .assistant, .content = assistant });
-                    }
-                }
-                const text = try formatBackgroundHistoryContext(alloc, entry);
-                errdefer alloc.free(text);
-                try messages.append(alloc, .{ .role = .user, .content = text });
-            },
             .interrupted => |entry| {
                 try messages.append(alloc, .{ .role = .user, .content = entry.user.text, .images = entry.user.images });
                 try appendExecutionMemoryChatMessages(alloc, messages, entry.execution);
@@ -2892,16 +2801,6 @@ pub fn formatCompactedContinuationMessage(alloc: Allocator, summary: []const u8)
         "{s}{s}\n\n{s}\n{s}",
         .{ compact_continuation_preamble, summary, compact_recent_messages_note, compact_direct_resume_instruction },
     );
-}
-
-pub fn formatBackgroundHistoryContext(alloc: Allocator, entry: BackgroundCommandHistoryTurn) ![]u8 {
-    if (entry.url) |url| {
-        return std.fmt.allocPrint(alloc, "Session event: a previous user request launched a background server. Log: {s}. URL observed at launch: {s}. Re-check runtime context for current liveness before reusing it.", .{ entry.log_path, url });
-    }
-    if (entry.expect_url) {
-        return std.fmt.allocPrint(alloc, "Session event: a previous user request launched a background server. Log: {s}. Re-check runtime context for current liveness and URL state before reusing it.", .{entry.log_path});
-    }
-    return std.fmt.allocPrint(alloc, "Session event: a previous user request launched a background command. Log: {s}. Re-check runtime context for current liveness before treating it as running.", .{entry.log_path});
 }
 
 pub fn formatExecutionFileContext(alloc: Allocator, files: []const core_types.FileEvidence) ![]u8 {
@@ -3223,7 +3122,6 @@ fn buildCompactedSummaryText(
     try appendUserSummaryLines(arena, &lines, removed);
     try appendAssistantSummaryLines(arena, &lines, removed);
     try appendExecutionSummaryLines(arena, &lines, removed);
-    try appendBackgroundSummaryLines(arena, &lines, removed);
     try appendInterruptedSummaryLines(arena, &lines, removed);
 
     if (lines.items.len <= 2) {
@@ -3239,7 +3137,6 @@ fn appendUserSummaryLines(arena: Allocator, lines: *std.ArrayList([]const u8), r
     for (removed) |turn| {
         const user_text = switch (turn) {
             .assistant => |entry| entry.user.text,
-            .background_command => |entry| entry.user.text,
             .interrupted => |entry| entry.user.text,
             .compacted_summary => continue,
         };
@@ -3262,7 +3159,6 @@ fn appendAssistantSummaryLines(arena: Allocator, lines: *std.ArrayList([]const u
     for (removed) |turn| {
         const assistant_text = switch (turn) {
             .assistant => |entry| entry.assistant,
-            .background_command => |entry| entry.assistant orelse continue,
             .interrupted => |entry| entry.assistant orelse continue,
             else => continue,
         };
@@ -3285,7 +3181,6 @@ fn appendExecutionSummaryLines(arena: Allocator, lines: *std.ArrayList([]const u
     for (removed) |turn| {
         const execution = switch (turn) {
             .assistant => |entry| entry.execution,
-            .background_command => |entry| entry.execution,
             .interrupted => |entry| entry.execution,
             else => continue,
         };
@@ -3368,7 +3263,6 @@ fn appendBudgetEvidenceForTurn(arena: Allocator, lines: *std.ArrayList([]const u
     if (remaining == 0) return 0;
     const execution = switch (turn) {
         .assistant => |entry| entry.execution,
-        .background_command => |entry| entry.execution,
         .interrupted => |entry| entry.execution,
         else => return 0,
     };
@@ -3404,11 +3298,6 @@ fn estimateHistoryTurnTokens(turn: HistoryTurn) usize {
     return switch (turn) {
         .compacted_summary => |entry| estimateTextTokens(entry.summary),
         .assistant => |entry| estimateTextTokens(entry.user.text) + estimateTextTokens(entry.assistant) + estimateExecutionTokens(entry.execution),
-        .background_command => |entry| estimateTextTokens(entry.user.text) +
-            (if (entry.assistant) |assistant| estimateTextTokens(assistant) else 0) +
-            estimateExecutionTokens(entry.execution) +
-            estimateTextTokens(entry.log_path) +
-            (if (entry.url) |url| estimateTextTokens(url) else 0),
         .interrupted => |entry| estimateTextTokens(entry.user.text) +
             (if (entry.assistant) |assistant| estimateTextTokens(assistant) else 0) +
             estimateExecutionTokens(entry.execution),
@@ -3455,32 +3344,6 @@ fn estimateTextTokens(text: []const u8) usize {
     }
     if (span_len > 0) count += (span_len + 3) / 4;
     return count;
-}
-
-fn appendBackgroundSummaryLines(arena: Allocator, lines: *std.ArrayList([]const u8), removed: []const HistoryTurn) !void {
-    var added: usize = 0;
-    var saw_header = false;
-    for (removed) |turn| {
-        const entry = switch (turn) {
-            .background_command => |value| value,
-            else => continue,
-        };
-
-        if (!saw_header) {
-            try lines.append(arena, "- Background activity:");
-            saw_header = true;
-        }
-
-        const line = if (entry.url) |url|
-            try std.fmt.allocPrint(arena, "  - log={s}, url={s}", .{ entry.log_path, url })
-        else if (entry.expect_url)
-            try std.fmt.allocPrint(arena, "  - log={s}, local server started (URL pending)", .{entry.log_path})
-        else
-            try std.fmt.allocPrint(arena, "  - log={s}", .{entry.log_path});
-        try lines.append(arena, line);
-        added += 1;
-        if (added >= 3) break;
-    }
 }
 
 fn appendInterruptedSummaryLines(arena: Allocator, lines: *std.ArrayList([]const u8), removed: []const HistoryTurn) !void {
@@ -3730,16 +3593,6 @@ test "appendHistoryMessages frees owned projection text when append fails" {
     var compact_failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
     var compact_messages: std.ArrayList(message.Message) = .empty;
     try std.testing.expectError(error.OutOfMemory, appendHistoryMessages(compact_failing.allocator(), &compact_messages, &compact));
-    var bg_failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
-    const bg_alloc = bg_failing.allocator();
-    var bg_messages: std.ArrayList(message.Message) = .empty;
-    defer bg_messages.deinit(bg_alloc);
-    try bg_messages.ensureTotalCapacity(bg_alloc, 1);
-    bg_failing.fail_index = bg_failing.alloc_index + 1;
-    bg_failing.resize_fail_index = bg_failing.resize_index;
-    const bg = [_]HistoryTurn{.{ .background_command = .{ .user = .{ .text = @constCast("run") }, .log_path = @constCast("/tmp/log"), .expect_url = true } }};
-    try std.testing.expectError(error.OutOfMemory, appendHistoryMessages(bg_alloc, &bg_messages, &bg));
-    for (bg_messages.items) |*msg| msg.deinit(bg_alloc);
 }
 test "dupeImageAttachment frees path when media_type allocation fails" {
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
@@ -3768,38 +3621,6 @@ test "conversation-language inference matches script signals" {
     try std.testing.expectEqual(ConversationLanguage.literal("und-Arab"), inferConversationLanguage("افتح الصفحة الرئيسية", ConversationLanguage.default()));
     try std.testing.expectEqual(ConversationLanguage.literal("und-Latn"), inferConversationLanguage("12345 !!!", ConversationLanguage.literal("und-Latn")));
 }
-test "resume projection emits compacted summary before background command context" {
-    const alloc = std.testing.allocator;
-
-    const history = [_]HistoryTurn{
-        .{ .compacted_summary = .{ .summary = @constCast("summary"), .removed_turn_count = 2, .compaction_count = 1 } },
-        .{ .background_command = .{ .user = .{ .text = @constCast("run dev") }, .log_path = @constCast("/tmp/server.log"), .expect_url = true, .url = @constCast("http://localhost:3000") } },
-    };
-    var messages: std.ArrayList(message.Message) = .empty;
-    defer {
-        for (messages.items) |*msg| msg.deinit(alloc);
-        messages.deinit(alloc);
-    }
-    try appendHistoryMessages(alloc, &messages, &history);
-
-    try std.testing.expectEqual(@as(usize, 3), messages.items.len);
-    try std.testing.expectEqual(.system, messages.items[0].role);
-    try std.testing.expectEqualStrings(
-        "This session is being continued from earlier compacted context. The summary below covers the earlier portion of the conversation.\n\n" ++
-            "summary\n\n" ++
-            "Recent conversation turns are preserved verbatim.\n" ++
-            "Continue the conversation from where it left off without asking the user to repeat context. Resume directly.",
-        messages.items[0].content.?.asText(),
-    );
-    try std.testing.expectEqual(.user, messages.items[1].role);
-    try std.testing.expectEqualStrings("run dev", messages.items[1].content.?.asText());
-    try std.testing.expectEqual(.user, messages.items[2].role);
-    try std.testing.expectEqualStrings(
-        "Session event: a previous user request launched a background server. Log: /tmp/server.log. URL observed at launch: http://localhost:3000. Re-check runtime context for current liveness before reusing it.",
-        messages.items[2].content.?.asText(),
-    );
-}
-
 test "history projection keeps system role only for leading summaries" {
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
@@ -4119,63 +3940,6 @@ test "execution replay context and token estimate include permission feedback" {
     try std.testing.expect(estimateExecutionTokens(with_feedback) > estimateExecutionTokens(without_feedback));
 }
 
-test "specialized history replays execution before visible terminal text and context" {
-    const alloc = std.testing.allocator;
-    var calls = [_]ToolCall{.{
-        .id = "call_read",
-        .name = "read_file",
-        .arguments_json = "{\"path\":\"src/main.zig\"}",
-    }};
-    var results = [_]PersistedToolResult{.{
-        .tool_call_id = @constCast("call_read"),
-        .tool_name = @constCast("read_file"),
-        .status = .success,
-        .output = @constCast("file contents"),
-        .output_bytes = 13,
-        .stored_output_bytes = 13,
-    }};
-    var steps = [_]ToolExecutionStep{.{
-        .assistant = @constCast("I'll inspect it."),
-        .tool_calls = calls[0..],
-        .tool_results = results[0..],
-    }};
-    const execution = ExecutionMemory{ .tool_steps = steps[0..] };
-    const history = [_]HistoryTurn{
-        .{ .background_command = .{
-            .user = .{ .text = @constCast("run dev") },
-            .assistant = @constCast("The server is starting."),
-            .execution = execution,
-            .log_path = @constCast("/tmp/server.log"),
-            .expect_url = true,
-        } },
-        .{ .interrupted = .{
-            .user = .{ .text = @constCast("inspect") },
-            .assistant = @constCast("I inspected the entry point."),
-            .execution = execution,
-        } },
-    };
-
-    var messages: std.ArrayList(message.Message) = .empty;
-    defer deinitMessages(alloc, &messages);
-    try appendHistoryMessages(alloc, &messages, &history);
-
-    try std.testing.expectEqual(@as(usize, 10), messages.items.len);
-    try std.testing.expectEqualStrings("run dev", messages.items[0].content.?.asText());
-    try std.testing.expectEqualStrings("call_read", messages.items[1].tool_calls[0].id);
-    try std.testing.expectEqualStrings("file contents", messages.items[2].content.?.asText());
-    try std.testing.expectEqualStrings("The server is starting.", messages.items[3].content.?.asText());
-    try std.testing.expectEqual(.user, messages.items[4].role);
-    try std.testing.expectEqualStrings("inspect", messages.items[5].content.?.asText());
-    try std.testing.expectEqualStrings("call_read", messages.items[6].tool_calls[0].id);
-    try std.testing.expectEqualStrings("file contents", messages.items[7].content.?.asText());
-    try std.testing.expect(std.mem.startsWith(
-        u8,
-        messages.items[8].content.?.asText(),
-        "I inspected the entry point.",
-    ));
-    try std.testing.expectEqual(.user, messages.items[9].role);
-}
-
 test "budgeted resume projection preserves latest turn and summarizes trimmed handle evidence" {
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
@@ -4373,7 +4137,7 @@ test "budgeted Message and Chat projections retain latest turn and identical tri
                 .files = trimmed_files[0..],
             },
         } },
-        .{ .background_command = .{
+        .{ .assistant = .{
             .user = .{
                 .text = @constCast("run retained"),
                 .images = background_images[0..],
@@ -4383,9 +4147,6 @@ test "budgeted Message and Chat projections retain latest turn and identical tri
                 .tool_steps = retained_steps[0..],
                 .files = retained_files[0..],
             },
-            .log_path = @constCast("/tmp/retained.log"),
-            .expect_url = true,
-            .url = @constCast("http://localhost:3000"),
         } },
         .{ .interrupted = .{
             .user = .{
@@ -4426,7 +4187,6 @@ test "budgeted Message and Chat projections retain latest turn and identical tri
     );
 
     try std.testing.expectEqual(messages.items.len, chat_messages.items.len);
-    var saw_background = false;
     var saw_interrupted = false;
     var saw_failure_status = false;
     var saw_file_evidence = false;
@@ -4441,8 +4201,6 @@ test "budgeted Message and Chat projections retain latest turn and identical tri
         try std.testing.expectEqual(projected.content == null, chat.content == null);
         if (projected.content) |content| {
             try std.testing.expectEqualStrings(content.asText(), chat.content.?);
-            saw_background = saw_background or
-                std.mem.find(u8, content.asText(), "/tmp/retained.log") != null;
             saw_interrupted = saw_interrupted or
                 std.mem.find(u8, content.asText(), "<turn_aborted>") != null;
             saw_file_evidence = saw_file_evidence or
@@ -4493,7 +4251,6 @@ test "budgeted Message and Chat projections retain latest turn and identical tri
         trimmed_context,
         "src/trimmed.zig",
     ) != null);
-    try std.testing.expect(saw_background);
     try std.testing.expect(saw_interrupted);
     try std.testing.expect(saw_failure_status);
     try std.testing.expect(saw_file_evidence);
@@ -4903,68 +4660,6 @@ test "SessionRuntime.clearHistory empties owned turns and keeps runtime reusable
     try std.testing.expectEqualStrings("three", runtime.lastAssistantReply().?);
 }
 
-test "SessionRuntime.appendHistoryEntry stores exact deep copies for all variants" {
-    const alloc = std.testing.allocator;
-    var runtime: SessionRuntime = .{ .max_history_turns = 0 };
-    defer runtime.deinit(alloc);
-
-    var caller_assistant = try makeAssistantTurn(alloc, "alpha", "assistant alpha");
-    defer freeHistoryTurn(alloc, caller_assistant);
-    var caller_background = HistoryTurn{ .background_command = .{
-        .user = .{ .text = try alloc.dupe(u8, "run server") },
-        .assistant = try alloc.dupe(u8, "server ready"),
-        .execution = .{ .files = blk: {
-            const files = try alloc.alloc(FileEvidence, 1);
-            files[0] = .{
-                .path = try alloc.dupe(u8, "src/main.zig"),
-                .tool_call_id = try alloc.dupe(u8, "call_read"),
-                .tool_name = try alloc.dupe(u8, "read_file"),
-                .action = .read,
-                .status = .success,
-            };
-            break :blk files;
-        } },
-        .log_path = try alloc.dupe(u8, "/tmp/server.log"),
-        .expect_url = true,
-        .url = try alloc.dupe(u8, "http://localhost:3000"),
-    } };
-    defer freeHistoryTurn(alloc, caller_background);
-    var caller_summary = HistoryTurn{ .compacted_summary = .{
-        .summary = try alloc.dupe(u8, "prior summary"),
-        .removed_turn_count = 4,
-        .compaction_count = 2,
-    } };
-    defer freeHistoryTurn(alloc, caller_summary);
-
-    try runtime.appendHistoryEntry(alloc, caller_assistant);
-    try runtime.appendHistoryEntry(alloc, caller_background);
-    try runtime.appendHistoryEntry(alloc, caller_summary);
-
-    caller_assistant.assistant.user.text[0] = 'z';
-    caller_background.background_command.assistant.?[0] = '!';
-    caller_background.background_command.execution.files[0].path[0] = '!';
-    caller_background.background_command.log_path[0] = '!';
-    caller_background.background_command.url.?[0] = '!';
-    caller_summary.compacted_summary.summary[0] = '!';
-
-    try std.testing.expectEqualStrings("alpha", runtime.history.items[0].assistant.user.text);
-    try std.testing.expectEqualStrings("server ready", runtime.history.items[1].background_command.assistant.?);
-    try std.testing.expectEqualStrings("src/main.zig", runtime.history.items[1].background_command.execution.files[0].path);
-    try std.testing.expectEqualStrings("/tmp/server.log", runtime.history.items[1].background_command.log_path);
-    try std.testing.expectEqualStrings("http://localhost:3000", runtime.history.items[1].background_command.url.?);
-    try std.testing.expectEqualStrings("prior summary", runtime.history.items[2].compacted_summary.summary);
-
-    runtime.max_history_turns = 3;
-    const extra = try makeAssistantTurn(alloc, "omega", "assistant omega");
-    defer freeHistoryTurn(alloc, extra);
-    try runtime.appendHistoryEntry(alloc, extra);
-
-    try std.testing.expectEqual(@as(usize, 4), runtime.historyLen());
-    try std.testing.expectEqualStrings("alpha", runtime.history.items[0].assistant.user.text);
-    try std.testing.expectEqualStrings("prior summary", runtime.history.items[2].compacted_summary.summary);
-    try std.testing.expectEqualStrings("omega", runtime.history.items[3].assistant.user.text);
-}
-
 test "SessionRuntime appends every canonical history turn without compaction" {
     const alloc = std.testing.allocator;
     var runtime = SessionRuntime{ .max_history_turns = 2 };
@@ -5235,85 +4930,76 @@ fn expectCanonicalHistoryFixtureUnchanged(
     );
     try std.testing.expectEqualStrings(
         "canonical background",
-        canonical[1].background_command.user.text,
+        canonical[1].assistant.user.text,
     );
     try std.testing.expectEqualStrings(
         "background assistant",
-        canonical[1].background_command.assistant.?,
+        canonical[1].assistant.assistant,
     );
-    try std.testing.expectEqual(@as(usize, 1), canonical[1].background_command.execution.tool_steps.len);
+    try std.testing.expectEqual(@as(usize, 1), canonical[1].assistant.execution.tool_steps.len);
     try std.testing.expectEqualStrings(
         "checking preserved evidence",
-        canonical[1].background_command.execution.tool_steps[0].assistant.?,
+        canonical[1].assistant.execution.tool_steps[0].assistant.?,
     );
-    try std.testing.expectEqual(@as(usize, 1), canonical[1].background_command.execution.tool_steps[0].tool_calls.len);
+    try std.testing.expectEqual(@as(usize, 1), canonical[1].assistant.execution.tool_steps[0].tool_calls.len);
     try std.testing.expectEqualStrings(
         "call_preserved",
-        canonical[1].background_command.execution.tool_steps[0].tool_calls[0].id,
+        canonical[1].assistant.execution.tool_steps[0].tool_calls[0].id,
     );
     try std.testing.expectEqualStrings(
         "read_file",
-        canonical[1].background_command.execution.tool_steps[0].tool_calls[0].name,
+        canonical[1].assistant.execution.tool_steps[0].tool_calls[0].name,
     );
     try std.testing.expectEqualStrings(
         "{\"path\":\"fixture.txt\"}",
-        canonical[1].background_command.execution.tool_steps[0].tool_calls[0].arguments_json,
+        canonical[1].assistant.execution.tool_steps[0].tool_calls[0].arguments_json,
     );
-    try std.testing.expectEqual(@as(usize, 1), canonical[1].background_command.execution.tool_steps[0].tool_results.len);
+    try std.testing.expectEqual(@as(usize, 1), canonical[1].assistant.execution.tool_steps[0].tool_results.len);
     try std.testing.expectEqual(
         PersistedToolStatus.failure,
-        canonical[1].background_command.execution.tool_steps[0].tool_results[0].status,
+        canonical[1].assistant.execution.tool_steps[0].tool_results[0].status,
     );
     try std.testing.expectEqualStrings(
         "preserved failure",
-        canonical[1].background_command.execution.tool_steps[0].tool_results[0].output,
+        canonical[1].assistant.execution.tool_steps[0].tool_results[0].output,
     );
     try std.testing.expectEqualStrings(
         "result-call_preserved.txt",
-        canonical[1].background_command.execution.tool_steps[0].tool_results[0].output_handle.?,
+        canonical[1].assistant.execution.tool_steps[0].tool_results[0].output_handle.?,
     );
     try std.testing.expectEqualStrings(
         "preserved preview",
-        canonical[1].background_command.execution.tool_steps[0].tool_results[0].preview.?,
+        canonical[1].assistant.execution.tool_steps[0].tool_results[0].preview.?,
     );
-    try std.testing.expectEqual(@as(usize, 17), canonical[1].background_command.execution.tool_steps[0].tool_results[0].output_bytes);
-    try std.testing.expectEqual(@as(usize, 17), canonical[1].background_command.execution.tool_steps[0].tool_results[0].stored_output_bytes);
-    try std.testing.expectEqual(@as(usize, 1), canonical[1].background_command.execution.files.len);
+    try std.testing.expectEqual(@as(usize, 17), canonical[1].assistant.execution.tool_steps[0].tool_results[0].output_bytes);
+    try std.testing.expectEqual(@as(usize, 17), canonical[1].assistant.execution.tool_steps[0].tool_results[0].stored_output_bytes);
+    try std.testing.expectEqual(@as(usize, 1), canonical[1].assistant.execution.files.len);
     try std.testing.expectEqualStrings(
         "src/preserved.zig",
-        canonical[1].background_command.execution.files[0].path,
+        canonical[1].assistant.execution.files[0].path,
     );
     try std.testing.expectEqualStrings(
         "src/preserved-renamed.zig",
-        canonical[1].background_command.execution.files[0].new_path.?,
+        canonical[1].assistant.execution.files[0].new_path.?,
     );
     try std.testing.expectEqualStrings(
         "call_preserved",
-        canonical[1].background_command.execution.files[0].tool_call_id,
+        canonical[1].assistant.execution.files[0].tool_call_id,
     );
     try std.testing.expectEqualStrings(
         "read_file",
-        canonical[1].background_command.execution.files[0].tool_name,
+        canonical[1].assistant.execution.files[0].tool_name,
     );
     try std.testing.expectEqual(
         FileEvidenceAction.rename,
-        canonical[1].background_command.execution.files[0].action,
+        canonical[1].assistant.execution.files[0].action,
     );
     try std.testing.expectEqual(
         PersistedToolStatus.failure,
-        canonical[1].background_command.execution.files[0].status,
+        canonical[1].assistant.execution.files[0].status,
     );
-    try std.testing.expect(canonical[1].background_command.execution.files[0].model_view_covers_full_file);
-    try std.testing.expect(canonical[1].background_command.execution.files[0].stale);
-    try std.testing.expectEqualStrings(
-        "/tmp/preserved.log",
-        canonical[1].background_command.log_path,
-    );
-    try std.testing.expect(canonical[1].background_command.expect_url);
-    try std.testing.expectEqualStrings(
-        "http://localhost:3000",
-        canonical[1].background_command.url.?,
-    );
+    try std.testing.expect(canonical[1].assistant.execution.files[0].model_view_covers_full_file);
+    try std.testing.expect(canonical[1].assistant.execution.files[0].stale);
     try std.testing.expectEqualStrings(
         "canonical interrupted",
         canonical[2].interrupted.user.text,
@@ -5386,16 +5072,13 @@ fn checkPromptHistorySnapshotAllocationFailures(alloc: Allocator) !void {
             },
             .assistant = @constCast("prefix assistant"),
         } },
-        .{ .background_command = .{
+        .{ .assistant = .{
             .user = .{ .text = @constCast("canonical background") },
             .assistant = @constCast("background assistant"),
             .execution = .{
                 .tool_steps = steps[0..],
                 .files = files[0..],
             },
-            .log_path = @constCast("/tmp/preserved.log"),
-            .expect_url = true,
-            .url = @constCast("http://localhost:3000"),
         } },
         .{ .interrupted = .{
             .user = .{ .text = @constCast("canonical interrupted") },
@@ -5649,84 +5332,24 @@ test "SessionRuntime context projection preserves nine typed canonical turns" {
     );
 }
 
-test "SessionRuntime.appendBackgroundCommandHistoryTurn duplicates fields and projects context" {
-    const alloc = std.testing.allocator;
-    var runtime: SessionRuntime = .{ .max_history_turns = 8 };
-    defer runtime.deinit(alloc);
-
-    const user_text = try alloc.dupe(u8, "run dev server");
-    defer alloc.free(user_text);
-    const log_path = try alloc.dupe(u8, "/tmp/dev.log");
-    defer alloc.free(log_path);
-    const url = try alloc.dupe(u8, "http://localhost:5173");
-    defer alloc.free(url);
-
-    const background = command_contract.BackgroundCommand{
-        .pid = "123",
-        .background_record_id = .{
-            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
-            0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
-        },
-        .command = "npm run dev",
-        .cwd = "/tmp/app",
-        .log_path = log_path,
-        .url = url,
-        .expect_url = true,
-    };
-
-    try runtime.appendBackgroundCommandHistoryTurn(alloc, user_text, background);
-    user_text[0] = '!';
-    log_path[0] = '!';
-    url[0] = '!';
-
-    const entry = runtime.history.items[0].background_command;
-    try std.testing.expectEqualStrings("run dev server", entry.user.text);
-    try std.testing.expectEqualStrings("/tmp/dev.log", entry.log_path);
-    try std.testing.expectEqualStrings("http://localhost:5173", entry.url.?);
-    try std.testing.expect(entry.expect_url);
-    try std.testing.expectEqualSlices(
-        u8,
-        &background.background_record_id.?,
-        &entry.background_record_id.?,
-    );
-
-    var messages: std.ArrayList(message.Message) = .empty;
-    defer deinitMessages(alloc, &messages);
-    try SessionRuntime.appendHistoryMessages(alloc, &messages, runtime.history.items);
-    try std.testing.expectEqual(@as(usize, 2), messages.items.len);
-    try std.testing.expectEqualStrings("run dev server", messages.items[0].content.?.asText());
-    try std.testing.expectEqualStrings(
-        "Session event: a previous user request launched a background server. Log: /tmp/dev.log. URL observed at launch: http://localhost:5173. Re-check runtime context for current liveness before reusing it.",
-        messages.items[1].content.?.asText(),
-    );
-    try std.testing.expect(messages.items[1].owns_content);
-}
-
 test "SessionRuntime.snapshotHistory returns deep copy that outlives runtime history" {
     const alloc = std.testing.allocator;
     var runtime: SessionRuntime = .{ .max_history_turns = 8 };
     defer runtime.deinit(alloc);
 
     try runtime.appendAssistantHistoryTurn(alloc, "hello", "world");
-    try runtime.appendBackgroundCommandHistoryTurn(alloc, "run", .{
-        .pid = "1",
-        .command = "serve",
-        .cwd = "/tmp",
-        .log_path = "/tmp/run.log",
-        .url = null,
-        .expect_url = false,
-    });
+    try runtime.appendAssistantHistoryTurn(alloc, "run", "historical command");
 
     const snapshot = try runtime.snapshotHistory(alloc);
     defer freeHistoryTurnSlice(alloc, snapshot);
 
     try std.testing.expect(snapshot[0].assistant.user.text.ptr != runtime.history.items[0].assistant.user.text.ptr);
-    try std.testing.expect(snapshot[1].background_command.log_path.ptr != runtime.history.items[1].background_command.log_path.ptr);
+    try std.testing.expect(snapshot[1].assistant.assistant.ptr != runtime.history.items[1].assistant.assistant.ptr);
 
     runtime.clearHistory(alloc);
 
     try std.testing.expectEqualStrings("hello", snapshot[0].assistant.user.text);
-    try std.testing.expectEqualStrings("/tmp/run.log", snapshot[1].background_command.log_path);
+    try std.testing.expectEqualStrings("historical command", snapshot[1].assistant.assistant);
 }
 
 test "work provenance survives owned runtime snapshots without entering model context" {
@@ -6254,11 +5877,9 @@ test "SessionRuntime.appendHistoryMessages matches top-level projection and pres
             .user = .{ .text = @constCast("question") },
             .assistant = @constCast("answer"),
         } },
-        .{ .background_command = .{
+        .{ .assistant = .{
             .user = .{ .text = @constCast("run dev") },
-            .log_path = @constCast("/tmp/dev.log"),
-            .expect_url = true,
-            .url = @constCast("http://localhost:3000"),
+            .assistant = @constCast("historical command"),
         } },
     };
 
@@ -6281,7 +5902,6 @@ test "SessionRuntime.appendHistoryMessages matches top-level projection and pres
     try std.testing.expect(!static_messages.items[1].owns_content);
     try std.testing.expect(!static_messages.items[2].owns_content);
     try std.testing.expect(!static_messages.items[3].owns_content);
-    try std.testing.expect(static_messages.items[4].owns_content);
 }
 
 test "SessionRuntime.appendHistoryMessages frees owned system text when append fails" {
@@ -6298,40 +5918,6 @@ test "SessionRuntime.appendHistoryMessages frees owned system text when append f
 
 test "history context formatters return exact text" {
     const alloc = std.testing.allocator;
-
-    const with_url = try formatBackgroundHistoryContext(alloc, .{
-        .user = .{ .text = @constCast("run") },
-        .log_path = @constCast("/tmp/url.log"),
-        .expect_url = true,
-        .url = @constCast("http://localhost:3000"),
-    });
-    defer alloc.free(with_url);
-    try std.testing.expectEqualStrings(
-        "Session event: a previous user request launched a background server. Log: /tmp/url.log. URL observed at launch: http://localhost:3000. Re-check runtime context for current liveness before reusing it.",
-        with_url,
-    );
-
-    const pending = try formatBackgroundHistoryContext(alloc, .{
-        .user = .{ .text = @constCast("run") },
-        .log_path = @constCast("/tmp/pending.log"),
-        .expect_url = true,
-    });
-    defer alloc.free(pending);
-    try std.testing.expectEqualStrings(
-        "Session event: a previous user request launched a background server. Log: /tmp/pending.log. Re-check runtime context for current liveness and URL state before reusing it.",
-        pending,
-    );
-
-    const command = try formatBackgroundHistoryContext(alloc, .{
-        .user = .{ .text = @constCast("run") },
-        .log_path = @constCast("/tmp/command.log"),
-        .expect_url = false,
-    });
-    defer alloc.free(command);
-    try std.testing.expectEqualStrings(
-        "Session event: a previous user request launched a background command. Log: /tmp/command.log. Re-check runtime context for current liveness before treating it as running.",
-        command,
-    );
 
     const compacted = try formatCompactedContinuationMessage(alloc, "summary");
     defer alloc.free(compacted);
