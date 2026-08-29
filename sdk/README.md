@@ -308,14 +308,14 @@ The WebAssembly runtime intentionally does not provide:
 - Public web fetch, web search, and general outbound network access
 
 The embedded runtime tells the model not to retry unavailable network work
-through terminal commands. Use locally installed fx when the full native tool
+through shell commands. Use locally installed fx when the full native tool
 suite is required.
 
-The optional browser workspace exposes foreground terminal execution through
+The optional browser workspace exposes completion-only shell execution through
 the typed contract:
 
 ```js
-{ action: "exec", command }
+{ action: "run", command }
 ```
 
 The host remains responsible for admitting commands, enforcing limits, and
