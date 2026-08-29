@@ -2860,27 +2860,21 @@ describe("gateway stream lifecycle", () => {
       const resumedParts = resumedRequest.prompt.flatMap((message) => message.content ?? []);
       const historicalCalls = resumedParts.filter((part) =>
         part.type === "tool-call" &&
-        part.toolCallId === callId &&
-        part.toolName === "terminal"
+        part.toolCallId === callId
       );
       const historicalResults = resumedParts.filter((part) =>
         part.type === "tool-result" &&
-        part.toolCallId === callId &&
-        part.toolName === "terminal"
+        part.toolCallId === callId
       );
-      expect(historicalCalls).toHaveLength(1);
-      expect(historicalCalls[0]).toEqual(
-        expect.objectContaining({ input: { request: {} } }),
+      const historicalSummaries = resumedParts.filter((part) =>
+        part.type === "text" &&
+        typeof part.text === "string" &&
+        part.text.includes("[Prior terminal unknown action completed.") &&
+        part.text.includes("tool_execution_failed")
       );
-      expect(historicalResults).toHaveLength(1);
-      expect(historicalResults[0]).toEqual(
-        expect.objectContaining({
-          output: expect.objectContaining({
-            type: "error-text",
-            value: expect.stringContaining("tool_execution_failed"),
-          }),
-        }),
-      );
+      expect(historicalCalls).toEqual([]);
+      expect(historicalResults).toEqual([]);
+      expect(historicalSummaries).toHaveLength(1);
       expect(gateway.requests[2].body).toContain("tool_execution_failed");
       expect(gateway.requests[2].body).not.toContain(malformedArguments);
       const resumeTrace = readFileSync(resumeTracePath, "utf8");
