@@ -208,8 +208,15 @@ function toolCalls(command: string, callIds: string[]) {
     ...callIds.map((toolCallId) => ({
       type: "tool-call",
       toolCallId,
-      toolName: "terminal",
-      input: { action: "exec", timeout_ms: 600_000, command },
+      toolName: "shell",
+      input: {
+        request: {
+          action: "run",
+          command,
+          yield_time_ms: 30_000,
+          timeout_ms: 600_000,
+        },
+      },
     })),
     {
       type: "finish",
@@ -223,14 +230,28 @@ function twoEffectfulCommandBatch(first: string, second: string) {
     {
       type: "tool-call",
       toolCallId: "history_feedback_first",
-      toolName: "terminal",
-      input: { action: "exec", timeout_ms: 600_000, command: first },
+      toolName: "shell",
+      input: {
+        request: {
+          action: "run",
+          command: first,
+          yield_time_ms: 30_000,
+          timeout_ms: 600_000,
+        },
+      },
     },
     {
       type: "tool-call",
       toolCallId: "history_feedback_second",
-      toolName: "terminal",
-      input: { action: "exec", timeout_ms: 600_000, command: second },
+      toolName: "shell",
+      input: {
+        request: {
+          action: "run",
+          command: second,
+          yield_time_ms: 30_000,
+          timeout_ms: 600_000,
+        },
+      },
     },
     {
       type: "finish",
@@ -286,7 +307,11 @@ function expectOrdinaryToolResults(body: string, callIds: string[]) {
   for (const result of results) {
     const output = result.output as Record<string, unknown> | undefined;
     expect(output?.type).toBe("text");
-    expect(output?.value).toEqual(expect.stringContaining("exit_code=0"));
+    expect(JSON.parse(output?.value as string)).toMatchObject({
+      state: "completed",
+      exit_code: 0,
+      error: null,
+    });
   }
   expect(JSON.stringify(results)).not.toContain("Repeated identical tool call blocked");
 }
@@ -5524,7 +5549,7 @@ describe("effect-aware command permissions", () => {
   );
 
   test(
-    "fx ask yolo executes pwd through the default user profile without an artifact",
+    "fx ask yolo executes pwd through the default user profile with process-scoped replay",
     async () => {
       const root = createIsolatedRoot();
       const gateway = startFakeGateway([toolCall("pwd"), finalText("ask direct complete")]);
@@ -5544,15 +5569,21 @@ describe("effect-aware command permissions", () => {
 
       expect(result.code).toBe(0);
       expect(result.stderr).toContain("Running pwd");
-      expect(result.stderr).toContain(root.workspace);
       expect(result.stderr.toLowerCase()).not.toContain("error");
+      expect(JSON.parse(toolResultText(gateway.requests[1].body, "command_1"))).toMatchObject({
+        state: "completed",
+        output_delta: `${root.workspace}\n`,
+        exit_code: 0,
+      });
       const json = JSON.parse(result.stdout.trim()) as any;
       expect(json.tool_calls).toHaveLength(1);
       expect(json.tool_calls[0].name).toBe("shell");
       expect(json.tool_calls[0].status).toBe("success");
       expect(json.tool_calls[0].command_result.command).toBe("pwd");
       expect(json.tool_calls[0].command_result.cwd).toBe(root.workspace);
-      expect(json.tool_calls[0].command_result.output_file).toBeNull();
+      expect(json.tool_calls[0].command_result.output_file).toMatch(
+        /^fx-command-replay-[a-f0-9-]+\.bin$/,
+      );
       expectUserProfileTrace(tracePath);
       expect(existsSync(root.profileMarker)).toBe(true);
       expectNoHostileExecutables(root);
@@ -6041,10 +6072,11 @@ describe("effect-aware command permissions", () => {
 
       expect(result.code).toBe(0);
       expect(gateway.requests).toHaveLength(2);
-      expect(gateway.requests[1].body).toContain("\\u001bname");
-      expect(gateway.requests[1].body).toContain("line\\nname");
-      expect(gateway.requests[1].body).not.toContain("\x1b");
-      expect(gateway.requests[1].body).not.toContain("\\x1b");
+      const encoded = toolResultText(gateway.requests[1].body, "command_1");
+      expect(encoded).toContain("\\u001bname");
+      expect(encoded).toContain("line\\nname");
+      expect(encoded).not.toContain("\x1b");
+      expect(encoded).not.toContain("\\x1b");
       expectUserProfileTrace(tracePath);
       expect(existsSync(root.profileMarker)).toBe(true);
       expectNoHostileExecutables(root);
@@ -6078,7 +6110,11 @@ describe("effect-aware command permissions", () => {
       expect(result.code).toBe(0);
       expect(result.stderr).toContain("Running printf '%s' '<'");
       expect(gateway.requests).toHaveLength(2);
-      expect(gateway.requests[1].body).toContain("<stdout>\\n<\\n</stdout>");
+      expect(JSON.parse(toolResultText(gateway.requests[1].body, "command_1"))).toMatchObject({
+        state: "completed",
+        output_delta: "<",
+        exit_code: 0,
+      });
       expectUserProfileTrace(tracePath);
       expect(existsSync(root.profileMarker)).toBe(true);
       expectNoHostileExecutables(root);

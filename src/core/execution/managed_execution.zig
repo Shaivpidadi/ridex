@@ -8,6 +8,7 @@ const contract = @import("managed_execution_contract.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const execution_router = @import("router.zig");
 const io_mod = @import("../shared/io.zig");
+const types = @import("../shared/types.zig");
 const command_replay_store = @import("../session/command_replay_store.zig");
 const session_child_store = @import("../session/session_child_store.zig");
 
@@ -24,6 +25,9 @@ pub const StartCapturedInput = struct {
     timeout_ms: ?usize,
     command_artifact_dir: ?[]const u8,
     replay_capability: ?*const session_child_store.SessionChildCapability = null,
+    output_chunk_lifecycle_id: ?types.ToolLifecycleId = null,
+    output_chunk_ctx: ?*anyopaque = null,
+    on_output_chunk: ?command_runner.CommandOutputCallback = null,
     yield_time_ms: u32 = contract.default_yield_time_ms,
     cancel_flag: ?*std.atomic.Value(bool) = null,
 };
@@ -97,6 +101,31 @@ pub const PreparedSnapshot = struct {
     }
 };
 
+pub fn modelOutputDelta(
+    alloc: Allocator,
+    encoded: []const u8,
+) Allocator.Error!?[]u8 {
+    var parsed = std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        encoded,
+        .{},
+    ) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => null,
+    };
+    defer parsed.deinit();
+    const object = switch (parsed.value) {
+        .object => |value| value,
+        else => return null,
+    };
+    const output_delta = switch (object.get("output_delta") orelse return null) {
+        .string => |value| value,
+        else => return null,
+    };
+    return try alloc.dupe(u8, output_delta);
+}
+
 pub const ListItem = struct {
     execution_id: []u8,
     command: []u8,
@@ -144,6 +173,9 @@ const Entry = struct {
     output: std.ArrayList(u8) = .empty,
     replay_capture: ?*command_replay_store.Capture = null,
     replay_capability: ?*session_child_store.SessionChildCapability = null,
+    output_chunk_lifecycle_id: ?types.ToolLifecycleId = null,
+    output_chunk_ctx: ?*anyopaque = null,
+    on_output_chunk: ?command_runner.CommandOutputCallback = null,
     output_handle: ?[]const u8 = null,
     output_framed_bytes: usize = 0,
     stdout_bytes: usize = 0,
@@ -203,6 +235,13 @@ const Entry = struct {
                 0,
                 &runtime.replay_store,
             );
+        const output_chunk_lifecycle_id = if (input.output_chunk_lifecycle_id) |id|
+            types.ToolLifecycleId{
+                .turn_id = id.turn_id,
+                .call_id = try owned.dupe(u8, id.call_id),
+            }
+        else
+            null;
         entry.* = .{
             .runtime = runtime,
             .arena = arena,
@@ -217,6 +256,9 @@ const Entry = struct {
             .backend_state = .{ .captured = .{ .route = route } },
             .replay_capture = replay_capture,
             .replay_capability = replay_capability,
+            .output_chunk_lifecycle_id = output_chunk_lifecycle_id,
+            .output_chunk_ctx = input.output_chunk_ctx,
+            .on_output_chunk = input.on_output_chunk,
         };
         return entry;
     }
@@ -354,9 +396,12 @@ const Entry = struct {
             .max_command_output_bytes = self.max_output_bytes,
             .cancel_flag = &self.cancel,
             .force_cancel_flag = &self.force_cancel,
+            .output_chunk_lifecycle_id = self.output_chunk_lifecycle_id,
+            .output_chunk_ctx = self.output_chunk_ctx,
+            .on_output_chunk = self.on_output_chunk,
             .accepted_output_chunk_ctx = self,
             .on_accepted_output_chunk = appendOutput,
-            .callback_projection = .model_safe,
+            .callback_projection = .raw,
             .timeout_ms = self.timeout_ms,
             .timeout_started_ms = started_ms,
             .command_artifact_dir = self.command_artifact_dir,

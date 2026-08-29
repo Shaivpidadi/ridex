@@ -396,6 +396,9 @@ fn callRun(
             ctx.command_timeout_ms,
         .command_artifact_dir = ctx.command_artifact_dir,
         .replay_capability = ctx.session_child_capability,
+        .output_chunk_lifecycle_id = ctx.output_chunk_lifecycle_id,
+        .output_chunk_ctx = ctx.output_chunk_ctx,
+        .on_output_chunk = ctx.on_output_chunk,
         .yield_time_ms = input.yield_time_ms,
         .cancel_flag = ctx.cancel_flag,
     }) catch |err| {
@@ -1508,6 +1511,18 @@ test "registered shell run yields and waits through one managed execution" {
     const alloc = std.testing.allocator;
     var runtime = managed_execution.Runtime.init(alloc);
     defer runtime.deinit();
+    var streamed_bytes = std.atomic.Value(usize).init(0);
+    const StreamCapture = struct {
+        fn append(
+            raw: *anyopaque,
+            _: ?types.ToolLifecycleId,
+            _: command_contract.CommandOutputStream,
+            chunk: []const u8,
+        ) !void {
+            const count: *std.atomic.Value(usize) = @ptrCast(@alignCast(raw));
+            _ = count.fetchAdd(chunk.len, .seq_cst);
+        }
+    };
     const spec = tool_dispatch.Tool{
         .name = "shell",
         .description = "shell",
@@ -1552,6 +1567,12 @@ test "registered shell run yields and waits through one managed execution" {
             .managed_executions = &runtime,
             .execution_authority = .{ .run_command = authority },
             .max_command_output_bytes = 4096,
+            .output_chunk_lifecycle_id = .{
+                .turn_id = 1,
+                .call_id = "shell-integration",
+            },
+            .output_chunk_ctx = &streamed_bytes,
+            .on_output_chunk = StreamCapture.append,
         },
         registry,
         .{
@@ -1584,6 +1605,7 @@ test "registered shell run yields and waits through one managed execution" {
     try std.testing.expect(std.mem.find(u8, waited.body, "\"state\":\"completed\"") != null);
     try std.testing.expect(std.mem.find(u8, waited.body, "ready") != null);
     try std.testing.expect(std.mem.find(u8, waited.body, "done") != null);
+    try std.testing.expectEqual(@as(usize, "readydone".len), streamed_bytes.load(.seq_cst));
     try std.testing.expect(std.mem.find(
         u8,
         waited.command_result_json orelse return error.TestExpectedEqual,

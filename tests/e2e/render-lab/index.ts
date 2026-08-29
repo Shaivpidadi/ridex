@@ -14,6 +14,7 @@ import {
 } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { FX_BIN, REPO_ROOT } from "../../evals/eval-helpers";
+import { isVolatileTokenStatusRow } from "../tmux-helpers";
 import {
   ACTIVE_TOOL_MARKER,
   analyzeRun,
@@ -1745,7 +1746,7 @@ function startActiveToolGatewayFixture(): LocalGatewayFixture {
           ? [
               `data: ${JSON.stringify({ type: "tool-input-start", id: "active_tool_1", toolName: "shell" })}`,
               "",
-              `data: ${JSON.stringify({ type: "tool-call", toolCallId: "active_tool_1", toolName: "shell", input: { request: { action: "run", command: "sleep 1; i=1; while [ \"$i\" -le 32 ]; do printf 'ACTIVE_TOOL_LINE_%02d\\n' \"$i\"; i=$((i+1)); sleep 0.03; done; while [ ! -f .active-tool-release ]; do sleep 0.05; done", yield_time_ms: 30_000, timeout_ms: 600_000 } } })}`,
+              `data: ${JSON.stringify({ type: "tool-call", toolCallId: "active_tool_1", toolName: "shell", input: { request: { action: "run", command: "sleep 1; i=1; sleep 3; while [ \"$i\" -le 32 ]; do printf 'ACTIVE_TOOL_LINE_%02d\\n' \"$i\"; i=$((i+1)); sleep 0.03; done; while [ ! -f .active-tool-release ]; do sleep 0.05; done", yield_time_ms: 30_000, timeout_ms: 600_000 } } })}`,
               "",
               `data: ${JSON.stringify({ type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" }, usage: { inputTokens: { total: 1 }, outputTokens: { total: 1 } } })}`,
               "",
@@ -2173,7 +2174,11 @@ class RenderLabTmux {
   }
 
   async waitForStableVisibleState() {
-    return waitForStableProbe(() => this.capturePane());
+    return waitForStableProbe(() =>
+      this.capturePane().split("\n").map((line) =>
+        isVolatileTokenStatusRow(line) ? "<volatile-status>" : line
+      ).join("\n")
+    );
   }
 
   captureFrame(index: number, event: string, binarySha256: string, traceLogPath: string): RenderLabFrame {

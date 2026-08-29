@@ -1,5 +1,6 @@
 const std = @import("std");
 const command_admission = @import("../../permissions/command_admission.zig");
+const managed_execution = @import("../../execution/managed_execution.zig");
 const permission_auto_classifier = @import("../../permissions/auto_classifier.zig");
 const types = @import("../../shared/types.zig");
 const text_utils = @import("../../shared/text_utils.zig");
@@ -902,7 +903,13 @@ pub fn finishCancelledToolStatus(
         "Cancelled",
         advertised_dynamic_tool_names,
     );
-    const command_artifact_handle = if (activityKindForCall(arena, hooks.tool_registry, call) == .command)
+    const command_activity = activityKindForCall(
+        arena,
+        hooks.tool_registry,
+        call,
+    ) == .command;
+    const shell_command = command_activity and std.mem.eql(u8, call.name, "shell");
+    const command_artifact_handle = if (command_activity and !shell_command)
         commandArtifactHandle(arena, result.command_result_json) catch |err| blk: {
             debug_trace.logf("tool", "cancelled command artifact handle omitted err={s}", .{@errorName(err)});
             break :blk null;
@@ -915,6 +922,7 @@ pub fn finishCancelledToolStatus(
             .kind = .cancelled,
             .summary = line,
         },
+        .result_memory = result.tool_result_memory,
         .command_artifact_handle = command_artifact_handle,
     } });
 }
@@ -1012,7 +1020,21 @@ pub fn finishExecutedToolStatus(
     const line = if (diff_entry) |payload| blk: {
         break :blk try formatToolStatusWithStats(arena, summary_line, payload.additions, payload.deletions, hooks.diff_marker_styles);
     } else summary_line;
-    const command_artifact_handle = if (activity_kind == .command)
+    const shell_command = activity_kind == .command and
+        std.mem.eql(u8, call.name, "shell");
+    const presentation_result = try presentedToolResult(
+        arena,
+        call,
+        activity_kind,
+        if (shell_command) result.model_output else safe_result,
+    );
+    var presentation_memory = result_memory;
+    if (shell_command) {
+        presentation_memory.output_handle = null;
+        presentation_memory.preview = presentation_result;
+    }
+    const command_artifact_handle = if (activity_kind == .command and
+        !shell_command)
         try commandArtifactHandle(arena, result.command_result_json)
     else
         null;
@@ -1028,11 +1050,58 @@ pub fn finishExecutedToolStatus(
                     .failed,
                 .summary = line,
             },
-            .result = safe_result,
-            .result_memory = result_memory,
+            .result = presentation_result,
+            .result_memory = presentation_memory,
             .command_artifact_handle = command_artifact_handle,
         },
     });
+}
+
+fn presentedToolResult(
+    arena: Allocator,
+    call: ToolCall,
+    activity_kind: types.ToolActivityKind,
+    safe_result: []const u8,
+) Allocator.Error![]const u8 {
+    if (activity_kind != .command or !std.mem.eql(u8, call.name, "shell")) {
+        return safe_result;
+    }
+    return try managed_execution.modelOutputDelta(arena, safe_result) orelse
+        safe_result;
+}
+
+test "shell command presentation projects output delta without changing other results" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const shell_call = ToolCall{
+        .id = "shell-result",
+        .name = "shell",
+        .arguments_json = "{}",
+    };
+    try std.testing.expectEqualStrings(
+        "visible output\n",
+        try presentedToolResult(
+            arena,
+            shell_call,
+            .command,
+            "{\"output_delta\":\"visible output\\n\",\"exit_code\":0}",
+        ),
+    );
+    const malformed = "not-json";
+    try std.testing.expectEqualStrings(
+        malformed,
+        try presentedToolResult(arena, shell_call, .command, malformed),
+    );
+    const read_call = ToolCall{
+        .id = "read-result",
+        .name = "read_file",
+        .arguments_json = "{}",
+    };
+    try std.testing.expectEqualStrings(
+        "unchanged",
+        try presentedToolResult(arena, read_call, .read, "unchanged"),
+    );
 }
 
 pub const ToolOutcomeDecision = struct {

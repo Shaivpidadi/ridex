@@ -1,5 +1,6 @@
 const std = @import("std");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
+const managed_execution = @import("../../core/execution/managed_execution.zig");
 const display_width = @import("../../core/shared/display_width.zig");
 const input_action = @import("../../core/input/input_action.zig");
 const io_mod = @import("../../core/shared/io.zig");
@@ -4941,7 +4942,20 @@ pub const TranscriptRuntime = struct {
         const context_deferred = types.isContextDeferredToolResult(result);
         const deferred = types.isDeferredToolResult(result);
         const permission_denied = tool_result_errors.toolPermissionDenialReason(result.output) != null;
-        const command_artifact_handle = if (!deferred and !permission_denied and activity_kind == .command)
+        const shell_command = !deferred and
+            !permission_denied and
+            activity_kind == .command and
+            std.mem.eql(u8, call.name, "shell");
+        const projected_shell_result = if (shell_command)
+            try managed_execution.modelOutputDelta(alloc, result.output)
+        else
+            null;
+        defer if (projected_shell_result) |value| alloc.free(value);
+        const presentation_result = projected_shell_result orelse result.output;
+        const command_artifact_handle = if (!deferred and
+            !permission_denied and
+            activity_kind == .command and
+            !shell_command)
             command_output_runtime.commandArtifactHandleFromResult(result.output)
         else
             null;
@@ -4964,10 +4978,10 @@ pub const TranscriptRuntime = struct {
                 .completed
             else
                 .failed,
-            if (deferred or permission_denied) null else result.output,
+            if (deferred or permission_denied) null else presentation_result,
             if (deferred or permission_denied) null else .{
-                .output_handle = result.output_handle,
-                .preview = result.preview,
+                .output_handle = if (shell_command) null else result.output_handle,
+                .preview = projected_shell_result orelse result.preview,
                 .output_bytes = result.output_bytes,
                 .stored_output_bytes = result.stored_output_bytes,
                 .truncated = result.truncated,

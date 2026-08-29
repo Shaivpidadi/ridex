@@ -38,6 +38,22 @@ const UPGRADE_TIMEOUT = TIMEOUT * 2;
 const SESSION_PICKER_META_RE = /\bturns?\b/;
 const SELECTED_COMPLETION_SGR = "\x1b[1m\x1b[38;5;255m";
 
+function fakeShellRun(
+  callId: string,
+  command: string,
+  options: Record<string, unknown> = {},
+): Response {
+  return fakeGatewayToolCall(callId, "shell", {
+    request: {
+      action: "run",
+      command,
+      yield_time_ms: 30_000,
+      timeout_ms: 600_000,
+      ...options,
+    },
+  });
+}
+
 function sessionIdFromHome(home: string): string {
   const sessions = join(home, ".fx", "sessions");
   const ids = readdirSync(sessions, { withFileTypes: true })
@@ -947,11 +963,7 @@ printf '${trailingMarker}   '
     chmodSync(scriptPath, 0o755);
 
     const gateway = startFakeGateway([
-      fakeGatewayToolCall("terminal-safety-command", "terminal", {
-        action: "exec",
-        timeout_ms: 600_000,
-        command: "./command-output-controls.sh",
-      }),
+      fakeShellRun("terminal-safety-command", "./command-output-controls.sh"),
       fakeGatewayFinalText(doneMarker),
     ]);
     let active: TmuxSession | null = null;
@@ -1138,7 +1150,7 @@ test.skipIf(!tmuxAvailable())(
       "awk 'BEGIN { for (i = 1; i <= 100; i++) printf \"FULL_CTRL_O_LINE_%04d\\n\", i }'" +
       ` # ${"argument-padding-".repeat(8)}${commandArgumentTail}`;
     const gateway = startFakeGateway([
-      fakeGatewayToolCall("ctrl-o-command", "terminal", { action: "exec", timeout_ms: 600_000, command }),
+      fakeShellRun("ctrl-o-command", command),
       fakeGatewayFinalText("FULL_CTRL_O_DONE"),
     ]);
     let active: TmuxSession | null = null;
@@ -1278,7 +1290,7 @@ test.skipIf(!tmuxAvailable())(
       `printf '${stdoutTail}\\n'; sleep 0.05; printf '${stderrTail}\\n' >&2`;
     const finalMarker = "CAP_CROSSING_DONE";
     const gateway = startFakeGateway([
-      fakeGatewayToolCall("cap-crossing-command", "terminal", { action: "exec", timeout_ms: 600_000, command }),
+      fakeShellRun("cap-crossing-command", command),
       fakeGatewayFinalText(finalMarker),
     ]);
     let active: TmuxSession | null = null;
@@ -1314,16 +1326,20 @@ test.skipIf(!tmuxAvailable())(
 
       const commandDir = join(home, ".fx", "sessions", sessionId, "logs", "commands");
       const artifactFiles = readdirSync(commandDir);
-      const stdoutName = artifactFiles.find((name) => name.endsWith(".stdout.log"));
-      const stderrName = artifactFiles.find((name) => name.endsWith(".stderr.log"));
-      expect(stdoutName).toBeDefined();
-      expect(stderrName).toBeDefined();
-      const stdoutArtifact = readFileSync(join(commandDir, stdoutName!), "utf8");
-      const stderrArtifact = readFileSync(join(commandDir, stderrName!), "utf8");
-      expect(stdoutArtifact.trimEnd().split("\n")).toHaveLength(lineCount);
-      expect(stderrArtifact.trimEnd().split("\n")).toHaveLength(lineCount);
-      expect(stdoutArtifact).toContain(stdoutTail);
-      expect(stderrArtifact).toContain(stderrTail);
+      const replayFiles = artifactFiles.filter((name) => name.endsWith(".bin"));
+      expect(replayFiles).toHaveLength(1);
+      expect(statSync(join(commandDir, replayFiles[0]!)).size).toBeGreaterThan(
+        1024 * 1024,
+      );
+
+      await active.sendKeys("C-o");
+      await active.waitForText("┃ Review · ←/→ switch · ctrl o close", timeout);
+      await active.sendKeys("Right");
+      await active.waitForText(stderrTail, timeout);
+      const fullDetail = await active.capturePane();
+      expect(fullDetail).toContain(stdoutTail);
+      expect(fullDetail).toContain(stderrTail);
+      await active.sendKeys("C-o");
 
       const replay = await runFx(["replay", tapePath, "--json"], {
         cwd: realpathSync(workspace),
@@ -1410,11 +1426,7 @@ printf '${tailMarker}\\n'
     );
     const gateway = startFakeGateway([
       fakeGatewayFinalText(historicalRows.join("\n")),
-      fakeGatewayToolCall("active-overflow-command", "terminal", {
-        action: "exec",
-        timeout_ms: 600_000,
-        command: "./active-overflow.sh",
-      }),
+      fakeShellRun("active-overflow-command", "./active-overflow.sh"),
       fakeGatewayFinalText(doneMarker),
     ]);
     let active: TmuxSession | null = null;
@@ -1519,18 +1531,21 @@ printf '${tailMarker}\\n'
       expect(terminalCompact).not.toContain(futureMarker);
       const sessionId = sessionIdFromHome(home);
       const commandDir = join(home, ".fx", "sessions", sessionId, "logs", "commands");
-      const combinedName = readdirSync(commandDir).find((name) =>
-        name.endsWith(".log") &&
-        !name.endsWith(".stdout.log") &&
-        !name.endsWith(".stderr.log")
+      const replayFiles = readdirSync(commandDir).filter((name) =>
+        name.endsWith(".bin")
       );
-      expect(combinedName).toBeDefined();
-      const artifact = readFileSync(join(commandDir, combinedName!), "utf8");
-      expect(Buffer.byteLength(artifact)).toBeGreaterThan(1024 * 1024);
-      expect(artifact).toContain(stableMarker);
-      expect(artifact).toContain("ACTIVE_OPEN_059999");
-      expect(artifact).toContain(continuedMarker);
-      expect(artifact).toContain(tailMarker);
+      expect(replayFiles).toHaveLength(1);
+      expect(statSync(join(commandDir, replayFiles[0]!)).size).toBeGreaterThan(
+        1024 * 1024,
+      );
+      await active.sendKeys("C-o");
+      await active.waitForText("┃ Review · ←/→ switch · ctrl o close", timeout);
+      await active.sendKeys("Right");
+      await active.waitForText(tailMarker, timeout);
+      const fullDetail = await active.capturePane();
+      expect(fullDetail).toContain(continuedMarker);
+      expect(fullDetail).toContain(tailMarker);
+      await active.sendKeys("C-o");
 
       expect(readFileSync(stderrPath, "utf8")).toBe("");
       passed = true;
@@ -1615,7 +1630,7 @@ while :; do :; done
       );
     });
     const gateway = startFakeGateway([
-      fakeGatewayToolCall(callId, "terminal", { action: "exec", timeout_ms: 600_000, command: "./cancel-cap.sh" }),
+      fakeShellRun(callId, "./cancel-cap.sh"),
       () => nextResponse,
     ]);
     let active: TmuxSession | null = null;
@@ -1672,19 +1687,14 @@ while :; do :; done
 
       const sessionId = sessionIdFromHome(home);
       const commandDir = join(home, ".fx", "sessions", sessionId, "logs", "commands");
-      const combinedName = readdirSync(commandDir).find((name) =>
-        name.endsWith(".log") &&
-        !name.endsWith(".stdout.log") &&
-        !name.endsWith(".stderr.log")
+      const replayNames = readdirSync(commandDir).filter((name) =>
+        name.endsWith(".bin")
       );
-      expect(combinedName).toBeDefined();
-      const combinedPath = join(commandDir, combinedName!);
-      const artifact = readFileSync(combinedPath, "utf8");
-      expect(Buffer.byteLength(artifact)).toBeGreaterThan(1024 * 1024);
-      expect(artifact).toContain(expectedRows[0]!);
-      expect(artifact).toContain(expectedRows.at(-1)!);
-      expect(artifact).toContain("CAP_FILL_0600_");
-      expect(artifact).toContain(tailMarker);
+      expect(replayNames).toHaveLength(1);
+      const replayName = replayNames[0]!;
+      const replayPath = join(commandDir, replayName);
+      const replayBytes = readFileSync(replayPath);
+      expect(replayBytes.byteLength).toBeGreaterThan(1024 * 1024);
 
       await active.sendKeys("C-o");
       await active.waitForText("┃ Full detail · ctrl o close", timeout);
@@ -1739,12 +1749,12 @@ while :; do :; done
       const calls = parts.filter((part) =>
         part.type === "tool-call" &&
         part.toolCallId === callId &&
-        part.toolName === "terminal"
+        part.toolName === "shell"
       );
       const results = parts.filter((part) =>
         part.type === "tool-result" &&
         part.toolCallId === callId &&
-        part.toolName === "terminal"
+        part.toolName === "shell"
       );
       expect(calls).toHaveLength(1);
       expect(results).toHaveLength(1);
@@ -1753,9 +1763,9 @@ while :; do :; done
       expect(gateway.requests[1]!.body).not.toContain(rowPrefix);
       expect(gateway.requests[1]!.body).not.toContain("CAP_FILL_0600_");
       expect(gateway.requests[1]!.body).not.toContain(tailMarker);
-      expect(gateway.requests[1]!.body).not.toContain(combinedName!);
-      expect(gateway.requests[1]!.body).not.toContain(combinedPath);
-      expect(readFileSync(combinedPath, "utf8")).toBe(artifact);
+      expect(gateway.requests[1]!.body).toContain(replayName);
+      expect(gateway.requests[1]!.body).not.toContain(replayPath);
+      expect(readFileSync(replayPath)).toEqual(replayBytes);
       expect(active.isPaneAlive()).toBe(true);
       await active.sendText("/quit");
       expect(await active.waitForSessionEnd()).toBe(true);
@@ -1780,11 +1790,10 @@ while :; do :; done
       expect(JSON.parse(replayJson.stdout).frame_count).toBeGreaterThan(0);
 
       const trace = readFileSync(tracePath, "utf8");
-      const artifactIndex = trace.indexOf("command output artifact created");
       const interruptIndex = trace.indexOf("event=interrupt_persisted");
       expect(trace).toContain("route=approved_shell");
-      expect(artifactIndex).toBeGreaterThanOrEqual(0);
-      expect(interruptIndex).toBeGreaterThan(artifactIndex);
+      expect(trace).toContain("command output retention cap reached");
+      expect(interruptIndex).toBeGreaterThanOrEqual(0);
       expect(trace).not.toContain("dropping buffered command output");
       expect(trace).not.toContain(
         "cancelled worker event dropped kind=command_output_complete",
@@ -1857,11 +1866,7 @@ while :; do :; done
     chmodSync(scriptPath, 0o755);
 
     const gateway = startFakeGateway([
-      fakeGatewayToolCall("cancelled-below-cap-command", "terminal", {
-        action: "exec",
-        timeout_ms: 600_000,
-        command: "./cancel-below.sh",
-      }),
+      fakeShellRun("cancelled-below-cap-command", "./cancel-below.sh"),
     ]);
     let active: TmuxSession | null = null;
     let passed = false;
@@ -1903,15 +1908,11 @@ while :; do :; done
       expect(compact).not.toContain(tailMarker);
       const sessionId = sessionIdFromHome(home);
       const commandDir = join(home, ".fx", "sessions", sessionId, "logs", "commands");
-      const combinedName = readdirSync(commandDir).find((name) =>
-        name.endsWith(".log") &&
-        !name.endsWith(".stdout.log") &&
-        !name.endsWith(".stderr.log")
+      const replayFiles = readdirSync(commandDir).filter((name) =>
+        name.endsWith(".bin")
       );
-      expect(combinedName).toBeDefined();
-      const artifact = readFileSync(join(commandDir, combinedName!), "utf8");
-      expect(Buffer.byteLength(artifact)).toBeLessThan(64 * 1024);
-      expect(artifact).toBe(`${headMarker}\n${tailMarker}\n`);
+      expect(replayFiles).toHaveLength(1);
+      expect(statSync(join(commandDir, replayFiles[0]!)).size).toBeGreaterThan(0);
 
       await active.sendKeys("C-o");
       await active.waitForText(tailMarker, timeout);
@@ -2019,7 +2020,7 @@ test.skipIf(!tmuxAvailable())(
       expect(countOccurrences(transcriptRegion, outputLine)).toBe(0);
     };
     const gateway = startFakeGateway([
-      fakeGatewayToolCall("order-repro-pwd", "terminal", { action: "exec", timeout_ms: 600_000, command: "pwd" }),
+      fakeShellRun("order-repro-pwd", "pwd"),
       fakeGatewayFinalText(finalMarker),
     ]);
     let active: TmuxSession | null = null;
@@ -2423,7 +2424,7 @@ test.skipIf(!tmuxAvailable())(
 
     const command = `sh -c 'while :; do printf "${streamMarker}\\n"; sleep 0.1; done'`;
     const gateway = startFakeGateway([
-      fakeGatewayToolCall("ctrl-o-cancel-command", "terminal", { action: "exec", timeout_ms: 600_000, command }),
+      fakeShellRun("ctrl-o-cancel-command", command),
     ]);
     let active: TmuxSession | null = null;
     try {
@@ -2489,7 +2490,7 @@ test.skipIf(!tmuxAvailable())(
     const tailMarker = "CTRL_O_LIVE_TAIL";
     const command = "sh -c 'printf \"CTRL_O_LIVE_HEAD\\n\"; sleep 1; printf \"CTRL_O_LIVE_TAIL\\n\"'";
     const gateway = startFakeGateway([
-      fakeGatewayToolCall("ctrl-o-live-command", "terminal", { action: "exec", timeout_ms: 600_000, command }),
+      fakeShellRun("ctrl-o-live-command", command),
       fakeGatewayFinalText("CTRL_O_LIVE_DONE"),
     ]);
     let active: TmuxSession | null = null;
@@ -2555,7 +2556,7 @@ test.skipIf(!tmuxAvailable())(
     const doneMarker = "STREAM_SCROLL_INLINE_DONE";
     const command = `zsh -lc 'for i in {1..80}; do printf "${lineMarker} %03d\\n" "$i"; done; sleep 2; for i in {81..160}; do printf "${lineMarker} %03d\\n" "$i"; done; : > ${shellQuote(phaseTwoComplete)}'`;
     const gateway = startFakeGateway([
-      fakeGatewayToolCall("stream-scroll-handoff", "terminal", { action: "exec", timeout_ms: 600_000, command }),
+      fakeShellRun("stream-scroll-handoff", command),
       fakeGatewayFinalText(doneMarker),
     ]);
     let active: TmuxSession | null = null;
@@ -2724,11 +2725,10 @@ test.skipIf(!tmuxAvailable())(
     const commandMarker = "CTRL_O_NAV_REPEAT";
     const doneMarker = "CTRL_O_NAVIGATION_DONE";
     const gateway = startFakeGateway([
-      fakeGatewayToolCall("ctrl-o-navigation-command", "terminal", {
-        action: "exec",
-        timeout_ms: 600_000,
-        command: `zsh -lc 'for i in {1..100}; do printf "${commandMarker} %05d\\n" "$i"; done; sleep 2; for i in {101..${lineCount}}; do printf "${commandMarker} %05d\\n" "$i"; done'`,
-      }),
+      fakeShellRun(
+        "ctrl-o-navigation-command",
+        `zsh -lc 'for i in {1..100}; do printf "${commandMarker} %05d\\n" "$i"; done; sleep 2; for i in {101..${lineCount}}; do printf "${commandMarker} %05d\\n" "$i"; done'`,
+      ),
       fakeGatewayFinalText(doneMarker),
     ]);
     let active: TmuxSession | null = null;
@@ -2804,11 +2804,10 @@ test.skipIf(!tmuxAvailable())(
     const questionMarker = "CTRL_O_QUESTION_PROMPT";
     const doneMarker = "CTRL_O_QUESTION_DONE";
     const gateway = startFakeGateway([
-      fakeGatewayToolCall("ctrl-o-question-command", "terminal", {
-        action: "exec",
-        timeout_ms: 600_000,
-        command: `sh -c 'printf "${commandMarker}\\n"; sleep 1'`,
-      }),
+      fakeShellRun(
+        "ctrl-o-question-command",
+        `sh -c 'printf "${commandMarker}\\n"; sleep 1'`,
+      ),
       fakeGatewayToolCall("ctrl-o-question", "ask_user_question", {
         questions: [
           {
@@ -2887,8 +2886,15 @@ test.skipIf(!tmuxAvailable())(
     const gateway = startFakeGateway([
       fakeGatewaySerializedToolCall(
         "ctrl-o-spacing-command",
-        "terminal",
-        JSON.stringify({ action: "exec", timeout_ms: 600_000, command }),
+        "shell",
+        JSON.stringify({
+          request: {
+            action: "run",
+            command,
+            yield_time_ms: 30_000,
+            timeout_ms: 600_000,
+          },
+        }),
         beforeMarker,
       ),
       fakeGatewayFinalText(afterMarker),
@@ -3202,17 +3208,20 @@ test.skipIf(!tmuxAvailable())(
       () => "The denied write remains visible while this streamed assistant response advances the compact transcript window.",
     ).join(" ")} CTRL_O_HANDOFF_DONE`;
     const gateway = startFakeGateway([
-      fakeGatewayToolCall("ctrl-o-handoff-prior", "terminal", { action: "exec", timeout_ms: 600_000, command: priorCommand }),
+      fakeShellRun("ctrl-o-handoff-prior", priorCommand),
       fakeGatewayFinalText(priorSummary),
       fakeGatewaySse([
         {
           type: "tool-call",
           toolCallId: "ctrl-o-handoff-command",
-          toolName: "terminal",
+          toolName: "shell",
           input: {
-            action: "exec",
-            timeout_ms: 600_000,
-            command: "sh -c 'sleep 5; printf \"CTRL_O_HANDOFF_READY\\n\"'",
+            request: {
+              action: "run",
+              command: "sh -c 'sleep 5; printf \"CTRL_O_HANDOFF_READY\\n\"'",
+              yield_time_ms: 30_000,
+              timeout_ms: 600_000,
+            },
           },
         },
         {
@@ -3325,11 +3334,10 @@ test.skipIf(!tmuxAvailable())(
     const gateway = startFakeGateway([
       async () => {
         await Bun.sleep(300);
-        return fakeGatewayToolCall("ctrl-o-shell-approval", "terminal", {
-          action: "exec",
-          timeout_ms: 600_000,
-          command: "sh -c 'printf \"CTRL_O_SHELL_APPROVAL_RAN\\n\"'",
-        });
+        return fakeShellRun(
+          "ctrl-o-shell-approval",
+          "sh -c 'printf \"CTRL_O_SHELL_APPROVAL_RAN\\n\"'",
+        );
       },
       fakeGatewayFinalText("CTRL_O_SHELL_APPROVAL_DONE"),
     ]);
@@ -3449,21 +3457,27 @@ test.skipIf(!tmuxAvailable())(
         {
           type: "tool-call",
           toolCallId: "ctrl-o-handoff-first",
-          toolName: "terminal",
+          toolName: "shell",
           input: {
-            action: "exec",
-            timeout_ms: 600_000,
-            command: "sh -c 'touch ctrl-o-handoff-first; printf \"CTRL_O_HANDOFF_FIRST_RUNNING\\n\"; sleep 1; printf \"CTRL_O_HANDOFF_FIRST_DONE\\n\"'",
+            request: {
+              action: "run",
+              command: "sh -c 'touch ctrl-o-handoff-first; printf \"CTRL_O_HANDOFF_FIRST_RUNNING\\n\"; sleep 1; printf \"CTRL_O_HANDOFF_FIRST_DONE\\n\"'",
+              yield_time_ms: 30_000,
+              timeout_ms: 600_000,
+            },
           },
         },
         {
           type: "tool-call",
           toolCallId: "ctrl-o-handoff-second",
-          toolName: "terminal",
+          toolName: "shell",
           input: {
-            action: "exec",
-            timeout_ms: 600_000,
-            command: "touch ctrl-o-handoff-second && printf 'CTRL_O_HANDOFF_SECOND_DONE\\n'",
+            request: {
+              action: "run",
+              command: "touch ctrl-o-handoff-second && printf 'CTRL_O_HANDOFF_SECOND_DONE\\n'",
+              yield_time_ms: 30_000,
+              timeout_ms: 600_000,
+            },
           },
         },
         { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
@@ -3611,18 +3625,21 @@ test.skipIf(!tmuxAvailable())(
       });
     };
     const gateway = startFakeGateway([
-      fakeGatewayToolCall("ctrl-o-pressure-setup", "terminal", {
-        action: "exec",
-        timeout_ms: 600_000,
-        command: setupCommand,
-      }),
+      fakeShellRun("ctrl-o-pressure-setup", setupCommand),
       fakeGatewayFinalText(`${assistantHistory}\n${setupSentinel}`),
       fakeGatewaySse([
         {
           type: "tool-call",
           toolCallId: "ctrl-o-pressure-command",
-          toolName: "terminal",
-          input: { action: "exec", timeout_ms: 600_000, command: activeCommand },
+          toolName: "shell",
+          input: {
+            request: {
+              action: "run",
+              command: activeCommand,
+              yield_time_ms: 30_000,
+              timeout_ms: 600_000,
+            },
+          },
         },
         {
           type: "tool-call",
@@ -4186,11 +4203,19 @@ test.skipIf(!tmuxAvailable())(
           delta: JSON.stringify({ path: "nested/input.txt" }),
         },
         { type: "tool-input-end", id: "deferred-read" },
-        { type: "tool-input-start", id: "deferred-command", toolName: "terminal" },
+        { type: "tool-input-start", id: "deferred-command", toolName: "shell" },
         {
           type: "tool-input-delta",
           id: "deferred-command",
-          delta: JSON.stringify({ action: "exec", timeout_ms: 600_000, command, cwd: "nested" }),
+          delta: JSON.stringify({
+            request: {
+              action: "run",
+              command,
+              cwd: "nested",
+              yield_time_ms: 30_000,
+              timeout_ms: 600_000,
+            },
+          }),
         },
         { type: "tool-input-end", id: "deferred-command" },
         {
@@ -4202,8 +4227,16 @@ test.skipIf(!tmuxAvailable())(
         {
           type: "tool-call",
           toolCallId: "deferred-command",
-          toolName: "terminal",
-          input: { action: "exec", timeout_ms: 600_000, command, cwd: "nested" },
+          toolName: "shell",
+          input: {
+            request: {
+              action: "run",
+              command,
+              cwd: "nested",
+              yield_time_ms: 30_000,
+              timeout_ms: 600_000,
+            },
+          },
         },
         { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
       ]),
@@ -4217,14 +4250,29 @@ test.skipIf(!tmuxAvailable())(
         {
           type: "tool-call",
           toolCallId: "reissued-command",
-          toolName: "terminal",
-          input: { action: "exec", timeout_ms: 600_000, command, cwd: "nested" },
+          toolName: "shell",
+          input: {
+            request: {
+              action: "run",
+              command,
+              cwd: "nested",
+              yield_time_ms: 30_000,
+              timeout_ms: 600_000,
+            },
+          },
         },
         {
           type: "tool-call",
           toolCallId: "ordinary-failure",
-          toolName: "terminal",
-          input: { action: "exec", timeout_ms: 600_000, command: failureCommand },
+          toolName: "shell",
+          input: {
+            request: {
+              action: "run",
+              command: failureCommand,
+              yield_time_ms: 30_000,
+              timeout_ms: 600_000,
+            },
+          },
         },
         { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
       ]),
@@ -4850,7 +4898,7 @@ test.skipIf(!tmuxAvailable())(
       const toolWorkspaceRoot = realpathSync(toolWorkspace);
       const toolReply = "TOOL_RESUME_FINAL_REPLY";
       const toolGateway = startFakeGateway([
-        fakeGatewayToolCall("resume_pwd", "terminal", { action: "exec", timeout_ms: 600_000, command: "pwd" }),
+        fakeShellRun("resume_pwd", "pwd"),
         fakeGatewayFinalText(toolReply),
       ]);
       gateways.push(toolGateway);
@@ -5518,7 +5566,7 @@ printf '${stdoutTail2}\\n'
 
     try {
       const initialGateway = startFakeGateway([
-        fakeGatewayToolCall("resume_long_command", "terminal", { action: "exec", timeout_ms: 600_000, command: fixtureCommand }),
+        fakeShellRun("resume_long_command", fixtureCommand),
         fakeGatewayFinalText(completion),
       ]);
       gateways.push(initialGateway);
@@ -6267,8 +6315,15 @@ while :; do sleep 1; done
     const initialGateway = startFakeGateway([
       fakeGatewaySerializedToolCall(
         "resume-cancelled-command",
-        "terminal",
-        JSON.stringify({ action: "exec", timeout_ms: 600_000, command: "./resume-cancel.sh" }),
+        "shell",
+        JSON.stringify({
+          request: {
+            action: "run",
+            command: "./resume-cancel.sh",
+            yield_time_ms: 30_000,
+            timeout_ms: 600_000,
+          },
+        }),
         assistantMarker,
       ),
       fakeGatewayFinalText(followUpMarker),
@@ -6325,23 +6380,15 @@ while :; do sleep 1; done
 
       const sessionId = sessionIdFromHome(home);
       const commandDir = join(home, ".fx", "sessions", sessionId, "logs", "commands");
-      const artifactName = readdirSync(commandDir).find((name) =>
-        name.endsWith(".log") &&
-        !name.endsWith(".stdout.log") &&
-        !name.endsWith(".stderr.log")
+      const replayNames = readdirSync(commandDir).filter((name) =>
+        name.endsWith(".bin")
       );
-      expect(artifactName).toBeDefined();
-      const artifact = readFileSync(join(commandDir, artifactName!), "utf8");
-      expect(artifact).toContain(outputMarker);
-      expect(artifact).toContain(bufferedTailMarker);
-      expect(artifact).toContain(artifactTailMarker);
-      expect(artifact.indexOf(artifactTailMarker)).toBeGreaterThan(artifact.indexOf(outputMarker));
-      const artifactDigest = createHash("sha256")
-        .update(artifact)
-        .digest("hex")
-        .slice(0, 16);
-      expect(artifactName).toEndWith(`-${artifactDigest}.log`);
-      expect(followUpBody).not.toContain(artifactName!);
+      expect(replayNames).toHaveLength(1);
+      const replayName = replayNames[0]!;
+      const replayPath = join(commandDir, replayName);
+      expect(statSync(replayPath).size).toBeGreaterThan(0);
+      expect(followUpBody).toContain(replayName);
+      expect(followUpBody).not.toContain(replayPath);
 
       await active.sendText("/quit");
       expect(await active.waitForSessionEnd()).toBe(true);
@@ -6431,7 +6478,7 @@ test.skipIf(!tmuxAvailable())(
     chmodSync(scriptPath, 0o755);
 
     const initialGateway = startFakeGateway([
-      fakeGatewayToolCall("resume-zero-output-command", "terminal", { action: "exec", timeout_ms: 600_000, command: "./z.sh" }),
+      fakeShellRun("resume-zero-output-command", "./z.sh"),
     ]);
     const resumedGateway = startFakeGateway([]);
     let active: TmuxSession | null = null;

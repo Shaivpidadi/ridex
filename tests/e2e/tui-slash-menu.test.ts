@@ -3504,7 +3504,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.waitForComposer(10_000);
 
       await session.sendKeys("-l '/clear'");
-      await session.waitForText("start a fresh session and keep background processes", 5_000);
+      await session.waitForText("start a fresh conversation", 5_000);
       await session.sendKeys("Enter");
       await session.waitForComposer(5_000);
 

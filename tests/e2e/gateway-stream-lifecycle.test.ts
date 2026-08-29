@@ -200,7 +200,7 @@ function fakeShellRun(
   options: Record<string, unknown> = {},
 ): Response {
   return fakeGatewayToolCall(callId, "shell", {
-    request: { action: "run", command, ...options },
+    request: { action: "run", command, yield_time_ms: 30_000, ...options },
   });
 }
 
