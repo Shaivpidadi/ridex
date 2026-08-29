@@ -398,7 +398,15 @@ fn callRun(
         .replay_capability = ctx.session_child_capability,
         .yield_time_ms = input.yield_time_ms,
         .cancel_flag = ctx.cancel_flag,
-    }) catch |err| return runtimeFailure(ctx, err);
+    }) catch |err| {
+        if (err == error.Cancelled and
+            ctx.cancel_flag != null and
+            ctx.cancel_flag.?.load(.seq_cst))
+        {
+            return error.Cancelled;
+        }
+        return runtimeFailure(ctx, err);
+    };
     defer prepared.deinit(ctx.allocator);
     return finishPrepared(ctx, runtime, &prepared, .command);
 }
@@ -1136,6 +1144,13 @@ fn finishPrepared(
     prepared: *managed_execution.PreparedSnapshot,
     action: enum { command, stop },
 ) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
+    if (action == .command and cancelledSnapshot(ctx, prepared.snapshot)) {
+        runtime.commitDelivery(
+            prepared.snapshot.execution_id,
+            prepared.reservation_id,
+        ) catch |err| return runtimeFailure(ctx, err);
+        return error.Cancelled;
+    }
     const body = formatSnapshot(ctx.allocator, prepared.snapshot, null) catch |err| {
         runtime.cancelDelivery(
             prepared.snapshot.execution_id,
@@ -1160,6 +1175,18 @@ fn finishPrepared(
         .{ .failure = body }
     else
         .{ .success = body };
+}
+
+fn cancelledSnapshot(
+    ctx: tool_dispatch.DispatchContext,
+    snapshot: managed_execution.Snapshot,
+) bool {
+    const cancel_flag = ctx.cancel_flag orelse return false;
+    if (!cancel_flag.load(.seq_cst)) return false;
+    return switch (snapshot.state) {
+        .running => false,
+        .completed, .stopped, .lost => true,
+    };
 }
 
 fn publishSnapshotMetadata(
