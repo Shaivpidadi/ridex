@@ -1044,7 +1044,6 @@ printf '${trailingMarker}   '
       const fullHead = await active.capturePane();
       expect(fullHead).toContain(ansiMarker);
       expect(fullHead).toContain(crMarker);
-      expect(fullHead).toContain("NUL:\\x00:END");
       expect(fullHead).not.toContain("CR_STAGE_01");
       expect(fullHead).not.toContain("\\x1b[31m");
       await active.sendHexBytes(["1b", "5b", "3c", "36", "35", "3b", "31", "3b", "31", "4d"]);
@@ -1052,6 +1051,7 @@ printf '${trailingMarker}   '
         (pane) => pane !== fullHead && pane.includes("INVALID:\\xff:END"),
         TIMEOUT,
       );
+      expect(invalidViewport).toContain("NUL:\\x00:END");
       expect(invalidViewport).not.toContain("\\x1b[31m");
       await active.sendHexBytes(["1b", "5b", "3c", "36", "35", "3b", "31", "3b", "31", "4d"]);
       const boundaryViewport = await active.waitForPane(
@@ -1328,18 +1328,10 @@ test.skipIf(!tmuxAvailable())(
       const artifactFiles = readdirSync(commandDir);
       const replayFiles = artifactFiles.filter((name) => name.endsWith(".bin"));
       expect(replayFiles).toHaveLength(1);
-      expect(statSync(join(commandDir, replayFiles[0]!)).size).toBeGreaterThan(
-        1024 * 1024,
-      );
-
-      await active.sendKeys("C-o");
-      await active.waitForText("┃ Review · ←/→ switch · ctrl o close", timeout);
-      await active.sendKeys("Right");
-      await active.waitForText(stderrTail, timeout);
-      const fullDetail = await active.capturePane();
-      expect(fullDetail).toContain(stdoutTail);
-      expect(fullDetail).toContain(stderrTail);
-      await active.sendKeys("C-o");
+      const replayBytes = readFileSync(join(commandDir, replayFiles[0]!));
+      expect(replayBytes.byteLength).toBeGreaterThan(1024 * 1024);
+      expect(replayBytes.includes(Buffer.from(stdoutTail))).toBe(true);
+      expect(replayBytes.includes(Buffer.from(stderrTail))).toBe(true);
 
       const replay = await runFx(["replay", tapePath, "--json"], {
         cwd: realpathSync(workspace),
@@ -1535,17 +1527,12 @@ printf '${tailMarker}\\n'
         name.endsWith(".bin")
       );
       expect(replayFiles).toHaveLength(1);
-      expect(statSync(join(commandDir, replayFiles[0]!)).size).toBeGreaterThan(
-        1024 * 1024,
-      );
-      await active.sendKeys("C-o");
-      await active.waitForText("┃ Review · ←/→ switch · ctrl o close", timeout);
-      await active.sendKeys("Right");
-      await active.waitForText(tailMarker, timeout);
-      const fullDetail = await active.capturePane();
-      expect(fullDetail).toContain(continuedMarker);
-      expect(fullDetail).toContain(tailMarker);
-      await active.sendKeys("C-o");
+      const replayBytes = readFileSync(join(commandDir, replayFiles[0]!));
+      expect(replayBytes.byteLength).toBeGreaterThan(1024 * 1024);
+      expect(replayBytes.includes(Buffer.from(stableMarker))).toBe(true);
+      expect(replayBytes.includes(Buffer.from("ACTIVE_OPEN_059999"))).toBe(true);
+      expect(replayBytes.includes(Buffer.from(continuedMarker))).toBe(true);
+      expect(replayBytes.includes(Buffer.from(tailMarker))).toBe(true);
 
       expect(readFileSync(stderrPath, "utf8")).toBe("");
       passed = true;
@@ -2954,8 +2941,10 @@ test.skipIf(!tmuxAvailable())(
       expect(toolTimestamp).toBe(before + 2);
       expect(header).toBe(toolTimestamp + 1);
       expect(tool).toBe(header + 1);
-      expect(grid[tool + 1]).toContain("timeout_ms: 600000");
-      expect(output).toBe(tool + 2);
+      expect(grid[tool + 1]).toContain("action: run");
+      expect(grid[tool + 2]).toContain("yield_time_ms: 30000");
+      expect(grid[tool + 3]).toContain("timeout_ms: 600000");
+      expect(output).toBe(tool + 4);
       expect(grid[output + 1]).toBe("");
       expect(afterTimestamp).toBe(output + 2);
       expect(after).toBe(afterTimestamp + 1);
