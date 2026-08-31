@@ -1007,7 +1007,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
     await expectFixtureProcessesExited(wire);
   }, 45_000);
 
-  test("one-off child uses only its captured MCP tools resources prompts and completion view", async () => {
+  test("managed child uses only its captured MCP tools resources prompts and completion view", async () => {
     const root = createRoot("one-off-mcp-view", MODERN_FIXTURE, { mode: "features" });
     const parentPrompt = "CREATE_SCOPED_MCP_ONE_OFF";
     const childPrompt = "SCOPED_MCP_ONE_OFF_WORK";
@@ -1069,12 +1069,9 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
       }
       if (body.includes(parentPrompt)) {
         return fakeGatewayToolCall("create_scoped_child", "subagent", {
-          command: {
-            create: {
-              name: "scoped-mcp-one-off",
-              mode: "one_off",
-              prompt: childPrompt,
-            },
+          request: {
+            action: "run",
+            task: childPrompt,
           },
         });
       }
@@ -1106,9 +1103,9 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
     await expectFixtureProcessesExited(wire);
   }, 40_000);
 
-  for (const childMode of ["one_off", "persistent"] as const) {
-    const label = childMode === "one_off" ? "one-off" : "persistent";
-    const marker = childMode === "one_off" ? "ONE_OFF" : "PERSISTENT";
+  for (const childMode of ["persistent"] as const) {
+    const label = "persistent";
+    const marker = "PERSISTENT";
     test(`${label} child admits a feature-only MCP server without tool access`, async () => {
       const root = createRoot(`${label}-feature-only`, MODERN_FIXTURE, {
         mode: "features_no_tools",
@@ -1138,12 +1135,9 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
         }
         if (body.includes(parentPrompt)) {
           return fakeGatewayToolCall("create_feature_only_child", "subagent", {
-            command: {
-              create: {
-                name: `feature-only-${label}`,
-                mode: childMode,
-                prompt: childPrompt,
-              },
+            request: {
+              action: "run",
+              task: childPrompt,
             },
           });
         }
@@ -1192,9 +1186,9 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
     }, 40_000);
   }
 
-  for (const childMode of ["one_off", "persistent"] as const) {
-    const label = childMode === "one_off" ? "one-off" : "persistent";
-    const marker = childMode === "one_off" ? "ONE_OFF" : "PERSISTENT";
+  for (const childMode of ["persistent"] as const) {
+    const label = "persistent";
+    const marker = "PERSISTENT";
     test(`${label} child with no configured MCP runtime fails closed before transport`, async () => {
       const root = createRoot(`${label}-mcp-disabled`, MODERN_FIXTURE);
       writeFileSync(join(root.home, ".fx", "mcp.json"), JSON.stringify({ mcp: {} }));
@@ -1236,12 +1230,9 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
         }
         if (body.includes(parentPrompt)) {
           return fakeGatewayToolCall("create_disabled_child", "subagent", {
-            command: {
-              create: {
-                name: `disabled-mcp-${label}`,
-                mode: childMode,
-                prompt: childPrompt,
-              },
+            request: {
+              action: "run",
+              task: childPrompt,
             },
           });
         }
@@ -1268,8 +1259,8 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
     }, 40_000);
   }
 
-  for (const childMode of ["one_off", "persistent"] as const) {
-    const label = childMode === "one_off" ? "one-off" : "persistent";
+  for (const childMode of ["persistent"] as const) {
+    const label = "persistent";
     test(`${label} scoped search refreshes only its admitted stale MCP server`, async () => {
       const root = createRoot(`${label}-scoped-refresh`, MODERN_FIXTURE, {
         mode: "subscription_cache",
@@ -1343,12 +1334,9 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
             "create_scoped_refresh_child",
             "subagent",
             {
-              command: {
-                create: {
-                  name: `scoped-refresh-${label}`,
-                  mode: childMode,
-                  prompt: childPrompt,
-                },
+              request: {
+                action: "run",
+                task: childPrompt,
               },
             },
           );
@@ -4827,12 +4815,9 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
           });
         }
         return fakeGatewayToolCall("reload_child_create", "subagent", {
-          command: {
-            create: {
-              name: "reload-mcp-child",
-              mode: "persistent",
-              prompt: childPrompt,
-            },
+          request: {
+            action: "run",
+            task: childPrompt,
           },
         });
       }, {
@@ -4987,7 +4972,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
     await expectFixtureProcessesExited(wire);
   }, 30_000);
 
-  for (const childMode of ["one_off", "persistent"] as const) {
+  for (const childMode of ["persistent"] as const) {
     test(`revoked ${childMode} authority prevents stdio recovery effects`, async () => {
       const root = realpathSync(mkdtempSync(join(tmpdir(), `fx-mcp-${childMode}-recovery-`)));
       cleanupRoot = root;

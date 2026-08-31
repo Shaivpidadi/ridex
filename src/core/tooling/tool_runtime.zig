@@ -32,6 +32,7 @@ const subagent_communication_store = @import("../subagent/communication_store.zi
 const subagent_control_store = @import("../subagent/control_store.zig");
 const subagent_create_store = @import("../subagent/create_store.zig");
 const subagent_domain = @import("../subagent/domain.zig");
+const subagent_model_contract = @import("../subagent/model_contract.zig");
 const subagent_tool_host = @import("../subagent/tool_host.zig");
 const subagent_tool_provider = @import("../subagent/tool_provider.zig");
 const subagent_tool_result = @import("../subagent/tool_result.zig");
@@ -1779,59 +1780,33 @@ const SubagentProviderState = struct {
 
 fn subagentProviderFailure(
     alloc: Allocator,
-    operation_id: []const u8,
+    child_id: ?[]const u8,
     error_code: []const u8,
     retryable: bool,
 ) Allocator.Error!subagent_tool_provider.Result {
-    const body = subagent_tool_result.failureAlloc(
-        alloc,
-        operation_id,
-        null,
-        "rejected",
-        error_code,
-        retryable,
-        null,
-    ) catch |err| return switch (err) {
-        error.OutOfMemory, error.WriteFailed => error.OutOfMemory,
-    };
+    const body = subagent_model_contract.encodeResultAlloc(alloc, .{
+        .ok = false,
+        .child_id = child_id,
+        .status = "rejected",
+        .error_code = error_code,
+        .retryable = retryable,
+    }) catch return error.OutOfMemory;
     return .{ .status = .failure, .body = body };
 }
 
 fn executeSubagentProvider(
     raw_context: ?*anyopaque,
     arena: Allocator,
-    command: *subagent_domain.Command,
+    request: *subagent_model_contract.Request,
     invocation_id: []const u8,
 ) Allocator.Error!subagent_tool_provider.Result {
     const state: *SubagentProviderState = @ptrCast(@alignCast(raw_context.?));
     const ctx = state.runtime;
     const host = ctx.subagent_host orelse
-        return subagentProviderFailure(arena, invocation_id, "host_unavailable", false);
+        return subagentProviderFailure(arena, null, "host_unavailable", false);
     const caller_id = ctx.subagent_caller_id orelse
-        return subagentProviderFailure(arena, invocation_id, "caller_unavailable", false);
-    const permission_admitted = host.admitModelCommand(
-        arena,
-        command,
-        caller_id,
-        ctx.permission_mode,
-    ) catch |err| {
-        if (err == error.OutOfMemory) return error.OutOfMemory;
-        return subagentProviderFailure(
-            arena,
-            invocation_id,
-            "host_failure",
-            true,
-        );
-    };
-    if (!permission_admitted) {
-        return subagentProviderFailure(
-            arena,
-            invocation_id,
-            "permission_escalation",
-            false,
-        );
-    }
-    const identity_epoch = if (command.* == .inspect)
+        return subagentProviderFailure(arena, null, "caller_unavailable", false);
+    const identity_epoch = if (request.* == .wait)
         0
     else switch (try persistedSubagentIdentity(
         arena,
@@ -1847,7 +1822,7 @@ fn executeSubagentProvider(
             if (err == error.OutOfMemory) return error.OutOfMemory;
             return try subagentProviderFailure(
                 arena,
-                invocation_id,
+                request.childId(),
                 "host_failure",
                 true,
             );
@@ -1855,12 +1830,12 @@ fn executeSubagentProvider(
         .replay => |epoch| epoch,
         .corrupt => return subagentProviderFailure(
             arena,
-            invocation_id,
+            request.childId(),
             "host_failure",
             true,
         ),
     };
-    const output = host.execute(arena, command, .{
+    const output = host.executeManaged(arena, request, .{
         .caller_id = caller_id,
         .invocation_id = invocation_id,
         .parent_permission_mode = ctx.permission_mode,
@@ -1879,23 +1854,16 @@ fn executeSubagentProvider(
         .identity_epoch = identity_epoch,
     }) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
-        const operation_id = if (command.* == .inspect)
-            invocation_id
-        else
-            try subagent_tool_result.boundOperationIdAlloc(
-                arena,
-                invocation_id,
-                .model,
-                identity_epoch,
-            );
-        return subagentProviderFailure(arena, operation_id, "host_failure", true);
+        return subagentProviderFailure(
+            arena,
+            request.childId(),
+            "host_failure",
+            true,
+        );
     };
     return .{
-        .status = if (std.mem.find(u8, output, "\"ok\":false") == null)
-            .success
-        else
-            .failure,
-        .body = output,
+        .status = if (output.success) .success else .failure,
+        .body = output.body,
     };
 }
 
@@ -2093,11 +2061,6 @@ fn persistedSubagentEpoch(
     const retryable_value = parsed.value.object.get("retryable") orelse
         return null;
     if (retryable_value != .bool) return null;
-    const requested_value = parsed.value.object.get("requested") orelse
-        return null;
-    if (requested_value != .null and requested_value != .object) return null;
-    const cursor_value = parsed.value.object.get("cursor") orelse return null;
-    if (cursor_value != .null and cursor_value != .string) return null;
     const operation_id = operation_value.string;
     const identity = subagent_tool_result.parseBoundOperationId(operation_id) orelse
         return null;
@@ -2649,22 +2612,7 @@ fn expectSingleSubagentCreateEffects(
     var record = try control.load(alloc);
     defer record.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), record.operations.len);
-    try std.testing.expectEqual(@as(usize, 1), record.events.len);
-    try std.testing.expectEqual(@as(usize, 0), record.queue.len);
-
-    const communications = subagent_communication_store.Store{
-        .capability = &capability,
-        .expected_session_id = child_id,
-    };
-    if (try communications.loadOptional(alloc)) |loaded| {
-        var ledger = loaded;
-        defer ledger.deinit(alloc);
-        return error.TestUnexpectedCommunicationEffect;
-    }
-
-    var child = try env.store.loadReadOnly(alloc, child_id);
-    defer child.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 0), child.history.len);
+    try std.testing.expectEqualStrings(child_id, record.child_id);
 }
 
 test "subagent production identity inspections leave no mutation reservations" {
@@ -2696,7 +2644,7 @@ test "subagent production identity inspections leave no mutation reservations" {
         .id = "inspect-fixture-create",
         .name = "subagent",
         .arguments_json =
-        \\{"command":{"create":{"name":"inspect-fixture","mode":"persistent"}}}
+        \\{"request":{"action":"run","task":"inspect fixture"}}
         ,
     });
     try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.success, created.status);
@@ -2705,7 +2653,7 @@ test "subagent production identity inspections leave no mutation reservations" {
 
     const inspect_args = try std.fmt.allocPrint(
         alloc,
-        "{{\"command\":{{\"inspect\":{{\"id\":\"{s}\",\"sections\":[\"status\"]}}}}}}",
+        "{{\"request\":{{\"action\":\"wait\",\"child_id\":\"{s}\"}}}}",
         .{child_id},
     );
     defer alloc.free(inspect_args);
@@ -2733,26 +2681,26 @@ test "subagent production identity inspections leave no mutation reservations" {
         );
     }
 
-    const configure_args = try std.fmt.allocPrint(
+    const send_args = try std.fmt.allocPrint(
         alloc,
-        "{{\"command\":{{\"configure\":{{\"id\":\"{s}\",\"name\":\"renamed\"}}}}}}",
+        "{{\"request\":{{\"action\":\"send\",\"child_id\":\"{s}\",\"message\":\"continue\"}}}}",
         .{child_id},
     );
-    defer alloc.free(configure_args);
-    var configure_arena = std.heap.ArenaAllocator.init(alloc);
-    defer configure_arena.deinit();
-    const configured = try executeToolCall(
+    defer alloc.free(send_args);
+    var send_arena = std.heap.ArenaAllocator.init(alloc);
+    defer send_arena.deinit();
+    const sent = try executeToolCall(
         runtime.context(),
-        configure_arena.allocator(),
+        send_arena.allocator(),
         .{
             .id = "mutation-after-inspections",
             .name = "subagent",
-            .arguments_json = configure_args,
+            .arguments_json = send_args,
         },
     );
     try std.testing.expectEqual(
         tool_contracts.ToolExecutionStatus.success,
-        configured.status,
+        sent.status,
     );
 
     var root_capability = try env.store.openSubagentControlCapabilityReadOnly(
@@ -2802,7 +2750,7 @@ test "subagent production stable failures leave no mutation reservations" {
         .id = "stable-failure-fixture-create",
         .name = "subagent",
         .arguments_json =
-        \\{"command":{"create":{"name":"stable-failure-fixture","mode":"persistent"}}}
+        \\{"request":{"action":"run","task":"stable failure fixture"}}
         ,
     });
     try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.success, created.status);
@@ -2810,7 +2758,7 @@ test "subagent production stable failures leave no mutation reservations" {
     defer alloc.free(child_id);
 
     const missing_args =
-        \\{"command":{"configure":{"id":"01J00000000000000000009999","name":"never applied"}}}
+        \\{"request":{"action":"send","child_id":"01J00000000000000000009999","message":"never applied"}}
     ;
     for (0..3) |index| {
         var invocation_buffer: [64]u8 = undefined;
@@ -2840,26 +2788,26 @@ test "subagent production stable failures leave no mutation reservations" {
         );
     }
 
-    const configure_args = try std.fmt.allocPrint(
+    const send_args = try std.fmt.allocPrint(
         alloc,
-        "{{\"command\":{{\"configure\":{{\"id\":\"{s}\",\"name\":\"still writable\"}}}}}}",
+        "{{\"request\":{{\"action\":\"send\",\"child_id\":\"{s}\",\"message\":\"still writable\"}}}}",
         .{child_id},
     );
-    defer alloc.free(configure_args);
-    var configure_arena = std.heap.ArenaAllocator.init(alloc);
-    defer configure_arena.deinit();
-    const configured = try executeToolCall(
+    defer alloc.free(send_args);
+    var send_arena = std.heap.ArenaAllocator.init(alloc);
+    defer send_arena.deinit();
+    const sent = try executeToolCall(
         runtime.context(),
-        configure_arena.allocator(),
+        send_arena.allocator(),
         .{
             .id = "model-mutation-after-stable-failures",
             .name = "subagent",
-            .arguments_json = configure_args,
+            .arguments_json = send_args,
         },
     );
     try std.testing.expectEqual(
         tool_contracts.ToolExecutionStatus.success,
-        configured.status,
+        sent.status,
     );
 
     var root_capability = try env.store.openSubagentControlCapabilityReadOnly(
@@ -2897,10 +2845,10 @@ test "subagent production identity replays one invocation within an active agent
     const root_id = "01J00000000000000000000000";
     const invocation_id = "production-active-turn-replay";
     const create_args =
-        \\{"command":{"create":{"name":"active-turn-worker","mode":"persistent"}}}
+        \\{"request":{"action":"run","task":"active turn worker"}}
     ;
     const changed_args =
-        \\{"command":{"create":{"name":"changed-active-turn-worker","mode":"persistent"}}}
+        \\{"request":{"action":"run","task":"changed active turn worker"}}
     ;
     var repeated_calls = [_]ToolCall{.{
         .id = invocation_id,
@@ -3037,7 +2985,7 @@ test "subagent production identity rejects malformed active-turn evidence before
     const root_id = "01J00000000000000000000000";
     const invocation_id = "production-active-turn-corrupt";
     const create_args =
-        \\{"command":{"create":{"name":"must-not-exist","mode":"persistent"}}}
+        \\{"request":{"action":"run","task":"must not exist"}}
     ;
     var calls = [_]ToolCall{.{
         .id = invocation_id,
@@ -3247,18 +3195,13 @@ test "subagent identity evidence prefers canonical active-turn results and authe
         }
     }
 
-    const invalid_requested_output = try subagent_tool_result.outcomeAlloc(alloc, .{
+    const missing_operation_output = try subagent_model_contract.encodeResultAlloc(alloc, .{
         .ok = true,
-        .operation_id = current_operation_id,
         .child_id = "invalid-child",
-        .status = "created",
-        .error_code = null,
-        .retryable = false,
-        .requested_json = "\"invalid\"",
-        .cursor = null,
+        .status = "idle",
     });
-    defer alloc.free(invalid_requested_output);
-    current_messages[1].content = invalid_requested_output;
+    defer alloc.free(missing_operation_output);
+    current_messages[1].content = missing_operation_output;
     switch (try persistedSubagentIdentity(
         alloc,
         &current_messages,
@@ -3287,7 +3230,7 @@ test "subagent production identity replays persisted invocation across restart w
     const root_id = "01J00000000000000000000000";
     const invocation_id = "production-adapter-replay";
     const create_args =
-        \\{"command":{"create":{"name":"replayed-worker","mode":"persistent"}}}
+        \\{"request":{"action":"run","task":"replayed worker"}}
     ;
     const call = ToolCall{
         .id = invocation_id,
@@ -3390,7 +3333,7 @@ test "subagent production identity replays persisted invocation across restart w
             .id = invocation_id,
             .name = "subagent",
             .arguments_json =
-            \\{"command":{"create":{"name":"different-worker","mode":"persistent"}}}
+            \\{"request":{"action":"run","task":"different worker"}}
             ,
         },
     );

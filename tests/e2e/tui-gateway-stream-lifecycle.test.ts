@@ -5628,13 +5628,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           }
           if (body.includes(parentPrompt)) {
             return fakeGatewayToolCall(parentCreateId, "subagent", {
-              command: {
-                create: {
-                  name: `fxc194-${decision}-child`,
-                  mode: "one_off",
-                  prompt: childPrompt,
-                },
-              },
+              request: { action: "run", task: childPrompt },
             });
           }
           return new Response("unexpected Gateway request", { status: 500 });

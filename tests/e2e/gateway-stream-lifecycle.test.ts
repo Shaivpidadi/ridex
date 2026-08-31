@@ -5013,7 +5013,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       }
       if (body.includes('"toolCallId":"parent_subagent_create_1"')) {
         expect(toolResultOutput(body, "parent_subagent_create_1")).toContain(
-          '"status":"created"',
+          '"child_id":',
         );
         return parentCompletion;
       }
@@ -5027,12 +5027,9 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         });
       }
       return fakeGatewayToolCall("parent_subagent_create_1", "subagent", {
-        command: {
-          create: {
-            name: "mcp-child",
-            mode: "one_off",
-            prompt: childPrompt,
-          },
+        request: {
+          action: "run",
+          task: childPrompt,
         },
       });
     }, {
@@ -5098,11 +5095,9 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       }
       if (body.includes(inspectPrompt)) {
         return fakeGatewayToolCall("host_exit_inspect_1", "subagent", {
-          command: {
-            inspect: {
-              id: childId,
-              sections: ["status"],
-            },
+          request: {
+            action: "wait",
+            child_id: childId,
           },
         });
       }
@@ -5110,7 +5105,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         const created = JSON.parse(
           toolResultOutput(body, "host_exit_create_1"),
         ) as { child_id: string; status: string };
-        expect(created.status).toBe("created");
+        expect(created.status).toBe("running");
         childId = created.child_id;
         return parentExit;
       }
@@ -5119,12 +5114,9 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         return delayedSuccessfulResponse();
       }
       return fakeGatewayToolCall("host_exit_create_1", "subagent", {
-        command: {
-          create: {
-            name: "host-exit-child",
-            mode: "persistent",
-            prompt: childPrompt,
-          },
+        request: {
+          action: "run",
+          task: childPrompt,
         },
       });
     }, {
@@ -5182,459 +5174,126 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   }, 30_000);
 
-  test("ask fake Gateway exercises the complete bounded subagent branch matrix", async () => {
-    const root = createFixtureRoot("subagent-branch-matrix");
+  test("ask fake Gateway exercises managed subagent run wait send and stop", async () => {
+    const root = createFixtureRoot("subagent-managed-flow");
     const tracePath = join(root.root, "trace.log");
-    const initialPrompt = "MATRIX_CHILD_INITIAL_INTERRUPTED_WORK";
-    const ordinaryMessage = "milestone: checkpoint is ordinary queued content";
-    const matrixPrompt = "Run the canonical subagent branch matrix.";
-    const replayPrompt = "Replay the original canonical create operation.";
-    let phase: "interrupt" | "matrix" | "replay" = "interrupt";
-    let interruptRootStarted = false;
-    let matrixRootStarted = false;
-    let replayRootStarted = false;
-    let childId = "";
-    let rootSessionId = "";
-    let originalCreateResult = "";
-    let releaseInterruptParent!: (response: Response) => void;
-    const interruptParent = new Promise<Response>((resolve) => {
-      releaseInterruptParent = resolve;
-    });
-    let releaseMatrixAfterMilestone!: (response: Response) => void;
-    let matrixAfterMilestone = new Promise<Response>((resolve) => {
-      releaseMatrixAfterMilestone = resolve;
-    });
-    let releaseCancelAfterOrdinaryStarts!: (response: Response) => void;
-    let cancelAfterOrdinaryStarts = new Promise<Response>((resolve) => {
-      releaseCancelAfterOrdinaryStarts = resolve;
-    });
-
-    const call = (callId: string, command: object) =>
-      fakeGatewayToolCall(callId, "subagent", { command });
-    const createCall = () => call("matrix_create_1", {
-      create: {
-        name: "matrix-child",
-        mode: "persistent",
-        prompt: initialPrompt,
-        notifications: {
-          milestones: ["checkpoint"],
-          stop_conditions: ["terminal"],
-        },
-      },
-    });
-    const expectModelOperationId = (outcome: SubagentOutcome) => {
-      expect(outcome.operation_id).toMatch(/^fxop:2:m:\d+:[0-9a-f]{64}$/);
-    };
+    const firstTask = "Reply exactly CHILD_ONE without using tools.";
+    const followUp = "Reply exactly CHILD_TWO without using tools.";
+    const longTask = "Run a 30-second shell sleep before replying LONG_DONE.";
+    let firstChildId = "";
+    let longChildId = "";
 
     const gateway = startDynamicFakeGateway((body) => {
-      if (hasCurrentToolResult(body, "matrix_reparent_1")) {
-        const outcome = subagentOutcome(body, "matrix_reparent_1");
-        expect(outcome).toMatchObject({
-          ok: true,
-          child_id: childId,
-          status: "awaiting_approval",
-          error_code: null,
-          retryable: false,
-          cursor: null,
-        });
-        expectModelOperationId(outcome);
-        expect(outcome.requested).toEqual({
-          action: "reparent",
-          approval_id: outcome.operation_id,
-        });
-        expect(subagentControl(root, childId).parent_id).toBeNull();
-        return fakeGatewayFinalText("Subagent branch matrix complete.");
-      }
-      if (hasCurrentToolResult(body, "matrix_attach_1")) {
-        const outcome = subagentOutcome(body, "matrix_attach_1");
-        expect(outcome).toMatchObject({
-          ok: true,
-          child_id: childId,
-          status: "awaiting_approval",
-          error_code: null,
-          retryable: false,
-          cursor: null,
-        });
-        expectModelOperationId(outcome);
-        expect(outcome.requested).toEqual({
-          action: "attach",
-          approval_id: outcome.operation_id,
-        });
-        expect(subagentControl(root, childId).parent_id).toBeNull();
-        return call("matrix_reparent_1", {
-          relationship: {
-            action: "reparent",
-            id: childId,
-            parent_id: rootSessionId,
-          },
-        });
-      }
-      if (hasCurrentToolResult(body, "matrix_scope_denied_1")) {
-        const outcome = subagentOutcome(body, "matrix_scope_denied_1");
-        expect(outcome).toMatchObject({
-          ok: false,
-          child_id: childId,
-          status: "rejected",
-          error_code: "child_unavailable",
-          retryable: false,
-          requested: null,
-          cursor: null,
-        });
-        expectModelOperationId(outcome);
-        expect(subagentControl(root, childId).parent_id).toBeNull();
-        return call("matrix_attach_1", {
-          relationship: { action: "attach", id: childId },
-        });
-      }
-      if (hasCurrentToolResult(body, "matrix_detach_1")) {
-        const outcome = subagentOutcome(body, "matrix_detach_1");
-        expect(outcome).toMatchObject({
-          ok: true,
-          child_id: childId,
-          status: "relationship_changed",
-          error_code: null,
-        });
-        expectModelOperationId(outcome);
-        expect(subagentControl(root, childId).parent_id).toBeNull();
-        return call("matrix_scope_denied_1", {
-          inspect: { id: childId, sections: ["status"] },
-        });
-      }
-      if (hasCurrentToolResult(body, "matrix_reopen_1")) {
-        const outcome = subagentOutcome(body, "matrix_reopen_1");
-        expect(outcome).toMatchObject({
-          ok: true,
-          child_id: childId,
-          status: "lifecycle_changed",
-          error_code: null,
-        });
-        expectModelOperationId(outcome);
-        expect(subagentControl(root, childId).state).toBe("idle");
-        return call("matrix_detach_1", {
-          relationship: { action: "detach", id: childId },
-        });
-      }
-      if (hasCurrentToolResult(body, "matrix_close_1")) {
-        const outcome = subagentOutcome(body, "matrix_close_1");
-        expect(outcome).toMatchObject({
-          ok: true,
-          child_id: childId,
-          status: "lifecycle_changed",
-          error_code: null,
-        });
-        expectModelOperationId(outcome);
-        expect(subagentControl(root, childId).state).toBe("archived");
-        return call("matrix_reopen_1", {
-          lifecycle: { id: childId, action: "reopen" },
-        });
-      }
-      if (hasCurrentToolResult(body, "matrix_after_cancel_1")) {
-        const outcome = subagentOutcome(body, "matrix_after_cancel_1");
-        expect(outcome).toMatchObject({
-          ok: true,
-          child_id: childId,
-          status: "idle",
-          error_code: null,
-        });
-        expectModelOperationId(outcome);
-        expect(JSON.stringify(outcome.requested)).toContain(ordinaryMessage);
-        const control = subagentControl(root, childId);
-        const ordinary = control.queue.find((item: any) => item.content === ordinaryMessage);
-        expect(ordinary?.status).toBe("cancelled");
-        expect(
-          control.events.filter((event: any) => event.kind === "milestone_emitted"),
-        ).toHaveLength(1);
-        return call("matrix_close_1", {
-          lifecycle: { id: childId, action: "close" },
-        });
-      }
-      if (hasCurrentToolResult(body, "matrix_cancel_1")) {
-        const outcome = subagentOutcome(body, "matrix_cancel_1");
-        expect(outcome).toMatchObject({
-          ok: true,
-          child_id: childId,
-          status: "lifecycle_changed",
-          error_code: null,
-        });
-        expectModelOperationId(outcome);
-        return call("matrix_after_cancel_1", {
-          inspect: {
-            id: childId,
-            sections: ["status", "messages", "events"],
-            limit: 32,
-          },
-        });
-      }
-      if (hasCurrentToolResult(body, "matrix_send_1")) {
-        const outcome = subagentOutcome(body, "matrix_send_1");
-        expect(outcome).toMatchObject({
-          ok: true,
-          child_id: childId,
-          status: "message_queued",
-          error_code: null,
-        });
-        expectModelOperationId(outcome);
-        return cancelAfterOrdinaryStarts;
-      }
-      if (hasCurrentToolResult(body, "matrix_configure_1")) {
-        const outcome = subagentOutcome(body, "matrix_configure_1");
-        expect(outcome).toMatchObject({
-          ok: true,
-          child_id: childId,
-          status: "configured",
-          error_code: null,
-        });
-        expectModelOperationId(outcome);
-        const control = subagentControl(root, childId);
-        expect(control.configuration).toMatchObject({
-          name: "matrix-renamed",
-          model: MODEL,
-          effort: "low",
-        });
-        return call("matrix_send_1", {
-          message: { send: { id: childId, content: ordinaryMessage } },
-        });
-      }
-      if (hasCurrentToolResult(body, "matrix_inspect_page_2")) {
-        const outcome = subagentOutcome(body, "matrix_inspect_page_2");
-        expect(outcome).toMatchObject({
-          ok: true,
-          child_id: childId,
-          error_code: null,
-        });
-        expectModelOperationId(outcome);
-        const requested = outcome.requested as { events: unknown[] };
-        expect(requested.events).toHaveLength(1);
-        return call("matrix_configure_1", {
-          configure: {
-            id: childId,
-            name: "matrix-renamed",
-            model: MODEL,
-            effort: "low",
-            notifications: {
-              milestones: ["checkpoint"],
-              stop_conditions: ["terminal"],
-            },
-          },
-        });
-      }
-      if (hasCurrentToolResult(body, "matrix_inspect_page_1")) {
-        const outcome = subagentOutcome(body, "matrix_inspect_page_1");
-        expect(outcome).toMatchObject({
-          ok: true,
-          child_id: childId,
-          status: "idle",
-          error_code: null,
-        });
-        expectModelOperationId(outcome);
-        expect(outcome.cursor).not.toBeNull();
-        const requested = outcome.requested as { events: unknown[]; next_cursor: string };
-        expect(requested.events).toHaveLength(1);
-        expect(requested.next_cursor).toBe(outcome.cursor);
-        return call("matrix_inspect_page_2", {
-          inspect: {
-            id: childId,
-            sections: ["events"],
-            cursor: outcome.cursor,
-            limit: 1,
-          },
-        });
-      }
-      if (hasCurrentToolResult(body, "matrix_resume_1")) {
-        const outcome = subagentOutcome(body, "matrix_resume_1");
-        expect(outcome).toMatchObject({
-          ok: true,
-          child_id: childId,
-          status: "lifecycle_changed",
-          error_code: null,
-        });
-        expectModelOperationId(outcome);
-        return matrixAfterMilestone;
-      }
-      if (hasCurrentToolResult(body, "matrix_milestone_1")) {
-        const outcome = subagentOutcome(body, "matrix_milestone_1");
-        expect(outcome).toMatchObject({
-          ok: true,
-          status: "milestone_emitted",
-          error_code: null,
-        });
-        expectModelOperationId(outcome);
-        const control = subagentControl(root, childId);
-        const milestones = control.events.filter((event: any) =>
-          event.kind === "milestone_emitted"
+      if (hasCurrentToolResult(body, "managed_stop_2")) {
+        expect(toolResultOutput(body, "managed_stop_2")).toContain(
+          '"status":"idle"',
         );
-        expect(milestones).toHaveLength(1);
-        expect(milestones[0]).toMatchObject({
-          source_child_id: childId,
-          target_parent_id: rootSessionId,
-          name: "checkpoint",
-        });
-        expect(milestones[0].operation_id).toMatch(
-          /^fxop:2:m:\d+:[0-9a-f]{64}$/,
+        return fakeGatewayFinalText("MANAGED_SUBAGENT_OK");
+      }
+      if (hasCurrentToolResult(body, "managed_stop_1")) {
+        expect(toolResultOutput(body, "managed_stop_1")).toContain(
+          '"status":"stopped"',
         );
-        setTimeout(() => {
-          releaseMatrixAfterMilestone(call("matrix_inspect_page_1", {
-            inspect: {
-              id: childId,
-              sections: ["status", "events", "configuration", "relationship"],
-              limit: 1,
-            },
-          }));
-        }, 100);
-        return fakeGatewayFinalText("Child emitted the derived milestone.");
-      }
-      if (hasCurrentToolResult(body, "matrix_create_1")) {
-        const encoded = toolResultOutput(body, "matrix_create_1");
-        const outcome = subagentOutcome(body, "matrix_create_1");
-        expect(outcome).toMatchObject({
-          ok: true,
-          status: "created",
-          error_code: null,
-        });
-        expectModelOperationId(outcome);
-        if (phase === "interrupt") {
-          childId = outcome.child_id ?? "";
-          originalCreateResult = encoded;
-          return interruptParent;
-        }
-        expect(phase).toBe("replay");
-        expect(outcome.child_id).toBe(childId);
-        expect(encoded).toBe(originalCreateResult);
-        return fakeGatewayFinalText("Original create replayed exactly.");
-      }
-
-      if (phase === "interrupt" && !interruptRootStarted) {
-        interruptRootStarted = true;
-        return createCall();
-      }
-      if (phase === "matrix" && !matrixRootStarted) {
-        matrixRootStarted = true;
-        return call("matrix_resume_1", {
-          lifecycle: { id: childId, action: "resume" },
+        return fakeGatewayToolCall("managed_stop_2", "subagent", {
+          request: { action: "stop", child_id: longChildId },
         });
       }
-      if (phase === "replay" && !replayRootStarted) {
-        replayRootStarted = true;
-        return createCall();
-      }
-      if (body.includes(ordinaryMessage) && phase === "matrix") {
-        releaseCancelAfterOrdinaryStarts(call("matrix_cancel_1", {
-          lifecycle: { id: childId, action: "cancel" },
-        }));
-        return delayedSuccessfulResponse();
-      }
-      if (body.includes(initialPrompt)) {
-        if (phase === "interrupt") {
-          releaseInterruptParent(fakeGatewayFinalText("Parent exits with active child."));
-          return delayedSuccessfulResponse();
-        }
-        return call("matrix_milestone_1", {
-          message: { milestone: { name: "checkpoint" } },
+      if (hasCurrentToolResult(body, "managed_run_long_1")) {
+        const result = JSON.parse(
+          toolResultOutput(body, "managed_run_long_1"),
+        ) as { child_id: string; status: string };
+        longChildId = result.child_id;
+        expect(result.status).toBe("running");
+        return fakeGatewayToolCall("managed_stop_1", "subagent", {
+          request: { action: "stop", child_id: longChildId },
         });
       }
-      return new Response("unexpected matrix request", { status: 500 });
+      if (hasCurrentToolResult(body, "managed_wait_two_1")) {
+        expect(toolResultOutput(body, "managed_wait_two_1")).toContain(
+          '"status":"idle"',
+        );
+        expect(body).toContain("CHILD_TWO");
+        return fakeGatewayToolCall("managed_run_long_1", "subagent", {
+          request: { action: "run", task: longTask },
+        });
+      }
+      if (hasCurrentToolResult(body, "managed_send_1")) {
+        expect(toolResultOutput(body, "managed_send_1")).toContain(
+          '"status":"message_sent"',
+        );
+        return fakeGatewayToolCall("managed_wait_two_1", "subagent", {
+          request: { action: "wait", child_id: firstChildId },
+        });
+      }
+      if (hasCurrentToolResult(body, "managed_wait_one_1")) {
+        expect(toolResultOutput(body, "managed_wait_one_1")).toContain(
+          '"status":"idle"',
+        );
+        expect(body).toContain("CHILD_ONE");
+        return fakeGatewayToolCall("managed_send_1", "subagent", {
+          request: {
+            action: "send",
+            child_id: firstChildId,
+            message: followUp,
+          },
+        });
+      }
+      if (hasCurrentToolResult(body, "managed_run_one_1")) {
+        const result = JSON.parse(
+          toolResultOutput(body, "managed_run_one_1"),
+        ) as { child_id: string; status: string };
+        firstChildId = result.child_id;
+        expect(firstChildId.length).toBeGreaterThan(0);
+        return fakeGatewayToolCall("managed_wait_one_1", "subagent", {
+          request: { action: "wait", child_id: firstChildId },
+        });
+      }
+      if (body.includes(longTask)) return delayedSuccessfulResponse();
+      if (body.includes(followUp)) return fakeGatewayFinalText("CHILD_TWO");
+      if (body.includes(firstTask)) return fakeGatewayFinalText("CHILD_ONE");
+      return fakeGatewayToolCall("managed_run_one_1", "subagent", {
+        request: { action: "run", task: firstTask },
+      });
     }, {
       classifierDecision: "clear",
       models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
     });
 
     try {
-      const interrupted = await runFx(
-        ["ask", "--json", "--auto", "Create the interrupted matrix child."],
-        {
-          cwd: root.workspace,
-          env: fixtureEnv(root, gateway, tracePath),
-          timeoutMs: 20_000,
-        },
-      );
-      expect(interrupted.code).toBe(0);
-      const interruptedJson = parseAskJson(interrupted.stdout);
-      rootSessionId = interruptedJson.session_id;
-      expect(childId.length).toBeGreaterThan(0);
-      expect(subagentControl(root, childId).state).toBe("interrupted");
-
-      phase = "matrix";
-      matrixAfterMilestone = new Promise<Response>((resolve) => {
-        releaseMatrixAfterMilestone = resolve;
-      });
-      cancelAfterOrdinaryStarts = new Promise<Response>((resolve) => {
-        releaseCancelAfterOrdinaryStarts = resolve;
-      });
-      const matrix = await runFx(
-        [
-          "ask",
-          "--json",
-          "--auto",
-          "--resume-id",
-          rootSessionId,
-          matrixPrompt,
-        ],
+      const result = await runFx(
+        ["ask", "--json", "--auto", "Exercise managed delegation."],
         {
           cwd: root.workspace,
           env: fixtureEnv(root, gateway, tracePath),
           timeoutMs: 30_000,
         },
       );
-      expect(matrix.code).toBe(0);
-      expect(parseAskJson(matrix.stdout).output).toContain(
-        "Subagent branch matrix complete.",
+      if (result.code !== 0) {
+        const trace = existsSync(tracePath)
+          ? readFileSync(tracePath, "utf8")
+          : "<no trace>";
+        throw new Error(
+          `managed subagent flow failed: code=${result.code}\nstdout=${result.stdout}\nstderr=${result.stderr}\ntrace=${trace}`,
+        );
+      }
+      expect(parseAskJson(result.stdout).output).toContain(
+        "MANAGED_SUBAGENT_OK",
       );
-
-      const beforeReplay = subagentControl(root, childId);
-      phase = "replay";
-      const replay = await runFx(
-        [
-          "ask",
-          "--json",
-          "--auto",
-          "--resume-id",
-          rootSessionId,
-          replayPrompt,
-        ],
-        {
-          cwd: root.workspace,
-          env: fixtureEnv(root, gateway, tracePath),
-          timeoutMs: 20_000,
-        },
-      );
-      expect(replay.code).toBe(0);
-      expect(parseAskJson(replay.stdout).output).toContain(
-        "Original create replayed exactly.",
-      );
-      expect(subagentControl(root, childId)).toEqual(beforeReplay);
-
-      const control = subagentControl(root, childId);
-      expect(control).toMatchObject({
-        child_id: childId,
-        parent_id: null,
-        mode: "persistent",
-        state: "idle",
-      });
-      expect(control.configuration).toMatchObject({
-        name: "matrix-renamed",
-        model: MODEL,
-        effort: "low",
-      });
-      expect(control.events.filter((event: any) =>
-        event.kind === "milestone_emitted"
-      )).toHaveLength(1);
-      expect(control.queue.find((item: any) => item.content === ordinaryMessage)).toMatchObject({
-        status: "cancelled",
-      });
-      const communication = subagentCommunication(root, childId);
-      expect(communication.ledger.deliveries.filter((delivery: any) =>
-        delivery.payload?.milestone === "checkpoint"
-      )).toHaveLength(1);
+      expect(firstChildId.length).toBeGreaterThan(0);
+      expect(longChildId.length).toBeGreaterThan(0);
+      expect(firstChildId).not.toBe(longChildId);
+      expect(subagentControl(root, firstChildId).state).toBe("idle");
+      expect(subagentControl(root, longChildId).state).toBe("idle");
       for (const request of gateway.requests) {
         expect(request.body).toContain('"name":"subagent"');
-        expect(request.body).not.toContain('"name":"task"');
+        expect(request.body).not.toContain('"command":{"create"');
+        expect(request.body).not.toContain('"operation_id"');
       }
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });
     }
-  }, 90_000);
-
+  }, 45_000);
   test("selected dynamic MCP review cautions with zero sends and clears exactly once", async () => {
     for (const decision of ["caution", "clear"] as const) {
       const root = createFixtureRoot(`mcp-review-${decision}`);

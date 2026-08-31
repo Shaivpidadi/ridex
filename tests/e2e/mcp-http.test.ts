@@ -1692,12 +1692,9 @@ describe("modern MCP Streamable HTTP", () => {
           });
         }
         return fakeGatewayToolCall("reload_http_child_create", "subagent", {
-          command: {
-            create: {
-              name: "reload-http-child",
-              mode: "persistent",
-              prompt: childPrompt,
-            },
+          request: {
+            action: "run",
+            task: childPrompt,
           },
         });
       }, {

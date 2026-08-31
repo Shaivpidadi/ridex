@@ -186,134 +186,47 @@ const ask_user_question_question_schema = model_tool_schema.ObjectSchema{
 };
 
 const subagent_description =
-    "Create, inspect, message, relate, configure, or control ordinary fx child sessions through one asynchronous manager API. When to use: delegate independent work, inspect an explicit child, send ordinary content, emit a configured milestone, or change an authorized child. Select exactly one command branch; creation returns an admitted child handle without waiting for completion. When NOT to use: ordinary local work, implicit child discovery, multiple operations in one call, or milestone-shaped chat content. Inspect only explicit child IDs and requested bounded sections. When the current turn requires the child's settled result, use inspect.wait instead of shell.run sleep or repeated polling. The messages section includes queued work and recent committed child conversation; tool_activity returns recent persisted tool phases; failed status includes the latest retained failure reason. Ordinary content must use message.send.";
+    "Delegate independent work to one managed child. Use run with a task; fx returns the child ID. Omit model and effort to inherit the current settings; never invent a model ID. Use wait only when the current turn needs the child settled, send for one follow-up to that exact child, and stop to cancel owned active work. Child persistence, inspection, notification, relationship, permission, and lifecycle mechanics are owned by fx.";
 
-const subagent_terminal_schema = model_tool_schema.ObjectSchema{
-    .properties = &.{
-        .{ .name = "completed", .json_type = .boolean },
-        .{ .name = "failed", .json_type = .boolean },
-        .{ .name = "cancelled", .json_type = .boolean },
-    },
-    .additional_properties = false,
+const subagent_model_run_properties = [_]model_tool_schema.Property{
+    .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{"run"} } },
+    .{ .name = "task", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = subagent_domain.max_prompt_bytes }, .description = "Complete delegated task. fx creates one persistent child and owns its lifecycle." },
+    .{ .name = "model", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = subagent_domain.max_model_bytes }, .description = "Optional exact configured model ID. Omit to inherit the current model; never guess an ID." },
+    .{ .name = "effort", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = types.ReasoningEffort.max_name_bytes }, .description = "Optional reasoning effort override. Omit to inherit the current effort." },
 };
 
-const subagent_notifications_schema = model_tool_schema.ObjectSchema{
-    .properties = &.{
-        .{ .name = "terminal", .json_type = .object, .shape = &.{ .object = &subagent_terminal_schema } },
-        .{ .name = "milestones", .json_type = .array, .bounds = &.{ .max_items = subagent_domain.max_milestones }, .shape = &.{ .array_values = .{ .json_type = .string } } },
-        .{ .name = "report_interval_ms", .json_type = .integer, .bounds = &.{ .minimum = 1 } },
-        .{ .name = "report_duration_ms", .json_type = .integer, .bounds = &.{ .minimum = 1 } },
-        .{ .name = "stop_conditions", .json_type = .array, .bounds = &.{ .max_items = subagent_domain.max_stop_conditions }, .shape = &.{ .array_values = .{ .json_type = .string, .enum_values = &.{ "terminal", "duration_elapsed" } } } },
-    },
-    .additional_properties = false,
+const subagent_model_wait_properties = [_]model_tool_schema.Property{
+    .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{"wait"} }, .description = "Wait once for the exact child. Provide only action and child_id; fx owns the bounded wait." },
+    .{ .name = "child_id", .json_type = .string, .bounds = &.{ .min_length = 1 }, .description = "Exact child ID returned by run." },
 };
 
-const subagent_create_schema = model_tool_schema.ObjectSchema{
-    .properties = &.{
-        .{ .name = "name", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = subagent_domain.max_name_bytes } },
-        .{ .name = "mode", .json_type = .string, .shape = &.{ .enum_values = &.{ "one_off", "persistent" } } },
-        .{ .name = "prompt", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = subagent_domain.max_prompt_bytes } },
-        .{ .name = "model", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = subagent_domain.max_model_bytes } },
-        .{ .name = "effort", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = types.ReasoningEffort.max_name_bytes } },
-        .{ .name = "permission_mode", .json_type = .string, .shape = &.{ .enum_values = &.{ "ask", "auto", "yolo" } }, .description = "Child permission mode. Inherits the caller when omitted and cannot exceed it." },
-        .{ .name = "notifications", .json_type = .object, .shape = &.{ .object = &subagent_notifications_schema } },
-    },
-    .required = &.{ "name", "mode" },
-    .additional_properties = false,
+const subagent_model_send_properties = [_]model_tool_schema.Property{
+    .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{"send"} } },
+    .{ .name = "child_id", .json_type = .string, .bounds = &.{ .min_length = 1 }, .description = "Exact messageable child ID returned by run." },
+    .{ .name = "message", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = subagent_domain.max_message_bytes }, .description = "One follow-up instruction for the same child." },
 };
 
-const subagent_inspect_wait_schema = model_tool_schema.ObjectSchema{
-    .properties = &.{
-        .{ .name = "until", .json_type = .string, .shape = &.{ .enum_values = &.{"settled"} }, .description = "Wait until a persistent child is idle or the child reaches another non-running terminal/recovery state." },
-        .{ .name = "after_generation", .json_type = .integer, .bounds = &.{ .minimum = 0 }, .description = "Optional durable generation that must be exceeded before the wait can complete." },
-        .{ .name = "timeout_ms", .json_type = .integer, .bounds = &.{ .minimum = 1, .maximum = subagent_domain.max_inspect_wait_ms }, .description = "Bounded wait deadline in milliseconds. A timeout returns the latest inspection with status wait_timed_out." },
-    },
-    .required = &.{ "until", "timeout_ms" },
-    .additional_properties = false,
+const subagent_model_stop_properties = [_]model_tool_schema.Property{
+    .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{"stop"} }, .description = "Stop owned active work. Already-settled children remain unchanged." },
+    .{ .name = "child_id", .json_type = .string, .bounds = &.{ .min_length = 1 }, .description = "Exact child ID returned by run." },
 };
 
-const subagent_inspect_schema = model_tool_schema.ObjectSchema{
-    .properties = &.{
-        .{ .name = "id", .json_type = .string, .bounds = &.{ .min_length = 1 } },
-        .{ .name = "sections", .json_type = .array, .bounds = &.{ .min_items = 1, .max_items = 6 }, .shape = &.{ .array_values = .{ .json_type = .string, .enum_values = &.{ "status", "messages", "tool_activity", "events", "configuration", "relationship" } } } },
-        .{ .name = "cursor", .json_type = .string, .bounds = &.{ .min_length = 1 } },
-        .{ .name = "limit", .json_type = .integer, .bounds = &.{ .minimum = 1, .maximum = subagent_domain.max_page_limit } },
-        .{ .name = "wait", .json_type = .object, .shape = &.{ .object = &subagent_inspect_wait_schema }, .description = "Optional condition-driven same-turn wait. Requires the status section and cannot be combined with a cursor." },
-    },
-    .required = &.{ "id", "sections" },
-    .additional_properties = false,
+const subagent_model_action_schemas = [_]model_tool_schema.ObjectSchema{
+    .{ .properties = &subagent_model_run_properties, .required = &.{ "action", "task" }, .additional_properties = false },
+    .{ .properties = &subagent_model_wait_properties, .required = &.{ "action", "child_id" }, .additional_properties = false },
+    .{ .properties = &subagent_model_send_properties, .required = &.{ "action", "child_id", "message" }, .additional_properties = false },
+    .{ .properties = &subagent_model_stop_properties, .required = &.{ "action", "child_id" }, .additional_properties = false },
 };
 
-const subagent_send_schema = model_tool_schema.ObjectSchema{
-    .properties = &.{
-        .{ .name = "id", .json_type = .string, .bounds = &.{ .min_length = 1 } },
-        .{ .name = "content", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = subagent_domain.max_message_bytes } },
-    },
-    .required = &.{ "id", "content" },
-    .additional_properties = false,
+const subagent_model_action_union = model_tool_schema.ObjectSchema{
+    .one_of = &subagent_model_action_schemas,
 };
 
-const subagent_milestone_schema = model_tool_schema.ObjectSchema{
-    .properties = &.{.{ .name = "name", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = subagent_domain.max_name_bytes } }},
-    .required = &.{"name"},
-    .additional_properties = false,
-};
-
-const subagent_message_schema = model_tool_schema.ObjectSchema{
-    .properties = &.{
-        .{ .name = "send", .json_type = .object, .shape = &.{ .object = &subagent_send_schema } },
-        .{ .name = "milestone", .json_type = .object, .shape = &.{ .object = &subagent_milestone_schema } },
-    },
-    .additional_properties = false,
-    .min_properties = 1,
-    .max_properties = 1,
-};
-
-const subagent_relationship_schema = model_tool_schema.ObjectSchema{
-    .properties = &.{
-        .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{ "attach", "detach", "reparent" } } },
-        .{ .name = "id", .json_type = .string, .bounds = &.{ .min_length = 1 } },
-        .{ .name = "parent_id", .json_type = .string, .bounds = &.{ .min_length = 1 } },
-    },
-    .required = &.{ "action", "id" },
-    .additional_properties = false,
-};
-
-const subagent_configure_schema = model_tool_schema.ObjectSchema{
-    .properties = &.{
-        .{ .name = "id", .json_type = .string, .bounds = &.{ .min_length = 1 } },
-        .{ .name = "name", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = subagent_domain.max_name_bytes } },
-        .{ .name = "model", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = subagent_domain.max_model_bytes } },
-        .{ .name = "effort", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = types.ReasoningEffort.max_name_bytes } },
-        .{ .name = "permission_mode", .json_type = .string, .shape = &.{ .enum_values = &.{ "ask", "auto", "yolo" } }, .description = "New child permission mode. Cannot exceed the caller's current mode." },
-        .{ .name = "notifications", .json_type = .object, .shape = &.{ .object = &subagent_notifications_schema } },
-    },
-    .required = &.{"id"},
-    .additional_properties = false,
-};
-
-const subagent_lifecycle_schema = model_tool_schema.ObjectSchema{
-    .properties = &.{
-        .{ .name = "id", .json_type = .string, .bounds = &.{ .min_length = 1 } },
-        .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{ "cancel", "resume", "close", "reopen" } } },
-    },
-    .required = &.{ "id", "action" },
-    .additional_properties = false,
-};
-
-const subagent_command_schema = model_tool_schema.ObjectSchema{
-    .properties = &.{
-        .{ .name = "create", .json_type = .object, .shape = &.{ .object = &subagent_create_schema } },
-        .{ .name = "inspect", .json_type = .object, .shape = &.{ .object = &subagent_inspect_schema } },
-        .{ .name = "message", .json_type = .object, .shape = &.{ .object = &subagent_message_schema } },
-        .{ .name = "relationship", .json_type = .object, .shape = &.{ .object = &subagent_relationship_schema } },
-        .{ .name = "configure", .json_type = .object, .shape = &.{ .object = &subagent_configure_schema } },
-        .{ .name = "lifecycle", .json_type = .object, .shape = &.{ .object = &subagent_lifecycle_schema } },
-    },
-    .additional_properties = false,
-    .min_properties = 1,
-    .max_properties = 1,
-};
+const subagent_model_request_properties = [_]model_tool_schema.Property{.{
+    .name = "request",
+    .json_type = .object,
+    .shape = &.{ .object = &subagent_model_action_union },
+}};
 const vision_description =
     "Inspect authorized images attached by the user or local image paths supplied in the conversation, and return structured factual evidence. Pass exactly one source: image_ids for attached images, or paths for local images. When to use: read visible text, UI state, objects, layout, or other visual details needed for the task. When NOT to use: inspect paths the user did not supply, infer details not visible in an image, or repeat evidence already available in the conversation.";
 const read_tool_result_description =
@@ -708,8 +621,8 @@ pub const subagent = ToolSpec{
         .name = "subagent",
         .description = subagent_description,
         .input_schema = .{
-            .properties = &.{.{ .name = "command", .json_type = .object, .shape = &.{ .object = &subagent_command_schema } }},
-            .required = &.{"command"},
+            .properties = &subagent_model_request_properties,
+            .required = &.{"request"},
             .additional_properties = false,
         },
     },
@@ -1013,7 +926,7 @@ test "built-in model-facing tool contract stays byte exact" {
 
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
-        "2e7b8166eef48f55b07925ac09a958a17811da4eadeb25ea23fb486cff5065aa",
+        "f5bced5ca0b0028442fcd0fc55d1f4befae6799256d0ae9c4716af7158dae8d1",
         &actual_hex,
     );
 }
@@ -1417,15 +1330,25 @@ test "built-in subagent owns product metadata schema and callbacks" {
     defer std.testing.allocator.free(schema_json);
 
     try std.testing.expectEqualStrings("subagent", subagent.name);
-    try std.testing.expect(std.mem.find(u8, subagent.description, "ordinary fx child sessions") != null);
-    try std.testing.expect(std.mem.find(u8, subagent.description, "Select exactly one command branch") != null);
-    try std.testing.expect(std.mem.find(u8, subagent.description, "use inspect.wait instead of shell.run") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "\"command\":{\"type\":\"object\"") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "\"minProperties\":1,\"maxProperties\":1") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "\"required\":[\"id\",\"sections\"]") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "\"until\":{\"type\":\"string\",\"enum\":[\"settled\"]") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "\"timeout_ms\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":60000") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "\"required\":[\"until\",\"timeout_ms\"]") != null);
+    try std.testing.expect(std.mem.find(u8, subagent.description, "one managed child") != null);
+    try std.testing.expect(std.mem.find(u8, subagent.description, "never invent a model ID") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "\"request\":{") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "\"required\":[\"request\"]") != null);
+    for ([_][]const u8{ "run", "wait", "send", "stop" }) |action| {
+        try std.testing.expect(std.mem.find(u8, schema_json, action) != null);
+    }
+    for ([_][]const u8{
+        "\"command\":",
+        "\"relationship\":",
+        "\"configure\":",
+        "\"notifications\":",
+        "\"sections\":",
+        "\"cursor\":",
+        "\"generation\":",
+        "\"reopen\"",
+    }) |mechanism| {
+        try std.testing.expect(std.mem.find(u8, schema_json, mechanism) == null);
+    }
     try std.testing.expect(std.mem.find(u8, schema_json, "subagent_type") == null);
     try std.testing.expectEqual(tool_dispatch.ExecutorKind.subagent, subagent.executor_kind);
     try std.testing.expectEqual(types.ToolActivityKind.subagent, subagent.activity_kind);

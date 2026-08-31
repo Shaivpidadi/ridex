@@ -310,16 +310,16 @@ function readSubagentChildIfPresent(home: string) {
   };
 }
 
-async function waitForCompletedSubagentChild(home: string, deadlineMs: number) {
+async function waitForSettledSubagentChild(home: string, deadlineMs: number) {
   const deadline = Date.now() + deadlineMs;
   while (Date.now() < deadline) {
     const child = readSubagentChildIfPresent(home);
-    if (child?.control.state === "completed" && child.readResult) {
+    if (child?.control.state === "idle" && child.readResult) {
       return child;
     }
     await Bun.sleep(10);
   }
-  throw new Error("timed out waiting for completed persisted child record");
+  throw new Error("timed out waiting for settled persisted child record");
 }
 
 // Hold the parent open until the child read completes; the deadline prevents hangs.
@@ -529,7 +529,7 @@ describe("filesystem path handling", () => {
 
       const childPrompt = `Read exactly ${target}.`;
       const childSnapshot = Promise.withResolvers<
-        Awaited<ReturnType<typeof waitForCompletedSubagentChild>>
+        Awaited<ReturnType<typeof waitForSettledSubagentChild>>
       >();
       const isChildTurn = (body: string) =>
         body.includes(childPrompt) && !body.includes("parent_create_1");
@@ -547,17 +547,13 @@ describe("filesystem path handling", () => {
         }
         await gate.opened;
         childSnapshot.resolve(
-          await waitForCompletedSubagentChild(root.home, TIMEOUT),
+          await waitForSettledSubagentChild(root.home, TIMEOUT),
         );
         return finalText("Parent received the admitted child handle.");
       };
       const gateway = startFakeGateway([
         toolCall("parent_create_1", "subagent", {
-          command: { create: {
-            name: "added-root-reader",
-            mode: "one_off",
-            prompt: childPrompt,
-          } },
+          request: { action: "run", task: childPrompt },
         }),
         routeChildAndParent,
         routeChildAndParent,
@@ -593,7 +589,7 @@ describe("filesystem path handling", () => {
         );
         expect(parentCreateTurn).toBeDefined();
         expect(toolResultOutput(parentCreateTurn!.body, "parent_create_1")).toContain(
-          '"status":"created"',
+          '"child_id":',
         );
 
         for (const request of gateway.requests) {
@@ -614,15 +610,15 @@ describe("filesystem path handling", () => {
         }
 
         const child = await childSnapshot.promise;
-        expect(child.control.configuration.name).toBe("added-root-reader");
-        expect(child.control.mode).toBe("one_off");
+        expect(child.control.configuration.name).toBe(childPrompt);
+        expect(child.control.mode).toBe("persistent");
         expect(child.control.queue.some((item) => item.content.includes(target))).toBe(
           true,
         );
         expect(child.control.events.some((event) => event.current === "running")).toBe(
           true,
         );
-        expect(child.control.state).toBe("completed");
+        expect(child.control.state).toBe("idle");
         expect(child.history).not.toContain(instructionSentinel);
 
         expect(child.readResult).toBeDefined();

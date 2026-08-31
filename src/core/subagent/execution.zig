@@ -2307,7 +2307,7 @@ pub const Owner = struct {
             "terminal reconciliation deferred child_id={s} outcome={s}",
             .{ child_id, @errorName(err) },
         );
-        _ = reconcileOneOffFinalResultLocked(
+        _ = reconcileFinalResultLocked(
             self.alloc,
             communication_state,
             record,
@@ -2430,7 +2430,7 @@ pub const Owner = struct {
             communication_state,
             record,
         ) catch return error.ControlStoreFailed;
-        _ = reconcileOneOffFinalResultLocked(
+        _ = reconcileFinalResultLocked(
             self.alloc,
             communication_state,
             record,
@@ -2671,7 +2671,7 @@ pub const Owner = struct {
             .capability = &communication_capability,
             .expected_session_id = child_id,
         };
-        _ = reconcileOneOffFinalResultLocked(
+        _ = reconcileFinalResultLocked(
             self.alloc,
             communication_state,
             record,
@@ -3209,7 +3209,7 @@ fn runOne(slot: *Slot) OneResult {
         communication_state,
         record,
     ) catch return .control_failed;
-    _ = reconcileOneOffFinalResultLocked(
+    _ = reconcileFinalResultLocked(
         owner.alloc,
         communication_state,
         record,
@@ -3357,7 +3357,7 @@ fn runOne(slot: *Slot) OneResult {
         owner.wakeNotificationSchedules(slot.child_id, completed_at_ms);
         return .control_failed;
     };
-    _ = reconcileOneOffFinalResultLocked(
+    _ = reconcileFinalResultLocked(
         owner.alloc,
         communication_state,
         current,
@@ -3525,37 +3525,44 @@ fn boundedFinalResultAlloc(
     return std.fmt.allocPrint(alloc, "{s}{s}", .{ prefix, suffix });
 }
 
-fn oneOffFinalResultAlloc(
+fn finalResultAlloc(
     alloc: Allocator,
+    mode: domain.Mode,
     work: domain.QueuedMessage,
     transition: TerminalTransition,
     history: []const types.HistoryTurn,
 ) (Allocator.Error || error{InvalidRecord})![]u8 {
-    const fallback_completed = "One-off subagent completed without a final text response.";
+    const subject = if (mode == .one_off) "One-off subagent" else "Subagent";
     var formatted: ?[]u8 = null;
     defer if (formatted) |value| alloc.free(value);
     const raw = switch (work.status) {
         .completed => blk: {
             const assistant = assistantTextForWork(history, work.id) orelse
-                fallback_completed;
+                "";
             break :blk if (assistant.len != 0 and text_utils.isModelSafeText(assistant))
                 assistant
-            else
-                fallback_completed;
+            else fallback: {
+                formatted = try std.fmt.allocPrint(
+                    alloc,
+                    "{s} completed without a final text response.",
+                    .{subject},
+                );
+                break :fallback formatted.?;
+            };
         },
         .failed => blk: {
             formatted = try std.fmt.allocPrint(
                 alloc,
-                "One-off subagent failed: {s}",
-                .{transition.reason orelse "unknown failure"},
+                "{s} failed: {s}",
+                .{ subject, transition.reason orelse "unknown failure" },
             );
             break :blk formatted.?;
         },
         .cancelled => blk: {
             formatted = try std.fmt.allocPrint(
                 alloc,
-                "One-off subagent cancelled: {s}",
-                .{work.cancellation_reason orelse transition.reason orelse "cancelled"},
+                "{s} cancelled: {s}",
+                .{ subject, work.cancellation_reason orelse transition.reason orelse "cancelled" },
             );
             break :blk formatted.?;
         },
@@ -3564,13 +3571,13 @@ fn oneOffFinalResultAlloc(
     return boundedFinalResultAlloc(alloc, raw);
 }
 
-fn reconcileOneOffFinalResultLocked(
+fn reconcileFinalResultLocked(
     alloc: Allocator,
     store: communication_store.Store,
     record: control_store.Record,
     history: []const types.HistoryTurn,
 ) communication_manager.Error!bool {
-    if (record.mode != .one_off) return false;
+    if (!shouldReconcileFinalResult(record)) return false;
     var index = record.queue.len;
     while (index > 0) {
         index -= 1;
@@ -3585,8 +3592,9 @@ fn reconcileOneOffFinalResultLocked(
             work.id,
             work.status,
         ) orelse return error.InvalidRecord;
-        const content = oneOffFinalResultAlloc(
+        const content = finalResultAlloc(
             alloc,
+            record.mode,
             work,
             transition,
             history,
@@ -3602,6 +3610,16 @@ fn reconcileOneOffFinalResultLocked(
             .timestamp_ms = transition.timestamp_ms,
             .content = content,
         });
+    }
+    return false;
+}
+
+fn shouldReconcileFinalResult(record: control_store.Record) bool {
+    if (record.mode == .one_off) return true;
+    for (record.operations) |operation| {
+        if (operation.code == .created and operation.identity_source == .model) {
+            return true;
+        }
     }
     return false;
 }
@@ -3659,7 +3677,7 @@ test "one off terminal results and retry classification stay bounded" {
         .status = .failed,
         .created_at_ms = 1,
     };
-    const failed_result = try oneOffFinalResultAlloc(alloc, failed, transition, &.{});
+    const failed_result = try finalResultAlloc(alloc, .one_off, failed, transition, &.{});
     defer alloc.free(failed_result);
     try std.testing.expectEqualStrings(
         "One-off subagent failed: provider_failed",
@@ -3674,8 +3692,9 @@ test "one off terminal results and retry classification stay bounded" {
         .cancellation_reason = @constCast("user cancelled"),
         .created_at_ms = 1,
     };
-    const cancelled_result = try oneOffFinalResultAlloc(
+    const cancelled_result = try finalResultAlloc(
         alloc,
+        .one_off,
         cancelled,
         .{ .timestamp_ms = 2, .reason = "user cancelled" },
         &.{},
@@ -3700,8 +3719,9 @@ test "one off terminal results and retry classification stay bounded" {
         .status = .completed,
         .created_at_ms = 1,
     };
-    const completed_result = try oneOffFinalResultAlloc(
+    const completed_result = try finalResultAlloc(
         alloc,
+        .one_off,
         completed,
         .{ .timestamp_ms = 2, .reason = null },
         &history,
@@ -8583,6 +8603,33 @@ test "completed one off reconciles one stable final result message" {
         "one-off-child",
         .{},
     )) == null);
+}
+
+test "final result delivery is mandatory for one off and model-created persistent children" {
+    var record = try testRecord(std.testing.allocator, .persistent, &.{});
+    defer record.deinit(std.testing.allocator);
+    try std.testing.expect(!shouldReconcileFinalResult(record));
+
+    const replacement = try std.testing.allocator.alloc(domain.OperationReceipt, 1);
+    std.testing.allocator.free(record.operations);
+    record.operations = replacement;
+    record.operations[0] = .{
+        .id = try std.testing.allocator.dupe(u8, "fxop:2:m:1:0000000000000000000000000000000000000000000000000000000000000000"),
+        .request_fingerprint = [_]u8{0} ** 32,
+        .fingerprint = [_]u8{0} ** 32,
+        .code = .created,
+        .target_id = try std.testing.allocator.dupe(u8, "persistent-child"),
+        .generation = 1,
+        .event_sequence = 1,
+        .identity_source = .model,
+        .identity_epoch = 1,
+    };
+    try std.testing.expect(shouldReconcileFinalResult(record));
+
+    record.operations[0].identity_source = .human;
+    try std.testing.expect(!shouldReconcileFinalResult(record));
+    record.mode = .one_off;
+    try std.testing.expect(shouldReconcileFinalResult(record));
 }
 
 fn checkAdmissionAllocationFailures(alloc: Allocator) !void {

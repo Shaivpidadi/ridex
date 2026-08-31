@@ -861,7 +861,7 @@ pub const FinalResultInput = struct {
     content: []const u8,
 };
 
-/// Appends the mandatory one-off result through the existing message ledger.
+/// Appends the mandatory child-turn result through the existing message ledger.
 /// The stable ID makes normal completion, restart recovery, and retries
 /// idempotent. The caller retains ownership of every input slice.
 pub fn reconcileFinalResultLocked(

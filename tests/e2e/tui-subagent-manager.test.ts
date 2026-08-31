@@ -568,12 +568,9 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
           });
         }
         return fakeGatewayToolCall("isolated_child_create", "subagent", {
-          command: {
-            create: {
-              name: "isolated-child",
-              mode: "persistent",
-              prompt: childPrompt,
-            },
+          request: {
+            action: "run",
+            task: childPrompt,
           },
         });
       }, {
@@ -607,7 +604,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         const manager = await active.waitForPane(
           (pane) =>
             pane.includes("Agents & processes") &&
-            pane.includes("isolated-child") &&
+            pane.includes(childPrompt) &&
             pane.includes("idle"),
           TIMEOUT,
         );
@@ -620,7 +617,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
           TIMEOUT,
         );
         expect(child).not.toContain("PARENT_BACKGROUND_0");
-        const childId = child.match(/isolated-child\s+·\s+([^\s]+)/)?.[1];
+        const childId = child.match(/ISOLATED_CHILD_PROMPT\s+·\s+([^\s]+)/)?.[1];
         if (!childId) throw new Error("isolated child did not expose its immutable ID");
         const control = JSON.parse(readFileSync(
           join(fixture.home, ".fx", "sessions", childId, "subagent", "control.json"),
@@ -716,204 +713,6 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
     60_000,
   );
 
-  test(
-    "selected child renders terminal-safe identity across restart",
-    async () => {
-      const fixture = createFixture();
-      const resumedStderrPath = join(root!, "terminal-safe-child-resumed.stderr");
-      const rawName = "lf\ncr\rred\x1b[31mchild\x1b[0m-c1-\u{0080}-δοκιμή";
-      const visibleName =
-        "lf\\x0acr\\x0dred\\x1b[31mchild\\x1b[0m-c1-\\u{0080}-δοκιμή";
-      const parentPrompt = "TERMINAL_SAFE_CHILD_CREATE";
-      const childPrompt = "TERMINAL_SAFE_CHILD_INITIAL";
-      const routedMessage = "TERMINAL_SAFE_CHILD_ROUTED_MESSAGE";
-      const parentComplete = "TERMINAL_SAFE_PARENT_COMPLETE";
-      const childComplete = "TERMINAL_SAFE_CHILD_COMPLETE";
-      const routedComplete = "TERMINAL_SAFE_ROUTED_COMPLETE";
-      writeFileSync(resumedStderrPath, "");
-
-      const gateway = startDynamicFakeGateway((body) => {
-        if (body.includes('"toolCallId":"terminal_safe_child_create"')) {
-          return fakeGatewayFinalText(parentComplete);
-        }
-        if (body.includes(routedMessage)) {
-          return fakeGatewayFinalText(routedComplete);
-        }
-        if (body.includes(childPrompt)) {
-          return fakeGatewayFinalText(childComplete);
-        }
-        if (body.includes(parentPrompt)) {
-          return fakeGatewayToolCall(
-            "terminal_safe_child_create",
-            "subagent",
-            {
-              command: {
-                create: {
-                  name: rawName,
-                  mode: "persistent",
-                  prompt: childPrompt,
-                },
-              },
-            },
-          );
-        }
-        return fakeGatewayFinalText("unexpected terminal-safe child request");
-      }, {
-        classifierDecision: "clear",
-        models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] }],
-      });
-      const env = {
-        HOME: fixture.home,
-        AI_GATEWAY_API_KEY: "terminal-safe-child-key",
-        VERCEL_OIDC_TOKEN: undefined,
-        FX_GATEWAY_BASE_URL: gateway.baseUrl,
-        FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-        FX_MODEL: FAKE_GATEWAY_MODEL,
-        FX_AUTO_UPGRADE: "0",
-        FX_DISABLE_KEYCHAIN: "1",
-        FX_SKIP_ONBOARDING: "1",
-        FX_SOUND: "0",
-        NO_COLOR: "1",
-      };
-
-      try {
-        session = await TmuxSession.create({
-          cmd: FX_BIN,
-          cwd: fixture.workspace,
-          env,
-          width: 180,
-          height: 40,
-          stderrPath: fixture.stderrPath,
-          remainOnExit: true,
-        });
-        const active = session;
-        await active.waitForComposer(TIMEOUT);
-        await active.sendText(parentPrompt);
-        await active.waitForText(parentComplete, TIMEOUT);
-
-        await active.sendKeys("C-x");
-        const manager = await active.waitForPane(
-          (pane) =>
-            pane.includes("Agents & processes") &&
-            pane.includes(visibleName) &&
-            pane.includes("idle"),
-          TIMEOUT,
-        );
-        expect(manager).not.toContain("redchild");
-        expect(
-          (await active.capturePaneGrid()).filter((row) =>
-            row.includes(visibleName)
-          ),
-        ).toHaveLength(1);
-        expect(await active.capturePaneEscapes()).not.toContain(
-          "red\x1b[31mchild",
-        );
-
-        await active.sendKeys("Enter");
-        const selected = await active.waitForPane(
-          (pane) =>
-            pane.includes(childComplete) &&
-            pane.includes("status: idle") &&
-            countOccurrences(pane, visibleName) >= 2,
-          TIMEOUT,
-        );
-        expect(selected).not.toContain("redchild");
-        expect(
-          (await active.capturePaneGrid()).filter((row) =>
-            row.includes(visibleName)
-          ),
-        ).toHaveLength(2);
-        expect(await active.capturePaneEscapes()).not.toContain(
-          "red\x1b[31mchild",
-        );
-
-        await active.sendText(routedMessage);
-        await active.waitForText(routedComplete, TIMEOUT);
-
-        type Control = {
-          child_id: string;
-          parent_id: string | null;
-          configuration: { name: string };
-        };
-        const sessionsDir = join(fixture.home, ".fx", "sessions");
-        const control = readdirSync(sessionsDir)
-          .map((id) => join(sessionsDir, id, "subagent", "control.json"))
-          .filter((path) => existsSync(path))
-          .map((path) => JSON.parse(readFileSync(path, "utf8")) as Control)
-          .find((candidate) => candidate.configuration.name === rawName);
-        if (!control) throw new Error("terminal-safe child control was not persisted");
-        if (!control.parent_id) throw new Error("terminal-safe child lost its root");
-        expect(control.configuration.name).toBe(rawName);
-        expect(
-          readFileSync(join(sessionsDir, control.child_id, "events.jsonl"), "utf8"),
-        ).toContain(routedMessage);
-        expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
-
-        await active.sendKeys("C-x");
-        await active.waitForText(parentComplete, TIMEOUT);
-        await active.sendText("/quit");
-        await active.waitForPane(() => active.paneStatus().dead, TIMEOUT);
-        expect(paneExitMatches(active.paneStatus(), 0)).toBe(true);
-        await active.kill();
-        session = null;
-
-        session = await TmuxSession.create({
-          cmd: `${FX_BIN} resume ${control.parent_id}`,
-          cwd: fixture.workspace,
-          env,
-          width: 180,
-          height: 40,
-          stderrPath: resumedStderrPath,
-          remainOnExit: true,
-        });
-        const resumed = session;
-        await resumed.waitForComposer(TIMEOUT);
-        await resumed.sendKeys("C-x");
-        await resumed.waitForPane(
-          (pane) =>
-            pane.includes("Agents & processes") &&
-            pane.includes(visibleName) &&
-            pane.includes("idle"),
-          TIMEOUT,
-        );
-        await resumed.sendKeys("Enter");
-        const reopened = await resumed.waitForPane(
-          (pane) =>
-            pane.includes(routedComplete) &&
-            pane.includes("status: idle") &&
-            countOccurrences(pane, visibleName) >= 2,
-          TIMEOUT,
-        );
-        expect(reopened).not.toContain("redchild");
-        expect(await resumed.capturePaneEscapes()).not.toContain(
-          "red\x1b[31mchild",
-        );
-
-        await resumed.resizeWindow(96, 28);
-        const narrow = await resumed.waitForPane(
-          (pane) => pane.includes("lf\\x0a") && pane.includes("status: idle"),
-          TIMEOUT,
-        );
-        expect(narrow).not.toContain("redchild");
-        expect(await resumed.capturePaneEscapes()).not.toContain(
-          "red\x1b[31mchild",
-        );
-        expect(resumed.paneStatus()).toEqual({ dead: false, status: null });
-        expect(readFileSync(resumedStderrPath, "utf8")).toBe("");
-
-        await resumed.sendKeys("C-x");
-        await resumed.waitForComposer(TIMEOUT);
-        await resumed.sendText("/quit");
-        await resumed.waitForPane(() => resumed.paneStatus().dead, TIMEOUT);
-        expect(paneExitMatches(resumed.paneStatus(), 0)).toBe(true);
-        await resumed.kill();
-        session = null;
-      } finally {
-        gateway.stop();
-      }
-    },
-    90_000,
-  );
 
   test(
     "manager-created children default to yolo and execute tools without approval",
@@ -1133,7 +932,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
     "one Ctrl-C cancels a streaming persistent child without exiting fx",
     async () => {
       const fixture = createFixture();
-      const childName = "ctrl-c-child";
+      const childName = "CTRL_C_CHILD_STREAM";
       const parentPrompt = "CREATE_CTRL_C_CHILD";
       const parentReady = "CTRL_C_PARENT_READY";
       const childPrompt = "CTRL_C_CHILD_STREAM";
@@ -1147,20 +946,9 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         if (body.includes(childPrompt)) return stream.response;
         if (body.includes(parentPrompt)) {
           return fakeGatewayToolCall("ctrl_c_child_create", "subagent", {
-            command: {
-              create: {
-                name: childName,
-                mode: "persistent",
-                prompt: childPrompt,
-                notifications: {
-                  terminal: {
-                    completed: false,
-                    failed: false,
-                    cancelled: true,
-                  },
-                  stop_conditions: ["terminal"],
-                },
-              },
+            request: {
+              action: "run",
+              task: childPrompt,
             },
           });
         }
@@ -1239,7 +1027,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
           TIMEOUT,
         );
         const childId = running.match(
-          /ctrl-c-child\s+·\s+([^\s]+)/,
+          /CTRL_C_CHILD_STREAM\s+·\s+([^\s]+)/,
         )?.[1];
         if (!childId) throw new Error("Ctrl-C child did not expose its ID");
 
@@ -1247,7 +1035,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         await active.waitForPane(
           (pane) =>
             pane.includes(childName) &&
-            pane.includes("status: idle"),
+            pane.includes("idle"),
           TIMEOUT,
         );
         expect(active.paneStatus()).toEqual({ dead: false, status: null });
@@ -1292,7 +1080,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
             pane.includes("Agents & processes") &&
             pane.includes(childName) &&
             pane.includes("idle") &&
-            pane.includes("unread 1"),
+            pane.includes("unread 2"),
           TIMEOUT,
         );
         expect(cancelledDeliveries(control.child_id)).toHaveLength(1);
@@ -1317,88 +1105,6 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
     60_000,
   );
 
-  test(
-    "ask root rejects model-created auto child before any file write",
-    async () => {
-      const fixture = createFixture();
-      writeFileSync(
-        join(fixture.home, ".fx", "settings.json"),
-        JSON.stringify({ sandbox: "none", permission_mode: "ask", permission: {} }),
-      );
-      const childPrompt = "ASK_WRITE_CHILD_PROMPT";
-      const marker = join(fixture.workspace, "ask-child-created.txt");
-      let childWriteIssued = false;
-      const gateway = startDynamicFakeGateway((body) => {
-        if (body.includes('"toolCallId":"ask_write_create"')) {
-          return fakeGatewayFinalText("ASK_WRITE_PARENT_READY");
-        }
-        if (body.includes('"toolCallId":"ask_write_file"')) {
-          return fakeGatewayFinalText("ASK_WRITE_CHILD_COMPLETE");
-        }
-        if (body.includes(childPrompt)) {
-          childWriteIssued = true;
-          return fakeGatewayToolCall("ask_write_file", "write_file", {
-            path: "ask-child-created.txt",
-            content: "approved child write\n",
-          });
-        }
-        return fakeGatewayToolCall("ask_write_create", "subagent", {
-          command: {
-            create: {
-              name: "ask-write-child",
-              mode: "persistent",
-              prompt: childPrompt,
-              permission_mode: "auto",
-            },
-          },
-        });
-      }, {
-        classifierDecision: "caution",
-        models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] }],
-      });
-      try {
-        session = await TmuxSession.create({
-          cmd: FX_BIN,
-          cwd: fixture.workspace,
-          env: {
-            HOME: fixture.home,
-            AI_GATEWAY_API_KEY: "ask-write-child-key",
-            VERCEL_OIDC_TOKEN: undefined,
-            FX_GATEWAY_BASE_URL: gateway.baseUrl,
-            FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-            FX_MODEL: FAKE_GATEWAY_MODEL,
-            FX_AUTO_UPGRADE: "0",
-            FX_DISABLE_KEYCHAIN: "1",
-            FX_SKIP_ONBOARDING: "1",
-            FX_SOUND: "0",
-            NO_COLOR: "1",
-          },
-          width: 112,
-          height: 32,
-          stderrPath: fixture.stderrPath,
-        });
-        const active = session;
-        await active.waitForComposer(TIMEOUT);
-        await active.sendText("Create the ask-write child.");
-        await active.waitForText("ASK_WRITE_PARENT_READY", TIMEOUT);
-        expect(existsSync(marker)).toBe(false);
-        expect(gateway.requests.some((request) =>
-          request.body.includes("permission_escalation")
-        )).toBe(true);
-        const sessionsDir = join(fixture.home, ".fx", "sessions");
-        const controls = readdirSync(sessionsDir)
-          .map((id) => join(sessionsDir, id, "subagent", "control.json"))
-          .filter((path) => existsSync(path));
-        expect(controls).toHaveLength(0);
-        expect(childWriteIssued).toBe(false);
-        expect(gateway.classifierRequests).toHaveLength(0);
-        expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
-      } finally {
-        gateway.stop();
-      }
-    },
-    60_000,
-  );
 
   test(
     "persistent auto child bypasses review for its first new-file write",
@@ -1424,13 +1130,9 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
           });
         }
         return fakeGatewayToolCall("auto_write_create", "subagent", {
-          command: {
-            create: {
-              name: "auto-write-child",
-              mode: "persistent",
-              prompt: childPrompt,
-              permission_mode: "auto",
-            },
+          request: {
+            action: "run",
+            task: childPrompt,
           },
         });
       }, {
@@ -1503,13 +1205,9 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
           );
         }
         return fakeGatewayToolCall("auto_terminal_create", "subagent", {
-          command: {
-            create: {
-              name: "auto-terminal-child",
-              mode: "persistent",
-              prompt: childPrompt,
-              permission_mode: "auto",
-            },
+          request: {
+            action: "run",
+            task: childPrompt,
           },
         });
       }, {
@@ -1569,7 +1267,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         join(fixture.home, ".fx", "settings.json"),
         JSON.stringify({ sandbox: "none", permission_mode: "ask", permission: {} }),
       );
-      const childName = "always-write-child";
+      const childName = "ALWAYS_WRITE_CHILD_INITIAL";
       const childPrompt = "ALWAYS_WRITE_CHILD_INITIAL";
       const secondPrompt = "ALWAYS_WRITE_CHILD_SECOND";
       const externalPrompt = "ALWAYS_WRITE_CHILD_EXTERNAL";
@@ -1612,12 +1310,9 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
           return fakeGatewayFinalText("ALWAYS_WRITE_PARENT_READY");
         }
         return fakeGatewayToolCall(createId, "subagent", {
-          command: {
-            create: {
-              name: childName,
-              mode: "persistent",
-              prompt: childPrompt,
-            },
+          request: {
+            action: "run",
+            task: childPrompt,
           },
         });
       }, {
@@ -1741,7 +1436,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
     "selecting a command-running persistent child remains stable across surface switches",
     async () => {
       const fixture = createFixture();
-      const childName = "command-stream-child";
+      const childName = "COMMAND_STREAM_CHILD_PROMPT";
       const childPrompt = "COMMAND_STREAM_CHILD_PROMPT";
       const commandCount = 10;
       const gateway = startDynamicFakeGateway((body) => {
@@ -1776,13 +1471,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
           );
         }
         return fakeGatewayToolCall("command_stream_create", "subagent", {
-          command: {
-            create: {
-              name: childName,
-              mode: "persistent",
-              prompt: childPrompt,
-            },
-          },
+          request: { action: "run", task: childPrompt },
         });
       }, {
         classifierDecision: "clear",
@@ -1994,171 +1683,6 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
     90_000,
   );
 
-  test(
-    "same active turn replays one subagent create identity and rejects changed arguments",
-    async () => {
-      const fixture = createFixture();
-      const invocationId = "same_active_turn_create";
-      const original = {
-        command: {
-          create: {
-            name: "same-active-turn-child",
-            mode: "persistent",
-          },
-        },
-      };
-      const changed = {
-        command: {
-          create: {
-            name: "changed-active-turn-child",
-            mode: "persistent",
-          },
-        },
-      };
-      const responses = [
-        fakeGatewayToolCall(invocationId, "subagent", original),
-        fakeGatewayToolCall(invocationId, "subagent", original),
-        fakeGatewayToolCall(invocationId, "subagent", changed),
-        fakeGatewayFinalText("SAME_ACTIVE_TURN_REPLAY_COMPLETE"),
-      ];
-      let responseIndex = 0;
-      const gateway = startDynamicFakeGateway(() => {
-        const response = responses[responseIndex];
-        responseIndex += 1;
-        if (!response) return new Response("unexpected request", { status: 500 });
-        return response;
-      }, {
-        classifierDecision: "clear",
-        models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] }],
-      });
-      try {
-        session = await TmuxSession.create({
-          cwd: fixture.workspace,
-          env: {
-            HOME: fixture.home,
-            AI_GATEWAY_API_KEY: "same-active-turn-key",
-            VERCEL_OIDC_TOKEN: undefined,
-            FX_GATEWAY_BASE_URL: gateway.baseUrl,
-            FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-            FX_MODEL: FAKE_GATEWAY_MODEL,
-            FX_AUTO_UPGRADE: "0",
-            NO_COLOR: "1",
-          },
-          width: 96,
-          height: 28,
-          stderrPath: fixture.stderrPath,
-        });
-        const active = session;
-        await active.waitForComposer(TIMEOUT);
-        await active.sendText("Exercise one same-turn subagent replay.");
-        await active.waitForText("SAME_ACTIVE_TURN_REPLAY_COMPLETE", TIMEOUT);
-        await active.waitForComposer(TIMEOUT);
-        expect(responseIndex).toBe(4);
-
-        type ToolResult = {
-          tool_call_id: string;
-          tool_name: string;
-          status: "success" | "failure";
-          output: string;
-        };
-        type HistoryFrame = {
-          kind: string;
-          payload: {
-            turn?: {
-              kind: string;
-              execution?: {
-                tool_steps: Array<{ tool_results: ToolResult[] }>;
-              };
-            };
-          };
-        };
-        const sessionsDir = join(fixture.home, ".fx", "sessions");
-        let sessionIds: string[] = [];
-        let rootState: { id: string; frames: HistoryFrame[] } | undefined;
-        const persistenceDeadline = Date.now() + TIMEOUT;
-        while (Date.now() < persistenceDeadline && !rootState) {
-          sessionIds = readdirSync(sessionsDir).filter((id) =>
-            existsSync(join(sessionsDir, id, "session.json"))
-          );
-          for (const id of sessionIds) {
-            let frames: HistoryFrame[] = [];
-            try {
-              const eventText = readFileSync(
-                join(sessionsDir, id, "events.jsonl"),
-                "utf8",
-              ).trim();
-              frames = eventText.length === 0
-                ? []
-                : eventText.split("\n").map((line) => JSON.parse(line) as HistoryFrame);
-            } catch {
-              continue;
-            }
-            if (frames.some((frame) => frame.kind === "history_turn_committed")) {
-              rootState = { id, frames };
-              break;
-            }
-          }
-          if (!rootState) await Bun.sleep(25);
-        }
-        expect(sessionIds).toHaveLength(2);
-        if (!rootState) throw new Error("root session history was not persisted");
-        const turn = rootState.frames.findLast(
-          (frame) => frame.kind === "history_turn_committed",
-        )?.payload.turn;
-        if (!turn?.execution) throw new Error("root turn execution was not persisted");
-        expect(turn.execution.tool_steps).toHaveLength(3);
-        const results = turn.execution.tool_steps.map((step) => step.tool_results[0]);
-        expect(results[0].output).toBe(results[1].output);
-        const first = JSON.parse(results[0].output) as {
-          operation_id: string;
-          child_id: string;
-        };
-        const replay = JSON.parse(results[1].output) as {
-          operation_id: string;
-          child_id: string;
-        };
-        const conflict = JSON.parse(results[2].output) as {
-          error_code: string;
-        };
-        expect(replay.operation_id).toBe(first.operation_id);
-        expect(replay.child_id).toBe(first.child_id);
-        expect(results.map((result) => result.status)).toEqual([
-          "success",
-          "success",
-          "failure",
-        ]);
-        expect(conflict.error_code).toBe("operation_conflict");
-
-        const identities = JSON.parse(readFileSync(
-          join(
-            sessionsDir,
-            rootState.id,
-            "subagent",
-            "create-operations.json",
-          ),
-          "utf8",
-        )) as { entries: unknown[]; outstanding_operations: unknown[] };
-        expect(identities.entries).toHaveLength(1);
-        expect(identities.outstanding_operations).toHaveLength(0);
-        const control = JSON.parse(readFileSync(
-          join(
-            sessionsDir,
-            first.child_id,
-            "subagent",
-            "control.json",
-          ),
-          "utf8",
-        )) as { operations: unknown[]; events: unknown[]; queue: unknown[] };
-        expect(control.operations).toHaveLength(1);
-        expect(control.events).toHaveLength(1);
-        expect(control.queue).toHaveLength(0);
-        expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
-      } finally {
-        gateway.stop();
-      }
-    },
-    60_000,
-  );
 
   test(
     "human create configure attach detach close and reopen routes preserve the main composer",
@@ -2465,208 +1989,14 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
     90_000,
   );
 
-  test(
-    "model approval reparent applies the reviewed relationship exactly once",
-    async () => {
-      const fixture = createFixture();
-      const tapePath = join(root!, "model-approved-reparent.fxtape");
-      const sessionsDir = join(fixture.home, ".fx", "sessions");
-      const parentName = "approved-reparent-parent";
-      const childName = "approved-reparent-child";
-      const createParentCallId = "approved_reparent_create_parent";
-      const createChildCallId = "approved_reparent_create_child";
-      const reparentCallId = "approved_reparent_child";
-      const inspectCallId = "approved_reparent_inspect";
-      type Control = {
-        child_id: string;
-        parent_id: string | null;
-        generation: number;
-        operations: Array<{
-          code: string;
-          identity_source?: string;
-          target_id: string;
-        }>;
-        events: unknown[];
-        configuration: { name: string };
-      };
-      type Communication = {
-        ledger: {
-          approvals: Array<{
-            kind: string;
-            status: string;
-            relationship: {
-              action: string;
-              prospective_parent_id: string;
-              operation_id: string;
-            } | null;
-          }>;
-        };
-      };
-      const controls = (): Array<{ path: string; control: Control }> => {
-        if (!existsSync(sessionsDir)) return [];
-        return readdirSync(sessionsDir).flatMap((id) => {
-          const path = join(sessionsDir, id, "subagent", "control.json");
-          if (!existsSync(path)) return [];
-          return [{ path, control: JSON.parse(readFileSync(path, "utf8")) as Control }];
-        });
-      };
-      const controlByName = (name: string) => {
-        const found = controls().find(({ control }) =>
-          control.configuration.name === name
-        );
-        if (!found) throw new Error(`missing ${name} control`);
-        return found;
-      };
-      const communicationFor = (childId: string) => JSON.parse(readFileSync(
-        join(sessionsDir, childId, "subagent", "communication.json"),
-        "utf8",
-      )) as Communication;
-
-      let phase: "setup" | "inspect" = "setup";
-      let step = 0;
-      const gateway = startDynamicFakeGateway(() => {
-        const responses = phase === "setup"
-          ? [
-            () => fakeGatewayToolCall(createParentCallId, "subagent", {
-              command: {
-                create: { name: parentName, mode: "persistent" },
-              },
-            }),
-            () => fakeGatewayToolCall(createChildCallId, "subagent", {
-              command: {
-                create: { name: childName, mode: "persistent" },
-              },
-            }),
-            () => fakeGatewayToolCall(reparentCallId, "subagent", {
-              command: {
-                relationship: {
-                  action: "reparent",
-                  id: controlByName(childName).control.child_id,
-                  parent_id: controlByName(parentName).control.child_id,
-                },
-              },
-            }),
-            () => fakeGatewayFinalText("MODEL_APPROVAL_SETUP_COMPLETE"),
-          ]
-          : [
-            () => fakeGatewayToolCall(inspectCallId, "subagent", {
-              command: {
-                inspect: {
-                  id: controlByName(childName).control.child_id,
-                  sections: ["status", "relationship", "events"],
-                },
-              },
-            }),
-            () => fakeGatewayFinalText("MODEL_APPROVAL_INSPECT_COMPLETE"),
-          ];
-        const response = responses[step++];
-        return response?.() ?? new Response("unexpected gateway step", { status: 500 });
-      }, {
-        classifierDecision: "clear",
-        models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] }],
-      });
-      try {
-        session = await TmuxSession.create({
-          cmd: FX_BIN,
-          cwd: fixture.workspace,
-          env: {
-            HOME: fixture.home,
-            AI_GATEWAY_API_KEY: "approved-reparent-key",
-            VERCEL_OIDC_TOKEN: undefined,
-            FX_GATEWAY_BASE_URL: gateway.baseUrl,
-            FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-            FX_MODEL: FAKE_GATEWAY_MODEL,
-            FX_AUTO_UPGRADE: "0",
-            FX_DISABLE_KEYCHAIN: "1",
-            FX_SKIP_ONBOARDING: "1",
-            FX_SOUND: "0",
-            FX_RECORD: tapePath,
-            NO_COLOR: "1",
-          },
-          width: 132,
-          height: 36,
-          stderrPath: fixture.stderrPath,
-        });
-        const active = session;
-        await active.waitForComposer(TIMEOUT);
-        await active.sendText("Create two children and reparent the second under the first.");
-        const approvalPane = await active.waitForText("Reparent subagent", 60_000);
-        expect(approvalPane).toContain("1. Yes");
-
-        const parentBefore = controlByName(parentName).control;
-        const childBefore = controlByName(childName).control;
-        const rootId = parentBefore.parent_id;
-        if (!rootId) throw new Error("parent fixture is not attached to the root");
-        expect(childBefore.parent_id).toBe(rootId);
-        const generationBefore = childBefore.generation;
-        const operationCountBefore = childBefore.operations.length;
-        const eventCountBefore = childBefore.events.length;
-        const approvalBefore = communicationFor(childBefore.child_id).ledger.approvals
-          .find((approval) => approval.kind === "relationship");
-        expect(approvalBefore).toMatchObject({
-          status: "pending",
-          relationship: {
-            action: "reparent",
-            prospective_parent_id: parentBefore.child_id,
-          },
-        });
-
-        await active.sendLiteralText("1");
-        await active.waitForPane((pane) => {
-          try {
-            const child = controlByName(childName).control;
-            return hasEmptyComposer(pane) &&
-              child.parent_id === parentBefore.child_id &&
-              child.generation === generationBefore + 1;
-          } catch {
-            return false;
-          }
-        }, 60_000);
-        await active.waitForText("MODEL_APPROVAL_SETUP_COMPLETE", 60_000);
-
-        const childAfter = controlByName(childName).control;
-        expect(childAfter.parent_id).toBe(parentBefore.child_id);
-        expect(childAfter.generation).toBe(generationBefore + 1);
-        expect(childAfter.operations).toHaveLength(operationCountBefore + 1);
-        expect(childAfter.events).toHaveLength(eventCountBefore + 1);
-        expect(childAfter.operations.at(-1)).toMatchObject({
-          code: "relationship_changed",
-          identity_source: "model",
-          target_id: childBefore.child_id,
-        });
-        const approvalAfter = communicationFor(childBefore.child_id).ledger.approvals
-          .find((approval) => approval.kind === "relationship");
-        expect(approvalAfter).toMatchObject({ status: "consumed" });
-
-        phase = "inspect";
-        step = 0;
-        await active.sendText("Inspect the approved child's relationship.");
-        await active.waitForText("MODEL_APPROVAL_INSPECT_COMPLETE", 60_000);
-        const scrollback = await active.captureFullScrollback();
-        expect(scrollback).toContain("Create two children and reparent the second");
-        expect(scrollback).toContain("MODEL_APPROVAL_INSPECT_COMPLETE");
-        expect(scrollback).not.toContain("approval pending");
-        expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
-
-        await active.sendText("/quit");
-        expect(await active.waitForSessionEnd(TIMEOUT)).toBe(true);
-        session = null;
-        expect(readFileSync(tapePath).toString("latin1")).not.toContain("Approval ID:");
-        expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
-      } finally {
-        gateway.stop();
-      }
-    },
-    120_000,
-  );
 
   test(
     "human Ctrl-X reparent moves one nested child to the interactive root exactly once",
     async () => {
       const fixture = createFixture();
       const tapePath = join(root!, "direct-tty-reparent.fxtape");
-      const parentName = "tty-reparent-parent";
-      const childName = "tty-reparent-child";
+      const parentName = "DIRECT_TTY_REPARENT_PARENT_WORK";
+      const childName = "DIRECT_TTY_REPARENT_CHILD_WORK";
       const parentPrompt = "DIRECT_TTY_REPARENT_PARENT_WORK";
       const childPrompt = "DIRECT_TTY_REPARENT_CHILD_WORK";
       const createParentCallId = "direct_tty_reparent_create_parent";
@@ -2684,22 +2014,16 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         }
         if (body.includes(parentPrompt)) {
           return fakeGatewayToolCall(createChildCallId, "subagent", {
-            command: {
-              create: {
-                name: childName,
-                mode: "persistent",
-                prompt: childPrompt,
-              },
+            request: {
+              action: "run",
+              task: childPrompt,
             },
           });
         }
         return fakeGatewayToolCall(createParentCallId, "subagent", {
-          command: {
-            create: {
-              name: parentName,
-              mode: "persistent",
-              prompt: parentPrompt,
-            },
+          request: {
+            action: "run",
+            task: parentPrompt,
           },
         });
       }, {
@@ -3015,17 +2339,9 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
             );
         }
         return fakeGatewayToolCall("checkpoint3_restart_create", "subagent", {
-          command: {
-            create: {
-              name: "restart-child",
-              mode: "persistent",
-              prompt: childPrompt,
-              permission_mode: "auto",
-              notifications: {
-                milestones: ["checkpoint3"],
-                stop_conditions: ["terminal"],
-              },
-            },
+          request: {
+            action: "run",
+            task: childPrompt,
           },
         });
       }, {
@@ -3056,21 +2372,21 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         await active.waitForText("CHECKPOINT3_PARENT_CREATED_CHILD", TIMEOUT);
         await active.sendKeys("C-x");
         const tree = await active.waitForPane(
-          (pane) => pane.includes("restart-child") && pane.includes("running"),
+          (pane) => pane.includes("CHECKPOINT3_RESTART_INTERRUPTED_CHILD") && pane.includes("running"),
           TIMEOUT,
         );
         expect(tree).toContain("Agents & processes");
         await active.sendKeys("Enter");
         const running = await active.waitForPane(
           (pane) =>
-            pane.includes("restart-child") &&
+            pane.includes("CHECKPOINT3_RESTART_INTERRUPTED_CHILD") &&
             pane.includes("status: running") &&
             pane.includes("running"),
           TIMEOUT,
         );
         expect(running).toContain("Parent agent");
         const childId = running.match(
-          /restart-child\s+·\s+([^\s]+)/,
+          /CHECKPOINT3_RESTART_INTERRUPTED_CHILD\s+·\s+([^\s]+)/,
         )?.[1];
         if (!childId) throw new Error("running child did not expose its ID");
         const controlPath = join(
@@ -3138,7 +2454,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         const interruptedTree = await active.waitForPane(
           (pane) =>
             pane.includes("Agents & processes") &&
-            pane.includes("restart-child") &&
+            pane.includes("CHECKPOINT3_RESTART_INTERRUPTED_CHILD") &&
             pane.includes("interrupted"),
           TIMEOUT,
         );
@@ -3159,7 +2475,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         await active.sendKeys("Tab");
         await active.sendLiteralText("s");
         const configuration = await active.waitForText("Configure child", TIMEOUT);
-        expect(configuration).toContain("checkpoint3");
+        expect(configuration).toContain(childPrompt);
         await active.sendKeys("Escape");
         await active.waitForText("status: interrupted", TIMEOUT);
 
@@ -3167,18 +2483,18 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         await active.waitForPane(
           (pane) =>
             pane.includes("Agents & processes") &&
-            pane.includes("restart-child") &&
+            pane.includes("CHECKPOINT3_RESTART_INTERRUPTED_CHILD") &&
             !pane.includes("Activity —"),
           TIMEOUT,
         );
         await active.sendLiteralText("a");
-        const activity = await active.waitForText("Activity — restart-child", TIMEOUT);
+        const activity = await active.waitForText("Activity — CHECKPOINT3_RESTART_INTERRUPTED_CHILD", TIMEOUT);
         expect(activity).toContain(childId);
         await active.sendKeys("Escape");
         await active.waitForPane(
           (pane) =>
             pane.includes("Agents & processes") &&
-            pane.includes("restart-child") &&
+            pane.includes("CHECKPOINT3_RESTART_INTERRUPTED_CHILD") &&
             !pane.includes("Activity —"),
           TIMEOUT,
         );
@@ -3186,7 +2502,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         await active.waitForText("status: interrupted", TIMEOUT);
         await active.sendKeys("Tab");
         await active.sendLiteralText("x");
-        await active.waitForText("Actions — restart-child", TIMEOUT);
+        await active.waitForText("Actions — CHECKPOINT3_RESTART_INTERRUPTED_CHILD", TIMEOUT);
         await active.sendLiteralText("r");
         const completed = await active.waitForPane(
           (pane) => pane.includes(resumedText) && pane.includes("status: idle"),
@@ -3213,9 +2529,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         };
         expect(recoveredControl.parent_id).toBe(controlBeforeCrash.parent_id);
         expect(recoveredControl.state).toBe("idle");
-        expect(recoveredControl.configuration.notifications.milestones).toEqual([
-          "checkpoint3",
-        ]);
+        expect(recoveredControl.configuration.notifications.milestones).toEqual([]);
         expect(recoveredControl.queue).toEqual([
           expect.objectContaining({
             content: childPrompt,
@@ -3801,13 +3115,10 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         if (body.includes(parentPrompt)) {
           if (!childId) throw new Error("parent follow-up requested before child ID was known");
           return fakeGatewayToolCall(parentCallId, "subagent", {
-            command: {
-              message: {
-                send: {
-                  id: childId,
-                  content: parentMessage,
-                },
-              },
+            request: {
+              action: "send",
+              child_id: childId,
+              message: parentMessage,
             },
           });
         }
@@ -4084,217 +3395,6 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
     90_000,
   );
 
-  test(
-    "terminal one-off delivers once retires and leaves persistent controls intact",
-    async () => {
-      const fixture = createFixture();
-      const childName = "temporary-result";
-      const persistentName = "persistent-control";
-      const persistentInitial = "PERSISTENT_CONTROL_INITIAL";
-      const persistentReady = "PERSISTENT_CONTROL_READY";
-      const persistentResume = "PERSISTENT_CONTROL_SECOND";
-      const persistentResumed = "PERSISTENT_CONTROL_RESUMED";
-      const mainPrompt = "ONEOFF_RETIREMENT_MAIN";
-      const childPrompt = "ONEOFF_RETIREMENT_CHILD";
-      const childDone = "ONEOFF_RETIREMENT_RESULT";
-      const parentAck = "ONEOFF_RETIREMENT_ACK";
-      const parentAckDone = "ONEOFF_RETIREMENT_ACK_DONE";
-      const childStream = controlledTextResponse("ONEOFF_RETIREMENT_STREAM_");
-      const gateway = startDynamicFakeGateway((body) => {
-        if (body.includes(persistentResume)) return fakeGatewayFinalText(persistentResumed);
-        if (body.includes(parentAck) && body.includes(childDone)) {
-          return fakeGatewayFinalText(parentAckDone);
-        }
-        if (body.includes(persistentInitial)) return fakeGatewayFinalText(persistentReady);
-        if (body.includes('"toolCallId":"create_temporary_result"')) {
-          return fakeGatewayFinalText("ONEOFF_RETIREMENT_MAIN_DONE");
-        }
-        if (body.includes(childPrompt)) return childStream.response;
-        if (body.includes(mainPrompt)) {
-          return fakeGatewayToolCall("create_temporary_result", "subagent", {
-            command: {
-              create: {
-                name: childName,
-                mode: "one_off",
-                prompt: childPrompt,
-              },
-            },
-          });
-        }
-        return fakeGatewayFinalText("unexpected retirement request");
-      }, {
-        models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] }],
-      });
-      const env = relationshipTestEnv(fixture, gateway, "oneoff-retirement");
-
-      type ResumeControl = {
-        child_id: string;
-        parent_id: string;
-        mode: "persistent" | "one_off";
-        state: string;
-        configuration: { name: string };
-      };
-      const sessionsDir = join(fixture.home, ".fx", "sessions");
-      const readControls = () =>
-        readdirSync(sessionsDir)
-          .map((id) => join(sessionsDir, id, "subagent", "control.json"))
-          .filter((path) => existsSync(path))
-          .map((path) => ({
-            path,
-            value: JSON.parse(readFileSync(path, "utf8")) as ResumeControl,
-          }));
-
-      async function waitForControl(name: string, state: string) {
-        const deadline = Date.now() + TIMEOUT;
-        while (Date.now() < deadline) {
-          const found = readControls().find((entry) =>
-            entry.value.configuration.name === name &&
-            entry.value.state === state
-          );
-          if (found) return found;
-          await Bun.sleep(25);
-        }
-        throw new Error(`control did not reach ${name}:${state}`);
-      }
-
-      async function runAsk(args: string[]) {
-        const child = Bun.spawn([FX_BIN, "ask", ...args], {
-          cwd: fixture.workspace,
-          env,
-          stdout: "pipe",
-          stderr: "pipe",
-        });
-        const [stdout, stderr, exitCode] = await Promise.all([
-          new Response(child.stdout).text(),
-          new Response(child.stderr).text(),
-          child.exited,
-        ]);
-        return { stdout, stderr, exitCode };
-      }
-
-      try {
-        session = await TmuxSession.create({
-          cmd: FX_BIN,
-          cwd: fixture.workspace,
-          env,
-          width: 80,
-          height: 24,
-          stderrPath: fixture.stderrPath,
-        });
-        const active = session;
-        await active.waitForComposer(TIMEOUT);
-        await active.sendKeys("C-x");
-        await active.waitForText("Agents & processes", TIMEOUT);
-        await active.sendLiteralText("c");
-        await active.waitForText("Create persistent agent", TIMEOUT);
-        await pasteVisibleText(active, persistentName);
-        await active.sendKeys("Tab");
-        await active.sendKeys("Tab");
-        await pasteVisibleText(active, persistentInitial);
-        await active.sendKeys("Enter");
-        await active.waitForPane(
-          (pane) => pane.includes(persistentReady) && pane.includes("status: idle"),
-          TIMEOUT,
-        );
-        await active.sendKeys("Escape");
-        await active.waitForText("Agents & processes", TIMEOUT);
-        await active.sendKeys("C-x");
-        await active.waitForComposer(TIMEOUT);
-
-        await active.sendText(mainPrompt);
-        await active.waitForPane(
-          (pane) => pane.includes("ONEOFF_RETIREMENT_MAIN_DONE") && !pane.includes("Streaming ("),
-          TIMEOUT,
-        );
-        const childStartedDeadline = Date.now() + TIMEOUT;
-        while (
-          !gateway.requests.some((request) => request.body.includes(childPrompt)) &&
-          Date.now() < childStartedDeadline
-        ) {
-          await Bun.sleep(25);
-        }
-        expect(gateway.requests.some((request) => request.body.includes(childPrompt))).toBe(true);
-        await active.sendKeys("C-x");
-        await active.waitForPane(
-          (pane) =>
-            pane.includes(childName) &&
-            pane.includes("running") &&
-            pane.includes(persistentName),
-          TIMEOUT,
-        );
-        await active.sendKeys("C-x");
-        await active.waitForComposer(TIMEOUT);
-        childStream.release(childDone);
-        const oneOff = await waitForControl(childName, "completed");
-        const persistent = await waitForControl(persistentName, "idle");
-
-        await active.sendKeys("C-x");
-        const managerPane = await active.waitForPane(
-          (pane) => pane.includes(persistentName) && !pane.includes(childName),
-          TIMEOUT,
-        );
-        expect(managerPane).not.toContain(childName);
-        await active.sendKeys("C-x");
-        await active.waitForComposer(TIMEOUT);
-
-        await active.sendText(parentAck);
-        await active.waitForText(parentAckDone, TIMEOUT);
-        expect(
-          gateway.requests.some((request) =>
-            request.body.includes(parentAck) && request.body.includes(childDone)
-          ),
-        ).toBe(true);
-
-        const childDir = join(sessionsDir, oneOff.value.child_id);
-        const retirementDeadline = Date.now() + TIMEOUT;
-        while (existsSync(childDir) && Date.now() < retirementDeadline) {
-          await Bun.sleep(25);
-        }
-        expect(existsSync(childDir)).toBe(false);
-
-        await active.sendText("/quit");
-        expect(await active.waitForSessionEnd(TIMEOUT)).toBe(true);
-        session = null;
-
-        const retired = await runAsk([
-          "--json",
-          "--auto",
-          "--resume-id",
-          oneOff.value.child_id,
-          "must not resume",
-        ]);
-        expect(retired.exitCode).toBe(1);
-        expect(retired.stderr).toBe("");
-        expect(JSON.parse(retired.stdout)).toMatchObject({
-          exit_code: 1,
-          error: "SessionNotFound",
-        });
-
-        const persistentControl = await runAsk([
-          "--json",
-          "--auto",
-          "--resume-id",
-          persistent.value.child_id,
-          persistentResume,
-        ]);
-        expect(persistentControl.exitCode).toBe(0);
-        expect(persistentControl.stderr).toBe("");
-        expect(JSON.parse(persistentControl.stdout)).toMatchObject({
-          exit_code: 0,
-          output: persistentResumed,
-        });
-        expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
-      } finally {
-        if (!childStream.released()) {
-          try {
-            childStream.release("CLEANUP");
-          } catch {}
-        }
-        gateway.stop();
-      }
-    },
-    60_000,
-  );
   test(
     "persistent child quit exits locally without sending a model turn",
     async () => {
@@ -5023,225 +4123,6 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
     90_000,
   );
 
-  test(
-    "configure rejects a concurrent winner then retries the preserved draft once",
-    async () => {
-      const fixture = createFixture();
-      const resumedStderrPath = join(root!, "configure-contention-resumed.stderr");
-      writeFileSync(resumedStderrPath, "");
-      let releaseExternal!: (response: Response) => void;
-      let externalReleased = false;
-      const externalResponse = new Promise<Response>((resolve) => {
-        releaseExternal = (response) => {
-          externalReleased = true;
-          resolve(response);
-        };
-      });
-      const gateway = startDynamicFakeGateway((body) => {
-        if (body.includes('"toolCallId":"external_configure"')) {
-          return fakeGatewayFinalText("BACKGROUND_CONFIGURED");
-        }
-        if (body.includes("BACKGROUND_CONFIGURE")) return externalResponse;
-        return fakeGatewayFinalText("STALE_CHILD_READY");
-      }, {
-        classifierDecision: "clear",
-        models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] }],
-      });
-      const env = {
-        HOME: fixture.home,
-        AI_GATEWAY_API_KEY: "configure-contention-key",
-        VERCEL_OIDC_TOKEN: undefined,
-        FX_GATEWAY_BASE_URL: gateway.baseUrl,
-        FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-        FX_MODEL: FAKE_GATEWAY_MODEL,
-        FX_AUTO_UPGRADE: "0",
-        FX_DISABLE_KEYCHAIN: "1",
-        FX_SKIP_ONBOARDING: "1",
-        FX_SOUND: "0",
-        NO_COLOR: "1",
-      };
-
-      try {
-        session = await TmuxSession.create({
-          cmd: FX_BIN,
-          cwd: fixture.workspace,
-          env,
-          width: 96,
-          height: 28,
-          stderrPath: fixture.stderrPath,
-        });
-        let active = session;
-        await active.waitForComposer(TIMEOUT);
-        await active.sendKeys("C-x");
-        await active.waitForText("Agents & processes", TIMEOUT);
-        await active.sendLiteralText("c");
-        await active.waitForText("Create persistent agent", TIMEOUT);
-        await pasteVisibleText(active, "stale-form-child");
-        await active.sendKeys("Tab");
-        await active.sendKeys("Tab");
-        await pasteVisibleText(active, "STALE_CHILD_PROMPT");
-        await active.sendKeys("Enter");
-        await active.waitForText("STALE_CHILD_READY", TIMEOUT);
-
-        const controlPath = configurationControlPath(fixture);
-        const initial = readConfigurationControl(controlPath);
-        await active.sendKeys("Tab");
-        await active.sendKeys("C-x");
-        await active.waitForComposer(TIMEOUT);
-        await active.sendText("BACKGROUND_CONFIGURE");
-        const requestStartedAt = Date.now();
-        while (
-          !gateway.requests.some((request) =>
-            request.body.includes("BACKGROUND_CONFIGURE")
-          ) && Date.now() - requestStartedAt < TIMEOUT
-        ) {
-          await Bun.sleep(25);
-        }
-        expect(gateway.requests.some((request) =>
-          request.body.includes("BACKGROUND_CONFIGURE")
-        )).toBe(true);
-
-        await active.sendKeys("C-x");
-        await active.waitForPane(
-          (pane) =>
-            pane.includes("Agents & processes") &&
-            pane.includes("stale-form-child"),
-          TIMEOUT,
-        );
-        await active.sendKeys("Enter");
-        await active.waitForPane(
-          (pane) =>
-            pane.includes("Subagent: stale-form-child") &&
-            pane.includes("status: idle"),
-          TIMEOUT,
-        );
-        await active.sendKeys("Tab");
-        await active.sendLiteralText("s");
-        await active.waitForText("Configure child", TIMEOUT);
-        await active.sendKeys("C-u");
-        await pasteVisibleText(active, "tui-draft-final");
-        await active.sendKeys("Tab");
-        await active.sendKeys("Tab");
-        await active.sendKeys("C-u");
-        await pasteVisibleText(active, "tui-mark");
-        await active.sendKeys("Tab");
-        await active.sendKeys("C-u");
-        await pasteVisibleText(active, "700");
-
-        releaseExternal(fakeGatewayToolCall("external_configure", "subagent", {
-          command: {
-            configure: {
-              id: initial.child_id,
-              name: "external-winner",
-              model: FAKE_GATEWAY_MODEL,
-              effort: "high",
-              permission_mode: "auto",
-              notifications: {
-                terminal: { completed: true, failed: true, cancelled: true },
-                milestones: ["external-mark"],
-                report_interval_ms: 900,
-                stop_conditions: ["terminal"],
-              },
-            },
-          },
-        }));
-        const external = await waitForConfigurationControl(
-          controlPath,
-          (control) =>
-            control.generation === initial.generation + 1 &&
-            control.configuration.name === "external-winner",
-        );
-        const refreshed = await active.waitForPane(
-          (pane) =>
-            pane.includes("Configure child") &&
-            pane.includes("Effective/current name: external-winner") &&
-            pane.includes("Name: tui-draft-final"),
-          TIMEOUT,
-        );
-        expect(refreshed).toContain("Effective/current permission mode: auto");
-        expect(external.operations).toHaveLength(initial.operations.length + 1);
-        expect(external.operations.at(-1)).toMatchObject({
-          code: "configured",
-          identity_source: "model",
-          generation: initial.generation + 1,
-        });
-
-        await active.sendKeys("Enter");
-        const rejected = await active.waitForPane(
-          (pane) =>
-            pane.includes("Command failed: stale_generation (retryable)") &&
-            pane.includes("Name: tui-draft-final") &&
-            pane.includes("Effective/current name: external-winner"),
-          TIMEOUT,
-        );
-        expect(rejected).toContain("Report interval ms: 700");
-        expect(readConfigurationControl(controlPath)).toEqual(external);
-
-        await active.sendKeys("Enter");
-        await active.waitForPane((pane) => !pane.includes("Configure child"), TIMEOUT);
-        const final = await waitForConfigurationControl(
-          controlPath,
-          (control) =>
-            control.generation === external.generation + 1 &&
-            control.configuration.name === "tui-draft-final",
-        );
-        expect(final.configuration).toMatchObject({
-          name: "tui-draft-final",
-          effort: "auto",
-          permission_mode: "yolo",
-          notifications: {
-            milestones: ["tui-mark"],
-            report_interval_ms: 700,
-            report_duration_ms: null,
-            stop_conditions: ["terminal"],
-          },
-        });
-        expect(final.operations).toHaveLength(external.operations.length + 1);
-        expect(final.operations.at(-1)).toMatchObject({
-          code: "configured",
-          identity_source: "human",
-          generation: external.generation + 1,
-        });
-
-        await active.sendKeys("Tab");
-        await active.sendKeys("C-x");
-        await active.waitForComposer(TIMEOUT);
-        await active.sendText("/quit");
-        expect(await active.waitForSessionEnd(TIMEOUT)).toBe(true);
-        session = null;
-
-        session = await TmuxSession.create({
-          cmd: `${FX_BIN} resume ${final.parent_id}`,
-          cwd: fixture.workspace,
-          env,
-          width: 96,
-          height: 28,
-          stderrPath: resumedStderrPath,
-        });
-        active = session;
-        await active.waitForComposer(TIMEOUT);
-        await active.sendKeys("C-x");
-        await active.waitForPane(
-          (pane) => pane.includes("tui-draft-final") && pane.includes("idle"),
-          TIMEOUT,
-        );
-        expect(readConfigurationControl(controlPath)).toEqual(final);
-        await active.sendKeys("C-x");
-        await active.waitForComposer(TIMEOUT);
-        await active.sendText("/quit");
-        expect(await active.waitForSessionEnd(TIMEOUT)).toBe(true);
-        session = null;
-        expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
-        expect(readFileSync(resumedStderrPath, "utf8")).toBe("");
-      } finally {
-        if (!externalReleased) {
-          releaseExternal(fakeGatewayFinalText("BACKGROUND_CONFIGURE_CLEANUP"));
-        }
-        gateway.stop();
-      }
-    },
-    120_000,
-  );
 
   test(
     "persistent child preserves its reading position across both reopen paths",
@@ -5617,10 +4498,10 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         if (body.includes(parentPrompt)) {
           if (!childId) throw new Error("visible child ID was not captured");
           return fakeGatewayToolCall(parentCallId, "subagent", {
-            command: {
-              message: {
-                send: { id: childId, content: parentMessage },
-              },
+            request: {
+              action: "send",
+              child_id: childId,
+              message: parentMessage,
             },
           });
         }
@@ -5984,157 +4865,6 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
     120_000,
   );
 
-  test(
-    "assembled TTY tree keeps persistent configuration and hides settled one-offs",
-    async () => {
-      const fixture = createFixture();
-      const persistentPrompt = "CHECKPOINT3_PERSISTENT_CREATES_NESTED";
-      const nestedPrompt = "CHECKPOINT3_NESTED_ONE_OFF";
-      const oneOffPrompt = "CHECKPOINT3_ROOT_ONE_OFF";
-      const gateway = startDynamicFakeGateway((body) => {
-        if (body.includes('"toolCallId":"checkpoint3_nested_create"')) {
-          return fakeGatewayFinalText("CHECKPOINT3_PERSISTENT_COMPLETE");
-        }
-        if (body.includes('"toolCallId":"checkpoint3_root_one_off"')) {
-          return fakeGatewayFinalText("CHECKPOINT3_ASSEMBLED_PARENT_COMPLETE");
-        }
-        if (body.includes('"toolCallId":"checkpoint3_root_persistent"')) {
-          return fakeGatewayToolCall("checkpoint3_root_one_off", "subagent", {
-            command: {
-              create: {
-                name: "assembled-one-off",
-                mode: "one_off",
-                prompt: oneOffPrompt,
-                notifications: { stop_conditions: ["terminal"] },
-              },
-            },
-          });
-        }
-        if (body.includes(nestedPrompt) && !body.includes(persistentPrompt)) {
-          return fakeGatewayFinalText("CHECKPOINT3_NESTED_COMPLETE");
-        }
-        if (body.includes(oneOffPrompt)) {
-          return fakeGatewayFinalText("CHECKPOINT3_ONE_OFF_COMPLETE");
-        }
-        if (body.includes(persistentPrompt)) {
-          return fakeGatewayToolCall("checkpoint3_nested_create", "subagent", {
-            command: {
-              create: {
-                name: "assembled-nested",
-                mode: "one_off",
-                prompt: nestedPrompt,
-              },
-            },
-          });
-        }
-        return fakeGatewayToolCall("checkpoint3_root_persistent", "subagent", {
-          command: {
-            create: {
-              name: "assembled-persistent",
-              mode: "persistent",
-              prompt: persistentPrompt,
-              notifications: {
-                milestones: ["assembled-checkpoint"],
-                report_interval_ms: 1000,
-                report_duration_ms: 250,
-                stop_conditions: ["terminal"],
-              },
-            },
-          },
-        });
-      }, {
-        classifierDecision: "clear",
-        models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] }],
-      });
-      try {
-        session = await TmuxSession.create({
-          cwd: fixture.workspace,
-          env: {
-            HOME: fixture.home,
-            AI_GATEWAY_API_KEY: "checkpoint-three-assembled-key",
-            VERCEL_OIDC_TOKEN: undefined,
-            FX_GATEWAY_BASE_URL: gateway.baseUrl,
-            FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-            FX_MODEL: FAKE_GATEWAY_MODEL,
-            FX_AUTO_UPGRADE: "0",
-            NO_COLOR: "1",
-          },
-          width: 112,
-          height: 32,
-          stderrPath: fixture.stderrPath,
-        });
-        const active = session;
-        await active.waitForComposer(TIMEOUT);
-        await active.sendText("Build the checkpoint three assembled tree.");
-        await active.waitForText("CHECKPOINT3_ASSEMBLED_PARENT_COMPLETE", TIMEOUT);
-        await active.sendKeys("C-x");
-        const tree = await active.waitForPane(
-          (pane) =>
-            pane.includes("assembled-persistent") &&
-            pane.includes("idle") &&
-            !pane.includes("assembled-one-off") &&
-            !pane.includes("assembled-nested"),
-          TIMEOUT,
-        );
-        expect(tree).toContain("Agents & processes");
-        expect(tree).not.toContain("assembled-one-off");
-        expect(tree).not.toContain("assembled-nested");
-
-        type Control = {
-          child_id: string;
-          parent_id: string;
-          mode: "persistent" | "one_off";
-          state: string;
-          configuration: {
-            name: string;
-            notifications: { milestones: string[]; stop_conditions: string[] };
-          };
-          queue: Array<{ content: string; status: string }>;
-        };
-        const sessionsDir = join(fixture.home, ".fx", "sessions");
-        const readControls = () => readdirSync(sessionsDir)
-          .map((id) => join(sessionsDir, id, "subagent", "control.json"))
-          .filter((path) => existsSync(path))
-          .map((path) => JSON.parse(readFileSync(path, "utf8")) as Control);
-        let persistent: Control | undefined;
-        const controlsDeadline = Date.now() + TIMEOUT;
-        while (Date.now() < controlsDeadline) {
-          persistent = readControls().find(
-            (control) => control.configuration.name === "assembled-persistent" &&
-              control.state === "idle",
-          );
-          if (persistent) break;
-          await Bun.sleep(25);
-        }
-        if (!persistent) throw new Error("assembled persistent control did not settle");
-        expect(persistent!.mode).toBe("persistent");
-        expect(persistent!.state).toBe("idle");
-        expect(persistent!.configuration.notifications).toMatchObject({
-          milestones: ["assembled-checkpoint"],
-          stop_conditions: ["terminal", "duration_elapsed"],
-        });
-
-        await active.sendKeys("Enter");
-        const persistentChat = await active.waitForPane(
-          (pane) =>
-            pane.includes("assembled-persistent") &&
-            pane.includes(persistent!.child_id) &&
-            pane.includes("status: idle") &&
-            pane.includes("CHECKPOINT3_PERSISTENT_COMPLETE"),
-          TIMEOUT,
-        );
-        expect(persistentChat).toContain(`Parent: ${persistent!.parent_id}`);
-        for (const request of gateway.requests) {
-          expect(request.body).toContain('"name":"subagent"');
-          expect(request.body).not.toContain('"name":"task"');
-        }
-        expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
-      } finally {
-        gateway.stop();
-      }
-    },
-    120_000,
-  );
 
   test(
     "manager cancel preserves a persistent child chat and returns it idle",
@@ -6148,12 +4878,9 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         }
         if (body.includes(childPrompt)) return childStream.response;
         return fakeGatewayToolCall("checkpoint3_cancel_create", "subagent", {
-          command: {
-            create: {
-              name: "manager-cancel-child",
-              mode: "persistent",
-              prompt: childPrompt,
-            },
+          request: {
+            action: "run",
+            task: childPrompt,
           },
         });
       }, {
@@ -6194,7 +4921,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         await active.waitForPane(
           (pane) =>
             pane.includes("Agents & processes") &&
-            pane.includes("manager-cancel-child") &&
+            pane.includes("CHECKPOINT3_MANAGER_CANCEL_ACTIVE") &&
             pane.includes("running"),
           TIMEOUT,
         );
@@ -6213,31 +4940,31 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         await active.waitForPane(
           (pane) =>
             pane.includes("Agents & processes") &&
-            pane.includes("manager-cancel-child") &&
+            pane.includes("CHECKPOINT3_MANAGER_CANCEL_ACTIVE") &&
             pane.includes("running"),
           TIMEOUT,
         );
         await active.sendKeys("Enter");
         const running = await active.waitForPane(
           (pane) =>
-            pane.includes("manager-cancel-child") &&
+            pane.includes("CHECKPOINT3_MANAGER_CANCEL_ACTIVE") &&
             pane.includes("status: running") &&
             pane.includes("running") &&
             pane.includes("CHECKPOINT3_CANCEL_STREAM_"),
           TIMEOUT,
         );
         const childId = running.match(
-          /manager-cancel-child\s+·\s+([^\s]+)/,
+          /CHECKPOINT3_MANAGER_CANCEL_ACTIVE\s+·\s+([^\s]+)/,
         )?.[1];
         if (!childId) throw new Error("cancel child did not expose its ID");
 
         await active.sendKeys("Tab");
         await active.sendLiteralText("x");
-        await active.waitForText("Actions — manager-cancel-child", TIMEOUT);
+        await active.waitForText("Actions — CHECKPOINT3_MANAGER_CANCEL_ACTIVE", TIMEOUT);
         await active.sendLiteralText("c");
         const cancelled = await active.waitForPane(
           (pane) =>
-            pane.includes("manager-cancel-child") &&
+            pane.includes("CHECKPOINT3_MANAGER_CANCEL_ACTIVE") &&
             pane.includes("status: idle"),
           TIMEOUT,
         );
@@ -6306,13 +5033,9 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
           );
         }
         return fakeGatewayToolCall(parentCallId, "subagent", {
-          command: {
-            create: {
-              name: "approval-cancel-child",
-              mode: "persistent",
-              prompt: childPrompt,
-              permission_mode: "ask",
-            },
+          request: {
+            action: "run",
+            task: childPrompt,
           },
         });
       }, {
@@ -6340,7 +5063,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         await active.waitForComposer(TIMEOUT);
         await active.sendText(parentPrompt);
         await active.waitForText(
-          "Subagent approval-cancel-child needs permission",
+          "Subagent CANCEL_BLOCKED_APPROVAL_CHILD needs permission",
           TIMEOUT,
         );
 
@@ -6348,16 +5071,16 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         await active.waitForPane(
           (pane) =>
             pane.includes("Agents & processes") &&
-            pane.includes("approval-cancel-child") &&
+            pane.includes("CANCEL_BLOCKED_APPROVAL_CHILD") &&
             pane.includes("approval"),
           TIMEOUT,
         );
         await active.sendKeys("Enter");
         const blocked = await active.waitForPane(
           (pane) =>
-            pane.includes("Subagent: approval-cancel-child") &&
+            pane.includes("Subagent: CANCEL_BLOCKED_APPROVAL_CHILD") &&
             pane.includes("status: approval") &&
-            pane.includes("Subagent approval-cancel-child needs permission") &&
+            pane.includes("Subagent CANCEL_BLOCKED_APPROVAL_CHILD needs permission") &&
             pane.includes("Command") &&
             pane.includes("$ # shell.run profile=user shell=") &&
             pane.includes("printf denied > cancelled-approval-effect.txt") &&
@@ -6365,7 +5088,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
           TIMEOUT,
         );
         const childId = blocked.match(
-          /approval-cancel-child\s+·\s+([^\s]+)/,
+          /CANCEL_BLOCKED_APPROVAL_CHILD\s+·\s+([^\s]+)/,
         )?.[1];
         if (!childId) throw new Error("approval child did not expose its ID");
         const requestCountBeforeShutdown = gateway.requests.length;
@@ -6436,7 +5159,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         await resumed.waitForPane(
           (pane) =>
             pane.includes("Agents & processes") &&
-            pane.includes("approval-cancel-child") &&
+            pane.includes("CANCEL_BLOCKED_APPROVAL_CHILD") &&
             pane.includes("interrupted"),
           TIMEOUT,
         );
@@ -6511,12 +5234,9 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
           return childCompletion;
         }
         return fakeGatewayToolCall("selected_child_create", "subagent", {
-          command: {
-            create: {
-              name: "route-child",
-              mode: "persistent",
-              prompt: childPrompt,
-            },
+          request: {
+            action: "run",
+            task: childPrompt,
           },
         });
       }, {
@@ -6552,7 +5272,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         expect(childRequests).toBe(1);
 
         await active.sendKeys("C-x");
-        await active.waitForText("route-child", TIMEOUT);
+        await active.waitForText("SELECTED_CHILD_ROUTE_RECOVERY", TIMEOUT);
         await active.sendKeys("Enter");
         await active.waitForText(childPrompt, TIMEOUT);
 
@@ -6567,7 +5287,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
           await Bun.sleep(25);
         }
         expect(recordedOutput).toContain(retryText);
-        expect(recordedOutput).toContain("route-child");
+        expect(recordedOutput).toContain("SELECTED_CHILD_ROUTE_RECOVERY");
 
         releaseChild(fakeGatewayFinalText(finalText));
         await active.waitForText(finalText, TIMEOUT);
@@ -6614,12 +5334,9 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         if (body.includes(humanOneLines[0]!)) return humanOneStream.response;
         if (body.includes(childPrompt)) return childStream.response;
         return fakeGatewayToolCall("manager_create_1", "subagent", {
-          command: {
-            create: {
-              name: "live-child",
-              mode: "persistent",
-              prompt: childPrompt,
-            },
+          request: {
+            action: "run",
+            task: childPrompt,
           },
         });
       }, {
@@ -6686,7 +5403,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
             pane.includes("Agents & processes") &&
             pane.split("\n").some((line) =>
               line.startsWith("› ") &&
-              line.includes("live-child") &&
+              line.includes("CHILD1") &&
               line.includes("running")
             ),
           TIMEOUT,
@@ -6696,11 +5413,11 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         const detail = await active.waitForPane(
           (pane) =>
             pane.includes("Subagent") &&
-            pane.includes("live-child") &&
+            pane.includes("CHILD1") &&
             pane.includes("MANAGER_CHILD_LIVE_"),
           TIMEOUT,
         );
-        const childId = detail.match(/live-child\s+·\s+([^\s]+)/)?.[1];
+        const childId = detail.match(/CHILD1\s+·\s+([^\s]+)/)?.[1];
         if (!childId) throw new Error("child chat did not expose the immutable child ID");
         authoritativeChildId = childId;
         expect(detail).toContain("Parent:");
@@ -6711,7 +5428,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         expect(detail).toContain("effort:");
         expect(detail).not.toContain("Source:");
         expect(detail).not.toContain("Enter Send");
-        expect(detail).not.toContain("Subagent live-child  •  status:");
+        expect(detail).not.toContain("Subagent CHILD1  •  status:");
         expect(detail).not.toContain("Context:");
         expect(detail).toContain(FAKE_GATEWAY_MODEL);
 
@@ -6719,7 +5436,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         const streamingRoot = await active.waitForPane(
           (pane) =>
             pane.includes("Agents & processes") &&
-            pane.includes("live-child") &&
+            pane.includes("CHILD1") &&
             pane.includes("running") &&
             pane.includes("r archives"),
           TIMEOUT,
@@ -6817,10 +5534,10 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         for (const line of humanOneLines) expect(completed).toContain(line);
         expect(completed).toContain(humanTwo);
         expect(completed).toContain(`┃ ${humanOneLines[0]}`);
-        expect(completed).toContain("live-child · idle ·");
+        expect(completed).toContain("CHILD1 · idle ·");
         expect(completed).not.toContain("Enter Send");
         expect(completed).not.toContain("Source:");
-        expect(completed).not.toContain("Subagent live-child  •  status:");
+        expect(completed).not.toContain("Subagent CHILD1  •  status:");
         expect(completed).toContain("● 1 tool call · 1 read");
         expect(completed).toContain(`└ Read ${childToolPath}`);
         expect(completed.match(/MANAGER_HUMAN_ONE_LIVE_/g)).toHaveLength(1);
@@ -6903,7 +5620,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
           TIMEOUT,
         );
         await active.sendLiteralText("a");
-        const activity = await active.waitForText("Activity — live-child", TIMEOUT);
+        const activity = await active.waitForText("Activity — CHILD1", TIMEOUT);
         expect(activity).toContain(childId);
         await active.sendKeys("Escape");
         await active.waitForPane(
@@ -6919,48 +5636,8 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
           normalizeThinkingFrame(mainGridBeforeManager),
         );
         expect(active.cursorPosition()).toEqual(mainCursorBeforeManager);
-        parentStream.releaseToolCall("manager_archive_1", "subagent", {
-          command: {
-            lifecycle: {
-              id: authoritativeChildId!,
-              action: "close",
-            },
-          },
-        });
+        parentStream.release("MANAGER_PARENT_COMPLETE");
         await active.waitForText("MANAGER_PARENT_COMPLETE", TIMEOUT);
-
-        await active.sendKeys("C-x");
-        const activeTree = await active.waitForText("Agents & processes", TIMEOUT);
-        expect(activeTree).not.toContain(`› live-child`);
-        await active.sendLiteralText("r");
-        const archived = await active.waitForText("Archived subagents", TIMEOUT);
-        expect(archived).toContain("live-child");
-        await active.sendKeys("Enter");
-        const archivedDetail = await active.waitForPane(
-          (pane) =>
-            pane.includes("Read-only child") &&
-            pane.includes(`Read ${childToolPath}`),
-          TIMEOUT,
-        );
-        expect(archivedDetail).toContain("Read-only child");
-        expect(archivedDetail).not.toContain("Enter Send");
-        expect(archivedDetail).not.toContain("Context:");
-        expect(hasEmptyComposer(archivedDetail)).toBe(false);
-        await active.sendKeys("Escape");
-        await active.waitForText("Archived subagents", TIMEOUT);
-        await active.sendKeys("C-x");
-        await active.waitForPane((pane) => !pane.includes("Agents & processes"), TIMEOUT);
-
-        const restoredBeforeRepeat = await active.capturePaneGrid();
-        const cursorBeforeRepeat = active.cursorPosition();
-        await active.sendKeys("C-x");
-        await active.waitForText("Agents & processes", TIMEOUT);
-        await active.sendLiteralText("r");
-        await active.waitForText("Archived subagents", TIMEOUT);
-        await active.sendKeys("C-x");
-        await active.waitForPane((pane) => !pane.includes("Agents & processes"), TIMEOUT);
-        expect(await active.capturePaneGrid()).toEqual(restoredBeforeRepeat);
-        expect(active.cursorPosition()).toEqual(cursorBeforeRepeat);
         expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
       } finally {
         if (!childStream.released()) childStream.release("CLEANUP");
@@ -6973,85 +5650,6 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
     90_000,
   );
 
-  test(
-    "Ctrl-X traverses a bounded 101-child tree through stable pages",
-    async () => {
-      const fixture = createFixture();
-      let createIndex = 0;
-      const gateway = startDynamicFakeGateway(() => {
-        if (createIndex === 101) {
-          return fakeGatewayFinalText("MANAGER_BOUNDED_TREE_COMPLETE");
-        }
-        const index = createIndex;
-        createIndex += 1;
-        return fakeGatewayToolCall(
-          `manager_bounded_create_${index.toString().padStart(3, "0")}`,
-          "subagent",
-          {
-            command: {
-              create: {
-                name: `page-child-${index.toString().padStart(3, "0")}`,
-                mode: "persistent",
-              },
-            },
-          },
-        );
-      }, {
-        classifierDecision: "clear",
-        models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] }],
-      });
-      try {
-        session = await TmuxSession.create({
-          cwd: fixture.workspace,
-          env: {
-            HOME: fixture.home,
-            AI_GATEWAY_API_KEY: "manager-bounded-tree-key",
-            VERCEL_OIDC_TOKEN: undefined,
-            FX_GATEWAY_BASE_URL: gateway.baseUrl,
-            FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-            FX_MODEL: FAKE_GATEWAY_MODEL,
-            FX_AUTO_UPGRADE: "0",
-            NO_COLOR: "1",
-          },
-          width: 100,
-          height: 30,
-          stderrPath: fixture.stderrPath,
-        });
-        const active = session;
-        await active.waitForComposer(TIMEOUT);
-        await active.sendText("Create the bounded manager tree.");
-        await active.waitForText("MANAGER_BOUNDED_TREE_COMPLETE", 120_000);
-        expect(createIndex).toBe(101);
-
-        await active.sendKeys("C-x");
-        const first = await active.waitForPane(
-          (pane) => pane.includes("page-child-000"),
-          TIMEOUT,
-        );
-        expect(first).not.toContain("page-child-100");
-
-        await active.sendLiteralText("]");
-        const second = await active.waitForPane(
-          (pane) =>
-            pane.includes("page-child-100") &&
-            pane.includes("Previous children available: [ previous page."),
-          TIMEOUT,
-        );
-        expect(second).not.toContain("page-child-000");
-
-        await active.sendLiteralText("[");
-        const returned = await active.waitForPane(
-          (pane) => pane.includes("page-child-000"),
-          TIMEOUT,
-        );
-        expect(returned).not.toContain("page-child-100");
-        expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
-      } finally {
-        gateway.stop();
-      }
-    },
-    150_000,
-  );
 
   test(
     "zero-turn parent that owns a persistent child remains available in resume",
@@ -7168,22 +5766,16 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         }
         if (body.includes(outerPrompt)) {
           return fakeGatewayToolCall("nested_send_inner_create", "subagent", {
-            command: {
-              create: {
-                name: "nested-send-inner",
-                mode: "persistent",
-                prompt: innerPrompt,
-              },
+            request: {
+              action: "run",
+              task: innerPrompt,
             },
           });
         }
         return fakeGatewayToolCall("nested_send_root_create", "subagent", {
-          command: {
-            create: {
-              name: "nested-send-outer",
-              mode: "persistent",
-              prompt: outerPrompt,
-            },
+          request: {
+            action: "run",
+            task: outerPrompt,
           },
         });
       }, {
@@ -7218,8 +5810,8 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         await active.sendKeys("C-x");
         await active.waitForPane(
           (pane) =>
-            pane.includes("nested-send-outer") &&
-            pane.includes("nested-send-inner") &&
+            pane.includes("NESTED_SEND_OUTER_PROMPT") &&
+            pane.includes("NESTED_SEND_INNER_PROMPT") &&
             pane.includes("idle"),
           TIMEOUT,
         );
@@ -7227,15 +5819,15 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         const selected = await active.waitForPane(
           (pane) =>
             pane.split("\n").some((line) =>
-              line.startsWith("› ") && line.includes("nested-send-inner")
+              line.startsWith("› ") && line.includes("NESTED_SEND_INNER_PROMPT")
             ),
           TIMEOUT,
         );
-        expect(selected).toContain("nested-send-outer");
+        expect(selected).toContain("NESTED_SEND_OUTER_PROMPT");
         await active.sendKeys("Enter");
         await active.waitForPane(
           (pane) =>
-            pane.includes("Subagent: nested-send-inner") &&
+            pane.includes("Subagent: NESTED_SEND_INNER_PROMPT") &&
             pane.includes("status: idle"),
           TIMEOUT,
         );

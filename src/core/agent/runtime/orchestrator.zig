@@ -127,11 +127,31 @@ fn terminal_request_schema_advertised(
     return false;
 }
 
+fn subagent_request_schema_advertised(
+    advertised_functions: []const model_tool_schema.FunctionSchema,
+) bool {
+    for (advertised_functions) |function| {
+        if (!std.mem.eql(u8, function.name, "subagent")) continue;
+        return model_tool_schema.isSingleRequiredObjectUnionField(
+            function.input_schema,
+            "request",
+        );
+    }
+    return false;
+}
+
 fn terminal_request_normalization_eligible(
     base_nested_terminal_advertised: bool,
     vision_mode: runtime_gateway_step.VisionToolMode,
 ) bool {
     return base_nested_terminal_advertised and vision_mode != .required;
+}
+
+fn subagent_request_normalization_eligible(
+    base_nested_subagent_advertised: bool,
+    vision_mode: runtime_gateway_step.VisionToolMode,
+) bool {
+    return base_nested_subagent_advertised and vision_mode != .required;
 }
 
 fn terminal_action_is(object: std.json.ObjectMap, action_name: []const u8) bool {
@@ -532,6 +552,456 @@ fn project_terminal_request_messages(
     return projected;
 }
 
+const SubagentHistoryDisposition = enum {
+    current,
+    mapped,
+    inert,
+};
+
+const SubagentHistoryCall = struct {
+    id: []const u8,
+    action: []const u8,
+    disposition: SubagentHistoryDisposition,
+};
+
+fn find_subagent_history_call(
+    calls: []const SubagentHistoryCall,
+    id: []const u8,
+) ?SubagentHistoryCall {
+    for (calls) |call| {
+        if (std.mem.eql(u8, call.id, id)) return call;
+    }
+    return null;
+}
+
+fn legacy_subagent_action(arguments_json: []const u8) ?[]const u8 {
+    var parsed = std.json.parseFromSlice(
+        std.json.Value,
+        std.heap.page_allocator,
+        arguments_json,
+        .{},
+    ) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const command = parsed.value.object.get("command") orelse return null;
+    if (command != .object or command.object.count() != 1) return "unknown";
+    const branch = command.object.keys()[0];
+    for ([_][]const u8{ "create", "inspect", "message", "relationship", "configure", "lifecycle" }) |known| {
+        if (std.mem.eql(u8, branch, known)) return known;
+    }
+    return "unknown";
+}
+
+fn project_legacy_subagent_arguments(
+    alloc: Allocator,
+    arguments_json: []const u8,
+) Allocator.Error!?[]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, arguments_json, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const command = parsed.value.object.get("command") orelse return null;
+    if (command != .object or command.object.count() != 1) return null;
+    const arena = parsed.arena.allocator();
+    const branch_name = command.object.keys()[0];
+    const branch = command.object.values()[0];
+    if (branch != .object) return null;
+
+    var request = std.json.Value{ .object = .empty };
+    if (std.mem.eql(u8, branch_name, "create")) {
+        const task = branch.object.get("prompt") orelse return null;
+        if (task != .string or task.string.len == 0) return null;
+        try request.object.put(arena, "action", .{ .string = "run" });
+        try request.object.put(arena, "task", task);
+        for ([_][]const u8{ "model", "effort" }) |name| {
+            if (branch.object.get(name)) |value| {
+                if (value != .string) return null;
+                try request.object.put(arena, name, value);
+            }
+        }
+    } else if (std.mem.eql(u8, branch_name, "inspect")) {
+        const child_id = branch.object.get("id") orelse return null;
+        const sections = branch.object.get("sections") orelse return null;
+        const wait = branch.object.get("wait") orelse return null;
+        if (child_id != .string or sections != .array or
+            sections.array.items.len != 1 or sections.array.items[0] != .string or
+            !std.mem.eql(u8, sections.array.items[0].string, "status") or
+            wait != .object or branch.object.get("cursor") != null)
+        {
+            return null;
+        }
+        const until = wait.object.get("until") orelse return null;
+        if (until != .string or !std.mem.eql(u8, until.string, "settled")) return null;
+        try request.object.put(arena, "action", .{ .string = "wait" });
+        try request.object.put(arena, "child_id", child_id);
+    } else if (std.mem.eql(u8, branch_name, "message")) {
+        if (branch.object.count() != 1) return null;
+        const send = branch.object.get("send") orelse return null;
+        if (send != .object) return null;
+        const child_id = send.object.get("id") orelse return null;
+        const message = send.object.get("content") orelse return null;
+        if (child_id != .string or message != .string) return null;
+        try request.object.put(arena, "action", .{ .string = "send" });
+        try request.object.put(arena, "child_id", child_id);
+        try request.object.put(arena, "message", message);
+    } else if (std.mem.eql(u8, branch_name, "lifecycle")) {
+        const child_id = branch.object.get("id") orelse return null;
+        const action = branch.object.get("action") orelse return null;
+        if (child_id != .string or action != .string or
+            !std.mem.eql(u8, action.string, "cancel"))
+        {
+            return null;
+        }
+        try request.object.put(arena, "action", .{ .string = "stop" });
+        try request.object.put(arena, "child_id", child_id);
+    } else {
+        return null;
+    }
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    std.json.Stringify.value(.{ .request = request }, .{}, &out.writer) catch
+        return error.OutOfMemory;
+    return try out.toOwnedSlice();
+}
+
+fn project_subagent_result_content(
+    alloc: Allocator,
+    content: []const u8,
+) Allocator.Error!?[]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, content, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const object = parsed.value.object;
+    if (object.count() == 5 and object.get("operation_id") == null and
+        object.get("requested") == null and object.get("cursor") == null)
+    {
+        return null;
+    }
+    const ok = object.get("ok") orelse return null;
+    const child_id = object.get("child_id") orelse return null;
+    const status = object.get("status") orelse return null;
+    const error_code = object.get("error_code") orelse return null;
+    const retryable = object.get("retryable") orelse return null;
+    if (ok != .bool or (child_id != .null and child_id != .string) or
+        status != .string or (error_code != .null and error_code != .string) or
+        retryable != .bool)
+    {
+        return null;
+    }
+
+    var compact = std.json.Value{ .object = .empty };
+    const arena = parsed.arena.allocator();
+    try compact.object.put(arena, "ok", ok);
+    try compact.object.put(arena, "child_id", child_id);
+    try compact.object.put(arena, "status", status);
+    try compact.object.put(arena, "error_code", error_code);
+    try compact.object.put(arena, "retryable", retryable);
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    std.json.Stringify.value(compact, .{}, &out.writer) catch return error.OutOfMemory;
+    return try out.toOwnedSlice();
+}
+
+fn subagent_history_summary(
+    alloc: Allocator,
+    action: []const u8,
+    content: ?[]const u8,
+) Allocator.Error![]u8 {
+    const bounded = text_utils.utf8PrefixByBytes(content orelse "", 4096);
+    return if (bounded.len == 0)
+        std.fmt.allocPrint(alloc, "[Prior subagent {s} action completed.]", .{action})
+    else
+        std.fmt.allocPrint(
+            alloc,
+            "[Prior subagent {s} action completed. Stored result follows.]\n{s}",
+            .{ action, bounded },
+        );
+}
+
+fn project_subagent_request_messages(
+    alloc: Allocator,
+    registry: tool_dispatch.Registry,
+    attempt_eligible: bool,
+    source: []const ChatMessage,
+) Allocator.Error![]const ChatMessage {
+    if (!attempt_eligible or registry.lookup("subagent") == null) return source;
+
+    var calls: std.ArrayList(SubagentHistoryCall) = .empty;
+    defer calls.deinit(alloc);
+    var needs_projection = false;
+    for (source) |message| {
+        if (message.role != .assistant) continue;
+        for (message.tool_calls) |call| {
+            if (!std.mem.eql(u8, call.name, "subagent")) continue;
+            if (call.argument_integrity != .valid) {
+                try calls.append(alloc, .{
+                    .id = call.id,
+                    .action = "malformed",
+                    .disposition = .inert,
+                });
+                needs_projection = true;
+                continue;
+            }
+            if (legacy_subagent_action(call.arguments_json)) |action| {
+                const projected = try project_legacy_subagent_arguments(
+                    alloc,
+                    call.arguments_json,
+                );
+                if (projected) |arguments| alloc.free(arguments);
+                try calls.append(alloc, .{
+                    .id = call.id,
+                    .action = action,
+                    .disposition = if (projected != null) .mapped else .inert,
+                });
+                needs_projection = true;
+                continue;
+            }
+            try calls.append(alloc, .{
+                .id = call.id,
+                .action = "managed",
+                .disposition = .current,
+            });
+            if (try normalized_subagent_request_arguments(
+                alloc,
+                call.arguments_json,
+            )) |arguments| {
+                alloc.free(arguments);
+                needs_projection = true;
+            }
+        }
+    }
+    for (source) |message| {
+        if (message.role != .tool or message.tool_call_id == null) continue;
+        const call = find_subagent_history_call(calls.items, message.tool_call_id.?) orelse continue;
+        if (call.disposition == .inert) {
+            needs_projection = true;
+            continue;
+        }
+        if (message.content) |content| {
+            if (try project_subagent_result_content(alloc, content)) |projected| {
+                alloc.free(projected);
+                needs_projection = true;
+            }
+        }
+    }
+    if (!needs_projection) return source;
+
+    const projected = try alloc.alloc(ChatMessage, source.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (projected[0..initialized]) |message| {
+            if (message.content) |content| alloc.free(@constCast(content));
+            for (message.tool_calls) |call| alloc.free(@constCast(call.arguments_json));
+            if (message.tool_calls.len != 0) alloc.free(@constCast(message.tool_calls));
+        }
+        alloc.free(projected);
+    }
+    for (source, projected) |message, *target| {
+        target.* = message;
+        target.content = if (message.content) |content| try alloc.dupe(u8, content) else null;
+        target.tool_calls = &.{};
+        initialized += 1;
+
+        if (message.role == .tool and message.tool_call_id != null) {
+            if (find_subagent_history_call(calls.items, message.tool_call_id.?)) |call| {
+                if (call.disposition == .inert) {
+                    if (target.content) |content| alloc.free(@constCast(content));
+                    target.role = .assistant;
+                    target.content = try subagent_history_summary(
+                        alloc,
+                        call.action,
+                        message.content,
+                    );
+                    target.tool_call_id = null;
+                    target.tool_name = null;
+                } else if (message.content) |content| {
+                    if (try project_subagent_result_content(alloc, content)) |compact| {
+                        if (target.content) |owned| alloc.free(@constCast(owned));
+                        target.content = compact;
+                    }
+                }
+            }
+        }
+
+        if (message.tool_calls.len != 0) {
+            var projected_calls: std.ArrayList(ToolCall) = .empty;
+            errdefer {
+                for (projected_calls.items) |call| alloc.free(@constCast(call.arguments_json));
+                projected_calls.deinit(alloc);
+            }
+            for (message.tool_calls) |call| {
+                const history_call = if (std.mem.eql(u8, call.name, "subagent"))
+                    find_subagent_history_call(calls.items, call.id)
+                else
+                    null;
+                if (history_call) |known| {
+                    if (known.disposition == .inert) continue;
+                    const arguments = if (known.disposition == .mapped)
+                        (try project_legacy_subagent_arguments(alloc, call.arguments_json)).?
+                    else
+                        (try normalized_subagent_request_arguments(
+                            alloc,
+                            call.arguments_json,
+                        )) orelse try alloc.dupe(u8, call.arguments_json);
+                    var copied = call;
+                    copied.arguments_json = arguments;
+                    projected_calls.append(alloc, copied) catch |err| {
+                        alloc.free(arguments);
+                        return err;
+                    };
+                    continue;
+                }
+                var copied = call;
+                copied.arguments_json = try alloc.dupe(u8, call.arguments_json);
+                projected_calls.append(alloc, copied) catch |err| {
+                    alloc.free(@constCast(copied.arguments_json));
+                    return err;
+                };
+            }
+            target.tool_calls = try projected_calls.toOwnedSlice(alloc);
+        }
+        if (message.role == .assistant and message.tool_calls.len != 0 and
+            target.tool_calls.len == 0 and target.content == null)
+        {
+            target.content = try alloc.dupe(
+                u8,
+                "Prior subagent manager actions are represented as completed history summaries below.",
+            );
+        }
+    }
+    return projected;
+}
+
+test "subagent history maps representable manager calls and makes removed actions inert" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const tool = tool_dispatch.Tool{
+        .name = "subagent",
+        .description = "subagent",
+        .model_schema = .{ .name = "subagent", .description = "subagent" },
+        .executor_kind = .subagent,
+        .decode = undefined,
+        .call = undefined,
+        .reads_only_fn = undefined,
+        .irreversible_fn = undefined,
+    };
+    const registry = tool_dispatch.Registry{ .tools = &.{tool} };
+    const calls = [_]ToolCall{
+        .{
+            .id = "legacy-create",
+            .name = "subagent",
+            .arguments_json = "{\"command\":{\"create\":{\"name\":\"worker\",\"mode\":\"persistent\",\"prompt\":\"do it\"}}}",
+        },
+        .{
+            .id = "legacy-configure",
+            .name = "subagent",
+            .arguments_json = "{\"command\":{\"configure\":{\"id\":\"child-1\",\"name\":\"renamed\"}}}",
+        },
+        .{
+            .id = "current-run",
+            .name = "subagent",
+            .arguments_json = "{\"request\":{\"action\":\"run\",\"task\":\"current\"}}",
+        },
+    };
+    const stored_result =
+        "{\"ok\":true,\"operation_id\":\"fxop:2:m:1:0000000000000000000000000000000000000000000000000000000000000000\",\"child_id\":\"child-1\",\"status\":\"idle\",\"error_code\":null,\"retryable\":false}";
+    const messages = [_]ChatMessage{
+        .{ .role = .assistant, .tool_calls = &calls },
+        .{ .role = .tool, .tool_call_id = "legacy-create", .tool_name = "subagent", .content = stored_result },
+        .{ .role = .tool, .tool_call_id = "legacy-configure", .tool_name = "subagent", .content = "configured" },
+        .{ .role = .tool, .tool_call_id = "current-run", .tool_name = "subagent", .content = stored_result },
+    };
+
+    const projected = try project_subagent_request_messages(
+        arena,
+        registry,
+        true,
+        &messages,
+    );
+    try std.testing.expect(projected.ptr != messages[0..].ptr);
+    try std.testing.expectEqual(@as(usize, 2), projected[0].tool_calls.len);
+    try std.testing.expectEqualStrings(
+        "{\"request\":{\"action\":\"run\",\"task\":\"do it\"}}",
+        projected[0].tool_calls[0].arguments_json,
+    );
+    try std.testing.expectEqualStrings(calls[2].arguments_json, projected[0].tool_calls[1].arguments_json);
+    try std.testing.expect(std.mem.find(u8, projected[1].content.?, "operation_id") == null);
+    try std.testing.expectEqual(types.ChatRole.assistant, projected[2].role);
+    try std.testing.expect(std.mem.find(
+        u8,
+        projected[2].content.?,
+        "Prior subagent configure action completed",
+    ) != null);
+    try std.testing.expect(std.mem.find(u8, projected[3].content.?, "operation_id") == null);
+    try std.testing.expectEqualStrings(calls[0].arguments_json, messages[0].tool_calls[0].arguments_json);
+
+    const idempotent = try project_subagent_request_messages(
+        arena,
+        registry,
+        true,
+        projected,
+    );
+    try std.testing.expectEqual(projected.ptr, idempotent.ptr);
+    const ineligible = try project_subagent_request_messages(
+        arena,
+        registry,
+        false,
+        &messages,
+    );
+    try std.testing.expectEqual(messages[0..].ptr, ineligible.ptr);
+}
+
+fn check_subagent_history_projection_allocation_failures(alloc: Allocator) !void {
+    const tool = tool_dispatch.Tool{
+        .name = "subagent",
+        .description = "subagent",
+        .model_schema = .{ .name = "subagent", .description = "subagent" },
+        .executor_kind = .subagent,
+        .decode = undefined,
+        .call = undefined,
+        .reads_only_fn = undefined,
+        .irreversible_fn = undefined,
+    };
+    const registry = tool_dispatch.Registry{ .tools = &.{tool} };
+    const calls = [_]ToolCall{.{
+        .id = "legacy",
+        .name = "subagent",
+        .arguments_json = "{\"command\":{\"message\":{\"send\":{\"id\":\"child-1\",\"content\":\"next\"}}}}",
+    }};
+    const messages = [_]ChatMessage{
+        .{ .role = .assistant, .tool_calls = &calls },
+        .{
+            .role = .tool,
+            .tool_call_id = "legacy",
+            .tool_name = "subagent",
+            .content = "{\"ok\":true,\"operation_id\":\"internal\",\"child_id\":\"child-1\",\"status\":\"message_sent\",\"error_code\":null,\"retryable\":false}",
+        },
+    };
+    const projected = try project_subagent_request_messages(
+        alloc,
+        registry,
+        true,
+        &messages,
+    );
+    if (projected.ptr == messages[0..].ptr) return error.TestUnexpectedResult;
+    defer free_terminal_request_projection(alloc, &messages, projected);
+}
+
+test "subagent history projection cleans every partial allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        check_subagent_history_projection_allocation_failures,
+        .{},
+    );
+}
+
 fn normalized_terminal_request_arguments(
     alloc: Allocator,
     arguments_json: []const u8,
@@ -552,6 +1022,51 @@ fn normalized_terminal_request_arguments(
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
     std.json.Stringify.value(request.*, .{}, &out.writer) catch return error.OutOfMemory;
+    return try out.toOwnedSlice();
+}
+
+fn managed_subagent_action(action: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, action, "cancel")) return "stop";
+    for ([_][]const u8{ "run", "wait", "send", "stop" }) |known| {
+        if (std.mem.eql(u8, action, known)) return known;
+    }
+    return null;
+}
+
+fn normalized_subagent_request_arguments(
+    alloc: Allocator,
+    arguments_json: []const u8,
+) Allocator.Error!?[]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, arguments_json, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const arena = parsed.arena.allocator();
+
+    if (parsed.value.object.getPtr("request")) |request| {
+        if (parsed.value.object.count() != 1 or request.* != .object) return null;
+        const action = request.object.getPtr("action") orelse return null;
+        if (action.* != .string) return null;
+        const canonical = managed_subagent_action(action.string) orelse return null;
+        if (std.mem.eql(u8, canonical, action.string)) return null;
+        action.* = .{ .string = canonical };
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        std.json.Stringify.value(parsed.value, .{}, &out.writer) catch return error.OutOfMemory;
+        return try out.toOwnedSlice();
+    }
+
+    const action = parsed.value.object.getPtr("action") orelse return null;
+    if (action.* != .string) return null;
+    const canonical = managed_subagent_action(action.string) orelse return null;
+    action.* = .{ .string = canonical };
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    std.json.Stringify.value(.{ .request = parsed.value }, .{}, &out.writer) catch
+        return error.OutOfMemory;
+    _ = arena;
     return try out.toOwnedSlice();
 }
 
@@ -651,6 +1166,106 @@ fn normalize_terminal_request_tool_calls(
         normalized.?[index].arguments_json = arguments_json;
     }
     return normalized orelse source;
+}
+
+fn normalize_subagent_request_tool_calls(
+    alloc: Allocator,
+    registry: tool_dispatch.Registry,
+    attempt_eligible: bool,
+    source: []const ToolCall,
+) Allocator.Error![]const ToolCall {
+    if (!attempt_eligible) return source;
+
+    var normalized: ?[]ToolCall = null;
+    errdefer if (normalized) |calls| {
+        for (calls, source) |call, original| {
+            if (call.arguments_json.ptr != original.arguments_json.ptr) {
+                alloc.free(@constCast(call.arguments_json));
+            }
+        }
+        alloc.free(calls);
+    };
+
+    for (source, 0..) |call, index| {
+        if (call.argument_integrity != .valid) continue;
+        const tool = registry.lookup(call.name) orelse continue;
+        if (tool.executor_kind != .subagent) continue;
+        const arguments_json = try normalized_subagent_request_arguments(
+            alloc,
+            call.arguments_json,
+        ) orelse continue;
+        if (normalized == null) {
+            normalized = alloc.dupe(ToolCall, source) catch |err| {
+                alloc.free(arguments_json);
+                return err;
+            };
+        }
+        normalized.?[index].arguments_json = arguments_json;
+    }
+    return normalized orelse source;
+}
+
+test "subagent request normalization follows effective attempt advertisement" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const nested = tool_dispatch.Tool{
+        .name = "subagent",
+        .description = "subagent",
+        .model_schema = .{
+            .name = "subagent",
+            .description = "subagent",
+            .input_schema = .{
+                .properties = &.{.{
+                    .name = "request",
+                    .json_type = .object,
+                    .shape = &.{ .object = &.{ .one_of = &.{.{}} } },
+                }},
+                .required = &.{"request"},
+                .additional_properties = false,
+            },
+        },
+        .executor_kind = .subagent,
+        .decode = undefined,
+        .call = undefined,
+        .reads_only_fn = undefined,
+        .irreversible_fn = undefined,
+    };
+    const registry = tool_dispatch.Registry{ .tools = &.{nested} };
+    const calls = [_]ToolCall{
+        .{ .id = "flat", .name = "subagent", .arguments_json = "{\"action\":\"wait\",\"child_id\":\"child-1\"}" },
+        .{ .id = "cancel", .name = "subagent", .arguments_json = "{\"request\":{\"action\":\"cancel\",\"child_id\":\"child-2\"}}" },
+        .{ .id = "canonical", .name = "subagent", .arguments_json = "{\"request\":{\"action\":\"stop\",\"child_id\":\"child-3\"}}" },
+        .{ .id = "legacy", .name = "subagent", .arguments_json = "{\"command\":{\"lifecycle\":{\"id\":\"child-4\",\"action\":\"cancel\"}}}" },
+    };
+
+    try std.testing.expect(subagent_request_schema_advertised(&.{nested.model_schema}));
+    try std.testing.expect(subagent_request_normalization_eligible(true, .optional));
+    try std.testing.expect(!subagent_request_normalization_eligible(true, .required));
+    const normalized = try normalize_subagent_request_tool_calls(
+        arena,
+        registry,
+        true,
+        &calls,
+    );
+    try std.testing.expect(normalized.ptr != calls[0..].ptr);
+    try std.testing.expectEqualStrings(
+        "{\"request\":{\"action\":\"wait\",\"child_id\":\"child-1\"}}",
+        normalized[0].arguments_json,
+    );
+    try std.testing.expectEqualStrings(
+        "{\"request\":{\"action\":\"stop\",\"child_id\":\"child-2\"}}",
+        normalized[1].arguments_json,
+    );
+    try std.testing.expectEqual(calls[2].arguments_json.ptr, normalized[2].arguments_json.ptr);
+    try std.testing.expectEqual(calls[3].arguments_json.ptr, normalized[3].arguments_json.ptr);
+    const ineligible = try normalize_subagent_request_tool_calls(
+        arena,
+        registry,
+        false,
+        &calls,
+    );
+    try std.testing.expectEqual(calls[0..].ptr, ineligible.ptr);
 }
 
 test "shell request normalization follows effective attempt advertisement" {
@@ -3041,6 +3656,9 @@ fn processQueuedPromptInner(
     const base_nested_terminal_advertised = terminal_request_schema_advertised(
         config.advertised_functions,
     );
+    const base_nested_subagent_advertised = subagent_request_schema_advertised(
+        config.advertised_functions,
+    );
 
     var stable_prefix: std.ArrayList(ChatMessage) = .empty;
     defer stable_prefix.deinit(arena);
@@ -3175,6 +3793,7 @@ fn processQueuedPromptInner(
         job,
         request_capabilities,
         base_nested_terminal_advertised,
+        base_nested_subagent_advertised,
         finalization,
         arena,
         turn_id,
@@ -3458,6 +4077,7 @@ fn processQueuedPromptLoop(
     job: QueuedPrompt,
     request_capabilities: model_capabilities.Capabilities,
     base_nested_terminal_advertised: bool,
+    base_nested_subagent_advertised: bool,
     finalization: *TurnFinalizationGuard,
     arena: Allocator,
     turn_id: u64,
@@ -3886,11 +4506,21 @@ fn processQueuedPromptLoop(
                 base_nested_terminal_advertised,
                 vision_mode,
             );
-            const request_messages = try project_terminal_request_messages(
+            const subagent_request_eligible = subagent_request_normalization_eligible(
+                base_nested_subagent_advertised,
+                vision_mode,
+            );
+            const terminal_request_messages = try project_terminal_request_messages(
                 overlay_arena,
                 deps.tool_registry,
                 terminal_request_eligible,
                 projected_request_messages,
+            );
+            const request_messages = try project_subagent_request_messages(
+                overlay_arena,
+                deps.tool_registry,
+                subagent_request_eligible,
+                terminal_request_messages,
             );
             last_gateway_message_count = request_messages.len;
             const provider_opts = model_capabilities.resolveProviderOptionsForCapabilities(request_capabilities, config.effort, route_fast_mode);
@@ -4387,6 +5017,12 @@ fn processQueuedPromptLoop(
                     arena,
                     deps.tool_registry,
                     terminal_request_eligible,
+                    completion.tool_calls,
+                );
+                completion.tool_calls = try normalize_subagent_request_tool_calls(
+                    arena,
+                    deps.tool_registry,
+                    subagent_request_eligible,
                     completion.tool_calls,
                 );
             }

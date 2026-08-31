@@ -12,6 +12,7 @@ const control_store = @import("control_store.zig");
 const domain = @import("domain.zig");
 const execution = @import("execution.zig");
 const manager_mod = @import("manager.zig");
+const model_contract = @import("model_contract.zig");
 const tool_result = @import("tool_result.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
@@ -146,6 +147,11 @@ pub const ExecuteOptions = struct {
     identity_epoch: u64 = 0,
 };
 
+pub const ManagedExecutionResult = struct {
+    success: bool,
+    body: []u8,
+};
+
 pub const MessageSendOptions = struct {
     caller_id: []const u8,
     invocation_id: []const u8,
@@ -211,6 +217,16 @@ const ModelCommandOutcome = union(enum) {
             .result => |*result| result.deinit(alloc),
             .relationship_approval, .adapter_failure => {},
         }
+        self.* = undefined;
+    }
+};
+
+const ModelInspectionOutcome = struct {
+    result: manager_mod.Result,
+    timed_out: bool = false,
+
+    fn deinit(self: *ModelInspectionOutcome, alloc: Allocator) void {
+        self.result.deinit(alloc);
         self.* = undefined;
     }
 };
@@ -462,6 +478,264 @@ pub const Runtime = struct {
         };
     }
 
+    pub fn executeManaged(
+        self: *Runtime,
+        alloc: Allocator,
+        request: *model_contract.Request,
+        options: ExecuteOptions,
+    ) !ManagedExecutionResult {
+        var command = try request.toDomainCommand(alloc);
+        defer command.deinit(alloc);
+        const identity_epoch = if (request.* == .wait)
+            0
+        else if (options.identity_epoch != 0)
+            options.identity_epoch
+        else
+            try self.issueOperationIdentity(alloc, options.invocation_id, .model);
+        const operation_id = if (identity_epoch == 0)
+            null
+        else
+            try tool_result.boundOperationIdAlloc(
+                alloc,
+                options.invocation_id,
+                .model,
+                identity_epoch,
+            );
+        defer if (operation_id) |id| alloc.free(id);
+
+        const snapshot = switch (request.*) {
+            .send, .stop => if (request.childId()) |child_id|
+                try self.managedChildSnapshot(
+                    alloc,
+                    options.caller_id,
+                    child_id,
+                    options.timestamp_ms,
+                )
+            else
+                null,
+            .run, .wait => null,
+        };
+        const effect = model_contract.plan(request.*, snapshot);
+        switch (effect) {
+            .reject => |code| {
+                if (operation_id) |id| try self.retireManagedIdentity(alloc, id);
+                return self.encodeManaged(alloc, .{
+                    .ok = false,
+                    .operation_id = operation_id,
+                    .child_id = request.childId(),
+                    .status = "rejected",
+                    .error_code = @tagName(code),
+                });
+            },
+            .no_op => {
+                if (operation_id) |id| try self.retireManagedIdentity(alloc, id);
+                return self.encodeManaged(alloc, .{
+                    .ok = true,
+                    .operation_id = operation_id,
+                    .child_id = request.childId(),
+                    .status = @tagName(snapshot.?.state),
+                });
+            },
+            .inspect_wait => {
+                var observed = try self.inspectModelResult(alloc, command, options);
+                defer observed.deinit(alloc);
+                return self.encodeManagedInspection(alloc, observed, null);
+            },
+            .create_and_observe, .send, .cancel => {},
+        }
+
+        if (effect == .create_and_observe and
+            !try self.callerMayCreate(alloc, options.caller_id))
+        {
+            try self.retireManagedIdentity(alloc, operation_id.?);
+            return self.encodeManaged(alloc, .{
+                .ok = false,
+                .operation_id = operation_id,
+                .child_id = null,
+                .status = "rejected",
+                .error_code = "invalid_state",
+            });
+        }
+
+        const identity_admitted = try self.operationIdentityOutstanding(
+            alloc,
+            operation_id.?,
+        );
+        self.recoverIfNeeded(options.timestamp_ms);
+
+        var outcome = try self.executeModelMutation(
+            alloc,
+            &command,
+            options,
+            operation_id.?,
+            identity_epoch,
+            identity_admitted,
+        );
+        defer outcome.deinit(alloc);
+        self.finishModelOutcome(alloc, operation_id.?, &outcome);
+
+        return switch (outcome) {
+            .adapter_failure => |failure| self.encodeManaged(alloc, .{
+                .ok = false,
+                .operation_id = operation_id,
+                .child_id = failure.child_id,
+                .status = "rejected",
+                .error_code = failure.code,
+                .retryable = failure.retryable,
+            }),
+            .relationship_approval => unreachable,
+            .result => |result| switch (result) {
+                .failure => |failure| self.encodeManaged(alloc, .{
+                    .ok = false,
+                    .operation_id = operation_id,
+                    .child_id = request.childId(),
+                    .status = "rejected",
+                    .error_code = @tagName(failure.code),
+                    .retryable = failure.retryable,
+                }),
+                .inspection => unreachable,
+                .receipt => |receipt| switch (effect) {
+                    .create_and_observe => self.observeManagedCreate(
+                        alloc,
+                        receipt.target_id,
+                        options,
+                        operation_id.?,
+                    ),
+                    .send => self.encodeManaged(alloc, .{
+                        .ok = true,
+                        .operation_id = operation_id,
+                        .child_id = receipt.target_id,
+                        .status = "message_sent",
+                    }),
+                    .cancel => self.encodeManaged(alloc, .{
+                        .ok = true,
+                        .operation_id = operation_id,
+                        .child_id = receipt.target_id,
+                        .status = "stopped",
+                    }),
+                    .inspect_wait, .no_op, .reject => unreachable,
+                },
+            },
+        };
+    }
+
+    fn retireManagedIdentity(
+        self: *Runtime,
+        alloc: Allocator,
+        operation_id: []const u8,
+    ) !void {
+        if (!try self.operationIdentityOutstanding(alloc, operation_id)) return;
+        try self.completeOperationIdentity(operation_id);
+    }
+
+    fn managedChildSnapshot(
+        self: *Runtime,
+        alloc: Allocator,
+        caller_id: []const u8,
+        child_id: []const u8,
+        timestamp_ms: i64,
+    ) !?model_contract.Snapshot {
+        self.recoverIfNeeded(timestamp_ms);
+        if (!std.mem.eql(u8, caller_id, self.root_id) and
+            !try self.isAttached(self.root_id, caller_id))
+        {
+            return null;
+        }
+        var result = try self.manager.snapshot(alloc, .{
+            .root_id = caller_id,
+            .anchor_id = child_id,
+            .limit = 1,
+        });
+        defer result.deinit(alloc);
+        return switch (result) {
+            .failure => null,
+            .snapshot => |value| if (value.nodes.len == 1)
+                .{
+                    .mode = value.nodes[0].mode,
+                    .state = value.nodes[0].state,
+                }
+            else
+                null,
+        };
+    }
+
+    fn observeManagedCreate(
+        self: *Runtime,
+        alloc: Allocator,
+        child_id: []const u8,
+        options: ExecuteOptions,
+        operation_id: []const u8,
+    ) !ManagedExecutionResult {
+        var command = try domain.validateCommand(alloc, .{ .inspect = .{
+            .id = child_id,
+            .sections = &.{.status},
+            .wait = .{
+                .until = .settled,
+                .timeout_ms = model_contract.initial_observe_ms,
+            },
+        } });
+        defer command.deinit(alloc);
+        var observed = self.inspectModelResult(alloc, command, options) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            return self.encodeManaged(alloc, .{
+                .ok = true,
+                .operation_id = operation_id,
+                .child_id = child_id,
+                .status = "unknown",
+                .error_code = "observation_failed",
+            });
+        };
+        defer observed.deinit(alloc);
+        return switch (observed.result) {
+            .inspection => self.encodeManagedInspection(alloc, observed, operation_id),
+            .failure => self.encodeManaged(alloc, .{
+                .ok = true,
+                .operation_id = operation_id,
+                .child_id = child_id,
+                .status = "unknown",
+                .error_code = "observation_failed",
+            }),
+            .receipt => unreachable,
+        };
+    }
+
+    fn encodeManagedInspection(
+        self: *Runtime,
+        alloc: Allocator,
+        observed: ModelInspectionOutcome,
+        operation_id: ?[]const u8,
+    ) !ManagedExecutionResult {
+        return switch (observed.result) {
+            .inspection => |inspection| self.encodeManaged(alloc, .{
+                .ok = true,
+                .operation_id = operation_id,
+                .child_id = inspection.child_id,
+                .status = if (inspection.status) |state| @tagName(state) else "unknown",
+            }),
+            .failure => |failure| self.encodeManaged(alloc, .{
+                .ok = false,
+                .operation_id = operation_id,
+                .child_id = null,
+                .status = "rejected",
+                .error_code = @tagName(failure.code),
+                .retryable = failure.retryable,
+            }),
+            .receipt => unreachable,
+        };
+    }
+
+    fn encodeManaged(
+        self: *Runtime,
+        alloc: Allocator,
+        result: model_contract.Result,
+    ) !ManagedExecutionResult {
+        _ = self;
+        return .{
+            .success = result.ok,
+            .body = try model_contract.encodeResultAlloc(alloc, result),
+        };
+    }
+
     fn executeModelInspection(
         self: *Runtime,
         alloc: Allocator,
@@ -476,6 +750,24 @@ pub const Runtime = struct {
             0,
         );
         defer alloc.free(operation_id);
+        var observed = try self.inspectModelResult(alloc, command, options);
+        defer observed.deinit(alloc);
+        return self.encodeResult(
+            alloc,
+            operation_id,
+            observed.result,
+            options.max_result_bytes,
+            if (observed.timed_out) "wait_timed_out" else null,
+        );
+    }
+
+    fn inspectModelResult(
+        self: *Runtime,
+        alloc: Allocator,
+        command: domain.Command,
+        options: ExecuteOptions,
+    ) !ModelInspectionOutcome {
+        std.debug.assert(command == .inspect);
         self.recoverIfNeeded(options.timestamp_ms);
         const target_id = command.inspect.id;
         const wait = command.inspect.wait;
@@ -495,28 +787,12 @@ pub const Runtime = struct {
             if (!std.mem.eql(u8, options.caller_id, self.root_id) and
                 !try self.isAttached(self.root_id, options.caller_id))
             {
-                return tool_result.failureAlloc(
-                    alloc,
-                    operation_id,
-                    null,
-                    "rejected",
-                    "caller_unavailable",
-                    false,
-                    null,
-                );
+                return .{ .result = .{ .failure = .{ .code = .caller_unavailable } } };
             }
             if (!std.mem.eql(u8, target_id, options.caller_id) and
                 !try self.isAttached(options.caller_id, target_id))
             {
-                return tool_result.failureAlloc(
-                    alloc,
-                    operation_id,
-                    target_id,
-                    "rejected",
-                    "child_unavailable",
-                    false,
-                    null,
-                );
+                return .{ .result = .{ .failure = .{ .code = .child_unavailable } } };
             }
             runAfterTargetAuthorizationTestHook();
 
@@ -525,50 +801,26 @@ pub const Runtime = struct {
                 .target_authorization = .{ .attached_to_root = self.root_id },
                 .timestamp_ms = options.timestamp_ms,
             });
-            defer result.deinit(alloc);
 
-            const requested_wait = wait orelse return self.encodeResult(
-                alloc,
-                operation_id,
-                result,
-                options.max_result_bytes,
-                null,
-            );
+            const requested_wait = wait orelse return .{ .result = result };
             const inspection = switch (result) {
                 .inspection => |*value| value,
                 .receipt => unreachable,
-                .failure => return self.encodeResult(
-                    alloc,
-                    operation_id,
-                    result,
-                    options.max_result_bytes,
-                    null,
-                ),
+                .failure => return .{ .result = result },
             };
             if (domain.inspectWaitSatisfied(
                 requested_wait,
                 inspection.generation,
                 inspection.status.?,
             )) {
-                return self.encodeResult(
-                    alloc,
-                    operation_id,
-                    result,
-                    options.max_result_bytes,
-                    null,
-                );
+                return .{ .result = result };
             }
 
             const remaining = deadline.?.durationFromNow(io_mod.getIo());
             if (remaining.raw.nanoseconds <= 0) {
-                return self.encodeResult(
-                    alloc,
-                    operation_id,
-                    result,
-                    options.max_result_bytes,
-                    "wait_timed_out",
-                );
+                return .{ .result = result, .timed_out = true };
             }
+            result.deinit(alloc);
             const poll_duration = std.Io.Duration.fromMilliseconds(
                 inspect_wait_external_poll_ms,
             );
