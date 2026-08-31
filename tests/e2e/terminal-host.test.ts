@@ -5710,6 +5710,18 @@ test.skipIf(!tmuxAvailable())(
       readFileSync(paths.identity, "utf8") !== oldIdentity
     , 8_000);
     const recovered = await handshake(paths.socket, { minimum: 4, current: 5 });
+    const listed = success(await requestAction(
+      recovered.client,
+      recovered.revision!,
+      315,
+      "list",
+      {},
+    ), "list") as {
+      sessions: Array<{
+        session_id: string;
+        lifecycle: string;
+      }>;
+    };
     await waitFor(() => !processExists(invalidPanePid), 5_000);
     expect(processExists(validPanePid)).toBe(true);
     const sessionNames = execFileSync(
@@ -5728,18 +5740,6 @@ test.skipIf(!tmuxAvailable())(
       `close-transaction-${invalidId}.json`,
     );
 
-    const listed = success(await requestAction(
-      recovered.client,
-      recovered.revision!,
-      315,
-      "list",
-      {},
-    ), "list") as {
-      sessions: Array<{
-        session_id: string;
-        lifecycle: string;
-      }>;
-    };
     expect(listed.sessions).toContainEqual(expect.objectContaining({
       session_id: validId,
       lifecycle: "running",
@@ -6076,6 +6076,13 @@ test.skipIf(!tmuxAvailable())(
     const replacementStderr = streamText(replacement.stderr);
     await waitFor(() => existsSync(paths.socket) && existsSync(paths.identity), 8_000);
     const recovered = await handshake(paths.socket, { minimum: 4, current: 5 });
+    success(await requestAction(
+      recovered.client,
+      recovered.revision!,
+      333,
+      "write",
+      { session_id: siblingId, payload: { text: "survived\n" } },
+    ), "write");
     await waitFor(() => !processExists(closingPanePid), 5_000);
     expect(processExists(siblingPanePid)).toBe(true);
     expect(readdirSync(stateDir)).not.toContain(transactionName);
@@ -6090,13 +6097,6 @@ test.skipIf(!tmuxAvailable())(
     ).trim().split("\n");
     expect(names).toEqual([`fx-${siblingIdentity}`]);
 
-    success(await requestAction(
-      recovered.client,
-      recovered.revision!,
-      333,
-      "write",
-      { session_id: siblingId, payload: { text: "survived\n" } },
-    ), "write");
     const waited = success(await requestAction(
       recovered.client,
       recovered.revision!,

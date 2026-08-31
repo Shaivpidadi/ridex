@@ -808,12 +808,14 @@ const DispatchMetadata = struct {
     web_search_completion: ?types.WebSearchCompletion = null,
     web_fetch_completion: ?types.WebFetchCompletion = null,
     tool_result_memory: ?types.ToolResultMemory = null,
+    command_result_json: ?[]const u8 = null,
 
     fn attach(self: *DispatchMetadata, ctx: *tool_dispatch.DispatchContext) void {
         ctx.inner_usage_sink = &self.inner_usage;
         ctx.web_search_completion_sink = &self.web_search_completion;
         ctx.web_fetch_completion_sink = &self.web_fetch_completion;
         ctx.tool_result_memory_sink = &self.tool_result_memory;
+        ctx.command_result_json_sink = &self.command_result_json;
     }
 };
 
@@ -829,6 +831,7 @@ fn toolExecutionResultFromDispatch(
             .web_search_completion = metadata.web_search_completion,
             .web_fetch_completion = metadata.web_fetch_completion,
             .tool_result_memory = metadata.tool_result_memory,
+            .command_result_json = metadata.command_result_json,
         },
         .failure => .{
             .status = .failure,
@@ -838,6 +841,7 @@ fn toolExecutionResultFromDispatch(
             .web_search_completion = metadata.web_search_completion,
             .web_fetch_completion = metadata.web_fetch_completion,
             .tool_result_memory = metadata.tool_result_memory,
+            .command_result_json = metadata.command_result_json,
         },
     };
 }

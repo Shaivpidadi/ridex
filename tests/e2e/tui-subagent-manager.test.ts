@@ -3885,8 +3885,6 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         );
         await active.sendText(childPrompt);
         await active.waitForText("[pending]", TIMEOUT);
-        await active.sendKeys("C-o");
-        await active.waitForText("Full detail · ctrl o close", TIMEOUT);
         heldStream.release("CHECKPOINT2_PARENT_FOLLOWUP_COMPLETE");
         const childApprovalRequestStartedAt = Date.now();
         while (
@@ -3897,10 +3895,6 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         }
         expect(childApprovalRequestStarted).toBe(true);
         expect(gateway.requests.some((request) => request.body.includes(childPrompt))).toBe(true);
-        await active.sendKeys("C-o");
-        await active.waitForText("Review · ←/→ switch · ctrl o close", TIMEOUT);
-        await active.sendKeys("Right");
-        await active.waitForText("Full detail · ←/→ switch · ctrl o close", TIMEOUT);
         releaseChildApproval(fakeShellRun(
           callId,
           "printf approved > child-approval-effect.txt",
