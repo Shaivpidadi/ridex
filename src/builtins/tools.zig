@@ -67,7 +67,7 @@ const write_file_description =
 const edit_file_description =
     "Edit an existing file by replacing one exact old_string occurrence with new_string. Paths may be workspace-relative or external using an absolute path, ~/..., or a relative workspace escape such as ../...; external access is subject to permission policy. When to use: make a focused patch after reading the file. When NOT to use: broad rewrites, ambiguous repeated text, generated formatting, missing files, or cross-file refactors.";
 const apply_patch_description =
-    "Apply one transactional workspace patch across files or @@ hunks after reading them. Use *** Begin Patch with Update, Add, or Delete File operations. Prefer this for coherent multi-file or multi-hunk changes; use edit_file for one exact replacement. On missing context, re-read. On ambiguous context, retry once with wider unchanged context. Never queue fallback edits behind an unobserved patch result. Do not use for external paths, binary files, generated rewrites, or speculative edits.";
+    "Apply one transactional workspace patch across files or @@ hunks after reading them. Use *** Begin Patch with Update, Add, or Delete File operations. Copy old lines verbatim from the latest read and include distinctive unchanged lines. Re-read a file after any mutation before patching it again. Prefer this for coherent multi-file or multi-hunk changes; use edit_file for one exact replacement and terminal for repetitive mechanical replacements. On missing context, re-read. On ambiguous context, retry once with wider unchanged context. Never queue fallback edits behind an unobserved patch result. Do not use for external paths, binary files, generated rewrites, or speculative edits.";
 const delete_file_description =
     "Delete a file or empty directory after the user request clearly requires removal. Paths may be workspace-relative or external using an absolute path, ~/..., or a relative workspace escape such as ../...; external access is subject to permission policy. When to use: remove obsolete files, generated artifacts, or empty folders. When NOT to use: clean up uncertain state, delete non-empty trees, or modify contents that should be edited instead.";
 const rename_file_description =
@@ -1593,7 +1593,7 @@ test "built-in model-facing tool contract stays byte exact" {
 
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
-        "323cd35a79a0b14a06c2713efffc485df7ff690ae558237d2db34c7dec23b7c7",
+        "2019f687f99ffdf7b085be79fff60ad8f0ffeeee4b275e58ec2ffa631d26fa99",
         &actual_hex,
     );
 }
@@ -2536,6 +2536,8 @@ test "built-in apply_patch is hidden and workspace scoped" {
     try std.testing.expect(!apply_patch.model_visible);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"required\":[\"patch\"]") != null);
     try std.testing.expect(std.mem.find(u8, apply_patch.description, "transactional workspace patch") != null);
+    try std.testing.expect(std.mem.find(u8, apply_patch.description, "verbatim from the latest read") != null);
+    try std.testing.expect(std.mem.find(u8, apply_patch.description, "repetitive mechanical replacements") != null);
     try std.testing.expectEqual(tool_dispatch.ExecutorKind.apply_patch, apply_patch.executor_kind);
     try std.testing.expectEqual(types.ToolActivityKind.edit, apply_patch.activity_kind);
     try std.testing.expect(apply_patch.requires_approval);
