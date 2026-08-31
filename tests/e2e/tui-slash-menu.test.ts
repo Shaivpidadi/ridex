@@ -1003,12 +1003,12 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(
         visibleTranscriptTailRow(afterResponse),
         `resumed baseline grid:\n${afterResponse.join("\n")}`,
-      ).toBe(71);
+      ).toBe(69);
       expect(closedComposerRow).toBe(73);
       await session.sendLiteralText("/");
       await session.waitForText("Commands 36", 5_000);
       const afterSlash = await capture("after-slash");
-      expect(visibleTranscriptTailRow(afterSlash)).toBe(62);
+      expect(visibleTranscriptTailRow(afterSlash)).toBe(60);
       expect(composerRow(afterSlash)).toBe(64);
       await session.sendLiteralText("f");
       await session.waitForText("/feedback", 5_000);
@@ -1028,7 +1028,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
         5_000,
       );
       const afterDismiss = await capture("after-dismiss");
-      expect(visibleTranscriptTailRow(afterDismiss)).toBe(62);
+      expect(visibleTranscriptTailRow(afterDismiss)).toBe(60);
       expect(composerRow(afterDismiss)).toBe(64);
       expect(footerStatusRow(afterDismiss)).toBe(66);
       await session.sendLiteralText("x");
@@ -1039,7 +1039,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
         5_000,
       );
       const afterDismissEdit = await capture("after-dismiss-edit");
-      expect(visibleTranscriptTailRow(afterDismissEdit)).toBe(62);
+      expect(visibleTranscriptTailRow(afterDismissEdit)).toBe(60);
       expect(composerRow(afterDismissEdit)).toBe(64);
       expect(footerStatusRow(afterDismissEdit)).toBe(66);
 
@@ -1195,13 +1195,13 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
 
       await session.sendKeys("Down");
       await session.waitForText(
-        "manage local and remote MCP servers, resources, and prompts",
+        "manage local and remote MCP servers, resources, prompts, and project trust",
         5_000,
       );
       const scrolledGrid = await session.capturePaneGrid();
       const mcpRow = scrolledGrid.find((line) =>
         line.includes("/mcp") &&
-        line.includes("manage local and remote MCP servers, resources, and prompts")
+        line.includes("manage local and remote MCP servers, resources, prompts, and project trust")
       );
       expect(mcpRow).toBeDefined();
       expect(mcpRow!.indexOf("Extensions")).toBe(metadataColumn);
@@ -1267,7 +1267,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(modelRow).toContain("choose what model and reasoning effort to use");
       expect(modelRow).not.toContain("Model");
       expect(mcpRow).toContain(
-        "manage local and remote MCP servers, resources, and prompts",
+        "manage local and remote MCP servers, resources, prompts, and project trust",
       );
       expect(mcpRow).not.toContain("Extensions");
 
@@ -3396,8 +3396,6 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect((await session.capturePane()).replace(/\s+/g, " ")).toMatch(
         new RegExp(`see "${tracePathPattern}" for details`),
       );
-      await session.sendKeys("Right");
-      await session.waitForText("Full detail · ←/→ switch · ctrl o close", 5_000);
       await session.sendKeys("C-o");
       await session.waitForComposer(5_000);
       const startupDiagnosticCount = fileMarkerCount(

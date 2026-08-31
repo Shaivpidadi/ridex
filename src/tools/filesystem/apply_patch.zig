@@ -941,7 +941,7 @@ fn publishUndoOperations(
             .kind = switch (change.kind) {
                 .update => .edit,
                 .add => .write,
-                .delete => .delete,
+                .delete => .edit,
             },
             .path = owned_path,
             .previous_content = previous_content,

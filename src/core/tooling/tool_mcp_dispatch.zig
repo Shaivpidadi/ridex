@@ -1,5 +1,6 @@
 const std = @import("std");
 const lexical_relevance = @import("../shared/lexical_relevance.zig");
+const capability_retrieval = @import("capability_retrieval.zig");
 const model_context_encoding = @import("../shared/model_context_encoding.zig");
 const tool_dispatch = @import("tool_dispatch.zig");
 const tool_result_errors = @import("tool_result_errors.zig");
@@ -130,8 +131,14 @@ pub fn callSearch(
     const result = search_tools(
         runtime_context,
         ctx.allocator,
-        &input.prepared,
-        input.limit,
+        .{
+            .query = &input.prepared,
+            .kind = .mcp,
+            .limit = @min(
+                if (input.limit == 0) @as(usize, 8) else input.limit,
+                capability_retrieval.max_limit,
+            ),
+        },
         ctx.mcp_permission_rules,
         ctx.context_limits,
         ctx.mcp_access,

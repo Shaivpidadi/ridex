@@ -3,7 +3,7 @@ const builtin = @import("builtin");
 const build_options = @import("build_options");
 const io_mod = @import("core/shared/io.zig");
 
-pub const version = "0.0.6";
+pub const version = "0.0.7";
 
 const app_lifecycle = @import("core/app/app_lifecycle.zig");
 const provider_runtime = @import("core/app/provider_runtime.zig");
@@ -76,7 +76,9 @@ const mcp_command_provider = @import("core/mcp/command_provider.zig");
 const mcp_runtime_mod = @import("core/mcp/mcp_runtime.zig");
 const mcp_model_catalog = @import("core/mcp/model_catalog.zig");
 const mcp_access_policy = @import("core/mcp/access_policy.zig");
+const mcp_menu_state = @import("core/mcp/menu_state.zig");
 const app_mcp_runtime = @import("core/app/app_mcp_runtime.zig");
+const app_mcp_menu_runtime = @import("core/app/app_mcp_menu_runtime.zig");
 const skill_commands = @import("core/skills/skill_commands.zig");
 const skill_runtime = @import("core/skills/skill_runtime.zig");
 const cli_surface = @import("core/cli/cli_surface.zig");
@@ -355,6 +357,21 @@ test "skill submit snapshot keeps display spans exact while agent bindings dedup
 var resize_interlock = shell_runtime.ResizeApprovalInterlock{};
 const default_context_registry = context_contract.Registry{ .default_provider = builtin_context.provider };
 const WorkspaceHostRuntime = if (host_target.is_wasm) js_host_workspace.Runtime else struct {};
+const selected_host_profile = if (host_target.is_wasm) host_runtime_profile.wasm else host_runtime_profile.native;
+const app_api_key_validator = if (host_target.is_wasm)
+    api_key_validator.unavailable_provider
+else
+    builtin_gateway.api_key_validator;
+const app_oauth_transport = if (selected_host_profile.js_host_auth)
+    js_host_auth.oauth_provider
+else if (selected_host_profile.native_auth)
+    builtin_gateway.oauth_transport_provider
+else
+    oauth_transport.unavailable_provider;
+const app_secret_store = if (host_target.is_wasm)
+    host.unavailable_secret_store
+else
+    native_host.secret_store;
 const wasm_skill_root_policy: @import("core/skills/skill_contract.zig").RootPolicy = .{
     .managed_root_source = null,
 };
@@ -368,7 +385,7 @@ fn currentBuild() update_target.CurrentBuild {
 
 const App = struct {
     pub const app_version = version;
-    pub const host_profile = if (host_target.is_wasm) host_runtime_profile.wasm else host_runtime_profile.native;
+    pub const host_profile = selected_host_profile;
     pub const input_limits = paste_framing.default_input_limits;
     pub const build_update_channel = compiled_update_channel;
     pub const build_revision = build_options.git_commit;
@@ -490,14 +507,9 @@ const App = struct {
     terminal: TerminalState = .{},
 
     auth: auth_runtime.Runtime = auth_runtime.Runtime.init(
-        if (host_target.is_wasm) api_key_validator.unavailable_provider else builtin_gateway.api_key_validator,
-        if (host_profile.js_host_auth)
-            js_host_auth.oauth_provider
-        else if (host_profile.native_auth)
-            builtin_gateway.oauth_transport_provider
-        else
-            oauth_transport.unavailable_provider,
-        if (host_target.is_wasm) host.unavailable_secret_store else native_host.secret_store,
+        app_api_key_validator,
+        app_oauth_transport,
+        app_secret_store,
     ),
     provider_selection: provider_runtime.Runtime = provider_runtime.Runtime.init(std.heap.c_allocator),
     model_cache: model_cache_runtime.Runtime = model_cache_runtime.Runtime.init(std.heap.c_allocator, builtin_gateway.models_path),
@@ -577,6 +589,7 @@ const App = struct {
     metrics: Metrics = .{},
     fn loadNoMcpRuntime(
         _: Allocator,
+        _: []const u8,
         _: @import("core/mcp/elicitation.zig").Capabilities,
     ) !?*mcp_runtime_mod.McpRuntime {
         return null;
@@ -585,6 +598,10 @@ const App = struct {
     pub fn init(alloc: Allocator, launch: *cli_surface.InteractiveLaunch) !Self {
         var app = Self{
             .alloc = alloc,
+            .auth = undefined,
+            .usage_dashboard = undefined,
+            .session_persistence = undefined,
+            .shell = TranscriptRuntime.init(),
             .subagents = ui_subagents.Controller.init(),
             .lifecycle_runtime = hooks.Runtime.init(alloc),
             .background = BackgroundRuntime.init(if (comptime host_target.is_wasm)
@@ -596,6 +613,14 @@ const App = struct {
             else
                 background_process.provider),
         };
+        auth_runtime.Runtime.initInto(
+            &app.auth,
+            app_api_key_validator,
+            app_oauth_transport,
+            app_secret_store,
+        );
+        usage_dashboard_runtime.Runtime.initInto(&app.usage_dashboard, std.heap.c_allocator);
+        app_session_runtime.Persistence.initInto(&app.session_persistence);
         if (comptime host_profile.js_host_workspace) {
             app.workspace_host = js_host_workspace.Runtime.init(alloc) catch |err| blk: {
                 if (err != error.WorkspaceUnavailable) {
@@ -1036,7 +1061,12 @@ const App = struct {
             prompt,
             skill_tokens,
             null,
+            .queue,
         );
+    }
+
+    pub fn steerPrompt(self: *App, prompt: []const u8) !bool {
+        return self.enqueuePromptWithOptionalReview(prompt, &.{}, null, .steer);
     }
 
     pub fn enqueuePromptWithReviewDraft(
@@ -1065,14 +1095,18 @@ const App = struct {
                 .image_tokens = @constCast(review_image_tokens),
                 .skill_display_spans = review_skill_spans,
             },
+            .queue,
         );
     }
+
+    const PromptSubmitIntent = enum { queue, steer };
 
     fn enqueuePromptWithOptionalReview(
         self: *App,
         prompt: []const u8,
         skill_tokens: []const registered_entities.SkillTokenSpan,
         review_draft: ?worker_runtime.QueueReviewDraft,
+        intent: PromptSubmitIntent,
     ) !bool {
         const context_targets = if (self.context_enabled)
             try context_contract.applicableTargetsForImages(self.alloc, self.pending_images.items)
@@ -1097,6 +1131,7 @@ const App = struct {
             prompt,
             skill_tokens,
             review_draft,
+            intent,
         )) return false;
         WorkerAppRuntime.syncState(
             self,
@@ -1141,6 +1176,7 @@ const App = struct {
             draft.images,
             draft.turn_id,
             true,
+            .queue,
         )) return error.PendingPromptQueueRejected;
         WorkerAppRuntime.syncState(
             self,
@@ -1294,6 +1330,7 @@ const App = struct {
         prompt: []const u8,
         skill_tokens: []const registered_entities.SkillTokenSpan,
         review_draft: ?worker_runtime.QueueReviewDraft,
+        intent: PromptSubmitIntent,
     ) !bool {
         return self.snapshotAndQueuePrompt(
             prompt,
@@ -1303,6 +1340,7 @@ const App = struct {
             null,
             0,
             false,
+            intent,
         );
     }
 
@@ -1322,6 +1360,7 @@ const App = struct {
             null,
             checkpoint.turn_id,
             false,
+            .queue,
         )) return false;
         WorkerAppRuntime.syncState(
             self,
@@ -1339,6 +1378,7 @@ const App = struct {
         prompt_images: ?[]const types.ImageAttachment,
         turn_id: u64,
         user_prompt_already_presented: bool,
+        intent: PromptSubmitIntent,
     ) !bool {
         try self.reloadSkills();
 
@@ -1426,7 +1466,7 @@ const App = struct {
                 review,
             );
 
-        try self.worker.enqueuePrompt(std.heap.c_allocator, .{
+        try self.worker.admitPrompt(std.heap.c_allocator, .{
             .turn_id = if (recovery_checkpoint) |checkpoint| checkpoint.turn_id else turn_id,
             .prompt = prompt_copy,
             .images = images_copy,
@@ -1448,7 +1488,7 @@ const App = struct {
             .recovery_checkpoint = recovery_checkpoint_copy,
             .recovery_source_already_presented = recovery_checkpoint != null,
             .user_prompt_already_presented = user_prompt_already_presented,
-        });
+        }, recovery_checkpoint == null and intent == .steer);
         HerdrAppRuntime.reportWorking(self);
         return true;
     }
@@ -1489,11 +1529,61 @@ const App = struct {
     pub fn beginMcpReload(self: *App) !void {
         return self.mcp.beginReload(
             self.alloc,
+            self.workspace_root,
+            .{ .form = true, .url = true },
+            if (comptime host_target.is_wasm) loadNoMcpRuntime else builtin_mcp.loadRuntime,
+            builtin_mcp.previewNativeWorkspaceAuthority,
+            self.toolRegistry(),
+            @intCast(@max(io_mod.milliTimestamp(), 0)),
+        );
+    }
+
+    pub fn beginMcpMenuReload(self: *App, generation: u64) !void {
+        return self.mcp.beginMenuReload(
+            self.alloc,
+            self.workspace_root,
+            .{ .form = true, .url = true },
+            if (comptime host_target.is_wasm) loadNoMcpRuntime else builtin_mcp.loadRuntime,
+            builtin_mcp.previewNativeWorkspaceAuthority,
+            self.toolRegistry(),
+            @intCast(@max(io_mod.milliTimestamp(), 0)),
+            generation,
+        );
+    }
+
+    pub fn beginMcpAuthorityReduction(self: *App, rebuild: bool) !void {
+        return self.mcp.beginAuthorityReduction(
+            self.alloc,
+            self.workspace_root,
             .{ .form = true, .url = true },
             if (comptime host_target.is_wasm) loadNoMcpRuntime else builtin_mcp.loadRuntime,
             self.toolRegistry(),
             @intCast(@max(io_mod.milliTimestamp(), 0)),
-        );
+            rebuild,
+        ) catch |err| {
+            self.mcp.retireAuthoritySynchronously(self.alloc);
+            return err;
+        };
+    }
+
+    pub fn beginMcpMenuAuthorityReduction(
+        self: *App,
+        rebuild: bool,
+        generation: u64,
+    ) !void {
+        return self.mcp.beginMenuAuthorityReduction(
+            self.alloc,
+            self.workspace_root,
+            .{ .form = true, .url = true },
+            if (comptime host_target.is_wasm) loadNoMcpRuntime else builtin_mcp.loadRuntime,
+            self.toolRegistry(),
+            @intCast(@max(io_mod.milliTimestamp(), 0)),
+            rebuild,
+            generation,
+        ) catch |err| {
+            self.mcp.retireAuthoritySynchronously(self.alloc);
+            return err;
+        };
     }
 
     pub fn startMcpAuthentication(
@@ -1507,10 +1597,43 @@ const App = struct {
         );
     }
 
+    pub fn beginMcpMenuAuthentication(self: *App, generation: u64) !void {
+        const server_name = self.mcp.selectedMenuServerName() orelse
+            return error.McpServerNotFound;
+        const started = try self.mcp.startMenuAuthentication(
+            self.alloc,
+            server_name,
+            self.urlOpener(),
+            generation,
+        );
+        if (started == .busy) return error.McpAuthenticationBusy;
+    }
+
     pub fn takeMcpAuthenticationCompletion(
         self: *App,
     ) !?app_mcp_runtime.AuthenticationCompletion {
         return self.mcp.takeAuthenticationCompletion();
+    }
+
+    pub fn mcpAuthenticationCompletionOrigin(self: *const App) app_mcp_runtime.PresentationOrigin {
+        return self.mcp.authenticationCompletionOrigin();
+    }
+
+    pub fn applyMcpMenuAuthenticationCompletion(
+        self: *App,
+        generation: u64,
+        completion: *const app_mcp_runtime.AuthenticationCompletion,
+    ) !void {
+        if (try self.mcp.applyMenuAuthenticationCompletion(
+            self.alloc,
+            generation,
+            completion,
+        )) {
+            self.beginMcpMenuReload(generation) catch |err| {
+                try self.mcp.recordMenuEffectFailure(self.alloc, generation, err);
+            };
+        }
+        self.shell.render_requests.request(.footer);
     }
 
     pub fn mcpAuthenticationPending(
@@ -1524,8 +1647,54 @@ const App = struct {
         return self.mcp.takeReloadCompletion();
     }
 
+    pub fn mcpReloadCompletionOrigin(self: *const App) app_mcp_runtime.PresentationOrigin {
+        return self.mcp.reloadCompletionOrigin();
+    }
+
+    pub fn applyMcpMenuReloadCompletion(
+        self: *App,
+        generation: u64,
+        completion: *const app_mcp_runtime.ReloadCompletion,
+    ) !void {
+        try self.mcp.applyMenuReloadCompletion(
+            self.alloc,
+            generation,
+            completion,
+            @intCast(@max(io_mod.milliTimestamp(), 0)),
+        );
+        self.shell.render_requests.request(.footer);
+    }
+
     pub fn startMcpDiscovery(self: *App) void {
         self.mcp.startDiscovery(self.toolRegistry());
+    }
+
+    pub fn presentProjectMcpPrompt(self: *App) !void {
+        const name = (try self.mcp.projectPromptDisplayName(self.alloc)) orelse return;
+        defer self.alloc.free(name);
+        var notice: std.Io.Writer.Allocating = .init(self.alloc);
+        defer notice.deinit();
+        try notice.writer.print(
+            "Project MCP server '{s}' is defined in .mcp.json.\n  [1] Approve  [2] Approve all  [3] Reject  [Esc] Dismiss remaining prompts\n",
+            .{name},
+        );
+        try self.writeTranscriptClassified(
+            notice.writer.buffered(),
+            true,
+            .unknown_raw,
+        );
+    }
+
+    pub fn projectMcpPromptActive(self: *App) bool {
+        return self.mcp.projectPromptActive();
+    }
+
+    pub fn projectMcpPromptName(self: *App, alloc: Allocator) !?[]u8 {
+        return self.mcp.projectPromptName(alloc);
+    }
+
+    pub fn suppressProjectMcpPrompts(self: *App) void {
+        self.mcp.suppressProjectPrompts();
     }
 
     fn effectiveToolSet(self: *const App) tool_set_contract.ToolSet {
@@ -1571,8 +1740,8 @@ const App = struct {
         return self.mcp.callTool(arena, name, arguments_json, max_tool_result_bytes, options);
     }
 
-    pub fn searchMcpTools(self: *App, arena: Allocator, query: *const tool_mcp_runtime.PreparedQuery, limit: usize, permission_rules: types.PermissionRuleSet, access: tool_mcp_runtime.Access) !tool_mcp_runtime.SearchResult {
-        return self.mcp.searchTools(arena, query, limit, permission_rules, self.context_limits, access);
+    pub fn searchMcpTools(self: *App, arena: Allocator, request: tool_mcp_runtime.SearchRequest, permission_rules: types.PermissionRuleSet, access: tool_mcp_runtime.Access) !tool_mcp_runtime.SearchResult {
+        return self.mcp.searchTools(arena, request, permission_rules, self.context_limits, access);
     }
 
     pub fn mcpToolSchemaJson(self: *App, arena: Allocator, name: []const u8, permission_rules: types.PermissionRuleSet, access: tool_mcp_runtime.Access) !?tool_mcp_runtime.ToolSchemaResult {
@@ -1581,6 +1750,54 @@ const App = struct {
 
     pub fn listMcpServersAndTools(self: *App, alloc: Allocator) ![]u8 {
         return self.mcp.renderHealth(alloc);
+    }
+
+    pub fn openMcpMenu(self: *App) !void {
+        try self.mcp.openMenu(
+            self.alloc,
+            @intCast(@max(io_mod.milliTimestamp(), 0)),
+        );
+    }
+
+    pub fn closeMcpMenu(self: *App) void {
+        self.mcp.closeMenu(self.alloc);
+    }
+
+    pub fn beginMcpMenuEffect(self: *App, effect: mcp_menu_state.Effect) !void {
+        return self.mcp.beginMenuEffect(
+            self.alloc,
+            effect,
+            self.permission_engine.rules,
+            self.context_limits,
+        );
+    }
+
+    pub fn recordMcpMenuEffectFailure(
+        self: *App,
+        generation: u64,
+        err: anyerror,
+    ) !void {
+        return self.mcp.recordMenuEffectFailure(self.alloc, generation, err);
+    }
+
+    pub fn saveMcpMenuAdd(
+        self: *App,
+        generation: u64,
+        transport: mcp_menu_state.AddTransport,
+    ) !void {
+        return app_mcp_menu_runtime.Runtime(App).saveAdd(self, generation, transport);
+    }
+
+    pub fn removeMcpMenuServer(self: *App, generation: u64) !void {
+        return app_mcp_menu_runtime.Runtime(App).removeServer(self, generation);
+    }
+
+    pub fn applyMcpMenuTrustAction(
+        self: *App,
+        generation: u64,
+        action: mcp_menu_state.Action,
+    ) !void {
+        return app_mcp_menu_runtime.Runtime(App).applyTrustAction(self, generation, action);
     }
 
     pub fn summarizeMcpServers(self: *App, alloc: Allocator) ![]u8 {
@@ -2367,6 +2584,7 @@ const App = struct {
             self.terminal_input_runtime.hasPendingTerminalAction() or
             self.question_prompt.isActive() or
             self.approval_prompt.isActive() or
+            @constCast(&self.mcp).projectPromptActive() or
             self.auth.apiKeyEntryActive() or
             self.subagents.isViewActive() or
             !self.shell.has_committed_frame or
@@ -2624,6 +2842,16 @@ const App = struct {
         if (try app_commands.Handlers(App).collectUsageDashboardFacts(self)) {
             RenderAppRuntime.requestActiveSurfaceFrame(self, .footer);
         }
+        switch (try self.mcp.collectMenuCompletion(self.alloc)) {
+            .none => {},
+            .repaint => RenderAppRuntime.requestActiveSurfaceFrame(self, .footer),
+            .reload => |generation| {
+                self.beginMcpMenuReload(generation) catch |err| {
+                    try self.mcp.recordMenuEffectFailure(self.alloc, generation, err);
+                };
+                RenderAppRuntime.requestActiveSurfaceFrame(self, .footer);
+            },
+        }
         try app_commands.Handlers(App).collectMcpAuthenticationFacts(self);
         try app_commands.Handlers(App).collectMcpReloadFacts(self);
         if (comptime host_profile.native_auth or host_profile.js_host_auth) {
@@ -2672,6 +2900,14 @@ const App = struct {
 
         if (comptime !host_target.is_wasm) {
             try SessionAppRuntime.pollSessionPicker(self);
+        }
+        if (try self.shell.pollFullTranscriptPageLoad()) {
+            RenderAppRuntime.requestActiveSurfaceFrame(self, .modal);
+        }
+        if (self.subagents.childConversationRuntime()) |child| {
+            if (try child.pollFullTranscriptPageLoad()) {
+                RenderAppRuntime.requestActiveSurfaceFrame(self, .modal);
+            }
         }
         if (!self.terminal_takeover.blocksFxSurface(&self.terminal)) {
             const input_now_ms = io_mod.milliTimestamp();
@@ -3248,7 +3484,15 @@ fn needsFullEntryConfig(args: []const [:0]const u8) bool {
 
 fn needsEarlyThreadedIo(args: []const [:0]const u8) bool {
     if (needsFullEntryConfig(args)) return true;
-    const command = cli_surface.commandAfterGlobalLaunchArgs(args) orelse return false;
+    const effective_args = cli_surface.argsAfterGlobalLaunchArgs(args);
+    if (effective_args.len == 0) return false;
+    const command = effective_args[0];
+    if (std.mem.eql(u8, command, "mcp")) {
+        if (effective_args.len < 2) return false;
+        return std.mem.eql(u8, effective_args[1], "auth") or
+            std.mem.eql(u8, effective_args[1], "list") or
+            std.mem.eql(u8, effective_args[1], "logout");
+    }
     return std.mem.eql(u8, command, "login") or
         std.mem.eql(u8, command, "logout") or
         std.mem.eql(u8, command, "teams") or
@@ -3278,6 +3522,22 @@ test "credential-reading commands use early threaded io without full entry confi
         const args = &.{command};
         try std.testing.expect(!needsFullEntryConfig(args));
         try std.testing.expect(needsEarlyThreadedIo(args));
+    }
+}
+
+test "MCP credential commands use early threaded io" {
+    for ([_][:0]const u8{ "auth", "list", "logout" }) |operation| {
+        try std.testing.expect(needsEarlyThreadedIo(&.{
+            @as([:0]const u8, "mcp"),
+            operation,
+            @as([:0]const u8, "fixture"),
+        }));
+    }
+    for ([_][:0]const u8{ "add", "path", "remove" }) |operation| {
+        try std.testing.expect(!needsEarlyThreadedIo(&.{
+            @as([:0]const u8, "mcp"),
+            operation,
+        }));
     }
 }
 
@@ -3382,7 +3642,10 @@ fn fullEntryConfig() app_entry_runtime.Config {
         .mode_registry = builtin_modes.registry,
         .tool_set = builtin_tools.advertisement_set,
         .inspect_mcp_profile_config = builtin_mcp.inspectProfileConfig,
+        .inspect_mcp_local_config = builtin_mcp.inspectLocalConfig,
         .load_mcp_runtime = builtin_mcp.loadRuntime,
+        .add_mcp_profile_server = builtin_mcp.addProfileServer,
+        .remove_mcp_profile_server = builtin_mcp.removeProfileServer,
         .acp_runner = .{ .run_fn = runAcpServer },
     };
 }
@@ -3417,7 +3680,10 @@ fn localEntryConfig() app_entry_runtime.Config {
         .mode_registry = builtin_modes.registry,
         .tool_set = builtin_tools.advertisement_set,
         .inspect_mcp_profile_config = builtin_mcp.inspectProfileConfig,
+        .inspect_mcp_local_config = builtin_mcp.inspectLocalConfig,
         .load_mcp_runtime = builtin_mcp.loadRuntime,
+        .add_mcp_profile_server = builtin_mcp.addProfileServer,
+        .remove_mcp_profile_server = builtin_mcp.removeProfileServer,
         .acp_runner = .{ .run_fn = runAcpServer },
     };
 }
@@ -3452,7 +3718,10 @@ fn emptyEntryConfig() app_entry_runtime.Config {
         .mode_registry = builtin_modes.registry,
         .tool_set = builtin_tools.advertisement_set,
         .inspect_mcp_profile_config = builtin_mcp.inspectProfileConfig,
+        .inspect_mcp_local_config = builtin_mcp.inspectLocalConfig,
         .load_mcp_runtime = builtin_mcp.loadRuntime,
+        .add_mcp_profile_server = builtin_mcp.addProfileServer,
+        .remove_mcp_profile_server = builtin_mcp.removeProfileServer,
         .acp_runner = .{ .run_fn = runAcpServer },
     };
 }
@@ -3823,13 +4092,13 @@ test "semantic code block preserves indentation on wrapped continuation rows" {
     const wide = try transcript_runtime.renderEntriesToBytes(alloc, entries.items, 80, .{});
     defer alloc.free(wide);
     try std.testing.expect(std.mem.find(u8, wide, "text") != null);
-    try std.testing.expect(std.mem.find(u8, wide, "┌") != null);
-    try std.testing.expect(std.mem.find(u8, wide, "└") != null);
+    try std.testing.expect(std.mem.find(u8, wide, "─") != null);
+    try std.testing.expect(std.mem.find(u8, wide, "│") == null);
     try std.testing.expect(std.mem.find(u8, wide, "  abcdefghijkl") != null);
 
     const narrow = try transcript_runtime.renderEntriesToBytes(alloc, entries.items, 12, .{});
     defer alloc.free(narrow);
-    try std.testing.expect(std.mem.find(u8, narrow, "\n  │   efgh │\n") != null);
+    try std.testing.expect(std.mem.find(u8, narrow, "\n    ijkl\n") != null);
     var lines = std.mem.splitScalar(u8, narrow, '\n');
     while (lines.next()) |line| {
         try std.testing.expect(display_width.visibleWidthIgnoringAnsi(line) <= 12);
@@ -4050,7 +4319,6 @@ test {
     _ = @import("tools/web/content.zig");
     _ = @import("tools/web/html_to_markdown.zig");
     _ = @import("tools/filesystem/read_file.zig");
-    _ = @import("tools/filesystem/semantic_search.zig");
     _ = @import("tools/session/read_tool_result.zig");
     _ = @import("tools/skills/install_skill.zig");
     _ = @import("tools/skills/skill.zig");

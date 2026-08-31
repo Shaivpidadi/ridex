@@ -12,6 +12,7 @@ pub const max_image_bytes: usize = 20 * 1024 * 1024;
 const max_encoded_image_bytes: usize = 5 * 1024 * 1024;
 pub const image_too_large_notice = "image exceeds the 20 MiB limit";
 pub const image_preparation_failed_notice = "Unable to prepare this image for upload. Use a smaller image.";
+pub const model_image_capability_unavailable_notice = "Unable to verify image support for this model, so the image was not sent. Try again later, choose another model, or remove the image.";
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const snapshot_digest_hex_len = Sha256.digest_length * 2;
 const transfer_buffer_bytes = 64 * 1024;

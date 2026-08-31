@@ -39,6 +39,7 @@ const mcp_elicitation = @import("../mcp/elicitation.zig");
 const mcp_access_policy = @import("../mcp/access_policy.zig");
 const mcp_model_catalog = @import("../mcp/model_catalog.zig");
 const mcp_runtime = @import("../mcp/mcp_runtime.zig");
+const mcp_contract = @import("../mcp/mcp_contract.zig");
 const mode_registry = @import("../modes/mode_registry.zig");
 const permission_auto_classifier = @import("../permissions/auto_classifier.zig");
 const prompt_policy = @import("../config/prompt_policy.zig");
@@ -310,6 +311,20 @@ pub const PromptRunResult = struct {
         freeToolCallRecords(alloc, self.tool_calls);
     }
 };
+
+inline fn failPromptRunResult(err: anytype) @TypeOf(err)!PromptRunResult {
+    return @errorCast(failPromptRunResultDynamic(err));
+}
+
+noinline fn failPromptRunResultDynamic(err: anyerror) anyerror!PromptRunResult {
+    return err;
+}
+
+test "prompt result failure writer preserves exact error type and identity" {
+    const failure = failPromptRunResult(error.NoPendingRecovery);
+    try std.testing.expect(@TypeOf(failure) == error{NoPendingRecovery}!PromptRunResult);
+    try std.testing.expectError(error.NoPendingRecovery, failure);
+}
 
 /// Resume selector parsed from fx ask --resume.
 const ResumeTarget = session_store.ResumeTarget;
@@ -1174,6 +1189,7 @@ fn writeAskUsage(deps: RunDeps, usage: []const u8) !void {
 fn askErrorNotice(err: anyerror) ?[]const u8 {
     return switch (err) {
         error.ImagePreparationFailed => image_attachments.image_preparation_failed_notice,
+        error.ModelImageCapabilityUnavailable => image_attachments.model_image_capability_unavailable_notice,
         else => null,
     };
 }
@@ -1529,9 +1545,9 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     var recovery_checkpoint: ?session_codec.RecoveryCheckpoint = null;
     defer if (recovery_checkpoint) |*checkpoint| checkpoint.deinit(alloc);
     if (options.continue_recovery) {
-        const writable = if (ctx.writable) |*value| value else return error.RecoverySessionUnavailable;
+        const writable = if (ctx.writable) |*value| value else return failPromptRunResult(error.RecoverySessionUnavailable);
         const checkpoint = writable.state.recovery_checkpoint orelse
-            return error.NoPendingRecovery;
+            return failPromptRunResult(error.NoPendingRecovery);
         recovery_checkpoint = try checkpoint.dupe(alloc);
         alloc.free(owned_prompt);
         owned_prompt = try alloc.dupe(u8, recovery_checkpoint.?.user.text);
@@ -1606,7 +1622,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
             usize,
             restored_image_bounds.next_id,
             current_images.len - 1,
-        ) catch return error.ImageIdOverflow;
+        ) catch return failPromptRunResult(error.ImageIdOverflow);
         for (current_images, 0..) |*image, index| image.id = restored_image_bounds.next_id + index;
         try ctx.captureImageAttachments(current_images);
         try ctx.checkCancellation();
@@ -1641,8 +1657,34 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     }
 
     try ctx.checkCancellation();
-    ctx.mcp = try options.deps.load_mcp_runtime(alloc, ctx.mcp_elicitation_capabilities);
-    if (ctx.mcp) |mcp| mcp.connectRequiredForAsk(ctx.toolRegistry());
+    ctx.mcp = try options.deps.load_mcp_runtime(
+        alloc,
+        startup.workspace_root,
+        ctx.mcp_elicitation_capabilities,
+    );
+    if (ctx.mcp) |mcp| {
+        var health_snapshot = try mcp.snapshotHealth(
+            alloc,
+            @intCast(@max(io_mod.milliTimestamp(), 0)),
+        );
+        defer health_snapshot.deinit(alloc);
+        for (health_snapshot.configuration_issues) |issue| {
+            try ctx.writeStderr("fx ask: ");
+            try ctx.writeStderr(issue.message);
+            try ctx.writeStderr("\n");
+        }
+        const project_names = try mcp.pendingWorkspaceNames(alloc);
+        defer mcp_contract.freeOwnedStrings(alloc, project_names);
+        if (project_names.len > 0) {
+            try ctx.writeStderr("fx ask: skipped unapproved project MCP servers: ");
+            for (project_names, 0..) |name, index| {
+                if (index > 0) try ctx.writeStderr(", ");
+                try ctx.writeStderr(name);
+            }
+            try ctx.writeStderr(". Approve with fx mcp trust approve <name> before retrying.\n");
+        }
+        mcp.connectRequiredForAsk(ctx.toolRegistry());
+    }
     try ctx.checkCancellation();
     if (ctx.mcp) |mcp| {
         if (try mcp.requiredStartupFailure(
@@ -1653,7 +1695,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
             try ctx.writeStderr("fx ask: ");
             try ctx.writeStderr(failure);
             try ctx.writeStderr("\n");
-            return error.McpRequiredServerUnavailable;
+            return failPromptRunResult(error.McpRequiredServerUnavailable);
         }
     }
     const session_child_capability = if (ctx.writable) |*writable|
@@ -1673,7 +1715,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         .items = loaded_skills.skills,
         .diagnostics = loaded_skills.diagnostics,
     };
-    var bounded_skills = try skills_view.buildBoundedSystemPromptSection(alloc, ctx.context_limits);
+    var bounded_skills = try skills_view.buildRoutedSystemPromptSection(alloc, owned_prompt, ctx.context_limits);
     defer bounded_skills.deinit(alloc);
     if (bounded_skills.notice) |notice| try pushContextNotice(@ptrCast(&ctx), notice);
     if (bounded_skills.diagnostic_notice) |notice| try pushContextNotice(@ptrCast(&ctx), notice);
@@ -2227,6 +2269,22 @@ fn requestToolPermissionOutcomeWithRequest(raw_ctx: *anyopaque, arena: Allocator
     );
 }
 
+inline fn failPermissionOutcome(err: anytype) @TypeOf(err)!command_admission.PermissionOutcome {
+    return @errorCast(failPermissionOutcomeDynamic(err));
+}
+
+noinline fn failPermissionOutcomeDynamic(err: anyerror) anyerror!command_admission.PermissionOutcome {
+    return err;
+}
+
+test "permission outcome failure writer preserves exact error type and identity" {
+    const failure = failPermissionOutcome(error.NonInteractivePermissionRequired);
+    try std.testing.expect(
+        @TypeOf(failure) == error{NonInteractivePermissionRequired}!command_admission.PermissionOutcome,
+    );
+    try std.testing.expectError(error.NonInteractivePermissionRequired, failure);
+}
+
 fn finishCliPermissionOutcome(
     ctx: *AskContext,
     tool_ctx: tool_runtime.Context,
@@ -2267,7 +2325,7 @@ fn finishCliPermissionOutcome(
         "Permission required",
         null,
     );
-    return error.NonInteractivePermissionRequired;
+    return failPermissionOutcome(error.NonInteractivePermissionRequired);
 }
 
 const TestReviewTurn = struct {
@@ -3078,10 +3136,10 @@ fn mcpCallTool(raw_ctx: *anyopaque, arena: Allocator, name: []const u8, argument
     );
 }
 
-fn mcpSearchTools(raw_ctx: *anyopaque, arena: Allocator, query: *const tool_mcp_runtime.PreparedQuery, limit: usize, permission_rules: types.PermissionRuleSet, limits: config_runtime.context_limits.Values, access: tool_mcp_runtime.Access) anyerror!tool_mcp_runtime.SearchResult {
+fn mcpSearchTools(raw_ctx: *anyopaque, arena: Allocator, request: tool_mcp_runtime.SearchRequest, permission_rules: types.PermissionRuleSet, limits: config_runtime.context_limits.Values, access: tool_mcp_runtime.Access) anyerror!tool_mcp_runtime.SearchResult {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     const mcp = try activateAskMcp(ctx);
-    return mcp.searchToolsPrepared(arena, query, limit, permission_rules, limits, access);
+    return mcp.searchToolsPrepared(arena, request, permission_rules, limits, access);
 }
 
 fn mcpToolSchemaJson(raw_ctx: *anyopaque, arena: Allocator, name: []const u8, permission_rules: types.PermissionRuleSet, limits: config_runtime.context_limits.Values, access: tool_mcp_runtime.Access) anyerror!?tool_mcp_runtime.ToolSchemaResult {
@@ -4417,7 +4475,7 @@ fn testPresentKeyNoContextStartup(alloc: Allocator, transport: oauth_transport.P
     return state;
 }
 
-fn testNoMcpRuntime(_: Allocator, _: mcp_elicitation.Capabilities) !?*mcp_runtime.McpRuntime {
+fn testNoMcpRuntime(_: Allocator, _: []const u8, _: mcp_elicitation.Capabilities) !?*mcp_runtime.McpRuntime {
     return null;
 }
 
@@ -5272,6 +5330,24 @@ test "image preparation failure has stable text and JSON contracts" {
     );
 }
 
+test "unresolved image capability has actionable text and stable JSON code" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectEqualStrings(
+        "Unable to verify image support for this model, so the image was not sent. Try again later, choose another model, or remove the image.",
+        askErrorNotice(error.ModelImageCapabilityUnavailable).?,
+    );
+
+    const json = try renderErrorJsonResult(
+        alloc,
+        @errorName(error.ModelImageCapabilityUnavailable),
+    );
+    defer alloc.free(json);
+    try std.testing.expectEqualStrings(
+        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"error\":\"ModelImageCapabilityUnavailable\"}\n",
+        json,
+    );
+}
+
 test "stdin read failure has distinct text and JSON output contracts" {
     const alloc = std.testing.allocator;
     var stdout_capture: TestCapture = .{};
@@ -5555,7 +5631,7 @@ const test_startup_cancellation_context_registry = context_contract.Registry{ .d
     .append_transient_fn = testNoTransientContext,
 } };
 
-fn testLoadMcpRuntimeWithCancellation(_: Allocator, _: mcp_elicitation.Capabilities) !?*mcp_runtime.McpRuntime {
+fn testLoadMcpRuntimeWithCancellation(_: Allocator, _: []const u8, _: mcp_elicitation.Capabilities) !?*mcp_runtime.McpRuntime {
     test_startup_cancellation_mcp_calls += 1;
     if (test_startup_cancellation_stage == .during_mcp_load) {
         requestTestHeadlessInterrupt();
@@ -6449,16 +6525,8 @@ test "fx ask preserves CLI headless blocker diagnostics" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
-    try tmp.dir.createDirPath(io_mod.getIo(), "external");
-    {
-        var source = try tmp.dir.createFile(io_mod.getIo(), "workspace/source.txt", .{ .truncate = true });
-        defer source.close(io_mod.getIo());
-        try source.writeStreamingAll(io_mod.getIo(), "source\n");
-    }
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
     defer alloc.free(workspace);
-    const external = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "external");
-    defer alloc.free(external);
 
     var stdout_capture: TestCapture = .{};
     defer stdout_capture.deinit(alloc);
@@ -6503,33 +6571,6 @@ test "fx ask preserves CLI headless blocker diagnostics" {
 
     ctx.permission_rules.deinit(alloc);
     ctx.permission_rules = .{};
-    stdout_capture.bytes.clearRetainingCapacity();
-    stderr_capture.bytes.clearRetainingCapacity();
-
-    const source = try std.fs.path.join(arena, &.{ workspace, "source.txt" });
-    const external_destination = try std.fs.path.join(arena, &.{ external, "copied.txt" });
-    const blocked_copy = ToolCall{
-        .id = "external-file-mutation",
-        .name = "copy_file",
-        .arguments_json = try std.fmt.allocPrint(
-            arena,
-            "{{\"source\":\"{s}\",\"destination\":\"{s}\"}}",
-            .{ source, external_destination },
-        ),
-    };
-    const external_outcome = try requestToolPermissionOutcome(
-        &ctx,
-        arena,
-        blocked_copy,
-        .auto,
-        &.{},
-        &.{},
-    );
-    try std.testing.expectEqual(ToolPermissionDecision.deny, external_outcome.decision);
-    try std.testing.expectEqual(types.ToolPermissionDenialReason.review_unavailable, external_outcome.denial_reason.?);
-    try std.testing.expectEqualStrings("", stdout_capture.bytes.items);
-    try std.testing.expectEqualStrings("", stderr_capture.bytes.items);
-
     stdout_capture.bytes.clearRetainingCapacity();
     stderr_capture.bytes.clearRetainingCapacity();
 
@@ -6593,171 +6634,6 @@ test "fx ask preserves CLI headless blocker diagnostics" {
     try std.testing.expect(default_safe_web_search.execution_authority != null);
     try std.testing.expectEqualStrings("", stdout_capture.bytes.items);
     try std.testing.expectEqualStrings("", stderr_capture.bytes.items);
-}
-
-test "fx ask ordinary multi-target admission preserves deny precedence without diagnostics" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
-    {
-        var source = try tmp.dir.createFile(io_mod.getIo(), "workspace/source.txt", .{ .truncate = true });
-        defer source.close(io_mod.getIo());
-        try source.writeStreamingAll(io_mod.getIo(), "source\n");
-    }
-    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
-    defer alloc.free(root);
-
-    var stdout_capture: TestCapture = .{};
-    defer stdout_capture.deinit(alloc);
-    var stderr_capture: TestCapture = .{};
-    defer stderr_capture.deinit(alloc);
-    var ctx = AskContext.init(
-        alloc,
-        testConfig(),
-        testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeyStartup),
-        root,
-    );
-    defer ctx.deinit();
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    const cases = [_]struct {
-        tool_name: []const u8,
-        arguments_json: []const u8,
-        source_action: types.PermissionAction,
-        destination_action: types.PermissionAction,
-    }{
-        .{
-            .tool_name = "copy_file",
-            .arguments_json = "{\"source\":\"source.txt\",\"destination\":\"destination.txt\"}",
-            .source_action = .ask,
-            .destination_action = .deny,
-        },
-        .{
-            .tool_name = "copy_file",
-            .arguments_json = "{\"source\":\"source.txt\",\"destination\":\"destination.txt\"}",
-            .source_action = .deny,
-            .destination_action = .ask,
-        },
-        .{
-            .tool_name = "rename_file",
-            .arguments_json = "{\"old_path\":\"source.txt\",\"new_path\":\"destination.txt\"}",
-            .source_action = .ask,
-            .destination_action = .deny,
-        },
-        .{
-            .tool_name = "rename_file",
-            .arguments_json = "{\"old_path\":\"source.txt\",\"new_path\":\"destination.txt\"}",
-            .source_action = .deny,
-            .destination_action = .ask,
-        },
-    };
-
-    for (cases, 0..) |case, index| {
-        ctx.permission_rules.deinit(alloc);
-        ctx.permission_rules = try testPermissionRuleSetPair(
-            alloc,
-            case.tool_name,
-            "source.txt",
-            case.source_action,
-            "destination.txt",
-            case.destination_action,
-        );
-        const outcome = try requestToolPermissionOutcome(&ctx, arena, .{
-            .id = try std.fmt.allocPrint(arena, "multi-target-{d}", .{index}),
-            .name = case.tool_name,
-            .arguments_json = case.arguments_json,
-        }, .ask, &.{}, &.{});
-        try std.testing.expectEqual(ToolPermissionDecision.policy_denied, outcome.decision);
-        try std.testing.expect(outcome.execution_authority == null);
-        try std.testing.expectEqualStrings("", stdout_capture.bytes.items);
-        try std.testing.expectEqualStrings("", stderr_capture.bytes.items);
-    }
-}
-
-test "CLI ask auto mode requires review when only one copy or rename target is configured" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
-    try tmp.dir.createDirPath(io_mod.getIo(), "external");
-    {
-        var workspace_file = try tmp.dir.createFile(io_mod.getIo(), "workspace/source.txt", .{ .truncate = true });
-        defer workspace_file.close(io_mod.getIo());
-        try workspace_file.writeStreamingAll(io_mod.getIo(), "workspace\n");
-    }
-    {
-        var external_file = try tmp.dir.createFile(io_mod.getIo(), "external/source.txt", .{ .truncate = true });
-        defer external_file.close(io_mod.getIo());
-        try external_file.writeStreamingAll(io_mod.getIo(), "external\n");
-    }
-
-    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
-    defer alloc.free(workspace);
-    const external = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "external");
-    defer alloc.free(external);
-    const external_pattern = try std.fmt.allocPrint(alloc, "{s}/**", .{external});
-    defer alloc.free(external_pattern);
-
-    var stdout_capture: TestCapture = .{};
-    defer stdout_capture.deinit(alloc);
-    var stderr_capture: TestCapture = .{};
-    defer stderr_capture.deinit(alloc);
-    var ctx = AskContext.init(alloc, testConfig(), testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeyStartup), workspace);
-    defer ctx.deinit();
-
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const workspace_source = try std.fs.path.join(arena, &.{ workspace, "source.txt" });
-    const workspace_copy = try std.fs.path.join(arena, &.{ workspace, "copied.txt" });
-    const workspace_rename = try std.fs.path.join(arena, &.{ workspace, "renamed.txt" });
-    const external_source = try std.fs.path.join(arena, &.{ external, "source.txt" });
-    const external_copy = try std.fs.path.join(arena, &.{ external, "copied.txt" });
-    const external_rename = try std.fs.path.join(arena, &.{ external, "renamed.txt" });
-
-    const cases = [_]struct {
-        tool_name: []const u8,
-        permission_name: []const u8,
-        arguments_json: []const u8,
-    }{
-        .{
-            .tool_name = "copy_file",
-            .permission_name = "copy_file",
-            .arguments_json = try std.fmt.allocPrint(arena, "{{\"source\":\"{s}\",\"destination\":\"{s}\"}}", .{ workspace_source, external_copy }),
-        },
-        .{
-            .tool_name = "copy_file",
-            .permission_name = "copy_file",
-            .arguments_json = try std.fmt.allocPrint(arena, "{{\"source\":\"{s}\",\"destination\":\"{s}\"}}", .{ external_source, workspace_copy }),
-        },
-        .{
-            .tool_name = "rename_file",
-            .permission_name = "rename_file",
-            .arguments_json = try std.fmt.allocPrint(arena, "{{\"old_path\":\"{s}\",\"new_path\":\"{s}\"}}", .{ workspace_source, external_rename }),
-        },
-        .{
-            .tool_name = "rename_file",
-            .permission_name = "rename_file",
-            .arguments_json = try std.fmt.allocPrint(arena, "{{\"old_path\":\"{s}\",\"new_path\":\"{s}\"}}", .{ external_source, workspace_rename }),
-        },
-    };
-
-    for (cases, 0..) |case, index| {
-        ctx.permission_rules.deinit(alloc);
-        ctx.permission_rules = try testPermissionRuleSet(alloc, case.permission_name, external_pattern, .allow);
-        const outcome = try requestToolPermissionOutcome(&ctx, arena, .{
-            .id = try std.fmt.allocPrint(arena, "mixed-{d}", .{index}),
-            .name = case.tool_name,
-            .arguments_json = case.arguments_json,
-        }, .auto, &.{}, &.{});
-        try std.testing.expectEqual(ToolPermissionDecision.deny, outcome.decision);
-        try std.testing.expectEqual(types.ToolPermissionDenialReason.review_unavailable, outcome.denial_reason.?);
-        stdout_capture.bytes.clearRetainingCapacity();
-        stderr_capture.bytes.clearRetainingCapacity();
-    }
 }
 
 test "runWithDeps projects exec-only terminal when saved setup has no capability" {
@@ -8548,8 +8424,8 @@ test "fx ask JSON captures parallel tool results without corrupting records" {
                     .result_allocator = arena,
                     .call = .{
                         .id = "parallel-capture",
-                        .name = "list_files",
-                        .arguments_json = "{}",
+                        .name = "glob_files",
+                        .arguments_json = "{\"pattern\":\"*\"}",
                     },
                     .authority = .ordinary,
                     .session_grants = &.{},
@@ -8586,7 +8462,7 @@ test "fx ask JSON captures parallel tool results without corrupting records" {
     try std.testing.expect(!failed.load(.seq_cst));
     try std.testing.expectEqual(expected_count, ctx.tool_call_records.items.len);
     for (ctx.tool_call_records.items) |record| {
-        try std.testing.expectEqualStrings("list_files", record.name);
+        try std.testing.expectEqualStrings("glob_files", record.name);
         try std.testing.expectEqualStrings("success", record.status);
     }
 }

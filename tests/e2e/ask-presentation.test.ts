@@ -632,6 +632,8 @@ describe("fx ask presentation", () => {
       expect(pane).toContain("bold and docs");
       expect(pane).toContain("first item");
       expect(pane).toContain("const answer: u8 = 42;");
+      expect(pane).toContain("─ zig ─");
+      expect(pane).not.toContain("│ const answer: u8 = 42;");
       expect(pane).not.toContain("# Ask presentation");
       expect(pane).not.toContain("**bold**");
       expect(escaped).toContain("\x1b[");

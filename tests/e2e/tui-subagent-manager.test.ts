@@ -159,6 +159,25 @@ function controlledTextResponse(initialText: string) {
       );
       controller.close();
     },
+    releaseToolCall(id: string, name: string, input: object) {
+      if (released || !controller) throw new Error("controlled response already released");
+      released = true;
+      controller.enqueue(
+        encoder.encode(
+          `data: ${JSON.stringify({
+            type: "tool-call",
+            toolCallId: id,
+            toolName: name,
+            input,
+          })}\n\n` +
+            `data: ${JSON.stringify({
+              type: "finish",
+              finishReason: { unified: "tool-calls", raw: "tool-calls" },
+            })}\n\ndata: [DONE]\n\n`,
+        ),
+      );
+      controller.close();
+    },
     released: () => released,
   };
 }
@@ -182,7 +201,9 @@ function providerErrorResponse(detail: string): Response {
 
 function normalizeThinkingFrame(grid: string[]) {
   return grid.map((line) =>
-    line.includes("Thinking (") ? "<animated thinking frame>" : line
+    line.includes("Thinking (") || line.includes("Generating (")
+      ? "<animated thinking frame>"
+      : line
   );
 }
 
@@ -1440,7 +1461,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
   );
 
   test(
-    "persistent auto child keeps an injected delete held after review caution",
+    "persistent auto child keeps a terminal removal held after review caution",
     async () => {
       const fixture = createFixture();
       writeFileSync(
@@ -1451,21 +1472,23 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
       const marker = join(fixture.workspace, "auto-child-keep.txt");
       writeFileSync(marker, "keep\n");
       const gateway = startDynamicFakeGateway((body) => {
-        if (body.includes('"toolCallId":"auto_delete_create"')) {
+        if (body.includes('"toolCallId":"auto_terminal_create"')) {
           return fakeGatewayFinalText("AUTO_DELETE_PARENT_READY");
         }
-        if (body.includes('"toolCallId":"auto_delete_file"')) {
+        if (body.includes('"toolCallId":"auto_terminal_remove"')) {
           return fakeGatewayFinalText("AUTO_DELETE_CHILD_COMPLETE");
         }
         if (body.includes(childPrompt)) {
-          return fakeGatewayToolCall("auto_delete_file", "delete_file", {
-            path: marker,
+          return fakeGatewayToolCall("auto_terminal_remove", "terminal", {
+            action: "exec",
+            command: `rm ${JSON.stringify(marker)}`,
+            timeout_ms: 600_000,
           });
         }
-        return fakeGatewayToolCall("auto_delete_create", "subagent", {
+        return fakeGatewayToolCall("auto_terminal_create", "subagent", {
           command: {
             create: {
-              name: "auto-delete-child",
+              name: "auto-terminal-child",
               mode: "persistent",
               prompt: childPrompt,
               permission_mode: "auto",
@@ -1499,7 +1522,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         });
         const active = session;
         await active.waitForComposer(TIMEOUT);
-        await active.sendText("Create the auto-delete child.");
+        await active.sendText("Create the auto terminal child.");
         await active.waitForText("AUTO_DELETE_PARENT_READY", TIMEOUT);
         const denialDeadline = Date.now() + TIMEOUT;
         while (
@@ -1657,12 +1680,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         });
         expect(authorityGrants.map((grant) => grant.tool_name)).toEqual([
           "edit",
-          "create_folder",
-          "open_file",
-          "rename_file",
-          "copy_file",
           "read",
-          "list",
           "glob",
           "grep",
         ]);
@@ -3730,6 +3748,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
       const heldStream = controlledTextResponse("CHECKPOINT2_PARENT_FOLLOWUP_STREAM");
       let releaseChildApproval!: (response: Response) => void;
       let childApprovalReleased = false;
+      let childApprovalRequestStarted = false;
       const childApprovalResponse = new Promise<Response>((resolve) => {
         releaseChildApproval = (response) => {
           childApprovalReleased = true;
@@ -3754,6 +3773,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
           return fakeGatewayFinalText("CHECKPOINT2_PARENT_SEND_COMPLETE");
         }
         if (body.includes(childPrompt)) {
+          childApprovalRequestStarted = true;
           return childApprovalResponse;
         }
         if (body.includes(parentMessage)) return heldStream.response;
@@ -3844,19 +3864,18 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         );
         await active.sendText(childPrompt);
         await active.waitForText("[pending]", TIMEOUT);
+        await active.sendKeys("C-o");
+        await active.waitForText("Full detail · ctrl o close", TIMEOUT);
         heldStream.release("CHECKPOINT2_PARENT_FOLLOWUP_COMPLETE");
         const childApprovalRequestStartedAt = Date.now();
         while (
-          !gateway.requests.some((request) => request.body.includes(childPrompt)) &&
+          !childApprovalRequestStarted &&
           Date.now() - childApprovalRequestStartedAt < TIMEOUT
         ) {
           await Bun.sleep(25);
         }
+        expect(childApprovalRequestStarted).toBe(true);
         expect(gateway.requests.some((request) => request.body.includes(childPrompt))).toBe(true);
-        await active.sendKeys("C-o");
-        await active.waitForText("Review · ←/→ switch · ctrl o close", TIMEOUT);
-        await active.sendKeys("Right");
-        await active.waitForText("Full detail · ←/→ switch · ctrl o close", TIMEOUT);
         releaseChildApproval(fakeGatewayToolCall(callId, "terminal", {
           action: "exec",
           timeout_ms: 600_000,
@@ -3879,15 +3898,13 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         expect(childApproval).toContain("3. No");
         expect(childApproval).toContain("❯ 1. Yes");
         expect(childApproval).not.toContain("APPROVAL_MAIN_COMPOSER");
-        expect(childApproval).not.toContain("Review · ←/→ switch · ctrl o close");
-        expect(childApproval).not.toContain("Full detail · ←/→ switch · ctrl o close");
+        expect(childApproval).not.toContain("Full detail · ctrl o close");
 
         await active.sendKeys("C-o");
         await Bun.sleep(100);
         const approvalAfterCtrlO = await active.capturePane();
         expect(approvalAfterCtrlO).toContain("Subagent approval-child needs permission");
-        expect(approvalAfterCtrlO).not.toContain("Review · ←/→ switch · ctrl o close");
-        expect(approvalAfterCtrlO).not.toContain("Full detail · ←/→ switch · ctrl o close");
+        expect(approvalAfterCtrlO).not.toContain("Full detail · ctrl o close");
 
         await active.sendKeys("C-x");
         const mainApproval = await active.waitForPane(
@@ -5305,8 +5322,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
           (pane) => pane.includes("CHILD_POSITION_"),
           TIMEOUT,
         );
-        await active.sendKeys("Right");
-        await active.waitForText("Full detail · ←/→ switch · ctrl o close", TIMEOUT);
+        await active.waitForText("Full detail · ctrl o close", TIMEOUT);
         for (let index = 0; index < 5; index += 1) {
           const before = await active.capturePane();
           await active.sendKeys("PageUp");
@@ -5320,10 +5336,8 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         await active.sendKeys("C-x");
         await active.waitForText("Agents & processes", TIMEOUT);
         await active.sendKeys("Enter");
-        const afterFullRoundTrip = await active.waitForPane(
-          (pane) => pane.includes("CHILD_POSITION_"),
-          TIMEOUT,
-        );
+        await active.waitForText("Full detail · ctrl o close", TIMEOUT);
+        const afterFullRoundTrip = await active.capturePane();
         expect(visibleRange(afterFullRoundTrip)).toEqual(beforeFullRoundTrip);
         expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
       } finally {
@@ -5859,17 +5873,15 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
           TIMEOUT,
         );
         await active.sendKeys("C-o");
-        await active.waitForText("Review · ←/→ switch · ctrl o close", TIMEOUT);
+        await active.waitForText("Full detail · ctrl o close", TIMEOUT);
         await active.sendKeys("PageUp");
-        expect(await active.capturePane()).toContain("Review · ←/→ switch · ctrl o close");
+        expect(await active.capturePane()).toContain("Full detail · ctrl o close");
         await active.sendKeys("Escape");
         await active.waitForText("Subagent: approval-second", TIMEOUT);
         await active.sendKeys("C-o");
-        await active.waitForText("Review · ←/→ switch · ctrl o close", TIMEOUT);
-        await active.sendKeys("Right");
-        await active.waitForText("Full detail · ←/→ switch · ctrl o close", TIMEOUT);
+        await active.waitForText("Full detail · ctrl o close", TIMEOUT);
         await active.sendKeys("PageDown");
-        expect(await active.capturePane()).toContain("Full detail · ←/→ switch · ctrl o close");
+        expect(await active.capturePane()).toContain("Full detail · ctrl o close");
         await active.sendKeys("C-c");
         await active.waitForPane(
           (pane) =>
@@ -6565,20 +6577,13 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
       const childStream = controlledTextResponse("MANAGER_CHILD_LIVE_\n");
       const humanOneStream = controlledTextResponse("MANAGER_HUMAN_ONE_LIVE_\n");
       const humanTwoStream = controlledTextResponse("MANAGER_HUMAN_TWO_LIVE_\n");
-      let releaseParent!: (response: Response) => void;
-      let parentReleased = false;
+      const parentStream = controlledTextResponse("PARENT_BACKGROUND_0\n");
       let authoritativeChildId: string | undefined;
-      const parentCompletion = new Promise<Response>((resolve) => {
-        releaseParent = (response) => {
-          parentReleased = true;
-          resolve(response);
-        };
-      });
       const gateway = startDynamicFakeGateway((body) => {
         if (body.includes('"toolCallId":"manager_archive_1"')) {
           return fakeGatewayFinalText("MANAGER_PARENT_COMPLETE");
         }
-        if (body.includes('"toolCallId":"manager_create_1"')) return parentCompletion;
+        if (body.includes('"toolCallId":"manager_create_1"')) return parentStream.response;
         if (body.includes('"toolCallId":"manager_child_read_1"')) {
           return humanTwoStream.response;
         }
@@ -6621,6 +6626,21 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
           stderrPath: fixture.stderrPath,
         });
         const active = session;
+        const pageUntil = async (
+          bytes: readonly string[],
+          predicate: (pane: string) => boolean,
+        ): Promise<string> => {
+          let pane = await active.capturePane();
+          for (let page = 0; page < 6 && !predicate(pane); page += 1) {
+            await active.sendHexBytes(bytes);
+            try {
+              pane = await active.waitForPane(predicate, 1_000);
+            } catch {
+              pane = await active.capturePane();
+            }
+          }
+          return pane;
+        };
         await active.waitForComposer(TIMEOUT);
         await active.sendText("Create the live manager fixture.");
         const startedAt = Date.now();
@@ -6797,20 +6817,21 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
           TIMEOUT,
         );
         expect(fullChild).not.toContain("Create the live manager fixture.");
-        await active.sendKeys("Right");
-        await active.waitForText("Full detail · ←/→ switch · ctrl o close", TIMEOUT);
+        await active.waitForText("Full detail · ctrl o close", TIMEOUT);
         const fullChildGrid = await active.capturePaneGrid();
         expect(fullChildGrid).not.toEqual(settledChildGrid);
-        await active.sendHexBytes(["1b", "5b", "35", "7e"]);
-        await active.waitForPane(
-          (pane) =>
-            pane.includes("Parent agent") &&
-            !pane.includes("MANAGER_HUMAN_TWO_LIVE_"),
-          TIMEOUT,
+        const olderChild = await pageUntil(
+          ["1b", "5b", "35", "7e"],
+          (pane) => pane.includes("Parent agent"),
         );
+        expect(olderChild).toContain("Parent agent");
+        expect(olderChild).not.toContain("MANAGER_HUMAN_TWO_LIVE_");
         expect(await active.capturePaneGrid()).not.toEqual(fullChildGrid);
-        await active.sendHexBytes(["1b", "5b", "36", "7e"]);
-        await active.waitForText("MANAGER_HUMAN_TWO_LIVE_", TIMEOUT);
+        const newerChild = await pageUntil(
+          ["1b", "5b", "36", "7e"],
+          (pane) => pane.includes("MANAGER_HUMAN_TWO_LIVE_"),
+        );
+        expect(newerChild).toContain("MANAGER_HUMAN_TWO_LIVE_");
         await active.sendKeys("C-o");
         await active.waitForPane(
           (pane) =>
@@ -6821,18 +6842,20 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         );
         expect(await active.capturePaneGrid()).toEqual(settledChildGrid);
 
-        await active.sendHexBytes(["1b", "5b", "35", "7e"]);
-        const scrolled = await active.waitForPane(
-          (pane) =>
-            pane.includes("Mode: persistent") &&
-            !pane.includes("MANAGER_HUMAN_TWO_LIVE_"),
-          TIMEOUT,
+        const scrolled = await pageUntil(
+          ["1b", "5b", "35", "7e"],
+          (pane) => pane.includes("Mode: persistent"),
         );
+        expect(scrolled).toContain("Mode: persistent");
+        expect(scrolled).not.toContain("MANAGER_HUMAN_TWO_LIVE_");
         expect(scrolled).not.toContain("Context:");
         expect(scrolled).not.toContain("Source:");
         expect(scrolled).not.toContain("Enter Send");
-        await active.sendHexBytes(["1b", "5b", "36", "7e"]);
-        await active.waitForText("MANAGER_HUMAN_TWO_LIVE_", TIMEOUT);
+        const restoredTail = await pageUntil(
+          ["1b", "5b", "36", "7e"],
+          (pane) => pane.includes("MANAGER_HUMAN_TWO_LIVE_"),
+        );
+        expect(restoredTail).toContain("MANAGER_HUMAN_TWO_LIVE_");
 
         await active.sendKeys("Escape");
         await active.waitForPane(
@@ -6877,14 +6900,14 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
           normalizeThinkingFrame(mainGridBeforeManager),
         );
         expect(active.cursorPosition()).toEqual(mainCursorBeforeManager);
-        releaseParent(fakeGatewayToolCall("manager_archive_1", "subagent", {
+        parentStream.releaseToolCall("manager_archive_1", "subagent", {
           command: {
             lifecycle: {
               id: authoritativeChildId!,
               action: "close",
             },
           },
-        }));
+        });
         await active.waitForText("MANAGER_PARENT_COMPLETE", TIMEOUT);
 
         await active.sendKeys("C-x");
@@ -6924,7 +6947,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         if (!childStream.released()) childStream.release("CLEANUP");
         if (!humanOneStream.released()) humanOneStream.release("CLEANUP");
         if (!humanTwoStream.released()) humanTwoStream.release("CLEANUP");
-        if (!parentReleased) releaseParent(fakeGatewayFinalText("parent cleanup"));
+        if (!parentStream.released()) parentStream.release("parent cleanup");
         gateway.stop();
       }
     },
