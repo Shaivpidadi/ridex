@@ -40,7 +40,6 @@ pub const Request = struct {
 
 pub const Result = struct {
     handoff: []u8,
-    usage: types.ToolUsage,
     retained_message_count: usize,
 
     pub fn deinit(self: *Result, alloc: Allocator) void {
@@ -247,7 +246,6 @@ pub fn compact(
     }
     return .{
         .handoff = handoff,
-        .usage = total_usage,
         .retained_message_count = request.protected_tail_messages,
     };
 }
@@ -474,6 +472,10 @@ const FakeProvider = struct {
         } } };
     }
 };
+
+test "compaction result exposes only caller-consumed state" {
+    try std.testing.expect(!@hasField(Result, "usage"));
+}
 
 test "semantic compaction summarizes once while runtime truth remains authoritative" {
     const alloc = std.testing.allocator;

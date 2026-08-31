@@ -1873,12 +1873,6 @@ pub const SessionRuntime = struct {
         return self.context_history_start;
     }
 
-    pub fn contextUnversionedHistoryCount(self: *const SessionRuntime) usize {
-        const boundary = @min(self.unversioned_history_len, self.history.items.len);
-        const start = @min(self.context_history_start, boundary);
-        return boundary - start;
-    }
-
     pub fn unversionedHistoryEnd(self: *const SessionRuntime) usize {
         return @min(self.unversioned_history_len, self.history.items.len);
     }
@@ -5446,12 +5440,15 @@ test "restored history keeps an in-memory unversioned prefix boundary" {
         &restored_history,
         1,
     );
-    try std.testing.expectEqual(@as(usize, 1), runtime.contextUnversionedHistoryCount());
+    try std.testing.expectEqual(@as(usize, 2), runtime.unversionedHistoryEnd());
+    try std.testing.expectEqual(@as(usize, 1), runtime.contextHistoryStart());
 
     try runtime.appendAssistantHistoryTurn(alloc, "fresh", "fresh reply");
-    try std.testing.expectEqual(@as(usize, 1), runtime.contextUnversionedHistoryCount());
+    try std.testing.expectEqual(@as(usize, 2), runtime.unversionedHistoryEnd());
+    try std.testing.expectEqual(@as(usize, 1), runtime.contextHistoryStart());
     runtime.reset(alloc);
-    try std.testing.expectEqual(@as(usize, 0), runtime.contextUnversionedHistoryCount());
+    try std.testing.expectEqual(@as(usize, 0), runtime.unversionedHistoryEnd());
+    try std.testing.expectEqual(@as(usize, 0), runtime.contextHistoryStart());
 }
 
 test "compacted failed turn does not claim user interruption" {

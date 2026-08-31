@@ -22,7 +22,6 @@ pub const CompactionTrigger = enum {
 pub const CompactionDecision = enum {
     no_op,
     compact,
-    capacity_failure,
 };
 
 pub const CompactionNextAction = enum {
@@ -375,6 +374,11 @@ test "provider request measurement includes serialized structure" {
 }
 
 test "compaction v2 triggers automatic work at eighty percent and targets ten percent" {
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        std.meta.tags(CompactionDecision).len,
+    );
+
     const capabilities = model_capabilities.Capabilities{
         .context_window = 1_000,
         .max_output_tokens = 200,

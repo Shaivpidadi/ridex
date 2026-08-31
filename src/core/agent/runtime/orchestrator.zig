@@ -3844,7 +3844,6 @@ fn processQueuedPromptLoop(
                             }
                         }
                     },
-                    .capacity_failure => return error.ContextCapacityExceeded,
                     .compact => {
                         std.debug.assert(projection_plan.next_action == .continue_turn);
                         try runtime_context_compaction.validateUnversionedHistoryResults(
