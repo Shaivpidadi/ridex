@@ -47,7 +47,7 @@ afterEach(async () => {
 });
 
 async function waitForTerminalHostExit(root: string): Promise<void> {
-  const identityPath = join(root, "home", ".fx", "terminal-host-v6", "host.json");
+  const identityPath = join(root, "home", ".fx", "terminal-host-v7", "host.json");
   const deadline = Date.now() + 5_000;
   while (Date.now() < deadline) {
     if (!existsSync(identityPath)) return;
@@ -302,7 +302,7 @@ describe("fx ask presentation", () => {
     expect(existsSync(nestedExecMarker)).toBe(true);
     expect(gateway.requests[6]!.body).toContain("neighbor-exec");
     expect(
-      existsSync(join(root.home, ".fx", "terminal-host-v6", "host.json")),
+      existsSync(join(root.home, ".fx", "terminal-host-v7", "host.json")),
     ).toBe(false);
   }, TIMEOUT);
 

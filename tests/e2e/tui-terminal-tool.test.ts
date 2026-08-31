@@ -67,10 +67,11 @@ function createFixture(prefix: string) {
 async function launch(
   fixture: ReturnType<typeof createFixture>,
   gateway: ReturnType<typeof startFakeGateway>,
+  cmd = FX_BIN,
 ) {
   const session = await TmuxSession.create({
     isolated: true,
-    cmd: FX_BIN,
+    cmd,
     cwd: fixture.workspace,
     env: {
       HOME: fixture.home,
@@ -161,7 +162,7 @@ function terminalRecords(home: string): Array<Record<string, unknown>> {
 }
 
 async function cleanupTerminalHost(home: string): Promise<void> {
-  const identityPath = join(home, ".fx", "terminal-host-v6", "host.json");
+  const identityPath = join(home, ".fx", "terminal-host-v7", "host.json");
   const deadline = Date.now() + 3_000;
   while (Date.now() < deadline) {
     if (!existsSync(identityPath)) return;
@@ -413,6 +414,127 @@ test.skipIf(!tmuxAvailable())(
     expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
   },
   TIMEOUT,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "shell TTY timeout stops the owned process and reports the deadline",
+  async () => {
+    const fixture = createFixture("fx-shell-tty-timeout-");
+    let sessionId = "";
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("shell_tty_timeout_run", "shell", {
+        request: {
+          action: "run",
+          command: "printf 'TTY_TIMEOUT_READY\\n'; sleep 30",
+          profile: "clean",
+          tty: true,
+          yield_time_ms: 0,
+          timeout_ms: 250,
+        },
+      }),
+      (body) => {
+        sessionId = findSessionId(JSON.parse(body)) ?? "";
+        return fakeGatewayToolCall("shell_tty_timeout_wait", "shell", {
+          request: {
+            action: "wait",
+            session_id: sessionId,
+            wait_ceiling_ms: 5_000,
+          },
+        });
+      },
+      fakeGatewayFinalText("SHELL_TTY_TIMEOUT_OK"),
+    ]);
+    gateways.push(gateway);
+    const active = await launch(fixture, gateway);
+    await active.sendText("Run the managed TTY timeout flow.");
+    await active.sendKeys("Enter");
+    await active.waitForText("SHELL_TTY_TIMEOUT_OK", TIMEOUT);
+
+    expect(sessionId.length).toBeGreaterThan(0);
+    const waitResult = toolResultEnvelope(
+      gateway.requests[2]!.body,
+      "shell_tty_timeout_wait",
+    );
+    expect(waitResult).toContain('\\"state\\":\\"completed\\"');
+    expect(waitResult).toContain('\\"error\\":\\"TimeoutExpired\\"');
+    expect(waitResult).toContain('\\"termination_indeterminate\\":false');
+    const record = terminalRecords(fixture.home).find((candidate) =>
+      candidate.session_id === sessionId
+    );
+    expect(record?.timed_out).toBe(true);
+    expect(record?.lifecycle).toBe("closed");
+    expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+  },
+  TIMEOUT,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "resumed fx reindexes and stops its durable managed TTY",
+  async () => {
+    const fixture = createFixture("fx-shell-tty-resume-");
+    let sessionId = "";
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("shell_tty_resume_run", "shell", {
+        request: {
+          action: "run",
+          command:
+            "printf 'TTY_RESUME_READY\\n'; while IFS= read -r line; do printf 'TTY_RESUME_ECHO:%s\\n' \"$line\"; done",
+          profile: "clean",
+          tty: true,
+          yield_time_ms: 0,
+        },
+      }),
+      (body) => {
+        sessionId = findSessionId(JSON.parse(body)) ?? "";
+        return fakeGatewayFinalText("SHELL_TTY_RESUME_STARTED");
+      },
+      fakeGatewayToolCall("shell_tty_resume_list", "shell", {
+        request: { action: "list" },
+      }),
+      (body) => {
+        const listed = toolResultEnvelope(body, "shell_tty_resume_list");
+        if (!listed.includes(sessionId)) {
+          throw new Error("resumed shell list omitted the durable TTY");
+        }
+        return fakeGatewayToolCall("shell_tty_resume_stop", "shell", {
+          request: {
+            action: "stop",
+            session_id: sessionId,
+            force: true,
+          },
+        });
+      },
+      fakeGatewayFinalText("SHELL_TTY_RESUME_OK"),
+    ]);
+    gateways.push(gateway);
+
+    const first = await launch(fixture, gateway);
+    await first.sendText("Start the durable managed TTY.");
+    await first.waitForText("SHELL_TTY_RESUME_STARTED", TIMEOUT);
+    expect(sessionId.length).toBeGreaterThan(0);
+    await first.sendText("/quit");
+    expect(await first.waitForSessionEnd(TIMEOUT)).toBe(true);
+
+    const resumed = await launch(
+      fixture,
+      gateway,
+      `${FX_BIN} --resume-last`,
+    );
+    await resumed.sendText("List and force-stop the durable managed TTY.");
+    await resumed.waitForText("SHELL_TTY_RESUME_OK", TIMEOUT);
+
+    const stopResult = toolResultEnvelope(
+      gateway.requests[4]!.body,
+      "shell_tty_resume_stop",
+    );
+    expect(stopResult).toContain('\\"state\\":\\"stopped\\"');
+    const record = terminalRecords(fixture.home).find((candidate) =>
+      candidate.session_id === sessionId
+    );
+    expect(record?.lifecycle).toBe("closed");
+    expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+  },
+  60_000,
 );
 
 test.skipIf(!tmuxAvailable())(

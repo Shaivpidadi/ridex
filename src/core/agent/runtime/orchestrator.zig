@@ -69,6 +69,8 @@ const post_tool_decision_prompt =
     "Continue the original task. If work remains and you can proceed, briefly tell the user what you are doing next, then perform that action with the appropriate tool. Do not end the turn with only a progress update. If the task is complete, respond with the result. If a genuine blocker prevents further action, explain the blocker and what is needed to continue.";
 const repeated_terminal_validation_notice =
     "Repeated shell validation failures stopped the tool loop. The invalid shell calls were not executed and produced no shell effect.";
+const repeated_shell_execution_failure_notice =
+    "Repeated identical shell failures stopped the tool loop. The failed action was not retried again; inspect the environment or change the action before continuing.";
 const repeated_malformed_arguments_notice =
     "Repeated malformed tool arguments stopped the agent loop. The invalid calls were not executed. Continue with a follow-up prompt if needed.";
 const Config = runtime_config.Config;
@@ -389,6 +391,19 @@ fn project_terminal_request_messages(
     var needs_projection = false;
     for (source) |message| {
         if (message.role != .assistant) continue;
+        var has_legacy_exec = false;
+        var has_removed_legacy_action = false;
+        for (message.tool_calls) |call| {
+            if (call.argument_integrity != .valid or
+                !std.mem.eql(u8, call.name, "terminal")) continue;
+            const action = legacyTerminalAction(call.arguments_json) orelse "unknown";
+            if (std.mem.eql(u8, action, "exec")) {
+                has_legacy_exec = true;
+            } else {
+                has_removed_legacy_action = true;
+            }
+        }
+        const mixed_legacy_batch = has_legacy_exec and has_removed_legacy_action;
         for (message.tool_calls) |call| {
             if (call.argument_integrity != .valid) continue;
             if (std.mem.eql(u8, call.name, "terminal")) {
@@ -396,7 +411,8 @@ fn project_terminal_request_messages(
                 try legacy_calls.append(alloc, .{
                     .id = call.id,
                     .action = action,
-                    .mapped = std.mem.eql(u8, action, "exec"),
+                    .mapped = std.mem.eql(u8, action, "exec") and
+                        !mixed_legacy_batch,
                 });
                 needs_projection = true;
                 continue;
@@ -792,7 +808,7 @@ test "shell request projection wraps eligible flat objects without changing sour
     try std.testing.expectEqual(messages[0..].ptr, ineligible.ptr);
 }
 
-test "legacy terminal history maps exec and makes removed actions inert" {
+test "mixed legacy terminal batches become inert in every order" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -841,14 +857,13 @@ test "legacy terminal history maps exec and makes removed actions inert" {
         true,
         &messages,
     );
-    try std.testing.expectEqual(@as(usize, 1), projected[0].tool_calls.len);
-    try std.testing.expectEqualStrings("shell", projected[0].tool_calls[0].name);
-    try std.testing.expectEqualStrings(
-        "{\"request\":{\"action\":\"run\",\"command\":\"printf ok\",\"timeout_ms\":1000}}",
-        projected[0].tool_calls[0].arguments_json,
-    );
-    try std.testing.expectEqual(types.ChatRole.tool, projected[1].role);
-    try std.testing.expectEqualStrings("shell", projected[1].tool_name.?);
+    try std.testing.expectEqual(@as(usize, 0), projected[0].tool_calls.len);
+    try std.testing.expectEqual(types.ChatRole.assistant, projected[1].role);
+    try std.testing.expect(std.mem.find(
+        u8,
+        projected[1].content.?,
+        "Prior terminal exec action completed",
+    ) != null);
     try std.testing.expectEqual(types.ChatRole.assistant, projected[2].role);
     try std.testing.expect(projected[2].tool_call_id == null);
     try std.testing.expect(projected[2].tool_name == null);
@@ -866,6 +881,57 @@ test "legacy terminal history maps exec and makes removed actions inert" {
         projected,
     );
     try std.testing.expectEqual(projected.ptr, idempotent.ptr);
+
+    const reversed_calls = [_]ToolCall{ calls[1], calls[0] };
+    const reversed_messages = [_]ChatMessage{
+        .{ .role = .assistant, .tool_calls = &reversed_calls },
+        .{
+            .role = .tool,
+            .tool_call_id = "legacy-start",
+            .tool_name = "terminal",
+            .content = "session started",
+        },
+        .{
+            .role = .tool,
+            .tool_call_id = "legacy-exec",
+            .tool_name = "terminal",
+            .content = "exit_code=0",
+        },
+    };
+    const reversed = try project_terminal_request_messages(
+        arena,
+        registry,
+        true,
+        &reversed_messages,
+    );
+    try std.testing.expectEqual(@as(usize, 0), reversed[0].tool_calls.len);
+    try std.testing.expectEqual(types.ChatRole.assistant, reversed[1].role);
+    try std.testing.expectEqual(types.ChatRole.assistant, reversed[2].role);
+    try std.testing.expect(std.mem.find(
+        u8,
+        reversed[1].content.?,
+        "Prior terminal start action completed",
+    ) != null);
+    try std.testing.expect(std.mem.find(
+        u8,
+        reversed[2].content.?,
+        "Prior terminal exec action completed",
+    ) != null);
+
+    const exec_only_messages = [_]ChatMessage{
+        .{ .role = .assistant, .tool_calls = calls[0..1] },
+        messages[1],
+    };
+    const exec_only = try project_terminal_request_messages(
+        arena,
+        registry,
+        true,
+        &exec_only_messages,
+    );
+    try std.testing.expectEqual(@as(usize, 1), exec_only[0].tool_calls.len);
+    try std.testing.expectEqualStrings("shell", exec_only[0].tool_calls[0].name);
+    try std.testing.expectEqual(types.ChatRole.tool, exec_only[1].role);
+    try std.testing.expectEqualStrings("shell", exec_only[1].tool_name.?);
 }
 
 fn check_terminal_request_projection_allocation_failures(alloc: Allocator) !void {
@@ -3420,6 +3486,8 @@ fn processQueuedPromptLoop(
     defer turn_review_cache.deinit(arena);
     var terminal_validation_retry: runtime_tool_admission.TerminalValidationRetryState = .{};
     defer terminal_validation_retry.deinit(arena);
+    var shell_execution_failure_retry: runtime_tool_admission.ShellExecutionFailureRetryState = .{};
+    defer shell_execution_failure_retry.deinit(arena);
     var malformed_arguments_retry: runtime_tool_admission.MalformedArgumentsRetryState = .{};
     var completed_tool_names = completed_tool_names_ptr.*;
     defer completed_tool_names_ptr.* = completed_tool_names;
@@ -5734,6 +5802,7 @@ fn processQueuedPromptLoop(
 
         var step_batch = runtime_tool_batch.StepBatchState{};
         terminal_validation_retry.beginBatch();
+        shell_execution_failure_retry.beginBatch();
         malformed_arguments_retry.beginBatch();
         for (effective_tool_calls) |tool_call| {
             malformed_arguments_retry.observe(tool_call);
@@ -7585,6 +7654,11 @@ fn processQueuedPromptLoop(
                 else => return err,
             };
             const safe_tool_output = prepared.model_output;
+            try shell_execution_failure_retry.observe(
+                arena,
+                tool_call,
+                execution,
+            );
             try runtime_tool_presentation.finishExecutedToolStatus(
                 deps,
                 call_allocator,
@@ -7797,6 +7871,28 @@ fn processQueuedPromptLoop(
                 null,
                 &finish_trace,
                 "terminal_validation_retry",
+            );
+            return;
+        }
+        if (shell_execution_failure_retry.finishBatch()) {
+            debug_trace.eventf(
+                "agent",
+                "repeated_shell_execution_failure",
+                step_ctx,
+                "tool_call_count={d}",
+                .{effective_tool_calls.len},
+            );
+            try finishFailedTurnWithNotice(
+                deps,
+                finalization,
+                arena,
+                job,
+                within_turn_suffix.items,
+                &summary_accumulator,
+                stop_state,
+                &finish_trace,
+                repeated_shell_execution_failure_notice,
+                "repeated_shell_execution_failure",
             );
             return;
         }

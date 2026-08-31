@@ -176,6 +176,54 @@ pub const TerminalValidationRetryState = struct {
     }
 };
 
+pub const ShellExecutionFailureRetryState = struct {
+    previous: std.ArrayList(TerminalValidationDigest) = .empty,
+    current: std.ArrayList(TerminalValidationDigest) = .empty,
+    stop_after_batch: bool = false,
+
+    pub fn deinit(self: *ShellExecutionFailureRetryState, alloc: Allocator) void {
+        self.previous.deinit(alloc);
+        self.current.deinit(alloc);
+        self.* = .{};
+    }
+
+    pub fn beginBatch(self: *ShellExecutionFailureRetryState) void {
+        self.current.clearRetainingCapacity();
+        self.stop_after_batch = false;
+    }
+
+    pub fn observe(
+        self: *ShellExecutionFailureRetryState,
+        alloc: Allocator,
+        call: ToolCall,
+        execution: ToolExecutionResult,
+    ) Allocator.Error!void {
+        if (!std.mem.eql(u8, call.name, "shell") or execution.status != .failure) {
+            return;
+        }
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update("fx.shell-execution-failure.v1\x00");
+        hash.update(call.arguments_json);
+        const digest = hash.finalResult();
+        const decision = terminalValidationDigestDecision(
+            self.previous.items,
+            self.current.items,
+            digest,
+        );
+        if (decision.append_current) try self.current.append(alloc, digest);
+        self.stop_after_batch = self.stop_after_batch or decision.repeated;
+    }
+
+    pub fn finishBatch(self: *ShellExecutionFailureRetryState) bool {
+        if (self.stop_after_batch) return true;
+        const previous = self.previous;
+        self.previous = self.current;
+        self.current = previous;
+        self.current.clearRetainingCapacity();
+        return false;
+    }
+};
+
 pub const MalformedArgumentsRetryState = struct {
     consecutive_malformed_batches: usize = 0,
     current_call_count: usize = 0,
@@ -294,6 +342,46 @@ test "terminal validation retry state retains independent batch corrections" {
     try state.observe(alloc, call, "ordinary valid result");
     try state.observe(alloc, call, correction_s);
     try std.testing.expectEqual(@as(usize, 2), state.current.items.len);
+    try std.testing.expect(state.finishBatch());
+}
+
+test "shell execution failures retain independent batch identities" {
+    const alloc = std.testing.allocator;
+    const first: ToolCall = .{
+        .id = "first",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"first\"}",
+    };
+    const second: ToolCall = .{
+        .id = "second",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"second\"}",
+    };
+    const failed = ToolExecutionResult{
+        .status = .failure,
+        .model_output = "session lost",
+    };
+    const succeeded = ToolExecutionResult{ .model_output = "ok" };
+    var state: ShellExecutionFailureRetryState = .{};
+    defer state.deinit(alloc);
+
+    state.beginBatch();
+    try state.observe(alloc, first, failed);
+    try state.observe(alloc, second, failed);
+    try std.testing.expect(!state.finishBatch());
+    state.beginBatch();
+    try state.observe(alloc, first, failed);
+    try state.observe(alloc, second, failed);
+    try std.testing.expect(state.finishBatch());
+
+    state.deinit(alloc);
+    state.beginBatch();
+    try state.observe(alloc, first, failed);
+    try state.observe(alloc, second, succeeded);
+    try std.testing.expect(!state.finishBatch());
+    state.beginBatch();
+    try state.observe(alloc, first, failed);
+    try state.observe(alloc, second, succeeded);
     try std.testing.expect(state.finishBatch());
 }
 

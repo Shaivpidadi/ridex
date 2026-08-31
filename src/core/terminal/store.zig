@@ -174,6 +174,9 @@ pub const Record = struct {
     shell: []u8,
     cwd: []u8,
     command: ?[]u8,
+    timeout_ms: ?u64,
+    timeout_at_ms: ?i64,
+    timed_out: bool,
     backend: contracts.Backend,
     lifecycle: contracts.Lifecycle,
     attention: contracts.AttentionState,
@@ -229,6 +232,16 @@ pub const Record = struct {
         if (self.host_identity.len == 0 or self.backend_identity.len == 0 or
             self.shell.len == 0 or self.cwd.len == 0 or
             !std.fs.path.isAbsolute(self.cwd))
+        {
+            return error.InvalidTerminalRecord;
+        }
+        if ((self.timed_out and
+            (self.timeout_ms == null or self.timeout_at_ms == null)) or
+            (self.timeout_at_ms != null and self.timeout_ms == null) or
+            if (self.timeout_at_ms) |deadline|
+                deadline < self.created_at_ms
+            else
+                false)
         {
             return error.InvalidTerminalRecord;
         }
@@ -408,6 +421,9 @@ const RecordWire = struct {
     shell: []const u8,
     cwd: []const u8,
     command: ?[]const u8,
+    timeout_ms: ?u64 = null,
+    timeout_at_ms: ?i64 = null,
+    timed_out: bool = false,
     backend: contracts.Backend,
     lifecycle: contracts.Lifecycle,
     attention: contracts.AttentionState,
@@ -1554,6 +1570,9 @@ fn record_wire(record: Record) RecordWire {
         .shell = record.shell,
         .cwd = record.cwd,
         .command = record.command,
+        .timeout_ms = record.timeout_ms,
+        .timeout_at_ms = record.timeout_at_ms,
+        .timed_out = record.timed_out,
         .backend = record.backend,
         .lifecycle = record.lifecycle,
         .attention = record.attention,
@@ -1633,6 +1652,9 @@ fn clone_record(alloc: Allocator, wire: RecordWire) Allocator.Error!Record {
         .shell = shell,
         .cwd = cwd,
         .command = command,
+        .timeout_ms = wire.timeout_ms,
+        .timeout_at_ms = wire.timeout_at_ms,
+        .timed_out = wire.timed_out,
         .backend = wire.backend,
         .lifecycle = wire.lifecycle,
         .attention = wire.attention,
@@ -2033,6 +2055,7 @@ pub const CreateInput = struct {
     shell: []const u8,
     cwd: []const u8,
     command: ?[]const u8,
+    timeout_ms: ?u64 = null,
     backend: contracts.Backend,
     dimensions: contracts.Dimensions,
     persistence: contracts.StartPersistence,
@@ -2441,6 +2464,9 @@ pub const DurableSession = struct {
             .shell = shell,
             .cwd = cwd,
             .command = command,
+            .timeout_ms = input.timeout_ms,
+            .timeout_at_ms = null,
+            .timed_out = false,
             .backend = input.backend,
             .lifecycle = .starting,
             .attention = .{},
@@ -2645,9 +2671,16 @@ pub const DurableSession = struct {
         const previous_pid = self.record.pid;
         const previous_token = self.record.process_token;
         const previous_lifecycle = self.record.lifecycle;
+        const previous_timeout_at_ms = self.record.timeout_at_ms;
         const previous_updated_at_ms = self.record.updated_at_ms;
+        const timeout_at_ms = if (self.record.timeout_ms) |timeout_ms|
+            std.math.add(i64, now_ms, @intCast(timeout_ms)) catch
+                return error.CapacityExceeded
+        else
+            null;
         self.record.pid = pid_owned;
         self.record.process_token = token_owned;
+        self.record.timeout_at_ms = timeout_at_ms;
         self.record.lifecycle = try contracts.transition_lifecycle(
             self.record.lifecycle,
             .child_started,
@@ -2657,12 +2690,34 @@ pub const DurableSession = struct {
             self.record.pid = previous_pid;
             self.record.process_token = previous_token;
             self.record.lifecycle = previous_lifecycle;
+            self.record.timeout_at_ms = previous_timeout_at_ms;
             self.record.updated_at_ms = previous_updated_at_ms;
             return err;
         };
         if (previous_pid) |value| alloc.free(value);
         if (previous_token) |value| alloc.free(value);
         _ = try self.append_event_locked(.lifecycle, now_ms);
+    }
+
+    pub fn mark_timed_out(self: *DurableSession, now_ms: i64) !void {
+        const zio = io_mod.getIo();
+        self.profile.mutex.lockUncancelable(zio);
+        defer self.profile.mutex.unlock(zio);
+        if (self.record.timed_out) return;
+        if (self.record.timeout_at_ms == null) return error.InvalidLifecycle;
+        const previous_timed_out = self.record.timed_out;
+        const previous_updated_at_ms = self.record.updated_at_ms;
+        self.record.timed_out = true;
+        self.record.updated_at_ms = now_ms;
+        save_record(
+            self.profile.alloc,
+            try self.state_capability(),
+            self.record,
+        ) catch |err| {
+            self.record.timed_out = previous_timed_out;
+            self.record.updated_at_ms = previous_updated_at_ms;
+            return err;
+        };
     }
 
     pub fn append(self: *DurableSession, bytes: []const u8, now_ms: i64) !void {
@@ -5136,6 +5191,8 @@ fn facts_from_record(record: Record, session_id: []const u8) contracts.SessionFa
         .lifecycle = record.lifecycle,
         .attention = record.attention,
         .backend = record.backend,
+        .model_managed = !record.direct_human_model_read_only,
+        .timed_out = record.timed_out,
         .output_cursor = record.output_cursor,
         .unread_range = unread_range,
         .raw_gap = record.raw_gap,

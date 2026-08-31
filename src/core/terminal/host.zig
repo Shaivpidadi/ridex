@@ -21,13 +21,13 @@ pub const internal_mode = "--fx-internal-terminal-host";
 pub const endpoint_name = "host.sock";
 pub const lock_name = "host.lock";
 const identity_name = "host.json";
-const host_dir_name = "terminal-host-v6";
+const host_dir_name = "terminal-host-v7";
 const default_idle_grace_ms: u64 = 30_000;
 const identity_max_bytes: usize = 1024;
 const max_connection_requests: usize = 32;
 const listener_poll_ms = 50;
 const transport_hash_bytes: usize = 16;
-const transport_hash_context = "fx.terminal.transport.v2\x00";
+const transport_hash_context = "fx.terminal.transport.v3\x00";
 const socket_permissions: std.Io.File.Permissions = switch (builtin.os.tag) {
     .macos, .linux => .fromMode(0o600),
     else => .default_file,
@@ -435,6 +435,31 @@ fn runSupported(alloc: Allocator, config: Config) !void {
     var state = HostState{
         .idle_grace_ms = config.idle_grace_ms,
     };
+    var startup = HostStartup{};
+    var accept_thread = try std.Thread.spawn(.{}, acceptLoop, .{
+        alloc,
+        &server,
+        config.process_provider,
+        config.hello,
+        &state,
+        &startup,
+    });
+    var startup_complete = false;
+    var accept_joined = false;
+    errdefer if (!startup_complete) {
+        state.stopping.store(true, .release);
+        startup.ready.set(io_mod.getIo());
+        accept_thread.join();
+        accept_joined = true;
+        _ = drainConnectedClients(&state, client_drain_timeout_ms);
+    };
+
+    debug_trace.logf(
+        "terminal_host",
+        "host listening pid={d} protocol={d}-{d}",
+        .{ std.c.getpid(), config.hello.range.minimum, config.hello.range.current },
+    );
+    maybeDelayForTest("FX_TERMINAL_TEST_STARTUP_RECOVERY_DELAY_MS");
     var persistent_store = try terminal_store.ProfileStore.init(
         alloc,
         home,
@@ -469,6 +494,16 @@ fn runSupported(alloc: Allocator, config: Config) !void {
             std.process.exit(1);
         }
     }
+    defer if (!accept_joined) {
+        state.stopping.store(true, .release);
+        state.changed.set(io_mod.getIo());
+        startup.ready.set(io_mod.getIo());
+        accept_thread.join();
+        accept_joined = true;
+    };
+    startup.registry = &registry;
+    startup.ready.set(io_mod.getIo());
+    startup_complete = true;
     var idle_thread = try std.Thread.spawn(.{}, idleOwner, .{&state});
     defer {
         state.stopping.store(true, .release);
@@ -476,40 +511,11 @@ fn runSupported(alloc: Allocator, config: Config) !void {
         idle_thread.join();
     }
 
-    debug_trace.logf(
-        "terminal_host",
-        "host listening pid={d} protocol={d}-{d}",
-        .{ std.c.getpid(), config.hello.range.minimum, config.hello.range.current },
-    );
-
-    while (!state.stopping.load(.acquire)) {
-        if (testAcceptFailureRequested()) return error.InjectedAcceptFailure;
-        if (!try listenerReady(server.socket.handle)) continue;
-        if (state.stopping.load(.acquire)) break;
-        var stream = server.accept(io_mod.getIo()) catch |err| switch (err) {
-            error.SocketNotListening => break,
-            else => return err,
-        };
-        if (state.stopping.load(.acquire)) {
-            stream.close(io_mod.getIo());
-            break;
-        }
-        _ = state.connected_clients.fetchAdd(1, .acq_rel);
-        state.noteChanged();
-        var thread = std.Thread.spawn(.{}, clientMain, .{
-            alloc,
-            stream,
-            config.process_provider,
-            config.hello,
-            &state,
-            &registry,
-        }) catch |err| {
-            stream.close(io_mod.getIo());
-            _ = state.connected_clients.fetchSub(1, .acq_rel);
-            state.noteChanged();
-            return err;
-        };
-        thread.detach();
+    debug_trace.logf("terminal_host", "host recovery ready", .{});
+    accept_thread.join();
+    accept_joined = true;
+    if (startup.accept_failed.load(.acquire)) {
+        return error.HostAcceptFailed;
     }
 
     debug_trace.logf("terminal_host", "host retiring idle=true", .{});
@@ -584,6 +590,78 @@ const HostState = struct {
         self.completeOrderedMutation(ticket);
     }
 };
+
+const HostStartup = struct {
+    ready: std.Io.Event = .unset,
+    registry: ?*native_session.Registry = null,
+    accept_failed: std.atomic.Value(bool) = .init(false),
+};
+
+fn acceptLoop(
+    alloc: Allocator,
+    server: *std.Io.net.Server,
+    process_provider: process_provider_mod.Provider,
+    hello: contracts.ProtocolHello,
+    state: *HostState,
+    startup: *HostStartup,
+) void {
+    while (!state.stopping.load(.acquire)) {
+        if (testAcceptFailureRequested()) {
+            startup.accept_failed.store(true, .release);
+            state.stopping.store(true, .release);
+            return;
+        }
+        if (!(listenerReady(server.socket.handle) catch |err| {
+            debug_trace.logf(
+                "terminal_host",
+                "host listener failed err={s}",
+                .{@errorName(err)},
+            );
+            startup.accept_failed.store(true, .release);
+            state.stopping.store(true, .release);
+            return;
+        })) continue;
+        if (state.stopping.load(.acquire)) break;
+        var stream = server.accept(io_mod.getIo()) catch |err| switch (err) {
+            error.SocketNotListening => break,
+            else => {
+                debug_trace.logf(
+                    "terminal_host",
+                    "host accept failed err={s}",
+                    .{@errorName(err)},
+                );
+                startup.accept_failed.store(true, .release);
+                state.stopping.store(true, .release);
+                return;
+            },
+        };
+        if (state.stopping.load(.acquire)) {
+            stream.close(io_mod.getIo());
+            break;
+        }
+        _ = state.connected_clients.fetchAdd(1, .acq_rel);
+        state.noteChanged();
+        var thread = std.Thread.spawn(.{}, clientMain, .{
+            alloc,
+            stream,
+            process_provider,
+            hello,
+            state,
+            startup,
+        }) catch |err| {
+            stream.close(io_mod.getIo());
+            _ = state.connected_clients.fetchSub(1, .acq_rel);
+            state.noteChanged();
+            debug_trace.logf(
+                "terminal_host",
+                "host client thread failed err={s}",
+                .{@errorName(err)},
+            );
+            continue;
+        };
+        thread.detach();
+    }
+}
 
 fn updateLiveWork(raw: ?*anyopaque, live: bool) void {
     const state: *HostState = @ptrCast(@alignCast(raw.?));
@@ -674,7 +752,7 @@ fn clientMain(
     process_provider: process_provider_mod.Provider,
     host_hello: contracts.ProtocolHello,
     state: *HostState,
-    registry: *native_session.Registry,
+    startup: *HostStartup,
 ) void {
     defer {
         _ = state.connected_clients.fetchSub(1, .acq_rel);
@@ -686,7 +764,7 @@ fn clientMain(
         process_provider,
         host_hello,
         state,
-        registry,
+        startup,
     ) catch |err| {
         debug_trace.logf(
             "terminal_host",
@@ -702,7 +780,7 @@ fn handleClient(
     process_provider: process_provider_mod.Provider,
     host_hello: contracts.ProtocolHello,
     state: *HostState,
-    registry: *native_session.Registry,
+    startup: *HostStartup,
 ) !void {
     defer stream.close(io_mod.getIo());
     if (!peerMatchesCurrentUser(stream.socket.handle)) {
@@ -748,6 +826,8 @@ fn handleClient(
         .compatible => |compatible| compatible,
         .incompatible => return,
     };
+    startup.ready.waitUncancelable(io_mod.getIo());
+    const registry = startup.registry orelse return error.TerminalHostStartupFailed;
 
     var connection = Connection{
         .alloc = alloc,
@@ -1608,7 +1688,7 @@ test "endpoint selection preserves short homes and deterministically separates l
     try std.testing.expect(std.mem.endsWith(
         u8,
         first.authority_root,
-        "/.fx/terminal-host-v6",
+        "/.fx/terminal-host-v7",
     ));
     try std.testing.expect(!std.mem.eql(
         u8,

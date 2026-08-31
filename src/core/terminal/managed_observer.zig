@@ -30,6 +30,7 @@ pub const Observation = struct {
     replay_output: []u8,
     next_cursor: managed_execution.TtyCursor,
     output_incomplete: bool,
+    timed_out: bool,
 
     pub fn deinit(self: *Observation, alloc: Allocator) void {
         alloc.free(self.output);
@@ -39,6 +40,7 @@ pub const Observation = struct {
 };
 
 pub fn refreshAll(ctx: Context) !void {
+    try syncOwned(ctx);
     const items = try ctx.managed_runtime.list(ctx.alloc);
     defer {
         for (items) |*item| item.deinit(ctx.alloc);
@@ -88,6 +90,7 @@ pub fn refresh(
         .replay_output = observed.replay_output,
         .next_cursor = observed.next_cursor,
         .output_incomplete = observed.output_incomplete,
+        .error_name = if (observed.timed_out) "TimeoutExpired" else null,
         .max_output_bytes = ctx.max_output_bytes,
         .published_running = true,
     });
@@ -194,7 +197,72 @@ pub fn observe(
             .offset = cursor.offset,
         },
         .output_incomplete = output_incomplete,
+        .timed_out = facts.timed_out,
     };
+}
+
+pub fn syncOwned(ctx: Context) !void {
+    var catalog_authority = try reloadOwnerCatalogAuthority(ctx);
+    defer catalog_authority.deinit();
+    var listed = try execute(ctx, .{ .list = .{
+        .owner_authority = catalog_authority.view(),
+    } });
+    defer listed.deinit(ctx.alloc);
+    const sessions = switch (listed.view()) {
+        .failure => |failure| return mapTerminalFailure(failure.code),
+        .success => |success| switch (success) {
+            .list => |value| value.sessions,
+            else => return error.InvalidTerminalResult,
+        },
+    };
+    for (sessions) |facts| {
+        if (!facts.model_managed or facts.lifecycle == .closed or
+            ctx.managed_runtime.backendFor(facts.session_id) != null)
+        {
+            continue;
+        }
+        var authority = try reloadAuthority(ctx, facts.session_id);
+        defer authority.deinit();
+        var inspected = try execute(ctx, .{ .inspect = .{
+            .session_id = facts.session_id,
+            .authority = authority.view(),
+        } });
+        defer inspected.deinit(ctx.alloc);
+        const inspect = switch (inspected.view()) {
+            .failure => |failure| return mapTerminalFailure(failure.code),
+            .success => |success| switch (success) {
+                .inspect => |value| value,
+                else => return error.InvalidTerminalResult,
+            },
+        };
+        const command = inspect.command orelse continue;
+        var observed = try observe(
+            ctx,
+            facts.session_id,
+            snapshotState(facts, null),
+            null,
+        );
+        defer observed.deinit(ctx.alloc);
+        var prepared = try ctx.managed_runtime.registerTty(ctx.alloc, .{
+            .execution_id = facts.session_id,
+            .command = command,
+            .cwd = inspect.cwd,
+            .state = observed.state,
+            .output = observed.output,
+            .replay_output = observed.replay_output,
+            .next_cursor = observed.next_cursor,
+            .output_incomplete = observed.output_incomplete,
+            .error_name = if (observed.timed_out) "TimeoutExpired" else null,
+            .max_output_bytes = ctx.max_output_bytes,
+            .published_running = true,
+            .replay_capability = ctx.owner,
+        });
+        defer prepared.deinit(ctx.alloc);
+        try ctx.managed_runtime.cancelDelivery(
+            prepared.snapshot.execution_id,
+            prepared.reservation_id,
+        );
+    }
 }
 
 fn resolveCompletedStatus(
@@ -323,6 +391,21 @@ fn reloadAuthority(
         return error.TerminalAuthorityUnavailable;
     return store.reloadOwnerAuthorityClaim(ctx.alloc, ctx.owner, .{
         .terminal_session_id = session_id,
+        .profile_user = profile_user,
+        .durable_session_id = ctx.durable_session_id,
+        .workspace_root = ctx.workspace_root,
+        .transport_role = ctx.transport_role,
+        .actor = .agent,
+    });
+}
+
+fn reloadOwnerCatalogAuthority(
+    ctx: Context,
+) !operation.OwnedOwnerCatalogClaim {
+    var profile_user_buffer: [64]u8 = undefined;
+    const profile_user = identity.profileUser(&profile_user_buffer) orelse
+        return error.TerminalAuthorityUnavailable;
+    return store.loadOrCreateOwnerCatalogClaim(ctx.alloc, ctx.owner, .{
         .profile_user = profile_user,
         .durable_session_id = ctx.durable_session_id,
         .workspace_root = ctx.workspace_root,

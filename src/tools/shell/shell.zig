@@ -424,12 +424,16 @@ fn callWait(
 ) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
     const runtime = ctx.managed_executions orelse return unavailable(ctx);
     const session_id = input.session_id orelse return unavailable(ctx);
-    if (runtime.retainedTerminalSnapshot(ctx.allocator, session_id) catch |err|
-        return runtimeFailure(ctx, err)) |retained|
-    {
-        var prepared = retained;
-        defer prepared.deinit(ctx.allocator);
-        return finishPrepared(ctx, runtime, &prepared, .command);
+    ensureOwnedTtyIndexed(ctx, runtime, session_id) catch |err|
+        return runtimeFailure(ctx, err);
+    if (runtime.isTombstone(session_id)) {
+        if (runtime.retainedTerminalSnapshot(ctx.allocator, session_id) catch |err|
+            return runtimeFailure(ctx, err)) |retained|
+        {
+            var prepared = retained;
+            defer prepared.deinit(ctx.allocator);
+            return finishPrepared(ctx, runtime, &prepared, .command);
+        }
     }
     if (runtime.backendFor(session_id) == .tty) {
         return callTtyWait(ctx, input);
@@ -450,12 +454,16 @@ fn callStop(
 ) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
     const runtime = ctx.managed_executions orelse return unavailable(ctx);
     const session_id = input.session_id orelse return unavailable(ctx);
-    if (runtime.retainedTerminalSnapshot(ctx.allocator, session_id) catch |err|
-        return runtimeFailure(ctx, err)) |retained|
-    {
-        var prepared = retained;
-        defer prepared.deinit(ctx.allocator);
-        return finishPrepared(ctx, runtime, &prepared, .stop);
+    ensureOwnedTtyIndexed(ctx, runtime, session_id) catch |err|
+        return runtimeFailure(ctx, err);
+    if (runtime.isTombstone(session_id)) {
+        if (runtime.retainedTerminalSnapshot(ctx.allocator, session_id) catch |err|
+            return runtimeFailure(ctx, err)) |retained|
+        {
+            var prepared = retained;
+            defer prepared.deinit(ctx.allocator);
+            return finishPrepared(ctx, runtime, &prepared, .stop);
+        }
     }
     if (runtime.backendFor(session_id) == .tty) {
         if (runtime.stateFor(session_id)) |state| {
@@ -531,6 +539,7 @@ fn callTtyRun(
         .backend = .native,
         .return_when = if (input.yield_time_ms == 0) .started else .exit,
         .wait_ceiling_ms = @max(@as(u64, 1), input.yield_time_ms),
+        .timeout_ms = input.timeout_ms,
         .persistence = persistence.view(),
     } };
     var executed = executeTerminal(ctx, request) catch |err|
@@ -564,6 +573,7 @@ fn callTtyRun(
         .replay_output = observed.replay_output,
         .next_cursor = observed.next_cursor,
         .output_incomplete = observed.output_incomplete,
+        .error_name = if (observed.timed_out) "TimeoutExpired" else null,
         .max_output_bytes = ctx.max_command_output_bytes,
         .published_running = observed.state == .running,
         .capacity_reserved = true,
@@ -627,6 +637,7 @@ fn callTtyWait(
         .replay_output = observed.replay_output,
         .next_cursor = observed.next_cursor,
         .output_incomplete = observed.output_incomplete,
+        .error_name = if (observed.timed_out) "TimeoutExpired" else null,
         .max_output_bytes = ctx.max_command_output_bytes,
         .published_running = true,
     }) catch |err| return runtimeFailure(ctx, err);
@@ -640,6 +651,8 @@ fn callWrite(
 ) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
     const runtime = ctx.managed_executions orelse return unavailable(ctx);
     const session_id = input.session_id orelse return unavailable(ctx);
+    ensureOwnedTtyIndexed(ctx, runtime, session_id) catch |err|
+        return runtimeFailure(ctx, err);
     if (runtime.isTombstone(session_id)) {
         return runtimeFailure(ctx, error.ExecutionTerminal);
     }
@@ -732,6 +745,7 @@ fn callWrite(
         .replay_output = observed.replay_output,
         .next_cursor = observed.next_cursor,
         .output_incomplete = observed.output_incomplete,
+        .error_name = if (observed.timed_out) "TimeoutExpired" else null,
         .max_output_bytes = ctx.max_command_output_bytes,
         .published_running = true,
     }) catch |err| return runtimeFailure(ctx, err);
@@ -810,6 +824,7 @@ fn callTtyStop(
         .replay_output = observed.replay_output,
         .next_cursor = observed.next_cursor,
         .output_incomplete = observed.output_incomplete,
+        .error_name = if (observed.timed_out) "TimeoutExpired" else null,
         .max_output_bytes = ctx.max_command_output_bytes,
         .published_running = true,
     }) catch |err| return runtimeFailure(ctx, err);
@@ -1109,6 +1124,16 @@ fn refreshTtyExecutions(
     );
 }
 
+fn ensureOwnedTtyIndexed(
+    ctx: tool_dispatch.DispatchContext,
+    runtime: *managed_execution.Runtime,
+    session_id: []const u8,
+) !void {
+    if (runtime.stateFor(session_id) != null) return;
+    const observer = ttyObserverContext(ctx, runtime) orelse return;
+    try terminal_managed_observer.syncOwned(observer);
+}
+
 fn refreshTtyExecution(
     ctx: tool_dispatch.DispatchContext,
     runtime: *managed_execution.Runtime,
@@ -1242,11 +1267,11 @@ fn publishSnapshotMetadata(
         .completed => true,
         .running, .stopped, .lost => false,
     };
-    if (completed and projection.signal != null) {
+    if (timed_out) {
+        memory.command_process_presentation = .timed_out;
+    } else if (completed and projection.signal != null) {
         const signal = projection.signal.?;
         memory.command_process_presentation = .{ .signal = signal };
-    } else if (timed_out) {
-        memory.command_process_presentation = .timed_out;
     } else if (projection.exit_code) |exit_code| {
         if (exit_code != 0) {
             memory.command_process_presentation = .{ .exit_code = exit_code };
@@ -1407,7 +1432,8 @@ fn formatSnapshotRaw(
     const status = switch (snapshot.state) {
         .completed => |value| value,
         .stopped => |value| value,
-        .running, .lost => null,
+        .lost => .indeterminate,
+        .running => null,
     };
     const projection: command_contract.StatusProjection = if (status) |value|
         command_contract.projectStatus(value)
@@ -1433,6 +1459,10 @@ fn formatSnapshotRaw(
         .accepted_bytes = accepted_bytes,
         .@"error" = snapshot.error_name,
         .next_action = next_action,
+        .retry_guidance = switch (snapshot.state) {
+            .lost => "Execution status is indeterminate. Inspect external state before retrying; do not blindly rerun a command that may have changed state.",
+            .running, .completed, .stopped => null,
+        },
         .output_delta = output_delta,
     }, .{}, &out.writer);
     return try out.toOwnedSlice();
@@ -1675,6 +1705,30 @@ test "stopped execution is a successful shell observation without command failur
     });
     try std.testing.expect(memory != null);
     try std.testing.expect(memory.?.command_process_presentation == null);
+}
+
+test "lost shell snapshot preserves indeterminate execution guidance" {
+    const alloc = std.testing.allocator;
+    const body = try formatSnapshot(alloc, .{
+        .execution_id = @constCast("shell-lost"),
+        .command = @constCast("mutating-command"),
+        .cwd = @constCast("/tmp"),
+        .retained = true,
+        .state = .lost,
+        .output_delta = @constCast(""),
+        .output_truncated = false,
+    }, null);
+    defer alloc.free(body);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    const object = parsed.value.object;
+    try std.testing.expect(object.get("termination_indeterminate").?.bool);
+    try std.testing.expect(std.mem.find(
+        u8,
+        object.get("retry_guidance").?.string,
+        "do not blindly rerun",
+    ) != null);
 }
 
 test "shell snapshot keeps bounded head tail and control metadata" {

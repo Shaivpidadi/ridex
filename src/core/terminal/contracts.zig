@@ -308,6 +308,7 @@ pub const StartRequest = struct {
     backend: Backend = .native,
     return_when: ?ReturnCondition = null,
     wait_ceiling_ms: ?u64 = null,
+    timeout_ms: ?u64 = null,
     dimensions: ?Dimensions = null,
     persistence: ?StartPersistence = null,
 };
@@ -421,6 +422,7 @@ pub const RequestValidationError = error{
     MissingReturnCondition,
     MissingWaitCeiling,
     InvalidWaitCeiling,
+    InvalidTimeout,
     InvalidDimensions,
     InvalidSessionId,
     InvalidRawCursor,
@@ -486,6 +488,11 @@ pub const ActionRequest = union(enum) {
                 }
                 if (request.wait_ceiling_ms) |ceiling_ms| {
                     if (ceiling_ms == 0) return error.InvalidWaitCeiling;
+                }
+                if (request.timeout_ms) |timeout_ms| {
+                    if (timeout_ms == 0 or timeout_ms > std.math.maxInt(i64)) {
+                        return error.InvalidTimeout;
+                    }
                 }
                 if (request.dimensions) |dimensions| try dimensions.validate();
                 if (request.persistence) |persistence| {
@@ -740,6 +747,7 @@ fn clone_start_request(alloc: Allocator, request: StartRequest) Allocator.Error!
         .backend = request.backend,
         .return_when = return_when,
         .wait_ceiling_ms = request.wait_ceiling_ms,
+        .timeout_ms = request.timeout_ms,
         .dimensions = request.dimensions,
         .persistence = persistence,
     };
@@ -2053,6 +2061,8 @@ pub const SessionFacts = struct {
     attention: AttentionState,
     backend: Backend,
     persistence: PersistenceLevel = .durable,
+    model_managed: bool = true,
+    timed_out: bool = false,
     output_cursor: RawCursor,
     unread_range: ?RawRange = null,
     raw_gap: ?RawGap = null,

@@ -65,7 +65,8 @@ pub fn execute(
                     .disconnected => .session_lost,
                     .response => .protocol_incompatible,
                 },
-                completion.kind == .disconnected,
+                completion.kind == .disconnected and
+                    disconnectedActionIsRetryable(request.action()),
             );
         }
         if (!cancellation_sent) {
@@ -78,6 +79,13 @@ pub fn execute(
         }
         io_mod.sleep(2 * std.time.ns_per_ms);
     }
+}
+
+fn disconnectedActionIsRetryable(action: contracts.Action) bool {
+    return switch (action) {
+        .read, .screen, .wait, .inspect, .list => true,
+        .start, .write, .resize, .signal, .close => false,
+    };
 }
 
 fn failure(
@@ -101,4 +109,13 @@ fn mapAdmissionError(err: anyerror) contracts.StructuredErrorCode {
         error.Cancelled => .cancelled,
         else => .protocol_incompatible,
     };
+}
+
+test "disconnect retryability excludes actions that may already have effects" {
+    try std.testing.expect(!disconnectedActionIsRetryable(.start));
+    try std.testing.expect(!disconnectedActionIsRetryable(.write));
+    try std.testing.expect(!disconnectedActionIsRetryable(.signal));
+    try std.testing.expect(!disconnectedActionIsRetryable(.close));
+    try std.testing.expect(disconnectedActionIsRetryable(.list));
+    try std.testing.expect(disconnectedActionIsRetryable(.wait));
 }

@@ -574,7 +574,7 @@ int main(int argc, char **argv) {
 buildCurrentClientFixture();
 
 function hostPaths(home: string) {
-  const dir = join(home, ".fx", "terminal-host-v6");
+  const dir = join(home, ".fx", "terminal-host-v7");
   return {
     dir,
     socket: join(dir, "host.sock"),
@@ -598,7 +598,7 @@ function terminalTransportPaths(home: string) {
     };
   }
   const digest = createHash("sha256")
-    .update("fx.terminal.transport.v2\0")
+    .update("fx.terminal.transport.v3\0")
     .update(home)
     .digest("hex")
     .slice(0, 32);
@@ -615,7 +615,7 @@ function terminalTransportPaths(home: string) {
 
 function makeLongHome(endpointBytes = 141): string {
   const root = mkdtempSync(join(tmpdir(), "fx-terminal-long-home-"));
-  const endpointSuffix = join(".fx", "terminal-host-v6", "host.sock");
+  const endpointSuffix = join(".fx", "terminal-host-v7", "host.sock");
   const componentBytes = endpointBytes -
     Buffer.byteLength(root) -
     Buffer.byteLength(endpointSuffix) -
@@ -1649,6 +1649,29 @@ test("fresh hidden host is singular, correlated, reconnectable, private, and idl
     expect(await streamText(child.stderr)).toBe("");
   }
 });
+
+test("host handshake is ready before slow durable recovery", async () => {
+  const home = makeHome();
+  const paths = hostPaths(home);
+  const child = startHost(home, { minimum: 4, current: 5 }, 350, {
+    FX_TERMINAL_TEST_STARTUP_RECOVERY_DELAY_MS: "5500",
+  });
+  await waitFor(() => existsSync(paths.socket) && existsSync(paths.identity));
+
+  const startedAt = Date.now();
+  const connected = await handshake(paths.socket, { minimum: 4, current: 5 });
+  expect(Date.now() - startedAt).toBeLessThan(2_000);
+  const response = await requestScreen(connected.client, connected.revision!, 73);
+  expect(response.payload).toMatchObject({
+    response: {
+      failure: { action: "screen", code: "protocol_incompatible" },
+    },
+  });
+  connected.client.close();
+  expect(await waitForExit(child)).toBe(0);
+  expect(await streamText(child.stdout)).toBe("");
+  expect(await streamText(child.stderr)).toBe("");
+}, 15_000);
 
 test("idle shutdown survives removal of the endpoint directory", async () => {
   const home = makeHome();

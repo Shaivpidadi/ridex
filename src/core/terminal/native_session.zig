@@ -1600,6 +1600,9 @@ const Session = struct {
     liveness_file: ?std.Io.File = null,
     output_thread: ?std.Thread = null,
     control_thread: ?std.Thread = null,
+    timeout_thread: ?std.Thread = null,
+    timeout_done: std.Io.Event = .unset,
+    timeout_at_ms: ?i64 = null,
     output_done: std.Io.Event = .unset,
     output_active: std.atomic.Value(bool) = .init(false),
     command_boundary_requested: std.atomic.Value(bool) = .init(false),
@@ -1666,6 +1669,7 @@ const Session = struct {
             .shell = shell,
             .cwd = cwd,
             .command = command,
+            .timeout_ms = request.timeout_ms,
             .backend = request.backend,
             .dimensions = dimensions,
             .persistence = persistence,
@@ -1744,6 +1748,7 @@ const Session = struct {
             .dimensions = durable.record.dimensions,
             .lifecycle = durable.record.lifecycle,
             .last_output_ms = durable.record.updated_at_ms,
+            .timeout_at_ms = durable.record.timeout_at_ms,
             .child_pid = child_pid,
             .child_token = child_token,
             .term = if (durable.record.termination) |termination| switch (termination) {
@@ -1779,10 +1784,57 @@ const Session = struct {
         durable_root: []const u8,
         transport_root: []const u8,
     ) !void {
-        return switch (request.backend) {
+        try switch (request.backend) {
             .native => self.launchNative(request),
             .tmux => self.launchTmux(request, durable_root, transport_root),
         };
+    }
+
+    fn startTimeoutWatcher(self: *Session) !void {
+        if (self.timeout_thread != null or self.timeout_at_ms == null or
+            self.timeout_done.isSet()) return;
+        self.timeout_thread = try std.Thread.spawn(.{}, timeoutMain, .{self});
+    }
+
+    fn stopTimeoutWatcher(self: *Session) void {
+        self.timeout_done.set(io_mod.getIo());
+        if (self.timeout_thread) |thread| {
+            thread.join();
+            self.timeout_thread = null;
+        }
+    }
+
+    fn timeoutMain(self: *Session) void {
+        const deadline_ms = self.timeout_at_ms orelse return;
+        while (!self.timeout_done.isSet()) {
+            const now_ms = io_mod.milliTimestamp();
+            if (now_ms >= deadline_ms) break;
+            const remaining_ms = deadline_ms - now_ms;
+            self.timeout_done.waitTimeout(io_mod.getIo(), .{ .duration = .{
+                .clock = .awake,
+                .raw = .fromMilliseconds(remaining_ms),
+            } }) catch |err| switch (err) {
+                error.Timeout => continue,
+                error.Canceled => return,
+            };
+        }
+        if (self.timeout_done.isSet()) return;
+
+        const zio = io_mod.getIo();
+        self.mutex.lockUncancelable(zio);
+        if (self.lifecycle != .starting and self.lifecycle != .running) {
+            self.mutex.unlock(zio);
+            return;
+        }
+        self.mutex.unlock(zio);
+        self.durable.mark_timed_out(io_mod.milliTimestamp()) catch |err| {
+            debug_trace.logf(
+                "terminal_host",
+                "terminal timeout persistence failed id={s} err={s}",
+                .{ self.id, @errorName(err) },
+            );
+        };
+        if (!self.signalProcess(.kill)) self.markLost();
     }
 
     fn launchTmux(
@@ -2039,6 +2091,7 @@ const Session = struct {
         if (tmuxRecoveryFailure(self.id, "control-thread")) return error.InjectedFailure;
         self.control_thread = try std.Thread.spawn(.{}, tmuxControlMain, .{self});
         self.backend_started = true;
+        try self.startTimeoutWatcher();
         return true;
     }
 
@@ -2259,6 +2312,7 @@ const Session = struct {
 
     fn deinit(self: *Session) void {
         self.shutdown();
+        self.stopTimeoutWatcher();
         if (self.backend_started) {
             self.finalizeBackend();
         } else {
@@ -2345,6 +2399,7 @@ const Session = struct {
     }
 
     fn shutdown(self: *Session) void {
+        self.timeout_done.set(io_mod.getIo());
         const zio = io_mod.getIo();
         self.mutex.lockUncancelable(zio);
         const running = self.lifecycle == .starting or self.lifecycle == .running;
@@ -2359,6 +2414,7 @@ const Session = struct {
         defer self.backend_join_mutex.unlock(zio);
         if (!self.backend_started) return;
         self.backend_done.waitUncancelable(zio);
+        self.stopTimeoutWatcher();
         if (self.control_thread) |thread| {
             thread.join();
             self.control_thread = null;
@@ -2917,6 +2973,7 @@ const Session = struct {
             };
             self.child_pid = pid;
             self.child_token = token;
+            self.timeout_at_ms = self.durable.record.timeout_at_ms;
             self.recovered_start_identity = false;
             self.lifecycle = contracts.transition_lifecycle(
                 self.lifecycle,
@@ -2925,11 +2982,23 @@ const Session = struct {
         }
         const failed = self.lifecycle == .lost;
         self.mutex.unlock(zio);
-        if (failed) self.closeLiveness();
+        if (failed) {
+            self.closeLiveness();
+            return;
+        }
+        self.startTimeoutWatcher() catch |err| {
+            debug_trace.logf(
+                "terminal_host",
+                "terminal timeout watcher failed id={s} err={s}",
+                .{ self.id, @errorName(err) },
+            );
+            self.markLost();
+        };
     }
 
     fn setTerm(self: *Session, term: std.process.Child.Term) void {
         const zio = io_mod.getIo();
+        self.timeout_done.set(zio);
         self.write_mutex.lockUncancelable(zio);
         self.mutex.lockUncancelable(zio);
         const final_checkpoint = self.lifecycle == .running and self.screen_available;
@@ -3036,6 +3105,7 @@ const Session = struct {
             .{self.id},
         );
         const zio = io_mod.getIo();
+        self.timeout_done.set(zio);
         self.mutex.lockUncancelable(zio);
         if (self.lifecycle == .starting or self.lifecycle == .running) {
             self.persistLostLocked(io_mod.milliTimestamp());

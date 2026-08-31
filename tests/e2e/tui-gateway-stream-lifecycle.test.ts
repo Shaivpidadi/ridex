@@ -6146,7 +6146,14 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       await session.waitForText("● 3 tool calls · 3 commands", TIMEOUT);
       await session.sendKeys("C-o");
       const fullAtTail = await session.waitForText(finalText, TIMEOUT);
-      expect(fullAtTail).toContain(
+      let fullAtNested = fullAtTail;
+      for (let page = 0; page < 10 && !fullAtNested.includes(
+        "├ Ran cd ./vercel/packages/cli/test/fixtures/unit/commands/git/connect/unlink",
+      ); page += 1) {
+        await session.sendKeys("PPage");
+        fullAtNested = await session.capturePane();
+      }
+      expect(fullAtNested).toContain(
         "├ Ran cd ./vercel/packages/cli/test/fixtures/unit/commands/git/connect/unlink",
       );
       expect(fullAtTail).toContain(`└ Ran ${thirdCommand}`);

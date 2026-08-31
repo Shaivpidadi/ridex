@@ -50,6 +50,7 @@ pub const TtyUpdate = struct {
     replay_output: ?[]const u8 = null,
     next_cursor: ?TtyCursor = null,
     output_incomplete: bool = false,
+    error_name: ?[]const u8 = null,
     max_output_bytes: usize,
     published_running: bool,
     capacity_reserved: bool = false,
@@ -157,10 +158,11 @@ const BackendState = union(enum) {
 
 const Entry = struct {
     runtime: *Runtime,
-    arena: std.heap.ArenaAllocator,
+    arena: *std.heap.ArenaAllocator,
     execution_id: []const u8,
     command: []const u8,
     cwd: []const u8,
+    environment: command_environment.Environment,
     max_output_bytes: usize,
     timeout_ms: ?usize,
     command_artifact_dir: ?[]const u8,
@@ -198,8 +200,12 @@ const Entry = struct {
     fn init(runtime: *Runtime, input: StartCapturedInput) !*Entry {
         const entry = try runtime.alloc.create(Entry);
         errdefer runtime.alloc.destroy(entry);
-        var arena = std.heap.ArenaAllocator.init(runtime.alloc);
-        errdefer arena.deinit();
+        const arena = try runtime.alloc.create(std.heap.ArenaAllocator);
+        arena.* = std.heap.ArenaAllocator.init(runtime.alloc);
+        errdefer {
+            arena.deinit();
+            runtime.alloc.destroy(arena);
+        }
         const owned = arena.allocator();
         const command = try owned.dupe(u8, input.command);
         const cwd = try owned.dupe(u8, input.cwd);
@@ -248,6 +254,7 @@ const Entry = struct {
             .execution_id = execution_id,
             .command = command,
             .cwd = cwd,
+            .environment = environment,
             .max_output_bytes = input.max_output_bytes,
             .timeout_ms = input.timeout_ms,
             .command_artifact_dir = command_artifact_dir,
@@ -267,8 +274,12 @@ const Entry = struct {
         if (input.next_cursor) |cursor| try cursor.validate();
         const entry = try runtime.alloc.create(Entry);
         errdefer runtime.alloc.destroy(entry);
-        var arena = std.heap.ArenaAllocator.init(runtime.alloc);
-        errdefer arena.deinit();
+        const arena = try runtime.alloc.create(std.heap.ArenaAllocator);
+        arena.* = std.heap.ArenaAllocator.init(runtime.alloc);
+        errdefer {
+            arena.deinit();
+            runtime.alloc.destroy(arena);
+        }
         const owned = arena.allocator();
         const execution_id = try owned.dupe(u8, input.execution_id);
         const command = try owned.dupe(u8, input.command);
@@ -296,12 +307,17 @@ const Entry = struct {
             input.output.len,
             input.max_output_bytes,
         )]);
+        const error_name = if (input.error_name) |value|
+            try owned.dupe(u8, value)
+        else
+            null;
         entry.* = .{
             .runtime = runtime,
             .arena = arena,
             .execution_id = execution_id,
             .command = command,
             .cwd = cwd,
+            .environment = .legacy,
             .max_output_bytes = input.max_output_bytes,
             .timeout_ms = null,
             .command_artifact_dir = null,
@@ -318,6 +334,7 @@ const Entry = struct {
             .published_running = input.published_running,
             .output_truncated = input.output.len > input.max_output_bytes,
             .stdout_bytes = raw_output.len,
+            .error_name = error_name,
         };
         if (entry.isTerminal()) entry.finalizeReplayLocked();
         return entry;
@@ -336,7 +353,18 @@ const Entry = struct {
         deinitReplayCapability(self.runtime, self.replay_capability);
         self.output.deinit(self.runtime.alloc);
         self.arena.deinit();
+        self.runtime.alloc.destroy(self.arena);
         self.runtime.alloc.destroy(self);
+    }
+
+    fn matchesCapturedInput(self: *const Entry, input: StartCapturedInput) bool {
+        return self.backend_kind == .captured and
+            std.mem.eql(u8, self.command, input.command) and
+            std.mem.eql(u8, self.cwd, input.cwd) and
+            self.environment.eql(input.environment) and
+            self.max_output_bytes == input.max_output_bytes and
+            self.timeout_ms == input.timeout_ms and
+            optionalStringEql(self.command_artifact_dir, input.command_artifact_dir);
     }
 
     fn statusSnapshot(self: *Entry) SnapshotState {
@@ -1028,6 +1056,9 @@ pub const Runtime = struct {
         defer self.mutex.unlock(zio);
         if (self.shutting_down) return error.RuntimeStopping;
         if (self.findEntryLocked(input.execution_id)) |existing| {
+            if (!existing.matchesCapturedInput(input)) {
+                return error.ExecutionIdentityConflict;
+            }
             return .{ .entry = existing, .created = false };
         }
         const live_count = self.liveCountLocked() + self.pending_admissions;
@@ -1345,7 +1376,16 @@ fn applyTtyUpdateLocked(entry: *Entry, input: TtyUpdate) !void {
     }
     try entry.appendBoundedOutput(input.output);
     entry.output_truncated = entry.output_truncated or input.output_incomplete;
+    if (input.error_name) |error_name| {
+        entry.error_name = try entry.arena.allocator().dupe(u8, error_name);
+    }
     if (entry.isTerminal()) entry.finalizeReplayLocked();
+}
+
+fn optionalStringEql(left: ?[]const u8, right: ?[]const u8) bool {
+    if ((left == null) != (right == null)) return false;
+    if (left) |value| return std.mem.eql(u8, value, right.?);
+    return true;
 }
 
 fn duplicateReplayCapability(
@@ -1462,6 +1502,36 @@ test "captured managed execution yields one handle and delivers ordered output o
     defer repeated.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 0), repeated.snapshot.output_delta.len);
     try runtime.commitDelivery(repeated.snapshot.execution_id, repeated.reservation_id);
+}
+
+test "captured execution identity rejects a different command" {
+    if (comptime builtin.os.tag == .wasi) return;
+    const alloc = std.testing.allocator;
+    var runtime = Runtime.init(alloc);
+    defer runtime.deinit();
+    var first = StartCapturedInput{
+        .execution_id = "managed-identity",
+        .command = "sleep 1",
+        .cwd = "/tmp",
+        .environment = .legacy,
+        .authority = undefined,
+        .max_output_bytes = 1024,
+        .timeout_ms = 2_000,
+        .command_artifact_dir = null,
+        .yield_time_ms = 0,
+    };
+    first.authority = testAuthority(first);
+    var started = try runtime.startCaptured(alloc, first);
+    defer started.deinit(alloc);
+    try runtime.commitDelivery(started.snapshot.execution_id, started.reservation_id);
+
+    var conflicting = first;
+    conflicting.command = "printf should-not-run";
+    conflicting.authority = testAuthority(conflicting);
+    try std.testing.expectError(
+        error.ExecutionIdentityConflict,
+        runtime.startCaptured(alloc, conflicting),
+    );
 }
 
 test "captured managed execution capacity rejects before spawn" {
