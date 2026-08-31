@@ -2962,7 +2962,6 @@ test "processQueuedPrompt compacts mid-turn after tool output crosses eighty per
     )};
     const completions = [_]FakeCompletion{
         .{ .tool_calls = &calls },
-        .{ .content = "{\"objective\":{\"text\":\"Finish after reading large.txt.\",\"sources\":[\"S0\"]},\"constraints\":[],\"obligations\":[],\"next_action\":{\"kind\":\"none\",\"text\":\"Return the conclusion.\",\"sources\":[\"S0\"]}}" },
         .{ .content = "Mid-turn compaction complete." },
     };
     var gateway = FakeGateway.init(alloc, &completions);
@@ -2987,13 +2986,12 @@ test "processQueuedPrompt compacts mid-turn after tool output crosses eighty per
 
     try runFakePrompt(&gateway, &hooks, config, job);
 
-    try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
     try expectBodyNotContains(&gateway, 0, "context_handoff");
-    try expectBodyContains(&gateway, 1, "MIDTURN_RESULT_SENTINEL");
-    try expectBodyContains(&gateway, 1, "\"toolChoice\":{\"type\":\"none\"}");
-    try expectBodyContains(&gateway, 1, "\"tools\":[]");
-    try expectBodyContains(&gateway, 2, "context_handoff");
-    try expectBodyNotContains(&gateway, 2, "MIDTURN_RESULT_SENTINEL");
+    try expectBodyContains(&gateway, 1, "context_handoff");
+    try expectBodyContains(&gateway, 1, "status=success");
+    try expectBodyContains(&gateway, 1, "result_handle=");
+    try expectBodyNotContains(&gateway, 1, "MIDTURN_RESULT_SENTINEL");
     try std.testing.expectEqual(@as(usize, 1), hooks.successful_effect_count.load(.seq_cst));
     try std.testing.expectEqual(@as(usize, 2), hooks.history_turns.items.len);
     try std.testing.expect(hooks.history_turns.items[0] == .compacted_summary);
@@ -3002,6 +3000,7 @@ test "processQueuedPrompt compacts mid-turn after tool output crosses eighty per
     try std.testing.expect(persisted_result.output_handle != null);
     try std.testing.expect(std.mem.find(u8, persisted_result.output, "MIDTURN_RESULT_SENTINEL") != null);
     try std.testing.expect(persisted_result.output.len > 10 * 1024);
+    try std.testing.expectEqualStrings("Mid-turn compaction complete.", hooks.finish_assistant_text.?);
 }
 
 test "processQueuedPrompt fails after an ineligible tool result cannot fit" {

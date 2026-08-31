@@ -3731,10 +3731,15 @@ fn processQueuedPromptLoop(
                             compaction_messages.items,
                             result_storage,
                         );
-                        const retained_message_count: usize = if (within_turn_suffix.items.len > 0)
-                            0
+                        const retained_history_tail = if (within_turn_suffix.items.len > 0)
+                            session_runtime.RetainedHistoryTail{ .turn_count = 0, .message_count = 0 }
                         else
-                            @min(@as(usize, 2), compaction_messages.items.len);
+                            try session_runtime.retainedHistoryTailForMessageCount(
+                                arena,
+                                job.history,
+                                2,
+                            );
+                        const retained_message_count = retained_history_tail.message_count;
                         const retained_tokens = runtime_prompt_context.estimateCompactionSourceTokens(
                             compaction_messages.items[compaction_messages.items.len - retained_message_count ..],
                         );
@@ -3792,6 +3797,9 @@ fn processQueuedPromptLoop(
                                 .cancel_flag = config.cancel_flag,
                                 .accepted_tokens = accepted_tokens,
                                 .generation_tokens = compactor_generation_tokens,
+                                .compactor_input_tokens = runtime_prompt_context.usableInputTokens(
+                                    compactor_capabilities,
+                                ),
                                 .provider_options = model_capabilities.resolveProviderOptionsForCapabilities(
                                     compactor_capabilities,
                                     .auto,

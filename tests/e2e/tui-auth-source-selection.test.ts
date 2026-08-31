@@ -159,14 +159,15 @@ function startFakeProviderCompaction(provider: "codex" | "grok") {
           timeout_ms: 600_000,
         });
         return new Response(
-          'data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call_pressure","name":"terminal"}}\n\n' +
+          'data: {"type":"response.output_text.delta","delta":"Running the requested pressure fixture."}\n\n' +
+            'data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call_pressure","name":"terminal"}}\n\n' +
             `data: ${JSON.stringify({ type: "response.function_call_arguments.done", output_index: 0, arguments: input })}\n\n` +
             'data: {"type":"response.completed","response":{"id":"response-tool","status":"completed","usage":{"input_tokens":7,"output_tokens":3}}}\n\n',
           { headers: { "content-type": "text/event-stream" } },
         );
       }
       const text = model === compactionModel
-        ? '{"objective":{"text":"Continue after provider-local compaction.","sources":["S0"]},"constraints":[],"obligations":[],"next_action":{"kind":"none","text":"Continue.","sources":["S0"]}}'
+        ? "Continue after provider-local compaction."
         : `${provider.toUpperCase()}_COMPACTION_CONTINUED`;
       return new Response(
         `data: ${JSON.stringify({ type: "response.output_text.delta", delta: text })}\n\n` +

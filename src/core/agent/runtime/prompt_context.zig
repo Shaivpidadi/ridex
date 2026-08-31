@@ -168,7 +168,7 @@ pub fn estimateCompactionSourceTokens(messages: []const ChatMessage) usize {
     return @intCast(@min(estimator.estimate(), std.math.maxInt(usize)));
 }
 
-fn usableInputTokens(
+pub fn usableInputTokens(
     capabilities: model_capabilities.Capabilities,
 ) ?usize {
     const context_window = capabilities.context_window orelse return null;

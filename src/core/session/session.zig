@@ -2633,6 +2633,82 @@ pub fn retainedHistoryTurnCountForMessageTail(
     return retained_turns;
 }
 
+pub const RetainedHistoryTail = struct {
+    turn_count: usize,
+    message_count: usize,
+};
+
+pub fn retainedHistoryTailForMessageCount(
+    alloc: Allocator,
+    history: []const HistoryTurn,
+    wanted_messages: usize,
+) !RetainedHistoryTail {
+    const turn_count = try retainedHistoryTurnCountForMessageTail(
+        alloc,
+        history,
+        wanted_messages,
+    );
+    if (turn_count == 0) return .{ .turn_count = 0, .message_count = 0 };
+
+    var retained_start = history.len;
+    var remaining = turn_count;
+    while (retained_start > 0 and remaining > 0) {
+        retained_start -= 1;
+        if (history[retained_start] != .compacted_summary) remaining -= 1;
+    }
+    if (remaining != 0) return error.InvalidContextHistoryStart;
+
+    var projected: std.ArrayList(core_types.ChatMessage) = .empty;
+    defer projected.deinit(alloc);
+    try appendCompactionHistoryChatMessages(
+        alloc,
+        &projected,
+        history[retained_start..],
+    );
+    return .{
+        .turn_count = turn_count,
+        .message_count = projected.items.len,
+    };
+}
+
+test "retained compaction tail expands requested messages to complete raw turns" {
+    const alloc = std.testing.allocator;
+    var calls = [_]core_types.ToolCall{.{
+        .id = @constCast("tail-call"),
+        .name = @constCast("terminal"),
+        .arguments_json = @constCast("{\"action\":\"exec\",\"command\":\"printf tail\"}"),
+    }};
+    var results = [_]core_types.PersistedToolResult{.{
+        .tool_call_id = @constCast("tail-call"),
+        .tool_name = @constCast("terminal"),
+        .status = .success,
+        .output = @constCast("tail result"),
+        .output_bytes = 11,
+        .stored_output_bytes = 11,
+    }};
+    var steps = [_]core_types.ToolExecutionStep{.{
+        .assistant = @constCast("running"),
+        .tool_calls = &calls,
+        .tool_results = &results,
+    }};
+    var history = [_]HistoryTurn{
+        .{ .compacted_summary = .{
+            .summary = @constCast("older summary"),
+            .removed_turn_count = 1,
+            .compaction_count = 1,
+        } },
+        .{ .assistant = .{
+            .user = .{ .text = @constCast("run the tail command") },
+            .assistant = @constCast("tail complete"),
+            .execution = .{ .tool_steps = &steps },
+        } },
+    };
+
+    const tail = try retainedHistoryTailForMessageCount(alloc, &history, 2);
+    try std.testing.expectEqual(@as(usize, 1), tail.turn_count);
+    try std.testing.expectEqual(@as(usize, 4), tail.message_count);
+}
+
 test "active context projects checkpoint before retained raw tail" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();

@@ -4122,7 +4122,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         fakeGatewayFinalText("FIRST_REPLY_COMPACTION_SENTINEL"),
         fakeGatewayFinalText("SECOND_REPLY_COMPACTION_SENTINEL"),
         fakeGatewayFinalText(
-          '{"objective":{"text":"Continue the compacted session.","sources":["S0"]},"constraints":[{"text":"Preserve FIRST_PROMPT_COMPACTION_SENTINEL and SECOND_PROMPT_COMPACTION_SENTINEL.","sources":["S0"]}],"obligations":[],"next_action":{"kind":"await_external_input","text":"Answer the next user prompt.","sources":["S0"]}}',
+          "Continue the compacted session. Preserve FIRST_PROMPT_COMPACTION_SENTINEL and SECOND_PROMPT_COMPACTION_SENTINEL.",
         ),
         fakeGatewayFinalText("compaction restart complete"),
       ];
@@ -4196,9 +4196,11 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         const compactRequest = JSON.parse(gateway.requests[3].body) as {
           tools?: unknown[];
           toolChoice?: { type?: string };
+          responseFormat?: unknown;
         };
         expect(compactRequest.tools).toEqual([]);
         expect(compactRequest.toolChoice).toEqual({ type: "none" });
+        expect(compactRequest.responseFormat).toBeUndefined();
 
         const resumed = await runFx(
           [
@@ -4289,9 +4291,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         fakeGatewayToolCall(beforeCallId, "skill", { name: skillName }),
         fakeGatewayFinalText("SKILL_BEFORE_COMPACTION_COMPLETE"),
         fakeGatewayFinalText("SECOND_COMPACTION_TURN_COMPLETE"),
-        fakeGatewayFinalText(
-          '{"objective":{"text":"Continue after compacting the explicit skill workflow.","sources":["S0"]},"constraints":[],"obligations":[],"next_action":{"kind":"await_external_input","text":"Read the skill again when asked.","sources":["S0"]}}',
-        ),
+        fakeGatewayFinalText("Continue the explicit skill workflow when the user asks."),
         fakeGatewayToolCall(afterCallId, "skill", { name: skillName }),
         fakeGatewayFinalText("SKILL_AFTER_COMPACTION_COMPLETE"),
       ];
@@ -4346,10 +4346,12 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         expect(after).toContain(bodySentinel);
         expect(before).not.toContain("tool_result_handle");
         expect(after).not.toContain("tool_result_handle");
-        expect(compactionRequest).toContain(bodySentinel);
-        expect(compactionRequest).toContain("<skill_content");
-        expect(compactionRequest).toContain("tool_result_handle");
+        expect(compactionRequest).toContain("Read the explicit skill before compaction.");
+        expect(compactionRequest).not.toContain(bodySentinel);
+        expect(compactionRequest).not.toContain("<skill_content");
+        expect(compactionRequest).not.toContain("tool_result_handle");
         expect(postCompactionRequest).toContain("context_handoff");
+        expect(postCompactionRequest).toContain("result_handle=");
         expect(postCompactionRequest).not.toContain(bodySentinel);
         expect(readFileSync(stderrPath, "utf8")).toBe("");
       } finally {

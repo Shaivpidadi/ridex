@@ -1044,7 +1044,12 @@ pub fn Runtime(comptime App: type) type {
             const source_tokens = runtime_prompt_context.estimateCompactionSourceTokens(
                 messages.items,
             );
-            const retained_message_count = @min(@as(usize, 2), messages.items.len);
+            const retained_tail = try session_runtime.retainedHistoryTailForMessageCount(
+                arena,
+                job.history,
+                2,
+            );
+            const retained_message_count = retained_tail.message_count;
             const retained_tokens = runtime_prompt_context.estimateCompactionSourceTokens(
                 messages.items[messages.items.len - retained_message_count ..],
             );
@@ -1106,6 +1111,9 @@ pub fn Runtime(comptime App: type) type {
                     .cancel_flag = &app.worker.worker_cancel_requested,
                     .accepted_tokens = accepted_tokens,
                     .generation_tokens = compactor_generation_tokens,
+                    .compactor_input_tokens = runtime_prompt_context.usableInputTokens(
+                        compactor_capabilities,
+                    ),
                     .provider_options = model_capabilities.resolveProviderOptionsForCapabilities(
                         compactor_capabilities,
                         .auto,
@@ -1119,11 +1127,8 @@ pub fn Runtime(comptime App: type) type {
             defer compacted.deinit(std.heap.c_allocator);
 
             const raw_turn_count = session_runtime.rawHistoryTurnCount(job.history);
-            const retained_turn_count = try session_runtime.retainedHistoryTurnCountForMessageTail(
-                arena,
-                job.history,
-                compacted.retained_message_count,
-            );
+            std.debug.assert(compacted.retained_message_count == retained_tail.message_count);
+            const retained_turn_count = retained_tail.turn_count;
             if (retained_turn_count > raw_turn_count) {
                 return error.InvalidContextHistoryStart;
             }
