@@ -166,9 +166,8 @@ pub fn validateRequest(
             .child_id = try validateChildIdAlloc(alloc, value.child_id),
         } },
         .send => |value| blk: {
-            domain.validateId(value.child_id) catch return error.InvalidChildId;
             try validateText(value.message, domain.max_message_bytes, error.InvalidMessage);
-            const child_id = try alloc.dupe(u8, value.child_id);
+            const child_id = try validateChildIdAlloc(alloc, value.child_id);
             errdefer alloc.free(child_id);
             break :blk .{ .send = .{
                 .child_id = child_id,
@@ -195,7 +194,58 @@ fn validateText(
 
 fn validateChildIdAlloc(alloc: Allocator, value: []const u8) ValidationError![]u8 {
     domain.validateId(value) catch return error.InvalidChildId;
-    return alloc.dupe(u8, value);
+    var segments = std.mem.splitScalar(u8, value, '-');
+    const millis = segments.next() orelse return alloc.dupe(u8, value);
+    const nanos_suffix = segments.next() orelse return alloc.dupe(u8, value);
+    const random = segments.next() orelse return alloc.dupe(u8, value);
+    if (segments.next() != null or nanos_suffix.len != 6 or
+        !asciiDigits(millis) or !asciiDigits(nanos_suffix) or
+        !lowerHex(random, 16))
+    {
+        return alloc.dupe(u8, value);
+    }
+    const canonical = try std.fmt.allocPrint(
+        alloc,
+        "{s}-{s}{s}-{s}",
+        .{ millis, millis, nanos_suffix, random },
+    );
+    domain.validateId(canonical) catch {
+        alloc.free(canonical);
+        return error.InvalidChildId;
+    };
+    return canonical;
+}
+
+pub fn modelChildIdAlloc(alloc: Allocator, value: []const u8) Allocator.Error![]u8 {
+    var segments = std.mem.splitScalar(u8, value, '-');
+    const millis = segments.next() orelse return alloc.dupe(u8, value);
+    const nanos = segments.next() orelse return alloc.dupe(u8, value);
+    const random = segments.next() orelse return alloc.dupe(u8, value);
+    if (segments.next() != null or nanos.len != millis.len + 6 or
+        !asciiDigits(millis) or !asciiDigits(nanos) or
+        !lowerHex(random, 16) or !std.mem.startsWith(u8, nanos, millis))
+    {
+        return alloc.dupe(u8, value);
+    }
+    return std.fmt.allocPrint(
+        alloc,
+        "{s}-{s}-{s}",
+        .{ millis, nanos[millis.len..], random },
+    );
+}
+
+fn asciiDigits(value: []const u8) bool {
+    if (value.len == 0) return false;
+    for (value) |byte| if (!std.ascii.isDigit(byte)) return false;
+    return true;
+}
+
+fn lowerHex(value: []const u8, expected_len: usize) bool {
+    if (value.len != expected_len) return false;
+    for (value) |byte| {
+        if (!std.ascii.isDigit(byte) and (byte < 'a' or byte > 'f')) return false;
+    }
+    return true;
 }
 
 pub const Snapshot = struct {
@@ -350,7 +400,7 @@ test "managed result encoding is compact and explicit" {
 
 fn checkValidationAllocationFailures(alloc: Allocator) !void {
     var request = try validateRequest(alloc, .{ .send = .{
-        .child_id = "01J00000000000000000000000",
+        .child_id = "1788212822437-350000-0924a40611358d88",
         .message = "continue",
     } });
     request.deinit(alloc);
@@ -362,4 +412,22 @@ test "managed request validation cleans partial allocation failures" {
         checkValidationAllocationFailures,
         .{},
     );
+}
+
+test "managed child IDs use one reversible model-facing representation" {
+    const alloc = std.testing.allocator;
+    const canonical = "1788212822437-1788212822437350000-0924a40611358d88";
+    const compact = try modelChildIdAlloc(alloc, canonical);
+    defer alloc.free(compact);
+    try std.testing.expectEqualStrings(
+        "1788212822437-350000-0924a40611358d88",
+        compact,
+    );
+    var request = try validateRequest(alloc, .{ .wait = .{ .child_id = compact } });
+    defer request.deinit(alloc);
+    try std.testing.expectEqualStrings(canonical, request.wait.child_id);
+
+    const unchanged = try modelChildIdAlloc(alloc, "child-1");
+    defer alloc.free(unchanged);
+    try std.testing.expectEqualStrings("child-1", unchanged);
 }

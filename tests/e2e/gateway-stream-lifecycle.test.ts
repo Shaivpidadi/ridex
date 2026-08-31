@@ -31,6 +31,7 @@ import {
 } from "./conditional-guidance-oracle";
 import { expectPermissionModeContext } from "./permission-mode-context";
 import {
+  canonicalSubagentIdForStore,
   fakeGatewayFinalText,
   fakeGatewaySse,
   fakeGatewaySerializedToolCall,
@@ -452,14 +453,28 @@ function subagentOutcome(body: string, callId: string): SubagentOutcome {
 
 function subagentControl(root: FixtureRoot, childId: string): any {
   return JSON.parse(readFileSync(
-    join(root.home, ".fx", "sessions", childId, "subagent", "control.json"),
+    join(
+      root.home,
+      ".fx",
+      "sessions",
+      canonicalSubagentIdForStore(childId),
+      "subagent",
+      "control.json",
+    ),
     "utf8",
   ));
 }
 
 function subagentCommunication(root: FixtureRoot, childId: string): any {
   return JSON.parse(readFileSync(
-    join(root.home, ".fx", "sessions", childId, "subagent", "communication.json"),
+    join(
+      root.home,
+      ".fx",
+      "sessions",
+      canonicalSubagentIdForStore(childId),
+      "subagent",
+      "communication.json",
+    ),
     "utf8",
   ));
 }
@@ -5282,6 +5297,8 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(firstChildId.length).toBeGreaterThan(0);
       expect(longChildId.length).toBeGreaterThan(0);
       expect(firstChildId).not.toBe(longChildId);
+      expect(firstChildId.split("-")[1]).toHaveLength(6);
+      expect(longChildId.split("-")[1]).toHaveLength(6);
       expect(subagentControl(root, firstChildId).state).toBe("idle");
       expect(subagentControl(root, longChildId).state).toBe("idle");
       for (const request of gateway.requests) {

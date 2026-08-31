@@ -39,6 +39,11 @@ const MIRRORED_ENV_KEYS = [
   "FX_MODEL",
 ] as const;
 
+export function canonicalSubagentIdForStore(childId: string): string {
+  const match = /^(\d+)-(\d{6})-([0-9a-f]{16})$/.exec(childId);
+  return match ? `${match[1]}-${match[1]}${match[2]}-${match[3]}` : childId;
+}
+
 export function terminalFixtureShell(): string {
   for (const path of ["/bin/zsh", "/bin/bash"]) {
     if (existsSync(path)) return path;

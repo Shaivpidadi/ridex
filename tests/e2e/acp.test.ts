@@ -26,6 +26,7 @@ import {
 } from "./conditional-guidance-oracle";
 import { expectPermissionModeContext } from "./permission-mode-context";
 import {
+  canonicalSubagentIdForStore,
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText as finalText,
   heldFakeGatewayFinalText,
@@ -2662,7 +2663,7 @@ describe("acp: model-independent", () => {
           const created = JSON.parse(acpToolResultText(body, createId)) as {
             child_id: string;
           };
-          childId = created.child_id;
+          childId = canonicalSubagentIdForStore(created.child_id);
           return finalText("ACP project MCP subagent started");
         }
         if (acpPromptText(body).includes(childPrompt)) {
@@ -7294,7 +7295,7 @@ describe("acp: model-independent", () => {
               acpToolResultText(body, parentCreateId),
             ) as { child_id: string; status: string };
             expect(created.status.length).toBeGreaterThan(0);
-            childId = created.child_id;
+            childId = canonicalSubagentIdForStore(created.child_id);
             parentCompleted = true;
             return finalText(`ACP_${childMode.toUpperCase()}_MCP_PARENT_DONE`);
           }
@@ -7543,7 +7544,7 @@ describe("acp: model-independent", () => {
               status: string;
             };
             expect(created.status.length).toBeGreaterThan(0);
-            childId = created.child_id;
+            childId = canonicalSubagentIdForStore(created.child_id);
             return codexFinalText("CODEX_PARENT_CREATED_CHILD");
           }
           if (body.includes("Send the persistent Codex child another message.")) {
@@ -7668,7 +7669,7 @@ describe("acp: model-independent", () => {
           if (toolResult?.callId === "grok_child_create") {
             const created = JSON.parse(toolResult.output) as { child_id: string; status: string };
             expect(created.status.length).toBeGreaterThan(0);
-            childId = created.child_id;
+            childId = canonicalSubagentIdForStore(created.child_id);
             return codexFinalText("GROK_PARENT_CREATED_CHILD");
           }
           if (body.includes("Send the persistent Grok child another message.")) {

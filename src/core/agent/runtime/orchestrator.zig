@@ -32,6 +32,7 @@ const tool_preparation = @import("../tool_preparation.zig");
 const command_admission = @import("../../permissions/command_admission.zig");
 const permission_auto_classifier = @import("../../permissions/auto_classifier.zig");
 const auto_classifier_context = @import("../../permissions/auto_classifier_context.zig");
+const subagent_model_contract = @import("../../subagent/model_contract.zig");
 
 const runtime_config = @import("config.zig");
 const runtime_finalization = @import("finalization.zig");
@@ -695,10 +696,17 @@ fn project_subagent_result_content(
         return null;
     }
 
-    var compact = std.json.Value{ .object = .empty };
     const arena = parsed.arena.allocator();
+    const model_child_id = if (child_id == .string)
+        std.json.Value{ .string = try subagent_model_contract.modelChildIdAlloc(
+            arena,
+            child_id.string,
+        ) }
+    else
+        child_id;
+    var compact = std.json.Value{ .object = .empty };
     try compact.object.put(arena, "ok", ok);
-    try compact.object.put(arena, "child_id", child_id);
+    try compact.object.put(arena, "child_id", model_child_id);
     try compact.object.put(arena, "status", status);
     try compact.object.put(arena, "error_code", error_code);
     try compact.object.put(arena, "retryable", retryable);
@@ -911,7 +919,7 @@ test "subagent history maps representable manager calls and makes removed action
         },
     };
     const stored_result =
-        "{\"ok\":true,\"operation_id\":\"fxop:2:m:1:0000000000000000000000000000000000000000000000000000000000000000\",\"child_id\":\"child-1\",\"status\":\"idle\",\"error_code\":null,\"retryable\":false}";
+        "{\"ok\":true,\"operation_id\":\"fxop:2:m:1:0000000000000000000000000000000000000000000000000000000000000000\",\"child_id\":\"1788212822437-1788212822437350000-0924a40611358d88\",\"status\":\"idle\",\"error_code\":null,\"retryable\":false}";
     const messages = [_]ChatMessage{
         .{ .role = .assistant, .tool_calls = &calls },
         .{ .role = .tool, .tool_call_id = "legacy-create", .tool_name = "subagent", .content = stored_result },
@@ -933,6 +941,11 @@ test "subagent history maps representable manager calls and makes removed action
     );
     try std.testing.expectEqualStrings(calls[2].arguments_json, projected[0].tool_calls[1].arguments_json);
     try std.testing.expect(std.mem.find(u8, projected[1].content.?, "operation_id") == null);
+    try std.testing.expect(std.mem.find(
+        u8,
+        projected[1].content.?,
+        "1788212822437-350000-0924a40611358d88",
+    ) != null);
     try std.testing.expectEqual(types.ChatRole.assistant, projected[2].role);
     try std.testing.expect(std.mem.find(
         u8,
