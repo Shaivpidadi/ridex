@@ -1494,6 +1494,94 @@ describe("acp: model-independent", () => {
   );
 
   test(
+    "ordinary ACP ignores private libfx host capabilities",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-private-capabilities-");
+      const gateway = startFakeGateway([finalText("ACP_PRIVATE_CAPABILITIES_IGNORED")]);
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        await client.request(
+          "initialize",
+          {
+            protocolVersion: 1,
+            clientCapabilities: {
+              libfx: {
+                tools: [{
+                  name: "private_lookup",
+                  description: "Private libfx tool",
+                  inputSchema: { type: "object" },
+                }],
+                instructions: "PRIVATE_LIBFX_INSTRUCTIONS",
+              },
+            },
+          },
+          1,
+        );
+        await client.request("session/new", { mcpServers: [] }, 2);
+        await client.readLine();
+        await client.request("session/set_mode", { modeId: "code" }, 3);
+
+        const result = await runPrompt(client, "Use the ordinary ACP tool surface.", TIMEOUT);
+        expect(result.promptResult.result.stopReason).toBe("end_turn");
+        expect(gateway.requests).toHaveLength(1);
+        const request = acpGatewayRequest(gateway.requests[0]!.body);
+        expect(request.tools.some((tool) => tool.name === "private_lookup")).toBe(false);
+        expect(request.tools.some((tool) => tool.name === "terminal")).toBe(true);
+        expect(gateway.requests[0]!.body).not.toContain("PRIVATE_LIBFX_INSTRUCTIONS");
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "ordinary ACP rejects private libfx methods without replacing its session",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-private-methods-");
+      const gateway = startFakeGateway([finalText("ACP_PRIVATE_METHODS_REJECTED")]);
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        const created = await client.request("session/new", { mcpServers: [] }, 2) as any;
+        const sessionId = created.result.sessionId as string;
+        await client.readLine();
+
+        for (const [id, method, params] of [
+          [3, "libfx/checkpoint", { sessionId }],
+          [4, "libfx/restore", { sessionId, checkpoint: "" }],
+          [5, "libfx/new", {}],
+        ] as const) {
+          expect(await client.request(method, params, id)).toMatchObject({
+            jsonrpc: "2.0",
+            id,
+            error: { code: -32601, message: "Method not found" },
+          });
+        }
+
+        const followUp = await runPrompt(client, "Keep using the original ACP session.", TIMEOUT);
+        expect(followUp.promptResult.result.stopReason).toBe("end_turn");
+        expect(gateway.requests).toHaveLength(1);
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "read_file rejects a FIFO without waiting for a writer",
     async () => {
       const root = createIsolatedRoot("fx-acp-read-file-fifo-");

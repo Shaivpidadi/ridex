@@ -105,6 +105,13 @@ const AcpMethod = enum {
             => true,
         };
     }
+
+    fn isLibfx(self: AcpMethod) bool {
+        return switch (self) {
+            .libfx_checkpoint, .libfx_restore, .libfx_new => true,
+            else => false,
+        };
+    }
 };
 
 pub const Config = acp_runner.Config;
@@ -1113,6 +1120,13 @@ fn dispatch(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void 
         return state.writer.writeResponse(alloc, msg.id, "null");
     }
 
+    if (method.isLibfx() and !state.cfg.minimal_kernel) {
+        return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.method_not_found,
+            .message = "Method not found",
+        });
+    }
+
     if (method.waitsForActivePrompt() and state.active_prompt != null) {
         return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_request,
@@ -1376,6 +1390,7 @@ const InitializeRequest = struct {
 fn parseInitializeRequest(
     alloc: Allocator,
     params: ?[]const u8,
+    allow_libfx: bool,
 ) !InitializeRequest {
     const raw = params orelse return error.InvalidInitializeParams;
     const parsed = std.json.parseFromSlice(std.json.Value, alloc, raw, .{}) catch
@@ -1407,18 +1422,20 @@ fn parseInitializeRequest(
         request.client_terminal = value == .bool and value.bool;
     }
     request.client_elicitation = elicitation.parseAcpCapabilities(capabilities);
-    if (capabilities.object.get("libfx")) |libfx| {
-        if (libfx != .object) return error.InvalidInitializeParams;
-        request.host_tools = try host_tool_runtime.Runtime.init(
-            alloc,
-            libfx.object.get("tools"),
-        );
-        errdefer request.host_tools.deinit();
-        if (libfx.object.get("instructions")) |instructions| {
-            if (instructions != .string or instructions.string.len > 64 * 1024) {
-                return error.InvalidInitializeParams;
+    if (allow_libfx) {
+        if (capabilities.object.get("libfx")) |libfx| {
+            if (libfx != .object) return error.InvalidInitializeParams;
+            request.host_tools = try host_tool_runtime.Runtime.init(
+                alloc,
+                libfx.object.get("tools"),
+            );
+            errdefer request.host_tools.deinit();
+            if (libfx.object.get("instructions")) |instructions| {
+                if (instructions != .string or instructions.string.len > 64 * 1024) {
+                    return error.InvalidInitializeParams;
+                }
+                request.host_instructions = try alloc.dupe(u8, instructions.string);
             }
-            request.host_instructions = try alloc.dupe(u8, instructions.string);
         }
     }
     return request;
@@ -1429,12 +1446,26 @@ test "ACP initialize owns libfx tools and instructions" {
     var request = try parseInitializeRequest(
         alloc,
         \\{"protocolVersion":1,"clientCapabilities":{"libfx":{"tools":[{"name":"lookup","description":"Lookup","inputSchema":{"type":"object"}}],"instructions":"Be concise."}}}
-        ,
+    ,
+        true,
     );
     defer request.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), request.host_tools.tools.len);
     try std.testing.expectEqualStrings("lookup", request.host_tools.tools[0].name);
     try std.testing.expectEqualStrings("Be concise.", request.host_instructions);
+}
+
+test "ordinary ACP ignores private libfx capabilities" {
+    const alloc = std.testing.allocator;
+    var request = try parseInitializeRequest(
+        alloc,
+        \\{"protocolVersion":1,"clientCapabilities":{"libfx":"ignored"}}
+    ,
+        false,
+    );
+    defer request.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), request.host_tools.tools.len);
+    try std.testing.expectEqual(@as(usize, 0), request.host_instructions.len);
 }
 
 fn loadConfiguredStartupState(state: *const ServerState, alloc: Allocator) !app_lifecycle.StartupState {
@@ -1474,7 +1505,11 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
         });
     }
 
-    var request = parseInitializeRequest(alloc, msg.params_raw) catch {
+    var request = parseInitializeRequest(
+        alloc,
+        msg.params_raw,
+        state.cfg.minimal_kernel,
+    ) catch {
         return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_params,
             .message = "Invalid initialize params",
@@ -2142,7 +2177,14 @@ test "ACP method parser classifies request dispatch methods" {
     try std.testing.expectEqual(AcpMethod.session_prompt, AcpMethod.parse("session/prompt"));
     try std.testing.expectEqual(AcpMethod.session_set_config_option, AcpMethod.parse("session/set_config_option"));
     try std.testing.expectEqual(AcpMethod.session_set_mode, AcpMethod.parse("session/set_mode"));
+    try std.testing.expectEqual(AcpMethod.libfx_checkpoint, AcpMethod.parse("libfx/checkpoint"));
+    try std.testing.expectEqual(AcpMethod.libfx_restore, AcpMethod.parse("libfx/restore"));
+    try std.testing.expectEqual(AcpMethod.libfx_new, AcpMethod.parse("libfx/new"));
     try std.testing.expectEqual(AcpMethod.unknown, AcpMethod.parse("workspace/unknown"));
+    try std.testing.expect(AcpMethod.libfx_checkpoint.isLibfx());
+    try std.testing.expect(AcpMethod.libfx_restore.isLibfx());
+    try std.testing.expect(AcpMethod.libfx_new.isLibfx());
+    try std.testing.expect(!AcpMethod.session_new.isLibfx());
 }
 
 test "ACP prompt gate policy keeps lifecycle interruption responsive" {
@@ -2164,14 +2206,15 @@ test "ACP initialize request validation requires a uint16 protocol version" {
     const valid = try parseInitializeRequest(
         alloc,
         "{\"protocolVersion\":1,\"clientCapabilities\":{\"fs\":{\"readTextFile\":true},\"terminal\":true}}",
+        false,
     );
     try std.testing.expect(valid.client_fs_read);
     try std.testing.expect(!valid.client_fs_write);
     try std.testing.expect(valid.client_terminal);
 
-    _ = try parseInitializeRequest(alloc, "{\"protocolVersion\":0}");
-    _ = try parseInitializeRequest(alloc, "{\"protocolVersion\":2}");
-    _ = try parseInitializeRequest(alloc, "{\"protocolVersion\":65535}");
+    _ = try parseInitializeRequest(alloc, "{\"protocolVersion\":0}", false);
+    _ = try parseInitializeRequest(alloc, "{\"protocolVersion\":2}", false);
+    _ = try parseInitializeRequest(alloc, "{\"protocolVersion\":65535}", false);
 
     const cases = [_]struct {
         params: ?[]const u8,
@@ -2187,7 +2230,7 @@ test "ACP initialize request validation requires a uint16 protocol version" {
     for (cases) |case| {
         try std.testing.expectError(
             case.expected,
-            parseInitializeRequest(alloc, case.params),
+            parseInitializeRequest(alloc, case.params, false),
         );
     }
 }
