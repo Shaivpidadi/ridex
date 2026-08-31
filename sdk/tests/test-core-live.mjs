@@ -8,6 +8,8 @@ import { createFxAgent, supportsJspi } from "../node.js";
 const scriptDir = fileURLToPath(new URL(".", import.meta.url));
 const defaultWasm = resolve(scriptDir, "../../zig-out/bin/fx-core.wasm");
 const wasmPath = resolve(process.argv[2] || defaultWasm);
+const backend = process.env.LIBFX_LIVE_BACKEND || "wasm";
+const nativeAddon = resolve(scriptDir, "../../zig-out/lib/libfx.node");
 const apiKey = process.env.AI_GATEWAY_API_KEY || process.env.FX_API_KEY;
 
 if (!supportsJspi()) {
@@ -69,7 +71,7 @@ const tracedFetch = async (url, init) => {
 };
 
 const agent = await Promise.race([
-  createFxAgent({ wasm: await readFile(wasmPath), fetch: tracedFetch, env: { AI_GATEWAY_API_KEY: apiKey } }),
+  createFxAgent({ backend, nativeAddon, wasm: await readFile(wasmPath), fetch: tracedFetch, env: { AI_GATEWAY_API_KEY: apiKey } }),
   new Promise((_, reject) => setTimeout(() => reject(new Error("timed out waiting for fx-core initialize")), 5000)),
 ]);
 
@@ -93,7 +95,7 @@ try {
   } finally {
     clearTimeout(timeout);
   }
-  const stopReason = await turn.stopReason;
+  const stopReason = (await turn.result).stopReason;
   const text = chunks.join("").trim();
 
   if (responseStatus !== 200) throw new Error(`live gateway returned HTTP ${responseStatus}`);
@@ -112,7 +114,7 @@ try {
   const elapsedMs = Math.round(performance.now() - startedAt);
   const firstBodyMs = firstResponseBodyChunkAt === null ? "n/a" : Math.round(firstResponseBodyChunkAt - startedAt);
   const firstAcpMs = firstAcpChunkAt === null ? "n/a" : Math.round(firstAcpChunkAt - startedAt);
-  console.log(`live core SDK stream passed (${requestedSessionId})`);
+  console.log(`live core SDK ${backend} stream passed (${requestedSessionId})`);
   console.log(`gateway HTTP ${responseStatus}; body chunks=${responseBodyChunks}; ACP text chunks=${chunks.length}`);
   console.log(`first body chunk=${firstBodyMs}ms; first ACP chunk=${firstAcpMs}ms; total=${elapsedMs}ms`);
   console.log(`model echoed nonce ${nonce}; response bytes=${new TextEncoder().encode(text).length}`);
