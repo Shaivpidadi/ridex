@@ -12,7 +12,6 @@ pub const max_checkpoint_bytes: usize = 4 * 1024 * 1024;
 pub const max_history_turns: usize = 1024;
 
 pub const Error = Allocator.Error || error{
-    AgentBusy,
     CheckpointTooLarge,
     CorruptCheckpoint,
     InvalidCheckpoint,

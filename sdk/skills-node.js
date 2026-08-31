@@ -1,6 +1,5 @@
 import { readFile } from "node:fs/promises";
 import { basename } from "node:path";
-import { createSkillsAdapter } from "./skills.js";
 
 function parseFrontmatter(source) {
   if (!source.startsWith("---\n")) return { metadata: {}, body: source };
@@ -25,11 +24,6 @@ export async function loadSkillFile(path, options = {}) {
     resources: options.resources ?? [],
     tools: options.tools ?? [],
   };
-}
-
-export async function loadSkills(paths, options = {}) {
-  const records = await Promise.all(paths.map((path) => loadSkillFile(path, options[path] ?? {})));
-  return createSkillsAdapter(records);
 }
 
 export { createSkillsAdapter } from "./skills.js";

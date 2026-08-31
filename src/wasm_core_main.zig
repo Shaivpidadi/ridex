@@ -57,7 +57,6 @@ pub fn main(init: std.process.Init) !void {
         .workspace_root_override = "/",
         .allow_acp_mcp = false,
         .allow_native_tools = false,
-        .allow_native_skills = false,
         .minimal_kernel = true,
     });
 }

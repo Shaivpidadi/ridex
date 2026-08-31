@@ -993,16 +993,18 @@ export async function createFxAgent(options = {}) {
   const instructions = normalizeInstructions(options.instructions);
   const initialCheckpoint = checkpointBytes(options.checkpoint);
   const pending = new Map();
-  const turns = new Map();
   let nextId = 1;
-  let activeSession = null;
+  let sessionId = null;
+  let activeTurn = null;
   let closing = false;
   const emit = (type, detail = {}) => {
     try { options.onEvent?.({ type, timestamp: performance.now(), ...detail }); } catch {}
   };
-  const executeHostTool = async (name, input, sessionId) => {
+  const executeHostTool = async (name, input, requestedSessionId) => {
     const execute = hostTools.executors.get(name);
-    const turn = sessionId ? turns.get(sessionId) : turns.values().next().value;
+    const turn = requestedSessionId === undefined || requestedSessionId === sessionId
+      ? activeTurn
+      : null;
     const controller = new AbortController();
     turn?.toolControllers.add(controller);
     let content;
@@ -1043,8 +1045,7 @@ export async function createFxAgent(options = {}) {
   runtime.setLineHandler(async (message) => {
     emit("acp.receive", { message });
     if (message.method === "session/update") {
-      const turn = turns.get(message.params.sessionId);
-      if (turn) turn.push(message.params.update);
+      if (message.params.sessionId === sessionId) activeTurn?.push(message.params.update);
       return;
     }
     if (message.method === "session/request_permission") {
@@ -1077,26 +1078,32 @@ export async function createFxAgent(options = {}) {
   });
 
   const sessionResult = await request("libfx/new");
-  activeSession = await makeSession(sessionResult);
+  sessionId = sessionResult.sessionId;
   if (initialCheckpoint) {
     await request("libfx/restore", {
-      sessionId: activeSession.id,
+      sessionId,
       checkpoint: bytesToBase64(initialCheckpoint),
     });
   }
 
   const agent = {
-    prompt(input, promptOptions) {
-      if (closing || !activeSession) throw new Error("fx agent is closed");
-      return normalizeTurn(activeSession.prompt(input, promptOptions));
+    prompt(input, promptOptions = {}) {
+      if (closing) throw new Error("fx agent is closed");
+      if (activeTurn) throw new Error("a prompt is already in progress for this session");
+      return normalizeTurn(startTurn(input, promptOptions));
     },
     async checkpoint() {
-      if (closing || !activeSession) throw new Error("fx agent is closed");
-      return activeSession.checkpoint();
+      if (closing) throw new Error("fx agent is closed");
+      if (activeTurn) throw new Error("cannot checkpoint while a prompt is active");
+      const response = await request("libfx/checkpoint", { sessionId });
+      if (typeof response?.checkpoint !== "string") throw new Error("fx returned an invalid checkpoint");
+      return base64ToBytes(response.checkpoint);
     },
     async close() {
       if (closing) { await runtime.exited; return; }
-      if (activeSession) await activeSession.close();
+      const turn = activeTurn;
+      turn?.cancel();
+      if (turn) await turn.result.catch(() => {});
       closing = true;
       runtime.closeStdin();
       await runtime.exited;
@@ -1165,75 +1172,44 @@ export async function createFxAgent(options = {}) {
     return result;
   }
 
-  async function makeSession(result) {
-    let closed = false;
-    let activeTurn = null;
-    const assertOpen = () => {
-      if (closed) throw new Error("fx session is closed");
-      if (activeSession !== session) throw new Error("fx session is no longer active");
+  function startTurn(input, promptOptions) {
+    const prompt = normalizePromptInput(input);
+    const signal = promptOptions.signal;
+    if (signal !== undefined && (typeof signal?.addEventListener !== "function" || typeof signal?.removeEventListener !== "function")) throw new TypeError("prompt signal must be an AbortSignal");
+    const queue = [];
+    const waiters = [];
+    const toolControllers = new Set();
+    let finished = false;
+    let cancelled = false;
+    const turn = {
+      push(update) { const waiter = waiters.shift(); if (waiter) waiter({ value: update, done: false }); else queue.push(update); },
+      toolControllers,
+      cancel() {
+        if (finished || cancelled) return;
+        cancelled = true;
+        send({ jsonrpc: "2.0", method: "session/cancel", params: { sessionId } });
+        for (const controller of toolControllers) controller.abort();
+        runtime.abortHostEffects();
+      },
+      [Symbol.asyncIterator]() { return { next() { if (queue.length) return Promise.resolve({ value: queue.shift(), done: false }); if (finished) return Promise.resolve({ done: true }); return new Promise((resolve) => waiters.push(resolve)); } }; },
     };
-    const session = {
-      id: result.sessionId,
-      async close() {
-        if (closed) return;
-        activeTurn?.cancel();
-        if (activeTurn) await activeTurn.result.catch(() => {});
-        closed = true;
-        activeTurn = null;
-        if (activeSession === session) activeSession = null;
-      },
-      async checkpoint() {
-        assertOpen();
-        if (activeTurn) throw new Error("cannot checkpoint while a prompt is active");
-        const response = await request("libfx/checkpoint", { sessionId: result.sessionId });
-        if (typeof response?.checkpoint !== "string") throw new Error("fx returned an invalid checkpoint");
-        return base64ToBytes(response.checkpoint);
-      },
-      prompt(input, promptOptions = {}) {
-        assertOpen();
-        if (activeTurn) throw new Error("a prompt is already in progress for this session");
-        const prompt = normalizePromptInput(input);
-        const signal = promptOptions.signal;
-        if (signal !== undefined && (typeof signal?.addEventListener !== "function" || typeof signal?.removeEventListener !== "function")) throw new TypeError("prompt signal must be an AbortSignal");
-        const queue = [];
-        const waiters = [];
-        const toolControllers = new Set();
-        let finished = false;
-        let cancelled = false;
-        const turn = {
-          push(update) { const waiter = waiters.shift(); if (waiter) waiter({ value: update, done: false }); else queue.push(update); },
-          toolControllers,
-          cancel() {
-            if (finished || cancelled) return;
-            cancelled = true;
-            send({ jsonrpc: "2.0", method: "session/cancel", params: { sessionId: result.sessionId } });
-            for (const controller of toolControllers) controller.abort();
-            runtime.abortHostEffects();
-          },
-          [Symbol.asyncIterator]() { return { next() { if (queue.length) return Promise.resolve({ value: queue.shift(), done: false }); if (finished) return Promise.resolve({ done: true }); return new Promise((resolve) => waiters.push(resolve)); } }; },
-        };
-        turns.set(result.sessionId, turn);
-        activeTurn = turn;
-        const abort = () => turn.cancel();
-        signal?.addEventListener("abort", abort, { once: true });
-        turn.result = request("session/prompt", { sessionId: result.sessionId, prompt })
-          .then((response) => ({ stopReason: response.stopReason, usage: response.usage }))
-          .catch((error) => {
-            if (error.message === "Cancelled") return { stopReason: "cancelled" };
-            throw error;
-          })
-          .finally(() => {
-            finished = true;
-            signal?.removeEventListener("abort", abort);
-            turns.delete(result.sessionId);
-            if (activeTurn === turn) activeTurn = null;
-            toolControllers.clear();
-            waiters.splice(0).forEach((resolve) => resolve({ done: true }));
-          });
-        if (signal?.aborted) turn.cancel();
-        return turn;
-      },
-    };
-    return session;
+    activeTurn = turn;
+    const abort = () => turn.cancel();
+    signal?.addEventListener("abort", abort, { once: true });
+    turn.result = request("session/prompt", { sessionId, prompt })
+      .then((response) => ({ stopReason: response.stopReason, usage: response.usage }))
+      .catch((error) => {
+        if (error.message === "Cancelled") return { stopReason: "cancelled" };
+        throw error;
+      })
+      .finally(() => {
+        finished = true;
+        signal?.removeEventListener("abort", abort);
+        if (activeTurn === turn) activeTurn = null;
+        toolControllers.clear();
+        waiters.splice(0).forEach((resolve) => resolve({ done: true }));
+      });
+    if (signal?.aborted) turn.cancel();
+    return turn;
   }
 }

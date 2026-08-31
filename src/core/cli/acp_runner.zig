@@ -44,7 +44,6 @@ pub const Config = struct {
     saved_directories_suppressed: bool = false,
     allow_acp_mcp: bool = true,
     allow_native_tools: bool = true,
-    allow_native_skills: bool = true,
     minimal_kernel: bool = false,
 };
 

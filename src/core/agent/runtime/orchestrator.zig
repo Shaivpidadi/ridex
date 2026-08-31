@@ -2677,29 +2677,10 @@ pub fn processAgentPrompt(
     config: Config,
     job: QueuedPrompt,
 ) !void {
-    return processPromptWithAgent(
-        agent,
-        deps,
-        semantic_presentation,
-        lifecycle,
-        config,
-        job,
-    );
-}
-
-fn processPromptWithAgent(
-    agent: *runtime_agent.Agent,
-    deps: *const AgentRuntimeDeps,
-    semantic_presentation: ?runtime_assistant_stream.SemanticPresentationSink,
-    lifecycle: LifecycleContext,
-    config: Config,
-    job: QueuedPrompt,
-) !void {
     var effective_job = job;
     if (effective_job.turn_id == 0) {
         effective_job.turn_id = debug_trace.nextTurnId();
     }
-    effective_job.history = agent.history.items;
     var effective_config = config;
     if (effective_config.origin == .subagent and effective_config.subagent_id == 0) {
         effective_config.subagent_id = debug_trace.nextSubagentId();
@@ -2711,29 +2692,15 @@ fn processPromptWithAgent(
     {
         effective_lifecycle.scope.subagent_id = effective_config.subagent_id;
     }
-    const agent_generation = try agent.beginNextPrompt();
+    agent.startTurn();
     var finalization = TurnFinalizationGuard.init(
         deps,
         effective_job.turn_id,
         effective_lifecycle,
     );
     defer finalization.deinit();
-    defer agent.finishPrompt(
-        agent_generation,
-        if (effective_config.cancel_flag.load(.seq_cst))
-            .cancelled
-        else if (finalization.outcome) |outcome|
-            switch (outcome) {
-                .completed => .completed,
-                .interrupted => .cancelled,
-                .failed => .failed,
-                .paused => .paused,
-            }
-        else
-            .failed,
-    ) catch unreachable;
 
-    processQueuedPromptInner(deps, semantic_presentation, effective_lifecycle, effective_config, effective_job, &finalization, agent, agent_generation) catch |err| {
+    processQueuedPromptInner(deps, semantic_presentation, effective_lifecycle, effective_config, effective_job, &finalization, agent) catch |err| {
         if (finalization.state == .open) {
             finalization.finish(.failed, null, null) catch |finalization_err| return finalization_err;
         }
@@ -2843,7 +2810,6 @@ fn processQueuedPromptInner(
     job: QueuedPrompt,
     finalization: *TurnFinalizationGuard,
     agent: *runtime_agent.Agent,
-    agent_generation: runtime_agent.Generation,
 ) !void {
     var summary_accumulator = runtime_telemetry.TurnSummaryAccumulator.init(
         io_mod.milliTimestamp(),
@@ -3015,7 +2981,6 @@ fn processQueuedPromptInner(
         current_user_message,
         &stop_state,
         agent,
-        agent_generation,
     ) catch |err| {
         if (stop_state.retained_candidate != null and
             !stop_state.terminal_materializing and
@@ -3300,7 +3265,6 @@ fn processQueuedPromptLoop(
     current_user_message: ChatMessage,
     stop_state: *CommonStopState,
     agent: *runtime_agent.Agent,
-    agent_generation: runtime_agent.Generation,
 ) !void {
     var stable_prefix = stable_prefix_ptr.*;
     defer stable_prefix_ptr.* = stable_prefix;
@@ -5278,11 +5242,6 @@ fn processQueuedPromptLoop(
                 },
             }
         }
-
-        const tool_batch_count = std.math.cast(u32, completion.tool_calls.len) orelse
-            return error.TooManyToolCalls;
-        agent.beginToolBatch(agent_generation, tool_batch_count) catch
-            return error.InvalidAgentLifecycleTransition;
 
         const prepared_tool_calls = try arena.alloc(
             PreparedToolCall,
@@ -7709,8 +7668,6 @@ fn processQueuedPromptLoop(
             &step_batch,
             &within_turn_suffix,
         );
-        agent.settleToolBatch(agent_generation) catch
-            return error.InvalidAgentLifecycleTransition;
         if (successful_vision_route == .text_only and settled_vision_ids.items.len > 0) {
             const transition = try runtime_vision_contracts.transition_pending_images(
                 arena,

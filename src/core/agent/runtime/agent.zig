@@ -1,29 +1,15 @@
 const std = @import("std");
 const types = @import("../../shared/types.zig");
 const checkpoint_codec = @import("checkpoint.zig");
-const state_machine = @import("state_machine.zig");
 
 const Allocator = std.mem.Allocator;
-pub const Generation = state_machine.Generation;
-
-pub const AdmissionError = error{
-    AgentBusy,
-    AgentClosed,
-    InvalidGeneration,
-    StaleGeneration,
-};
-
-pub const TransitionError = error{
-    InvalidAgentTransition,
-    StaleGeneration,
-};
 
 /// The provider-neutral state for one conversation. Product session metadata,
 /// persistence, permissions, credentials, and host effects live outside it.
 pub const Agent = struct {
     history: std.ArrayList(types.HistoryTurn) = .empty,
-    lifecycle: state_machine.State = .{},
     turn_usage: types.Usage = .{},
+    fresh: bool = true,
 
     pub fn deinit(self: *Agent, alloc: Allocator) void {
         self.clearHistory(alloc);
@@ -31,135 +17,12 @@ pub const Agent = struct {
         self.* = undefined;
     }
 
-    pub fn beginPrompt(
-        self: *Agent,
-        generation: state_machine.Generation,
-    ) AdmissionError!void {
-        const decision = state_machine.decide(self.lifecycle, .{
-            .begin_prompt = generation,
-        });
-        switch (decision.action) {
-            .start_model => {
-                self.lifecycle = decision.state;
-                self.turn_usage = .{};
-            },
-            .reject_busy => return error.AgentBusy,
-            .stale => |reason| return switch (reason) {
-                .generation_reused => error.StaleGeneration,
-                .phase_mismatch => error.AgentClosed,
-                .generation_mismatch => error.StaleGeneration,
-            },
-            .invalid => return error.InvalidGeneration,
-            else => return error.AgentBusy,
-        }
-    }
-
-    pub fn beginNextPrompt(self: *Agent) AdmissionError!Generation {
-        const generation = std.math.add(
-            Generation,
-            self.lifecycle.last_generation,
-            1,
-        ) catch return error.InvalidGeneration;
-        try self.beginPrompt(generation);
-        return generation;
-    }
-
-    pub fn beginToolBatch(
-        self: *Agent,
-        generation: state_machine.Generation,
-        count: u32,
-    ) TransitionError!void {
-        const decision = state_machine.decide(self.lifecycle, .{
-            .model_yielded_tools = .{
-                .generation = generation,
-                .count = count,
-            },
-        });
-        switch (decision.action) {
-            .start_tools => self.lifecycle = decision.state,
-            .stale => return error.StaleGeneration,
-            else => return error.InvalidAgentTransition,
-        }
-    }
-
-    pub fn settleToolBatch(
-        self: *Agent,
-        generation: state_machine.Generation,
-    ) TransitionError!void {
-        const decision = state_machine.decide(self.lifecycle, .{
-            .tools_settled = generation,
-        });
-        switch (decision.action) {
-            .resume_model => self.lifecycle = decision.state,
-            .stale => return error.StaleGeneration,
-            else => return error.InvalidAgentTransition,
-        }
-    }
-
-    pub fn cancel(self: *Agent) ?state_machine.Generation {
-        const decision = state_machine.decide(self.lifecycle, .cancel);
-        return switch (decision.action) {
-            .cancel_active => |generation| blk: {
-                self.lifecycle = decision.state;
-                break :blk generation;
-            },
-            else => null,
-        };
-    }
-
-    pub fn finishPrompt(
-        self: *Agent,
-        generation: state_machine.Generation,
-        outcome: state_machine.Outcome,
-    ) TransitionError!void {
-        if (outcome == .cancelled) _ = self.cancel();
-        const completed = state_machine.decide(self.lifecycle, .{
-            .complete = .{ .generation = generation, .outcome = outcome },
-        });
-        switch (completed.action) {
-            .publish_result => self.lifecycle = completed.state,
-            .stale => return error.StaleGeneration,
-            else => return error.InvalidAgentTransition,
-        }
-        const acknowledged = state_machine.decide(self.lifecycle, .{
-            .acknowledge = generation,
-        });
-        switch (acknowledged.action) {
-            .none => self.lifecycle = acknowledged.state,
-            else => return error.InvalidAgentTransition,
-        }
-    }
-
-    pub fn close(self: *Agent) ?state_machine.Generation {
-        const decision = state_machine.decide(self.lifecycle, .close);
-        return switch (decision.action) {
-            .cancel_and_close => |generation| blk: {
-                self.lifecycle = decision.state;
-                break :blk generation;
-            },
-            .close => blk: {
-                self.lifecycle = decision.state;
-                break :blk null;
-            },
-            .none => null,
-            else => unreachable,
-        };
-    }
-
-    pub fn isBusy(self: *const Agent) bool {
-        return state_machine.isBusy(self.lifecycle);
-    }
-
-    pub fn isClosed(self: *const Agent) bool {
-        return self.lifecycle.phase == .closed;
-    }
-
-    pub fn checkpointEligible(self: *const Agent) bool {
-        return self.lifecycle.phase == .idle;
+    pub fn startTurn(self: *Agent) void {
+        self.fresh = false;
+        self.turn_usage = .{};
     }
 
     pub fn checkpoint(self: *const Agent, alloc: Allocator) checkpoint_codec.Error![]u8 {
-        if (!self.checkpointEligible()) return error.AgentBusy;
         return checkpoint_codec.encode(alloc, self.history.items, self.turn_usage);
     }
 
@@ -168,10 +31,7 @@ pub const Agent = struct {
         alloc: Allocator,
         bytes: []const u8,
     ) (checkpoint_codec.Error || error{AgentNotFresh})!void {
-        if (!self.checkpointEligible() or
-            self.lifecycle.last_generation != 0 or
-            self.history.items.len != 0)
-        {
+        if (!self.fresh or self.history.items.len != 0) {
             return error.AgentNotFresh;
         }
         var decoded = try checkpoint_codec.decode(alloc, bytes);
@@ -182,6 +42,7 @@ pub const Agent = struct {
         for (previous.items) |turn| types.freeHistoryTurn(alloc, turn);
         previous.deinit(alloc);
         self.turn_usage = decoded.usage;
+        self.fresh = false;
     }
 
     pub fn observeUsage(self: *Agent, usage: types.Usage) void {
@@ -200,6 +61,7 @@ pub const Agent = struct {
         const copy = try types.dupeHistoryTurn(alloc, turn);
         errdefer types.freeHistoryTurn(alloc, copy);
         try self.history.append(alloc, copy);
+        self.fresh = false;
     }
 
     pub fn clearHistory(self: *Agent, alloc: Allocator) void {
@@ -243,6 +105,7 @@ pub const Agent = struct {
         self.history = replacement;
         for (previous.items) |turn| types.freeHistoryTurn(alloc, turn);
         previous.deinit(alloc);
+        self.fresh = false;
     }
 };
 
@@ -251,43 +114,17 @@ fn addOptional(total: *?u64, value: ?u64) void {
     total.* = std.math.add(u64, total.* orelse 0, amount) catch std.math.maxInt(u64);
 }
 
-test "Agent owns one lifecycle and rejects a concurrent prompt" {
+test "Agent startTurn consumes freshness and resets usage" {
     var agent: Agent = .{};
-    try agent.beginPrompt(1);
-    try std.testing.expect(agent.isBusy());
-    try std.testing.expectError(error.AgentBusy, agent.beginPrompt(2));
-    try agent.beginToolBatch(1, 2);
-    try agent.settleToolBatch(1);
-    try agent.finishPrompt(1, .completed);
-    try std.testing.expect(agent.checkpointEligible());
-    try agent.beginPrompt(2);
-}
-
-test "Agent allocates prompt generations independently from trace identity" {
-    var agent: Agent = .{};
-    const first = try agent.beginNextPrompt();
-    try std.testing.expectEqual(@as(u64, 1), first);
-    try agent.finishPrompt(first, .completed);
-    const second = try agent.beginNextPrompt();
-    try std.testing.expectEqual(@as(u64, 2), second);
-    try agent.finishPrompt(second, .completed);
-}
-
-test "Agent cancellation and close are idempotent" {
-    var agent: Agent = .{};
-    try agent.beginPrompt(1);
-    try std.testing.expectEqual(@as(?u64, 1), agent.cancel());
-    try std.testing.expectEqual(@as(?u64, null), agent.cancel());
-    try agent.finishPrompt(1, .cancelled);
-    try std.testing.expectEqual(@as(?u64, null), agent.close());
-    try std.testing.expect(agent.isClosed());
-    try std.testing.expectEqual(@as(?u64, null), agent.close());
-    try std.testing.expectError(error.AgentClosed, agent.beginPrompt(2));
+    agent.turn_usage = .{ .input_tokens = 4 };
+    agent.startTurn();
+    try std.testing.expect(!agent.fresh);
+    try std.testing.expectEqual(@as(?u64, null), agent.turn_usage.input_tokens);
 }
 
 test "Agent accumulates per-turn usage with saturation" {
     var agent: Agent = .{};
-    try agent.beginPrompt(1);
+    agent.startTurn();
     agent.observeUsage(.{ .input_tokens = 4, .output_tokens = 2 });
     agent.observeUsage(.{ .input_tokens = 3, .reasoning_tokens = 1 });
     try std.testing.expectEqual(@as(?u64, 7), agent.turn_usage.input_tokens);
@@ -326,7 +163,7 @@ test "Agent history restore is transactional" {
     try std.testing.expectEqualStrings("new", agent.history.items[0].assistant.user.text);
 }
 
-test "Agent checkpoint restores only into a fresh idle owner" {
+test "Agent checkpoint restores only into a fresh owner" {
     const alloc = std.testing.allocator;
     var source: Agent = .{};
     defer source.deinit(alloc);
@@ -342,8 +179,17 @@ test "Agent checkpoint restores only into a fresh idle owner" {
     try restored.restoreCheckpoint(alloc, bytes);
     try std.testing.expectEqualStrings("before", restored.history.items[0].assistant.user.text);
     try std.testing.expectError(error.AgentNotFresh, restored.restoreCheckpoint(alloc, bytes));
+}
 
-    try source.beginPrompt(1);
-    try std.testing.expectError(error.AgentBusy, source.checkpoint(alloc));
-    try source.finishPrompt(1, .cancelled);
+test "Agent checkpoint restore consumes freshness for empty history" {
+    const alloc = std.testing.allocator;
+    var source: Agent = .{};
+    defer source.deinit(alloc);
+    const bytes = try source.checkpoint(alloc);
+    defer alloc.free(bytes);
+
+    var restored: Agent = .{};
+    defer restored.deinit(alloc);
+    try restored.restoreCheckpoint(alloc, bytes);
+    try std.testing.expectError(error.AgentNotFresh, restored.restoreCheckpoint(alloc, bytes));
 }

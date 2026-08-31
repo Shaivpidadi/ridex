@@ -469,7 +469,6 @@ const Runtime = struct {
                 .workspace_root_override = self.workspace_root,
                 .allow_acp_mcp = false,
                 .allow_native_tools = false,
-                .allow_native_skills = false,
                 .minimal_kernel = true,
             },
             jsonrpc.Reader.initCallback(self, Runtime.readInput),
