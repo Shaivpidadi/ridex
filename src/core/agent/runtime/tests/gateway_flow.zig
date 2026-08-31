@@ -8,6 +8,7 @@ const session_runtime = @import("../../../session/session.zig");
 const session_codec = @import("../../../session/session_codec.zig");
 const session_usage = @import("../../../session/session_usage.zig");
 const model_capabilities = @import("../../../config/model_capabilities.zig");
+const model_provider = @import("../../../config/model_provider.zig");
 const debug_trace = @import("../../../shared/debug_trace.zig");
 const image_attachments = @import("../../../images/image_attachments.zig");
 const io_mod = @import("../../../shared/io.zig");
@@ -2743,6 +2744,102 @@ test "processQueuedPrompt uses one available capability snapshot for compaction 
     try expectBodyContains(&gateway, 1, "NEW_HISTORY_USER");
     try expectBodyContains(&gateway, 1, "NEW_HISTORY_ASSISTANT");
     try expectBodyContains(&gateway, 1, "\"maxOutputTokens\":16000");
+}
+
+test "processQueuedPrompt uses the provider-local compaction model" {
+    const alloc = std.testing.allocator;
+    const old_user = try alloc.alloc(u8, 48_000);
+    defer alloc.free(old_user);
+    @memset(old_user, 'u');
+    const old_assistant = try alloc.alloc(u8, 48_000);
+    defer alloc.free(old_assistant);
+    @memset(old_assistant, 'a');
+    var history = [_]HistoryTurn{
+        .{ .assistant = .{
+            .user = .{ .text = old_user },
+            .assistant = old_assistant,
+        } },
+        .{ .assistant = .{
+            .user = .{ .text = @constCast("recent user") },
+            .assistant = @constCast("recent assistant"),
+        } },
+    };
+    const cases = [_]struct {
+        provider: model_provider.ProviderId,
+        credential_source: types.CredentialSource,
+        working_model: []const u8,
+        compaction_model: []const u8,
+    }{
+        .{
+            .provider = .codex,
+            .credential_source = .chatgpt_subscription,
+            .working_model = "gpt-5.6-sol",
+            .compaction_model = "gpt-5.6-luna",
+        },
+        .{
+            .provider = .grok,
+            .credential_source = .grok_subscription,
+            .working_model = "grok-4.6",
+            .compaction_model = "grok-4.5",
+        },
+    };
+    for (cases) |case| {
+        const available_overrides = [_]ModelCapabilityOverride{.{
+            .model = case.working_model,
+            .capabilities = .{ .context_window = 32_000, .max_output_tokens = 16_000 },
+        }};
+        const completions = [_]FakeCompletion{
+            .{ .content = "{\"objective\":{\"text\":\"Continue.\",\"sources\":[\"S0\"]},\"constraints\":[],\"obligations\":[],\"next_action\":{\"kind\":\"none\",\"text\":\"Continue.\",\"sources\":[\"S0\"]}}" },
+            .{ .content = "Done" },
+        };
+        var gateway = FakeGateway.init(alloc, &completions);
+        defer gateway.deinit();
+        var hooks = FakeAgentRuntimeDeps.init(alloc);
+        hooks.available_capability_overrides = &available_overrides;
+        hooks.compaction_route = .{ .ready = .{
+            .provider = case.provider,
+            .model = case.compaction_model,
+        } };
+        defer hooks.deinit();
+        var fixture = PromptFixture{};
+        var job = fixture.job();
+        job.provider = case.provider;
+        job.credential_source = case.credential_source;
+        job.model = @constCast(case.working_model);
+        job.history = &history;
+
+        try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+
+        try std.testing.expectEqual(@as(usize, 2), gateway.request_models.items.len);
+        try std.testing.expectEqualStrings(case.compaction_model, gateway.request_models.items[0]);
+        try std.testing.expectEqualStrings(case.working_model, gateway.request_models.items[1]);
+    }
+
+    const unavailable_capabilities = [_]ModelCapabilityOverride{.{
+        .model = "anthropic/claude-opus-4.6",
+        .capabilities = .{ .context_window = 32_000, .max_output_tokens = 16_000 },
+    }};
+    const unused = [_]FakeCompletion{.{ .content = "must not run" }};
+    var unavailable_gateway = FakeGateway.init(alloc, &unused);
+    defer unavailable_gateway.deinit();
+    var unavailable_hooks = FakeAgentRuntimeDeps.init(alloc);
+    unavailable_hooks.available_capability_overrides = &unavailable_capabilities;
+    unavailable_hooks.compaction_route = .{ .unavailable = .missing_policy };
+    defer unavailable_hooks.deinit();
+    var unavailable_fixture = PromptFixture{};
+    var unavailable_job = unavailable_fixture.job();
+    unavailable_job.history = &history;
+
+    try std.testing.expectError(
+        error.ContextCompactionUnavailable,
+        runFakePrompt(
+            &unavailable_gateway,
+            &unavailable_hooks,
+            unavailable_fixture.config(),
+            unavailable_job,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 0), unavailable_gateway.request_models.items.len);
 }
 
 test "processQueuedPrompt projects bounded output limits into gateway requests" {

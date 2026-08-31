@@ -2679,8 +2679,24 @@ fn requiresResolvedRequestCapabilities(
     available: model_capabilities.Capabilities,
 ) bool {
     return has_images or
+        available.context_window == null or
         (!effort.isDefault() and !model_capabilities.reasoningEffortSupported(available, effort)) or
         (fast_mode and !available.supports_fast_mode);
+}
+
+test "request capabilities resolve before automatic capacity planning" {
+    try std.testing.expect(requiresResolvedRequestCapabilities(
+        false,
+        .auto,
+        false,
+        .{},
+    ));
+    try std.testing.expect(!requiresResolvedRequestCapabilities(
+        false,
+        .auto,
+        false,
+        .{ .context_window = 128_000 },
+    ));
 }
 
 fn request_max_output_tokens(capabilities: model_capabilities.Capabilities) ?u32 {
@@ -3739,9 +3755,16 @@ fn processQueuedPromptLoop(
                             return error.ContextCapacityExceeded;
                         const generation_tokens = refined_plan.generation_tokens orelse
                             return error.ContextCapacityExceeded;
+                        const compaction_route = switch (deps.compaction_route) {
+                            .ready => |route| if (route.provider == job.provider)
+                                route
+                            else
+                                return error.ContextCompactionRouteMismatch,
+                            .unavailable => return error.ContextCompactionUnavailable,
+                        };
                         const compactor_capabilities = deps.available_model_capabilities(
                             deps.ctx,
-                            runtime_context_compaction.compactor_model,
+                            compaction_route.model,
                         );
                         const compactor_generation_tokens = if (compactor_capabilities.max_output_tokens) |limit|
                             @min(generation_tokens, @as(usize, @intCast(limit)))
@@ -3758,9 +3781,11 @@ fn processQueuedPromptLoop(
                             arena,
                             compaction_messages.items,
                             .{
-                                .stream_provider = deps.compaction_stream_provider,
+                                .stream_provider = deps.agent_stream_provider,
+                                .model = compaction_route.model,
                                 .api_key = active_api_key,
                                 .credential_source = job.credential_source,
+                                .account_id = job.account_id,
                                 .gateway_team = job.gateway_team,
                                 .session_id = lifecycle.scope.session_id,
                                 .retry_count = config.gateway_retry_count,

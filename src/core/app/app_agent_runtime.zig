@@ -221,10 +221,15 @@ pub fn Runtime(comptime App: type) type {
                     app.agentStreamProvider()
                 else
                     agent_stream_provider.unavailable_provider,
-                .compaction_stream_provider = if (comptime @hasDecl(App, "compactionStreamProvider"))
-                    app.compactionStreamProvider()
+                .compaction_route = if (comptime @hasDecl(App, "providerSet"))
+                    app.providerSet().compactionRoute(
+                        selected_provider,
+                        app.auth.credentialSource(),
+                    )
+                else if (comptime @hasDecl(App, "compactionRoute"))
+                    app.compactionRoute()
                 else
-                    agent_stream_provider.unavailable_provider,
+                    .{ .unavailable = .missing_policy },
                 .gateway_team = app.auth.gatewayTeam(),
                 .credential_source = app.auth.credentialSource(),
                 .account_id = app.auth.accountId(),
@@ -1065,9 +1070,16 @@ pub fn Runtime(comptime App: type) type {
                 return error.ContextCapacityExceeded;
             const generation_tokens = plan.generation_tokens orelse
                 return error.ContextCapacityExceeded;
+            const compaction_route = switch (deps.compaction_route) {
+                .ready => |route| if (route.provider == job.provider)
+                    route
+                else
+                    return error.ContextCompactionRouteMismatch,
+                .unavailable => return error.ContextCompactionUnavailable,
+            };
             const compactor_capabilities = deps.available_model_capabilities(
                 deps.ctx,
-                runtime_context_compaction.compactor_model,
+                compaction_route.model,
             );
             const compactor_generation_tokens = if (compactor_capabilities.max_output_tokens) |limit|
                 @min(generation_tokens, @as(usize, @intCast(limit)))
@@ -1083,9 +1095,11 @@ pub fn Runtime(comptime App: type) type {
                 std.heap.c_allocator,
                 messages.items,
                 .{
-                    .stream_provider = deps.compaction_stream_provider,
+                    .stream_provider = deps.agent_stream_provider,
+                    .model = compaction_route.model,
                     .api_key = job.api_key,
                     .credential_source = job.credential_source,
+                    .account_id = job.account_id,
                     .gateway_team = job.gateway_team,
                     .session_id = app_session_runtime.Runtime(App).activeSessionId(app),
                     .retry_count = gateway_retry_count,
@@ -1678,8 +1692,8 @@ const FakeApp = struct {
         return self.agent_stream_provider;
     }
 
-    pub fn compactionStreamProvider(self: *const FakeApp) agent_stream_provider.Provider {
-        return self.agent_stream_provider;
+    pub fn compactionRoute(_: *const FakeApp) provider_set.CompactionRouteDecision {
+        return .{ .ready = .{ .provider = .gateway, .model = "openai/gpt-5.6-luna" } };
     }
 
     fn deinit(self: *FakeApp) void {
@@ -2604,6 +2618,7 @@ test "manual compaction worker call commits a checkpoint without a continuation"
     const Gateway = struct {
         request_count: usize = 0,
         saw_no_tools: bool = false,
+        observed_model: ?[]const u8 = null,
 
         fn stream(
             raw: ?*anyopaque,
@@ -2612,6 +2627,7 @@ test "manual compaction worker call commits a checkpoint without a continuation"
         ) !agent_stream_provider.Result {
             const self: *@This() = @ptrCast(@alignCast(raw.?));
             self.request_count += 1;
+            self.observed_model = request.model;
             self.saw_no_tools = request.tools.advertised_names.len == 0 and
                 request.tools.advertised_functions.len == 0 and
                 request.tools.additional_functions.len == 0 and
@@ -2658,6 +2674,7 @@ test "manual compaction worker call commits a checkpoint without a continuation"
 
     try std.testing.expectEqual(@as(usize, 1), gateway.request_count);
     try std.testing.expect(gateway.saw_no_tools);
+    try std.testing.expectEqualStrings("openai/gpt-5.6-luna", gateway.observed_model.?);
     var events = app.worker.takeEvents();
     defer events.deinit(std.heap.c_allocator);
     defer for (events.items) |event| worker_runtime.freeWorkerEvent(std.heap.c_allocator, event);

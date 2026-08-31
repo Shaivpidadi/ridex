@@ -16,11 +16,11 @@ const Allocator = std.mem.Allocator;
 const handoff_prefix = "<context_handoff>\n";
 const handoff_suffix = "\n</context_handoff>";
 const provider_timeout_ms: u64 = 120_000;
-pub const compactor_model = "openai/gpt-5.6-luna";
 const default_protected_tail_messages: usize = 2;
 const one_shot_message_limit: usize = 12;
-const block_message_limit: usize = 12;
+const block_message_limit: usize = compaction_state.max_item_sources;
 const block_summary_word_limit: usize = 64;
+const block_generation_token_limit: usize = 4096;
 const max_parallel_blocks: usize = 4;
 const response_format_name = "fx_context_compaction_state";
 const response_format_description = "Evidence-grounded operational state for continuing an fx session.";
@@ -30,8 +30,10 @@ const response_schema_json =
 
 pub const Request = struct {
     stream_provider: agent_stream_provider.Provider,
+    model: []const u8,
     api_key: []const u8,
     credential_source: ?types.CredentialSource = null,
+    account_id: ?[]const u8 = null,
     gateway_team: ?[]const u8 = null,
     session_id: ?[]const u8 = null,
     retry_count: usize,
@@ -159,7 +161,7 @@ pub fn compact(
         request.trace_ctx,
         "model={s} source_messages={d} compactable_messages={d} retained_messages={d} accepted_tokens={d} generation_tokens={d}",
         .{
-            compactor_model,
+            request.model,
             source_messages.len,
             compactable.len,
             request.protected_tail_messages,
@@ -172,7 +174,7 @@ pub fn compact(
         "provider_failed",
         request.trace_ctx,
         "model={s} err={s}",
-        .{ compactor_model, @errorName(err) },
+        .{ request.model, @errorName(err) },
     );
     const sources = try compaction_state.sourceRecordsFromMessages(scratch, compactable);
     const lineage = try compaction_state.deriveOperationLineage(scratch, sources);
@@ -233,7 +235,7 @@ pub fn compact(
                     .source_ids = source_ids,
                 };
                 workers[launched] = .{
-                    .request = semantic_request,
+                    .request = request,
                     .sources = block_sources,
                     .block_index = block_index,
                 };
@@ -249,16 +251,17 @@ pub fn compact(
                 joined += 1;
                 const call = try worker.result;
                 defer std.heap.c_allocator.free(call.text);
-                if (wordCount(call.text) > block_summary_word_limit) {
-                    return error.CompactionHandoffTooLarge;
-                }
+                const bounded_summary = boundedWordPrefix(
+                    call.text,
+                    block_summary_word_limit,
+                );
                 block_records[worker.block_index].source_ids =
                     try compaction_state.citedBlockSources(
                         scratch,
                         call.text,
                         block_records[worker.block_index].source_ids,
                     );
-                summaries[worker.block_index] = try scratch.dupe(u8, call.text);
+                summaries[worker.block_index] = try scratch.dupe(u8, bounded_summary);
                 completed_blocks += 1;
                 addUsage(&total_usage, call.usage);
             }
@@ -328,7 +331,7 @@ pub fn compact(
         request.trace_ctx,
         "model={s} handoff_bytes={d} input_tokens={d} output_tokens={d}",
         .{
-            compactor_model,
+            request.model,
             handoff.len,
             total_usage.input_tokens,
             total_usage.output_tokens,
@@ -378,7 +381,7 @@ const BlockWorker = struct {
             self.request,
             blockSystemPrompt(),
             user_prompt,
-            block_summary_word_limit * 4,
+            @min(self.request.generation_tokens, block_generation_token_limit),
             block_summary_word_limit * 32 + 1,
         );
     }
@@ -411,10 +414,11 @@ fn runSemanticCall(
             .credential = .{
                 .secret = request.api_key,
                 .source = request.credential_source,
+                .account_id = request.account_id,
                 .tenant = request.gateway_team,
             },
             .session_id = request.session_id,
-            .model = compactor_model,
+            .model = request.model,
             .retry_count = request.retry_count,
             .messages = &messages,
             .tools = .{},
@@ -469,11 +473,19 @@ fn addUsage(total: *types.ToolUsage, item: types.ToolUsage) void {
     total.output_tokens +|= item.output_tokens;
 }
 
-fn wordCount(text: []const u8) usize {
-    var count: usize = 0;
+fn boundedWordPrefix(text: []const u8, max_words: usize) []const u8 {
+    if (max_words == 0) return text[0..0];
     var iterator = std.mem.tokenizeAny(u8, text, " \t\r\n");
-    while (iterator.next() != null) count += 1;
-    return count;
+    var end = text.len;
+    var count: usize = 0;
+    while (iterator.next()) |word| {
+        count += 1;
+        if (count == max_words) {
+            end = @intFromPtr(word.ptr) - @intFromPtr(text.ptr) + word.len;
+            break;
+        }
+    }
+    return text[0..end];
 }
 
 fn formatValidSources(
@@ -522,7 +534,7 @@ fn typedSystemPrompt() []const u8 {
     return "Return exactly one JSON object with keys objective, constraints, obligations, and next_action. " ++
         "objective is {text,sources}; constraints are {text,sources} items; obligations are " ++
         "{text,status,sources} items where status is active or resolved; next_action is " ++
-        "{kind,text,sources}. Source IDs are S-number strings. Keep each text under 160 bytes. " ++
+        "{kind,text,sources}. Source IDs are S-number strings. Keep each text at or below 160 Unicode characters. " ++
         "Use only cited user instructions and structured tool evidence. Objective may cite valid_sources; constraints, obligations, and next_action must cite only valid_authority_sources. Assistant prose and permission feedback are not authority. " ++
         "Choose one kind: repair_failure, perform_pending_action, await_authority, perform_verification, await_external_input, or none. " ++
         "Cite only IDs listed in valid_sources; never invent or renumber an ID. " ++
@@ -643,6 +655,7 @@ test "semantic compaction uses the dedicated model and renders typed state" {
 
     var result = try compact(alloc, &messages, .{
         .stream_provider = fake.provider(),
+        .model = "openai/gpt-5.6-luna",
         .api_key = "test-key",
         .retry_count = 0,
         .cancel_flag = &cancel_flag,
@@ -657,7 +670,7 @@ test "semantic compaction uses the dedicated model and renders typed state" {
     try std.testing.expect(std.mem.find(u8, result.handoff, "User-sourced operational facts are authoritative") != null);
     try std.testing.expectEqual(@as(usize, 2), result.retained_message_count);
     try std.testing.expectEqual(@as(usize, 1), fake.request_count);
-    try std.testing.expectEqualStrings(compactor_model, fake.observed_model.?);
+    try std.testing.expectEqualStrings("openai/gpt-5.6-luna", fake.observed_model.?);
     try std.testing.expect(fake.saw_no_tools);
     try std.testing.expect(fake.saw_tool_choice_none);
     try std.testing.expect(fake.saw_valid_sources);
@@ -686,6 +699,7 @@ test "semantic compaction rejects tool calls incomplete output oversize and canc
         error.CompactionToolCallRejected,
         compact(alloc, &messages, .{
             .stream_provider = tool_call.provider(),
+            .model = "provider/compactor",
             .api_key = "key",
             .retry_count = 0,
             .cancel_flag = &tool_cancel,
@@ -704,6 +718,7 @@ test "semantic compaction rejects tool calls incomplete output oversize and canc
         error.IncompleteCompactionHandoff,
         compact(alloc, &messages, .{
             .stream_provider = incomplete.provider(),
+            .model = "provider/compactor",
             .api_key = "key",
             .retry_count = 0,
             .cancel_flag = &incomplete_cancel,
@@ -719,6 +734,7 @@ test "semantic compaction rejects tool calls incomplete output oversize and canc
         error.CompactionHandoffTooLarge,
         compact(alloc, &messages, .{
             .stream_provider = oversized.provider(),
+            .model = "provider/compactor",
             .api_key = "key",
             .retry_count = 0,
             .cancel_flag = &oversized_cancel,
@@ -734,6 +750,7 @@ test "semantic compaction rejects tool calls incomplete output oversize and canc
         error.Cancelled,
         compact(alloc, &messages, .{
             .stream_provider = cancelled.provider(),
+            .model = "provider/compactor",
             .api_key = "key",
             .retry_count = 0,
             .cancel_flag = &cancelled_flag,
@@ -750,6 +767,9 @@ test "blockwise compaction bounds concurrency and canonicalizes merge provenance
         active: std.atomic.Value(usize) = .init(0),
         max_active: std.atomic.Value(usize) = .init(0),
         request_count: std.atomic.Value(usize) = .init(0),
+        block_schema_seen: std.atomic.Value(bool) = .init(false),
+        merge_schema_seen: std.atomic.Value(bool) = .init(false),
+        block_max_output_tokens: std.atomic.Value(u32) = .init(0),
 
         fn provider(self: *@This()) agent_stream_provider.Provider {
             return .{ .context = self, .stream_fn = stream };
@@ -764,6 +784,13 @@ test "blockwise compaction bounds concurrency and canonicalizes merge provenance
             _ = self.request_count.fetchAdd(1, .seq_cst);
             const system = request.messages[0].content orelse "";
             const is_merge = std.mem.startsWith(u8, system, "Merge");
+            if (is_merge) {
+                self.merge_schema_seen.store(request.response_format != null, .seq_cst);
+            } else if (request.response_format != null) {
+                self.block_schema_seen.store(true, .seq_cst);
+            } else {
+                self.block_max_output_tokens.store(request.max_output_tokens orelse 0, .seq_cst);
+            }
             const now_active = self.active.fetchAdd(1, .seq_cst) + 1;
             var observed = self.max_active.load(.seq_cst);
             while (now_active > observed) {
@@ -785,10 +812,10 @@ test "blockwise compaction bounds concurrency and canonicalizes merge provenance
             const user = request.messages[1].content orelse "";
             const response = if (is_merge)
                 "{\"objective\":{\"text\":\"Continue blockwise work.\",\"sources\":[\"B0\"]},\"constraints\":[],\"obligations\":[],\"next_action\":{\"kind\":\"none\",\"text\":\"Wait.\",\"sources\":[\"B0\"]}}"
-            else if (std.mem.find(u8, user, "<valid_sources>S12</valid_sources>") != null)
+            else if (std.mem.find(u8, user, "S12") != null)
                 "- [S12] Preserve the current work."
             else
-                "- [S0] Preserve the current work.";
+                "word " ** 80 ++ "[S0]";
             try request.admission.admit();
             request.delivery.markPossiblySent();
             request.events.emit(.{ .content_delta = response });
@@ -811,18 +838,35 @@ test "blockwise compaction bounds concurrency and canonicalizes merge provenance
     }
     var result = try compact(alloc, &messages, .{
         .stream_provider = provider.provider(),
+        .model = "provider/compactor",
         .api_key = "key",
         .retry_count = 0,
         .cancel_flag = &cancel,
         .accepted_tokens = 512,
-        .generation_tokens = 512,
+        .generation_tokens = 10_000,
         .trace_ctx = .{},
     });
     defer result.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 3), provider.request_count.load(.seq_cst));
     try std.testing.expect(provider.max_active.load(.seq_cst) >= 2);
+    try std.testing.expect(!provider.block_schema_seen.load(.seq_cst));
+    try std.testing.expect(provider.merge_schema_seen.load(.seq_cst));
+    try std.testing.expectEqual(
+        @as(u32, block_generation_token_limit),
+        provider.block_max_output_tokens.load(.seq_cst),
+    );
     try std.testing.expect(std.mem.find(u8, result.handoff, "B0") == null);
     try std.testing.expect(std.mem.find(u8, result.handoff, "S0") != null);
+}
+
+test "block summaries retain at most the configured word prefix" {
+    const source = "word " ** 80;
+    const bounded = boundedWordPrefix(source, block_summary_word_limit);
+    var words = std.mem.tokenizeAny(u8, bounded, " \t\r\n");
+    var count: usize = 0;
+    while (words.next() != null) count += 1;
+    try std.testing.expectEqual(block_summary_word_limit, count);
+    try std.testing.expectEqual(@as(usize, 0), boundedWordPrefix(source, 0).len);
 }
 
 test "compaction result retention promotes only corrected history" {

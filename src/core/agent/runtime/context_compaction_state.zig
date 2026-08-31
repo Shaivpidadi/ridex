@@ -3,7 +3,7 @@ const types = @import("../../shared/types.zig");
 
 const Allocator = std.mem.Allocator;
 
-pub const max_item_text_bytes: usize = 160;
+pub const max_item_text_codepoints: usize = 160;
 pub const max_item_sources: usize = 8;
 pub const max_constraints: usize = 12;
 pub const max_obligations: usize = 12;
@@ -333,12 +333,10 @@ fn parseNextAction(
 }
 
 fn parseText(value: std.json.Value) ParseError![]const u8 {
-    if (value != .string or value.string.len == 0 or
-        value.string.len > max_item_text_bytes or
-        !std.unicode.utf8ValidateSlice(value.string))
-    {
+    if (value != .string or value.string.len == 0) return error.InvalidText;
+    const codepoints = std.unicode.utf8CountCodepoints(value.string) catch
         return error.InvalidText;
-    }
+    if (codepoints > max_item_text_codepoints) return error.InvalidText;
     return value.string;
 }
 
@@ -390,7 +388,6 @@ fn appendSourceReference(
             if (block.id != id or block.source_ids.len == 0) continue;
             for (block.source_ids) |source_id| {
                 if (!containsSource(normalized.items, source_id)) {
-                    if (normalized.items.len == max_item_sources) return error.InvalidSource;
                     try normalized.append(alloc, source_id);
                 }
             }
@@ -623,15 +620,66 @@ pub fn citedBlockSources(
         while (tokens.next()) |raw_token| {
             const token = std.mem.trim(u8, raw_token, " \t");
             if (token.len < 2 or token[0] != 'S') continue;
-            const source_id = std.fmt.parseInt(usize, token[1..], 10) catch
-                return error.InvalidSource;
-            if (!containsSource(allowed_sources, source_id)) return error.InvalidSource;
-            if (!containsSource(cited.items, source_id)) try cited.append(alloc, source_id);
+            try appendBlockCitationToken(alloc, &cited, token, allowed_sources);
         }
         cursor = close + 1;
     }
     if (cited.items.len == 0) return error.InvalidSource;
     return cited.toOwnedSlice(alloc);
+}
+
+fn appendBlockCitationToken(
+    alloc: Allocator,
+    cited: *std.ArrayList(usize),
+    token: []const u8,
+    allowed_sources: []const usize,
+) ParseError!void {
+    const range = findCitationRange(token);
+    if (range) |separator| {
+        const first = std.fmt.parseInt(usize, token[1..separator.start], 10) catch
+            return error.InvalidSource;
+        const suffix = token[separator.end..];
+        if (suffix.len < 2 or suffix[0] != 'S') return error.InvalidSource;
+        const last = std.fmt.parseInt(usize, suffix[1..], 10) catch
+            return error.InvalidSource;
+        if (first > last) return error.InvalidSource;
+        var source_id = first;
+        while (true) {
+            try appendAllowedBlockSource(alloc, cited, source_id, allowed_sources);
+            if (source_id == last) break;
+            source_id = std.math.add(usize, source_id, 1) catch
+                return error.InvalidSource;
+        }
+        return;
+    }
+    const source_id = std.fmt.parseInt(usize, token[1..], 10) catch
+        return error.InvalidSource;
+    try appendAllowedBlockSource(alloc, cited, source_id, allowed_sources);
+}
+
+const CitationRange = struct { start: usize, end: usize };
+
+fn findCitationRange(token: []const u8) ?CitationRange {
+    if (std.mem.find(u8, token[1..], "–")) |relative| {
+        const start = relative + 1;
+        return .{ .start = start, .end = start + "–".len };
+    }
+    if (std.mem.findScalarPos(u8, token, 1, '-')) |start| {
+        return .{ .start = start, .end = start + 1 };
+    }
+    return null;
+}
+
+fn appendAllowedBlockSource(
+    alloc: Allocator,
+    cited: *std.ArrayList(usize),
+    source_id: usize,
+    allowed_sources: []const usize,
+) ParseError!void {
+    if (!containsSource(allowed_sources, source_id)) return error.InvalidSource;
+    if (containsSource(cited.items, source_id)) return;
+    if (cited.items.len == max_item_sources) return error.InvalidSource;
+    try cited.append(alloc, source_id);
 }
 
 fn writeEvidenceLine(
@@ -699,6 +747,52 @@ test "typed state normalizes known blocks and rejects unknown provenance" {
     );
 }
 
+test "typed state expands bounded block references into complete provenance" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+    var sources: [10]SourceRecord = undefined;
+    for (&sources, 0..) |*source, id| source.* = .{ .id = id, .role = .user };
+    const blocks = [_]BlockRecord{
+        .{ .id = 0, .source_ids = &.{ 0, 1, 2, 3, 4, 5, 6, 7 } },
+        .{ .id = 1, .source_ids = &.{ 8, 9 } },
+    };
+    const input =
+        \\{"objective":{"text":"continue","sources":["B0","B1"]},"constraints":[],"obligations":[],"next_action":{"kind":"none","text":"wait","sources":["B0"]}}
+    ;
+    const state = try parseOperationalState(alloc, input, &sources, &blocks);
+    try std.testing.expectEqualSlices(
+        usize,
+        &.{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 },
+        state.objective.source_ids,
+    );
+}
+
+test "typed state text limit matches JSON Schema Unicode length" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+    const sources = [_]SourceRecord{.{ .id = 0, .role = .user }};
+    const accepted_text = "—" ** max_item_text_codepoints;
+    const accepted = try std.fmt.allocPrint(
+        alloc,
+        "{{\"objective\":{{\"text\":\"{s}\",\"sources\":[\"S0\"]}},\"constraints\":[],\"obligations\":[],\"next_action\":{{\"kind\":\"none\",\"text\":\"wait\",\"sources\":[\"S0\"]}}}}",
+        .{accepted_text},
+    );
+    _ = try parseOperationalState(alloc, accepted, &sources, &.{});
+
+    const rejected_text = "—" ** (max_item_text_codepoints + 1);
+    const rejected = try std.fmt.allocPrint(
+        alloc,
+        "{{\"objective\":{{\"text\":\"{s}\",\"sources\":[\"S0\"]}},\"constraints\":[],\"obligations\":[],\"next_action\":{{\"kind\":\"none\",\"text\":\"wait\",\"sources\":[\"S0\"]}}}}",
+        .{rejected_text},
+    );
+    try std.testing.expectError(
+        error.InvalidText,
+        parseOperationalState(alloc, rejected, &sources, &.{}),
+    );
+}
+
 test "block citations expand only to cited canonical sources" {
     const alloc = std.testing.allocator;
     const cited = try citedBlockSources(
@@ -708,9 +802,19 @@ test "block citations expand only to cited canonical sources" {
     );
     defer alloc.free(cited);
     try std.testing.expectEqualSlices(usize, &.{ 1, 2 }, cited);
+    const ranged = try citedBlockSources(alloc, "- [S0–S2] range", &.{ 0, 1, 2 });
+    defer alloc.free(ranged);
+    try std.testing.expectEqualSlices(usize, &.{ 0, 1, 2 }, ranged);
+    const ascii_ranged = try citedBlockSources(alloc, "- [S0-S2] range", &.{ 0, 1, 2 });
+    defer alloc.free(ascii_ranged);
+    try std.testing.expectEqualSlices(usize, &.{ 0, 1, 2 }, ascii_ranged);
     try std.testing.expectError(
         error.InvalidSource,
         citedBlockSources(alloc, "- [S9] forged", &.{ 0, 1, 2 }),
+    );
+    try std.testing.expectError(
+        error.InvalidSource,
+        citedBlockSources(alloc, "- [S0–S3] forged range", &.{ 0, 1, 2 }),
     );
 
     var arena_state = std.heap.ArenaAllocator.init(alloc);

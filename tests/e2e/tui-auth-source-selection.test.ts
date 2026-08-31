@@ -1,5 +1,6 @@
 import { afterEach, expect, test } from "bun:test";
 import { spawn as nodeSpawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   chmodSync,
   existsSync,
@@ -101,6 +102,86 @@ function startFakeDirectUsageProvider(
   });
   return {
     get responses() { return responses; },
+    responsesUrl: `http://127.0.0.1:${server.port}/responses`,
+    modelsUrl: `http://127.0.0.1:${server.port}/models`,
+    modalitiesUrl: `http://127.0.0.1:${server.port}/modalities`,
+    stop() { server.stop(true); },
+  };
+}
+
+function startFakeProviderCompaction(provider: "codex" | "grok") {
+  const workingModel = provider === "codex" ? "gpt-5.6-sol" : "grok-4.6";
+  const compactionModel = provider === "codex" ? "gpt-5.6-luna" : "grok-4.5";
+  const accessToken = provider === "codex"
+    ? chatgptAccessToken()
+    : "grok-compaction-token";
+  const bodies: string[] = [];
+  const authorizations: Array<string | null> = [];
+  const modelOverrides: Array<string | null> = [];
+  let workingRequests = 0;
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    async fetch(request) {
+      const path = new URL(request.url).pathname;
+      if (path === "/models") {
+        return provider === "codex"
+          ? Response.json({ models: [
+            { slug: workingModel, visibility: "list", supported_in_api: true, supported_reasoning_levels: [{ effort: "high" }], additional_speed_tiers: [], input_modalities: ["text"], context_window: 200_000 },
+            { slug: compactionModel, visibility: "list", supported_in_api: true, supported_reasoning_levels: [{ effort: "medium" }], additional_speed_tiers: [], input_modalities: ["text"], context_window: 272_000 },
+            { slug: "gpt-5.4-mini", visibility: "list", supported_in_api: true, supported_reasoning_levels: [{ effort: "low" }], additional_speed_tiers: [], input_modalities: ["text"], context_window: 128_000 },
+          ] })
+          : Response.json({ data: [
+            grokSubscriptionModel(workingModel, 200_000),
+            grokSubscriptionModel(compactionModel, 500_000),
+          ] });
+      }
+      if (path === "/modalities") {
+        return Response.json({ models: [
+          grokModalityModel(workingModel, false),
+          grokModalityModel(compactionModel, false),
+        ] });
+      }
+      const body = await request.text();
+      bodies.push(body);
+      authorizations.push(request.headers.get("authorization"));
+      modelOverrides.push(request.headers.get("x-grok-model-override"));
+      const model = (JSON.parse(body) as { model?: string }).model;
+      if (model !== compactionModel) workingRequests += 1;
+      if (model !== compactionModel && workingRequests === 1) {
+        const pressure = Array.from(
+          { length: 10_000 },
+          (_, index) => createHash("sha256").update(`${provider}:${index}`).digest("hex"),
+        ).join("");
+        const input = JSON.stringify({
+          action: "exec",
+          command: `printf TOOL_PRESSURE_OK >/dev/null # ${pressure}`,
+          timeout_ms: 600_000,
+        });
+        return new Response(
+          'data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call_pressure","name":"terminal"}}\n\n' +
+            `data: ${JSON.stringify({ type: "response.function_call_arguments.done", output_index: 0, arguments: input })}\n\n` +
+            'data: {"type":"response.completed","response":{"id":"response-tool","status":"completed","usage":{"input_tokens":7,"output_tokens":3}}}\n\n',
+          { headers: { "content-type": "text/event-stream" } },
+        );
+      }
+      const text = model === compactionModel
+        ? '{"objective":{"text":"Continue after provider-local compaction.","sources":["S0"]},"constraints":[],"obligations":[],"next_action":{"kind":"none","text":"Continue.","sources":["S0"]}}'
+        : `${provider.toUpperCase()}_COMPACTION_CONTINUED`;
+      return new Response(
+        `data: ${JSON.stringify({ type: "response.output_text.delta", delta: text })}\n\n` +
+          `data: ${JSON.stringify({ type: "response.completed", response: { id: `response-${bodies.length}`, status: "completed", usage: { input_tokens: 7, output_tokens: 3 } } })}\n\n`,
+        { headers: { "content-type": "text/event-stream" } },
+      );
+    },
+  });
+  return {
+    accessToken,
+    bodies,
+    authorizations,
+    modelOverrides,
+    workingModel,
+    compactionModel,
     responsesUrl: `http://127.0.0.1:${server.port}/responses`,
     modelsUrl: `http://127.0.0.1:${server.port}/models`,
     modalitiesUrl: `http://127.0.0.1:${server.port}/modalities`,
@@ -3244,6 +3325,75 @@ test(
     }
   },
   60_000,
+);
+
+test(
+  "provider-local automatic compaction never reaches Gateway",
+  async () => {
+    for (const provider of ["codex", "grok"] as const) {
+      const testHome = mkdtempSync(join(tmpdir(), `fx-${provider}-compaction-`));
+      const testGateway = startFakeGateway([]);
+      const direct = startFakeProviderCompaction(provider);
+      try {
+        if (provider === "codex") {
+          writeSeededChatGptLogin(testHome, direct.accessToken);
+        } else {
+          writeSeededGrokLogin(testHome, direct.accessToken);
+        }
+        writeFileSync(
+          join(testHome, ".fx", "settings.json"),
+          JSON.stringify(provider === "codex"
+            ? { provider, codex_model: direct.workingModel }
+            : { provider, grok_model: direct.workingModel }) + "\n",
+          { mode: 0o600 },
+        );
+        const result = await runFx(
+          ["ask", "--json", "--yolo", `Run the pressure fixture and continue as requested for ${provider}.`],
+          {
+            env: {
+              HOME: testHome,
+              AI_GATEWAY_API_KEY: "gateway-compaction-sentinel",
+              VERCEL_OIDC_TOKEN: undefined,
+              FX_DISABLE_KEYCHAIN: "1",
+              FX_AUTO_UPGRADE: "0",
+              FX_GATEWAY_BASE_URL: testGateway.baseUrl,
+              FX_E2E_GATEWAY_MODELS_URL: `${testGateway.baseUrl}/coding-agent/v1/models`,
+              FX_E2E_OPENAI_CODEX_RESPONSES_URL: direct.responsesUrl,
+              FX_E2E_OPENAI_CODEX_MODELS_URL: direct.modelsUrl,
+              FX_E2E_XAI_GROK_RESPONSES_URL: direct.responsesUrl,
+              FX_E2E_XAI_GROK_MODELS_URL: direct.modelsUrl,
+              FX_E2E_XAI_GROK_MODALITIES_URL: direct.modalitiesUrl,
+            },
+            timeoutMs: 60_000,
+          },
+        );
+
+        expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+        expect(JSON.parse(result.stdout).output).toContain(`${provider.toUpperCase()}_COMPACTION_CONTINUED`);
+        expect(
+          direct.bodies.map((body) => (JSON.parse(body) as { model: string }).model),
+          JSON.stringify({
+            body_lengths: direct.bodies.map((body) => body.length),
+          }),
+        )
+          .toEqual([direct.workingModel, direct.compactionModel, direct.workingModel]);
+        expect(direct.authorizations).toEqual(Array(3).fill(`Bearer ${direct.accessToken}`));
+        if (provider === "grok") {
+          expect(direct.modelOverrides).toEqual([
+            direct.workingModel,
+            direct.compactionModel,
+            direct.workingModel,
+          ]);
+        }
+        expect(testGateway.requests).toHaveLength(0);
+      } finally {
+        direct.stop();
+        testGateway.stop();
+        rmSync(testHome, { recursive: true, force: true });
+      }
+    }
+  },
+  120_000,
 );
 
 test(

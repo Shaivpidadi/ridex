@@ -229,7 +229,10 @@ const AcpContext = struct {
             .max_tool_result_bytes = session.max_tool_result_bytes,
             .api_key = session.api_key,
             .agent_stream_provider = server.streamProviderFor(self.state, session.provider),
-            .compaction_stream_provider = server.streamProviderFor(self.state, .gateway),
+            .compaction_route = self.state.cfg.provider_set.compactionRoute(
+                session.provider,
+                session.credential_source,
+            ),
             .credential_source = session.credential_source,
             .account_id = session.account_id,
             .provider = session.provider,
@@ -980,7 +983,10 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
     return .{
         .ctx = @ptrCast(ctx),
         .agent_stream_provider = server.streamProviderFor(ctx.state, ctx.state.active_session.?.provider),
-        .compaction_stream_provider = server.streamProviderFor(ctx.state, .gateway),
+        .compaction_route = ctx.state.cfg.provider_set.compactionRoute(
+            ctx.state.active_session.?.provider,
+            ctx.state.active_session.?.credential_source,
+        ),
         .flush_assistant_stream_per_content_chunk = host_target.is_wasm,
         .tool_registry = ctx.toolRegistry(),
         .context_registry = ctx.state.cfg.context_registry,

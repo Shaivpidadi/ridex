@@ -456,12 +456,6 @@ const App = struct {
             .agent_stream_or_unavailable();
     }
 
-    pub fn compactionStreamProvider(self: *const Self) agent_stream_provider.Provider {
-        return self.providerSet()
-            .select(.gateway)
-            .agent_stream_or_unavailable();
-    }
-
     pub fn fetchProviderCatalog(
         self: *Self,
         provider: model_provider.ProviderId,

@@ -272,10 +272,15 @@ pub fn Bindings(comptime App: type) type {
                     app.agentStreamProvider()
                 else
                     agent_stream_provider.unavailable_provider,
-                .compaction_stream_provider = if (comptime @hasDecl(App, "compactionStreamProvider"))
-                    app.compactionStreamProvider()
+                .compaction_route = if (comptime @hasDecl(App, "compactionRoute"))
+                    app.compactionRoute()
+                else if (comptime @hasDecl(App, "providerSet") and @hasField(App, "auth"))
+                    app.providerSet().compactionRoute(
+                        provider_runtime.provider(app),
+                        app.auth.credentialSource(),
+                    )
                 else
-                    agent_stream_provider.unavailable_provider,
+                    .{ .unavailable = .missing_policy },
                 .cooperative_transport_pulse = if (comptime @hasDecl(App, "cooperativeTransportPulse")) .{
                     .ctx = @ptrCast(app),
                     .run = cooperativeTransportPulse,

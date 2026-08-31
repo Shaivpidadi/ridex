@@ -300,7 +300,7 @@ fn runtimeDeps(context: *Context) agent_runtime.AgentRuntimeDeps {
     return .{
         .ctx = context,
         .agent_stream_provider = context.config.tool_context.agent_stream_provider,
-        .compaction_stream_provider = context.config.tool_context.compaction_stream_provider,
+        .compaction_route = context.config.tool_context.compaction_route,
         .tool_registry = context.config.tool_context.tool_registry,
         .context_registry = context.config.context_registry,
         .context_enabled = context.config.context_enabled,

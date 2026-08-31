@@ -69,10 +69,13 @@ pub fn buildRequest(
     try writeResponsesInput(writer, alloc, request.messages, request.verified_images);
     try writer.writeByte(']');
 
-    _ = try responses_protocol.writeTools(writer, alloc, request.tools);
-    try writer.writeAll(",\"tool_choice\":");
-    try std.json.Stringify.value(request.tool_choice.label(), .{}, writer);
-    try writer.writeAll(",\"parallel_tool_calls\":true,\"include\":[\"reasoning.encrypted_content\"]");
+    const tool_count = try responses_protocol.writeTools(writer, alloc, request.tools);
+    if (tool_count > 0) {
+        try writer.writeAll(",\"tool_choice\":");
+        try std.json.Stringify.value(request.tool_choice.label(), .{}, writer);
+        try writer.writeAll(",\"parallel_tool_calls\":true");
+    }
+    try writer.writeAll(",\"include\":[\"reasoning.encrypted_content\"]");
     try writer.writeAll(",\"text\":{\"verbosity\":\"low\"");
     if (request.response_format) |format| {
         if (format.schema != .object) return error.InvalidStructuredResponseSchema;
@@ -577,6 +580,8 @@ test "xAI Grok standard requests omit the priority service tier" {
     defer std.testing.allocator.free(body);
 
     try std.testing.expect(std.mem.find(u8, body, "\"service_tier\"") == null);
+    try std.testing.expect(std.mem.find(u8, body, "\"tool_choice\"") == null);
+    try std.testing.expect(std.mem.find(u8, body, "\"parallel_tool_calls\"") == null);
 }
 
 test "xAI Grok serializes each verified image directly once" {

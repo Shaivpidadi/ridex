@@ -18,6 +18,7 @@ const command_replay_store = @import("../../../session/command_replay_store.zig"
 const session_child_store = @import("../../../session/session_child_store.zig");
 const lifecycle_hooks = @import("../../../hooks/hooks.zig");
 const model_capabilities = @import("../../../config/model_capabilities.zig");
+const provider_set = @import("../../../gateway/provider_set.zig");
 const file_mutation = @import("../../../tooling/file_mutation.zig");
 const file_mutation_contract = @import("../../../tooling/file_mutation_contract.zig");
 const context_contract = @import("../../../workspace/context_contract.zig");
@@ -644,6 +645,9 @@ pub const FakeAgentRuntimeDeps = struct {
     },
     capability_overrides: []const ModelCapabilityOverride = &.{},
     available_capability_overrides: []const ModelCapabilityOverride = &.{},
+    compaction_route: provider_set.CompactionRouteDecision = .{
+        .ready = .{ .provider = .gateway, .model = "openai/gpt-5.6-luna" },
+    },
     capability_queries: std.ArrayList([]u8) = .empty,
     cancel_on_capability_resolution: ?*std.atomic.Value(bool) = null,
     cancel_after_capability_resolution: ?*std.atomic.Value(bool) = null,
@@ -730,6 +734,7 @@ pub const FakeAgentRuntimeDeps = struct {
         return .{
             .ctx = self,
             .agent_stream_provider = self.agent_stream_provider,
+            .compaction_route = self.compaction_route,
             .tool_registry = self.tool_registry,
             .live_tool_authority = self.live_tool_authority,
             .tool_activity_recorder = self.tool_activity_recorder,
@@ -1927,7 +1932,6 @@ pub fn runFakePromptWithLifecycle(
     hooks.workspace_root = config.workspace_root;
     var deps = hooks.deps();
     deps.agent_stream_provider = gateway.provider();
-    deps.compaction_stream_provider = gateway.provider();
     if (hooks.execute_delegate) |delegate| {
         if (delegate.set_agent_stream_provider) |set_provider| {
             set_provider(delegate.ctx, deps.agent_stream_provider);
