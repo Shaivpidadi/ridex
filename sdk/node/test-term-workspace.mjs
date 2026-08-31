@@ -15,6 +15,8 @@ const config = new Map([["model", "test/workspace-model"], ["mode", "code"]]);
 const encoder = new TextEncoder();
 const requestDecoder = new TextDecoder();
 const stderrDecoder = new TextDecoder();
+const POST_TOOL_DECISION_PROMPT =
+  "Continue the original task. If work remains and you can proceed, briefly tell the user what you are doing next, then perform that action with the appropriate tool. Do not end the turn with only a progress update. If the task is complete, respond with the result. If a genuine blocker prevents further action, explain the blocker and what is needed to continue.";
 const catalog = {
   object: "list",
   data: [{ id: "test/workspace-model", type: "language", released: 1, tags: ["tool-use"], context_window: 128000, max_tokens: 8192 }],
@@ -116,22 +118,31 @@ function textResponse(value) {
 
 function toolResult(body, id) {
   const prompt = body.prompt || [];
-  let lastUser = -1;
+  let lastUserIndex = -1;
   for (let index = prompt.length - 1; index >= 0; index -= 1) {
-    if (prompt[index].role === "user") {
-      lastUser = index;
-      break;
-    }
+    const message = prompt[index];
+    if (message.role !== "user") continue;
+    if (contentText(message.content) === POST_TOOL_DECISION_PROMPT) continue;
+    lastUserIndex = index;
+    break;
   }
-  return prompt.slice(lastUser + 1)
+  return prompt.slice(lastUserIndex + 1)
     .flatMap((message) => Array.isArray(message.content) ? message.content : [])
     .find((part) => part.type === "tool-result" && part.toolCallId === id);
+}
+
+function contentText(content) {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content.map((part) => part?.text || "").join("");
 }
 
 function latestUserText(body) {
   for (let index = (body.prompt || []).length - 1; index >= 0; index -= 1) {
     const message = body.prompt[index];
-    if (message.role === "user") return JSON.stringify(message.content);
+    if (message.role !== "user") continue;
+    if (contentText(message.content) === POST_TOOL_DECISION_PROMPT) continue;
+    return JSON.stringify(message.content);
   }
   return "";
 }

@@ -15,6 +15,8 @@ import { FX_BIN, REPO_ROOT } from "../evals/eval-helpers";
 let sessionCounter = 0;
 
 export const FAKE_GATEWAY_MODEL = "openai/gpt-5";
+export const POST_TOOL_DECISION_PROMPT =
+  "Continue the original task. If work remains and you can proceed, briefly tell the user what you are doing next, then perform that action with the appropriate tool. Do not end the turn with only a progress update. If the task is complete, respond with the result. If a genuine blocker prevents further action, explain the blocker and what is needed to continue.";
 const TMUX_CAPTURE_MAX_BUFFER = 32 * 1024 * 1024;
 const TMUX_HEX_CHUNK_BYTES = 256;
 const COMPOSER_LINE = /^[ \t]*(?:┃|❯|>)(?:[ \t]|$)/;

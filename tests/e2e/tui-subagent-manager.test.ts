@@ -21,6 +21,7 @@ import {
   hasEmptyComposer,
   isVolatileTokenStatusRow,
   paneExitMatches,
+  POST_TOOL_DECISION_PROMPT,
   startDynamicFakeGateway,
   TmuxSession,
   tmuxAvailable,
@@ -213,7 +214,13 @@ function countOccurrences(text: string, needle: string): number {
 
 function latestPrompt(body: string): string {
   const request = JSON.parse(body) as { prompt?: unknown[] };
-  return JSON.stringify(request.prompt?.at(-1) ?? "");
+  const prompt = request.prompt ?? [];
+  for (let index = prompt.length - 1; index >= 0; index -= 1) {
+    const serialized = JSON.stringify(prompt[index] ?? "");
+    if (serialized.includes(POST_TOOL_DECISION_PROMPT)) continue;
+    return serialized;
+  }
+  return "";
 }
 
 function textHex(text: string): string[] {

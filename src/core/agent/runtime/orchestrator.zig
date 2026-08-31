@@ -67,8 +67,8 @@ const AgentRuntimeDeps = runtime_deps.AgentRuntimeDeps;
 const CredentialRefreshMode = runtime_deps.CredentialRefreshMode;
 
 const http_error_detail_max_bytes: usize = 4096;
-const assistant_prefill_recovery_prompt =
-    "Continue from the preceding tool result.";
+const post_tool_decision_prompt =
+    "Continue the original task. If work remains and you can proceed, briefly tell the user what you are doing next, then perform that action with the appropriate tool. Do not end the turn with only a progress update. If the task is complete, respond with the result. If a genuine blocker prevents further action, explain the blocker and what is needed to continue.";
 const repeated_terminal_validation_notice =
     "Repeated terminal validation failures stopped the tool loop. The invalid terminal calls were not executed and produced no terminal effect.";
 const repeated_malformed_arguments_notice =
@@ -79,6 +79,40 @@ const PreparedToolCall = runtime_lifecycle.PreparedToolCall;
 const TurnFinalizationGuard = runtime_finalization.TurnFinalizationGuard;
 const PromptFinishTrace = runtime_finalization.PromptFinishTrace;
 const ToolExecutionResult = runtime_tool_contracts.ToolExecutionResult;
+
+fn append_post_tool_decision_prompt(
+    alloc: Allocator,
+    messages: []const ChatMessage,
+    pending: bool,
+) ![]const ChatMessage {
+    if (!pending) return messages;
+    const projected = try alloc.alloc(ChatMessage, messages.len + 1);
+    @memcpy(projected[0..messages.len], messages);
+    projected[messages.len] = .{
+        .role = .user,
+        .content = post_tool_decision_prompt,
+        .cache_policy = .no_cache,
+    };
+    return projected;
+}
+
+test "append_post_tool_decision_prompt appends one no-cache user message only when pending" {
+    const alloc = std.testing.allocator;
+    const source = [_]ChatMessage{.{ .role = .system, .content = "system" }};
+
+    const unchanged = try append_post_tool_decision_prompt(alloc, &source, false);
+    try std.testing.expectEqual(@as(usize, 1), unchanged.len);
+
+    const projected = try append_post_tool_decision_prompt(alloc, &source, true);
+    defer alloc.free(projected);
+    try std.testing.expectEqual(@as(usize, 2), projected.len);
+    try std.testing.expectEqual(types.ChatRole.user, projected[1].role);
+    try std.testing.expectEqualStrings(
+        "Continue the original task. If work remains and you can proceed, briefly tell the user what you are doing next, then perform that action with the appropriate tool. Do not end the turn with only a progress update. If the task is complete, respond with the result. If a genuine blocker prevents further action, explain the blocker and what is needed to continue.",
+        projected[1].content.?,
+    );
+    try std.testing.expectEqual(types.ChatCachePolicy.no_cache, projected[1].cache_policy);
+}
 
 fn terminal_request_schema_advertised(
     advertised_functions: []const model_tool_schema.FunctionSchema,
@@ -2152,22 +2186,6 @@ fn failureHttpStatus(kind: agent_stream_provider.FailureKind) std.http.Status {
     };
 }
 
-fn isPostVisionAssistantPrefillRejection(
-    status: std.http.Status,
-    detail: []const u8,
-    messages: []const ChatMessage,
-) bool {
-    if (status != .bad_request or messages.len == 0) return false;
-    const tail = messages[messages.len - 1];
-    if (tail.role != .tool or
-        !std.mem.eql(u8, tail.tool_name orelse return false, "vision"))
-    {
-        return false;
-    }
-    return std.mem.find(u8, detail, "does not support assistant message prefill") != null and
-        std.mem.find(u8, detail, "must end with a user message") != null;
-}
-
 fn recovery_deadline(delay_ns: u64) std.Io.Clock.Timestamp {
     const started = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
     return .{
@@ -3332,6 +3350,10 @@ fn processQueuedPromptLoop(
     else
         .none;
     var restore_recovery_source = job.recovery_checkpoint != null;
+    var post_tool_decision_pending = if (job.recovery_checkpoint) |checkpoint|
+        checkpoint.execution.tool_steps.len > 0
+    else
+        false;
     var step: usize = 0;
     while (agent_steps.allowsStep(config.agent_step_limit, step)) : (step += 1) {
         current_step_index = step + 1;
@@ -3370,7 +3392,9 @@ fn processQueuedPromptLoop(
             &ephemeral_overlay,
         );
         var gateway_messages = try runtime_prompt_context.buildGatewayMessages(overlay_arena, stable_prefix.items, ephemeral_overlay.items, history_messages.items, current_user_effective, within_turn_suffix.items);
-        last_gateway_message_count = gateway_messages.items.len;
+        const initial_decision_pending = post_tool_decision_pending or
+            recovery_strategy == .continue_after_confirmed_tool;
+        last_gateway_message_count = gateway_messages.items.len + @intFromBool(initial_decision_pending);
         const history_start_index = stable_prefix.items.len + ephemeral_overlay.items.len;
         const current_user_message_index = history_start_index + history_messages.items.len;
 
@@ -3411,7 +3435,6 @@ fn processQueuedPromptLoop(
         var successful_vision_mode: runtime_gateway_step.VisionToolMode = .unavailable;
         var reset_stream_for_next_attempt = false;
         var auth_retry_used = false;
-        var assistant_prefill_recovery_used = false;
         var skip_next_preflight_refresh = false;
         var recovery_has_unexecuted_tool_start = false;
         var successful_recovery_strategy: ?model_response_recovery.Strategy = null;
@@ -3578,14 +3601,20 @@ fn processQueuedPromptLoop(
                     stream_ctx.raw_text.items,
                 ),
             );
+            const decision_source_messages = try append_post_tool_decision_prompt(
+                overlay_arena,
+                recovery_source_messages,
+                post_tool_decision_pending or
+                    recovery_strategy == .continue_after_confirmed_tool,
+            );
             const projected_request_messages = blk: {
                 if (job.authorized_image_catalog.len == 0 and job.images.len == 0) {
-                    break :blk recovery_source_messages;
+                    break :blk decision_source_messages;
                 }
                 break :blk switch (vision_policy.route) {
                     .native => try runtime_vision_contracts.project_native_messages(
                         overlay_arena,
-                        recovery_source_messages,
+                        decision_source_messages,
                         current_user_message_index,
                     ),
                     .fallback => fallback: {
@@ -3594,7 +3623,7 @@ fn processQueuedPromptLoop(
                         }
                         break :fallback try runtime_vision_contracts.project_text_only_messages(
                             overlay_arena,
-                            recovery_source_messages,
+                            decision_source_messages,
                             current_user_message_index,
                             job.authorized_image_catalog,
                         );
@@ -4245,36 +4274,6 @@ fn processQueuedPromptLoop(
             const gateway_wait_finished_ms = io_mod.milliTimestamp();
             summary_accumulator.addThinkingWait(gateway_wait_started_ms, stream_ctx.first_model_output_at_ms orelse gateway_wait_finished_ms);
 
-            if (!assistant_prefill_recovery_used and
-                semantic_attempt + 1 < semantic_limit and
-                streamReplaySafe(&stream_ctx) and
-                isPostVisionAssistantPrefillRejection(
-                    if (response_failure) |failure| failureHttpStatus(failure.kind) else .ok,
-                    if (response_failure) |failure| failure.detail orelse "" else "",
-                    request_messages,
-                ))
-            {
-                try within_turn_suffix.append(arena, .{
-                    .role = .user,
-                    .content = assistant_prefill_recovery_prompt,
-                    .cache_policy = .no_cache,
-                });
-                debug_trace.eventf(
-                    "gateway",
-                    "assistant_prefill_recovery",
-                    step_ctx,
-                    "tool_name=vision provider_attempt={d}/{d}",
-                    .{ semantic_attempt + 1, semantic_limit },
-                );
-                stream_result.deinit(arena);
-                stream_result_set = false;
-                assistant_prefill_recovery_used = true;
-                semantic_attempt += 1;
-                retry_pacing = .idle;
-                reset_stream_for_next_attempt = true;
-                continue;
-            }
-
             if (response_failure) |failure| if (isRetryableModelFailure(failure.kind)) {
                 const cause: model_response_recovery.FailureCause = if (failure.kind == .rate_limited)
                     .rate_limited
@@ -4703,6 +4702,7 @@ fn processQueuedPromptLoop(
             if (vision_mode != .required) configured_first_tool_choice_pending = false;
             break;
         }
+        post_tool_decision_pending = false;
         defer if (stream_result_set) stream_result.deinit(arena);
 
         var completion = streamCompletion(stream_result);
@@ -4736,6 +4736,7 @@ fn processQueuedPromptLoop(
                     recovery_strategy = null;
                     recovery_cause = .transport_interrupted;
                     preserved_tool_evidence = .none;
+                    post_tool_decision_pending = true;
                     continue;
                 }
                 completion.finish_reason = .stop;
@@ -7681,6 +7682,7 @@ fn processQueuedPromptLoop(
             &within_turn_suffix,
             &step_batch,
         );
+        post_tool_decision_pending = true;
         if (malformed_arguments_retry.finishBatch()) {
             debug_trace.eventf(
                 "agent",

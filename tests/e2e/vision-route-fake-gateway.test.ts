@@ -18,7 +18,12 @@ import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, REPO_ROOT, runFx } from "../evals/eval-helpers";
-import { hasEmptyComposer, TmuxSession, tmuxAvailable } from "./tmux-helpers";
+import {
+  hasEmptyComposer,
+  POST_TOOL_DECISION_PROMPT,
+  TmuxSession,
+  tmuxAvailable,
+} from "./tmux-helpers";
 
 const TIMEOUT = 15_000;
 const GLM_MODEL = "zai/glm-5.2-fast";
@@ -535,7 +540,11 @@ function textFromContent(content: unknown): string {
 
 function lastUserText(body: string): string {
   const parsed = JSON.parse(body) as { prompt: Array<{ role?: string; content?: unknown }> };
-  const users = parsed.prompt.filter((entry) => entry.role === "user");
+  const users = parsed.prompt.filter(
+    (entry) =>
+      entry.role === "user" &&
+      textFromContent(entry.content) !== POST_TOOL_DECISION_PROMPT,
+  );
   expect(users.length).toBeGreaterThan(0);
   return textFromContent(users[users.length - 1].content);
 }
@@ -724,20 +733,10 @@ describe("Vision route fake Gateway", () => {
   );
 
   test(
-    "fx ask recovers when the model rejects the post-Vision prompt as assistant prefill",
+    "fx ask ends the post-Vision prompt with user decision guidance",
     async () => {
       const root = createIsolatedRoot();
       const fixture = createScopedImageFixture(root);
-      const prefillRejection = new Response(
-        JSON.stringify({
-          error: {
-            message:
-              "AI_APICallError: This model does not support assistant message prefill. " +
-              "The conversation must end with a user message.",
-          },
-        }),
-        { status: 400, headers: { "content-type": "application/json" } },
-      );
       const gateway = startImageGateway([
         sseToolCall(
           "vision",
@@ -745,7 +744,6 @@ describe("Vision route fake Gateway", () => {
           "vision_prefill_recovery",
         ),
         sseText(VISION_RESULT),
-        prefillRejection,
         sseText("Recovered final image answer"),
       ]);
       try {
@@ -769,14 +767,12 @@ describe("Vision route fake Gateway", () => {
         const json = parseFxJson(result);
         expect(json.exit_code).toBe(0);
         expect(json.output).toContain("Recovered final image answer");
-        expect(gateway.chatRequests).toHaveLength(4);
+        expect(gateway.chatRequests).toHaveLength(3);
 
-        const rejectedPrompt = JSON.parse(gateway.chatRequests[2].body).prompt;
-        expect(rejectedPrompt.at(-1)).toMatchObject({ role: "tool" });
-        const retryPrompt = JSON.parse(gateway.chatRequests[3].body).prompt;
-        expect(retryPrompt.at(-1)).toMatchObject({ role: "user" });
-        expect(JSON.stringify(retryPrompt.at(-1))).toContain(
-          "Continue from the preceding tool result.",
+        const selectedPrompt = JSON.parse(gateway.chatRequests[2].body).prompt;
+        expect(selectedPrompt.at(-1)).toMatchObject({ role: "user" });
+        expect(JSON.stringify(selectedPrompt.at(-1))).toContain(
+          POST_TOOL_DECISION_PROMPT,
         );
         expect(result.stderr).toBe("Inspecting images\n");
       } finally {
@@ -2968,6 +2964,7 @@ describe("Vision route fake Gateway", () => {
         expect(gateway.chatRequests).toHaveLength(3);
         const selectedFollowup = gateway.chatRequests[2].body;
         expect(lastUserText(selectedFollowup)).toBe(feedback);
+        expect(selectedFollowup).toContain(POST_TOOL_DECISION_PROMPT);
         expect(selectedFollowup.split("<available_images>")).toHaveLength(2);
         expect(selectedFollowup).toContain(rootRequest);
         expect(selectedFollowup).not.toContain(imagePath);

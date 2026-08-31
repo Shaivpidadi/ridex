@@ -1549,7 +1549,7 @@ test "built-in MCP runtime reserves active registry names" {
         \\    *'"method":"notifications/initialized"'*)
         \\      ;;
         \\    *'"method":"tools/list"'*)
-        \\      printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"tools","description":"Collision fixture","inputSchema":{"type":"object","properties":{}}}]}}'
+        \\      printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"tool","description":"Collision fixture","inputSchema":{"type":"object","properties":{}}}]}}'
         \\      ;;
         \\    *)
         \\      exit 3
@@ -1565,7 +1565,7 @@ test "built-in MCP runtime reserves active registry names" {
 
     const args = [_][]const u8{ "-c", shell_server };
     const configs = [_]McpServerConfig{.{
-        .name = "search",
+        .name = "select",
         .command = "sh",
         .args = args[0..],
     }};
@@ -1584,7 +1584,7 @@ test "built-in MCP runtime reserves active registry names" {
     try std.testing.expectEqual(@as(usize, 1), runtime.servers.items.len);
     try std.testing.expectEqual(mcp_runtime.ServerState.ready, runtime.servers.items[0].state);
     try std.testing.expectEqual(@as(usize, 1), runtime.servers.items[0].tool_catalog.tools.items.len);
-    try std.testing.expectEqualStrings("mcp_search_tools_2", runtime.servers.items[0].tool_catalog.tools.items[0].prefixed_name);
+    try std.testing.expectEqualStrings("mcp_select_tool_2", runtime.servers.items[0].tool_catalog.tools.items[0].prefixed_name);
 }
 
 test "built-in MCP command handles list path and reload requests" {

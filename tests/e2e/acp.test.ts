@@ -33,6 +33,7 @@ import {
   fakeGatewaySerializedToolCall,
   fakeGatewaySse,
   fakeGatewayToolCall,
+  POST_TOOL_DECISION_PROMPT,
   startDynamicFakeGateway,
   startFakeGateway,
   terminalFixtureShell,
@@ -263,7 +264,11 @@ function acpPromptText(body: string): string {
 
 function acpLatestPromptText(body: string): string {
   const prompt = acpGatewayRequest(body).prompt;
-  return acpContentText(prompt.at(-1)?.content);
+  for (let index = prompt.length - 1; index >= 0; index -= 1) {
+    const text = acpContentText(prompt[index]?.content);
+    if (text !== POST_TOOL_DECISION_PROMPT) return text;
+  }
+  return "";
 }
 
 function expectNoAcpParentDeliveries(body: string) {
@@ -565,9 +570,27 @@ function codexToolCall(callId: string, name: string, args: object): string {
 
 function codexLatestToolResult(body: string): { callId: string; output: string } | null {
   const request = JSON.parse(body) as {
-    input?: Array<{ type?: string; call_id?: string; output?: string }>;
+    input?: Array<{
+      type?: string;
+      role?: string;
+      content?: Array<{ type?: string; text?: string }>;
+      call_id?: string;
+      output?: string;
+    }>;
   };
-  const result = request.input?.at(-1);
+  const input = request.input ?? [];
+  let lastUserIndex = -1;
+  for (let index = input.length - 1; index >= 0; index -= 1) {
+    const item = input[index];
+    if (item?.role !== "user") continue;
+    const text = item.content?.map((part) => part.text ?? "").join("") ?? "";
+    if (text === POST_TOOL_DECISION_PROMPT) continue;
+    lastUserIndex = index;
+    break;
+  }
+  const result = input
+    .slice(lastUserIndex + 1)
+    .findLast((item) => item.type === "function_call_output");
   if (result?.type !== "function_call_output" || !result.call_id || !result.output) {
     return null;
   }

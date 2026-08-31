@@ -18113,19 +18113,13 @@ test "tool name allocation sanitizes truncates and deconflicts" {
 test "MCP tool name allocation reserves registered tool names" {
     const builtin_tools = @import("../../builtins/tools.zig");
     const alloc = std.testing.allocator;
-    const registry = tool_dispatch.Registry{ .tools = &.{
-        builtin_tools.mcp_search_tools,
-        builtin_tools.mcp_select_tool,
-    } };
+    const registry = tool_dispatch.Registry{ .tools = &.{builtin_tools.mcp_select_tool} };
     var used = std.StringHashMap(void).init(alloc);
     defer used.deinit();
 
-    const search_name = try allocateToolName(alloc, registry, &used, "search", "tools");
-    defer alloc.free(search_name);
     const select_name = try allocateToolName(alloc, registry, &used, "select", "tool");
     defer alloc.free(select_name);
 
-    try std.testing.expectEqualStrings("mcp_search_tools_2", search_name);
     try std.testing.expectEqualStrings("mcp_select_tool_2", select_name);
 }
 

@@ -37,6 +37,7 @@ import {
   fakeGatewayToolCall,
   hasEmptyComposer,
   paneExitMatches,
+  POST_TOOL_DECISION_PROMPT,
   startDynamicFakeGateway,
   TmuxSession,
   tmuxAvailable,
@@ -361,7 +362,7 @@ function toolResultOutput(body: string, callId: string): string {
   const parts = gatewayRequest(body).prompt.flatMap((message) =>
     Array.isArray(message.content) ? message.content : []
   ) as Array<Record<string, unknown>>;
-  const result = parts.find((part) =>
+  const result = parts.findLast((part) =>
     part.type === "tool-result" && part.toolCallId === callId
   );
   if (!result) throw new Error(`Missing tool result for ${callId}`);
@@ -369,10 +370,20 @@ function toolResultOutput(body: string, callId: string): string {
 }
 
 function hasCurrentToolResult(body: string, callId: string): boolean {
-  const last = gatewayRequest(body).prompt.at(-1);
-  if (!last || !Array.isArray(last.content)) return false;
-  return (last.content as Array<Record<string, unknown>>).some((part) =>
-    part.type === "tool-result" && part.toolCallId === callId
+  const prompt = gatewayRequest(body).prompt;
+  let lastUserIndex = -1;
+  for (let index = prompt.length - 1; index >= 0; index -= 1) {
+    const message = prompt[index];
+    if (message?.role !== "user") continue;
+    if (contentText(message.content) === POST_TOOL_DECISION_PROMPT) continue;
+    lastUserIndex = index;
+    break;
+  }
+  return prompt.slice(lastUserIndex + 1).some((message) =>
+    Array.isArray(message.content) &&
+    (message.content as Array<Record<string, unknown>>).some((part) =>
+      part.type === "tool-result" && part.toolCallId === callId
+    )
   );
 }
 

@@ -309,12 +309,12 @@ describe("version-scoped legacy MCP remote transports", () => {
       const root = createRoot(`list-changed-${version}`, "http", streamable.url);
       const freshTool = "mcp_fixture_fresh";
       gateway = startFakeGateway([
-        fakeGatewayToolCall("activate_listener", "mcp_search_tools", {
+        fakeGatewayToolCall("activate_listener", "capability_search", {
           query: "echo",
         }),
         async () => {
           await Bun.sleep(100);
-          return fakeGatewayToolCall("search_fresh", "mcp_search_tools", {
+          return fakeGatewayToolCall("search_fresh", "capability_search", {
             query: "fresh",
           });
         },
@@ -370,12 +370,12 @@ describe("version-scoped legacy MCP remote transports", () => {
     const root = createRoot("sse-list-changed", "sse", legacySse.url);
     const freshTool = "mcp_fixture_fresh";
     gateway = startFakeGateway([
-      fakeGatewayToolCall("activate_sse_reader", "mcp_search_tools", {
+      fakeGatewayToolCall("activate_sse_reader", "capability_search", {
         query: "echo",
       }),
       async () => {
         await Bun.sleep(100);
-        return fakeGatewayToolCall("search_fresh", "mcp_search_tools", {
+        return fakeGatewayToolCall("search_fresh", "capability_search", {
           query: "fresh",
         });
       },
@@ -1025,7 +1025,7 @@ describe("version-scoped legacy MCP remote transports", () => {
       });
       const root = createRoot(`sse-version-${label}`, "sse", legacySse.url);
       gateway = startFakeGateway([
-        fakeGatewayToolCall("inspect_invalid_sse", "mcp_search_tools", {
+        fakeGatewayToolCall("inspect_invalid_sse", "capability_search", {
           query: "echo",
         }),
         fakeGatewayFinalText("Invalid SSE version isolated."),
@@ -1062,7 +1062,7 @@ describe("version-scoped legacy MCP remote transports", () => {
       legacySse.url,
     );
     gateway = startFakeGateway([
-      fakeGatewayToolCall("inspect_malformed_sse", "mcp_search_tools", {
+      fakeGatewayToolCall("inspect_malformed_sse", "capability_search", {
         query: "echo",
       }),
       fakeGatewayFinalText("Malformed SSE startup isolated."),

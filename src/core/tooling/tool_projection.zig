@@ -319,24 +319,8 @@ const test_skill = blk: {
     break :blk spec;
 };
 
-const test_skill_search = blk: {
-    var spec = test_skill;
-    spec.name = "skill_search";
-    spec.description = "Test skill search. When to use: exercise registered skill discovery. When NOT to use: load an exact skill.";
-    spec.model_schema = .{
-        .name = "skill_search",
-        .description = spec.description,
-    };
-    spec.action_label = "Searching skills";
-    spec.completed_action_label = "Searched skills";
-    spec.label_arg_kind = .query;
-    spec.label_arg_default = "skills";
-    spec.model_visible = false;
-    break :blk spec;
-};
-
 const test_capability_search = blk: {
-    var spec = test_skill_search;
+    var spec = test_skill;
     spec.name = "capability_search";
     spec.description = "Test capability search. When to use: discover skill and MCP metadata together. When NOT to use: load or execute a match.";
     spec.model_schema = .{
@@ -346,6 +330,7 @@ const test_capability_search = blk: {
     spec.model_visible = true;
     spec.action_label = "Searching capabilities";
     spec.completed_action_label = "Searched capabilities";
+    spec.label_arg_kind = .query;
     spec.label_arg_default = "capabilities";
     break :blk spec;
 };
@@ -467,33 +452,6 @@ const test_read_tool_result = blk: {
     break :blk spec;
 };
 
-const test_mcp_search_tools = blk: {
-    var spec = test_mcp_select_tool;
-    spec.name = "mcp_search_tools";
-    spec.description = "Test MCP tool search. When to use: exercise deferred dynamic-tool discovery. When NOT to use: assert product-specific search guidance.";
-    spec.model_schema = .{
-        .name = "mcp_search_tools",
-        .description = spec.description,
-        .input_schema = .{
-            .properties = &.{
-                .{ .name = "query", .json_type = .string },
-                .{ .name = "limit", .json_type = .integer },
-            },
-            .required = &.{"query"},
-        },
-    };
-    spec.executor_kind = .mcp_search_tools;
-    spec.activity_kind = .read;
-    spec.requires_approval = false;
-    spec.action_label = "Searching MCP tools";
-    spec.completed_action_label = "Searched MCP tools";
-    spec.label_arg_kind = .query;
-    spec.label_arg_default = "dynamic tools";
-    spec.permission_target_kind = .none;
-    spec.model_visible = false;
-    break :blk spec;
-};
-
 fn writeTestMirrorProviderAdvertisement(
     _: Allocator,
     writer: *std.Io.Writer,
@@ -605,11 +563,9 @@ const test_all_tools = [_]tool_dispatch.Tool{
     test_web_search,
     test_terminal,
     test_capability_search,
-    test_skill_search,
     test_skill,
     test_install_skill,
     test_subagent,
-    test_mcp_search_tools,
     test_mcp_select_tool,
     test_ask_user_question,
     test_vision,
@@ -1045,8 +1001,6 @@ test "MCP tools stay deferred and base selection is stable across catalog churn"
     defer second.deinit(alloc);
 
     try expectContainsName(first.advertised_names, "capability_search");
-    try expectNotContainsName(first.advertised_names, "skill_search");
-    try expectNotContainsName(first.advertised_names, "mcp_search_tools");
     try expectContainsName(first.advertised_names, "mcp_select_tool");
     try expectNotContainsName(first.advertised_names, "mcp_first_a");
     try std.testing.expectEqual(first.advertised_names.len, second.advertised_names.len);

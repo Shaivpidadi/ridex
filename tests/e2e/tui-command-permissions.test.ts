@@ -24,6 +24,7 @@ import {
   fakeGatewayPermissionDecision,
   heldFakeGatewayFinalText,
   isVolatileTokenStatusRow,
+  POST_TOOL_DECISION_PROMPT,
   startDynamicFakeGateway,
   TmuxSession,
   tmuxAvailable,
@@ -313,9 +314,14 @@ function currentUserText(body: string): string {
   const request = JSON.parse(body) as {
     prompt?: Array<{ role?: string; content?: unknown }>;
   };
-  return contentText(
-    request.prompt?.findLast((message) => message.role === "user")?.content,
-  );
+  const prompt = request.prompt ?? [];
+  for (let index = prompt.length - 1; index >= 0; index -= 1) {
+    const message = prompt[index];
+    if (message?.role !== "user") continue;
+    const text = contentText(message.content);
+    if (text !== POST_TOOL_DECISION_PROMPT) return text;
+  }
+  return "";
 }
 
 function occurrenceCount(text: string, needle: string): number {

@@ -131,7 +131,7 @@ const gatewaySteps = toolCalls.flatMap((call, index) => {
 if (toolCalls.length === 0) {
   gatewaySteps.push(fakeGatewayToolCall(
     "search_conformance_server",
-    "mcp_search_tools",
+    "capability_search",
     { query: "conformance" },
   ));
 }

@@ -393,7 +393,6 @@ pub const ExecutorKind = enum {
     skill,
     install_skill,
     subagent,
-    mcp_search_tools,
     mcp_select_tool,
     mcp_features,
     ask_user_question,

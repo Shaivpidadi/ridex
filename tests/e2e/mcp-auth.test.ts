@@ -1655,12 +1655,12 @@ describe("MCP remote authentication lifecycle", () => {
     const root = createRoot(auth);
     seedExpiredCredentials(root, auth, Date.now() + 62_000);
     gateway = startFakeGateway([
-        fakeGatewayToolCall("search_initial", "mcp_search_tools", {
+        fakeGatewayToolCall("search_initial", "capability_search", {
           query: "echo",
         }),
         async () => {
           await Bun.sleep(3_000);
-          return fakeGatewayToolCall("search_refreshed", "mcp_search_tools", {
+          return fakeGatewayToolCall("search_refreshed", "capability_search", {
             query: "echo",
           });
         },
@@ -1680,7 +1680,7 @@ describe("MCP remote authentication lifecycle", () => {
           );
           return fakeGatewayToolCall(
             "search_reconnected",
-            "mcp_search_tools",
+            "capability_search",
             { query: "echo" },
           );
         },
@@ -1726,7 +1726,7 @@ describe("MCP remote authentication lifecycle", () => {
       const root = createRoot(auth);
       seedExpiredCredentials(root, auth, Date.now() + 3_600_000);
       gateway = startFakeGateway([
-        fakeGatewayToolCall("search_after_challenge", "mcp_search_tools", {
+        fakeGatewayToolCall("search_after_challenge", "capability_search", {
           query: "echo",
         }),
         async () => {
@@ -1784,7 +1784,7 @@ describe("MCP remote authentication lifecycle", () => {
     const root = createRoot(auth);
     seedExpiredCredentials(root, auth, Date.now() + 3_600_000);
     gateway = startFakeGateway([
-      fakeGatewayToolCall("search_rotated_catalog", "mcp_search_tools", {
+      fakeGatewayToolCall("search_rotated_catalog", "capability_search", {
         query: "fixture",
       }),
       fakeGatewayFinalText("Private pagination rotation complete."),
@@ -1851,7 +1851,7 @@ describe("MCP remote authentication lifecycle", () => {
             text: "rotate",
           });
         },
-        fakeGatewayToolCall("search_after_rotation", "mcp_search_tools", {
+        fakeGatewayToolCall("search_after_rotation", "capability_search", {
           query: "echo",
         }),
         fakeGatewayFinalText("Authentication cache partition observed."),
@@ -1977,7 +1977,7 @@ describe("MCP remote authentication lifecycle", () => {
       auth = startAuthFixture(upstream.url);
       const root = createRoot(auth, false);
       gateway = startFakeGateway([
-        fakeGatewayToolCall("search_auth", "mcp_search_tools", {
+        fakeGatewayToolCall("search_auth", "capability_search", {
           query: "fixture",
         }),
         fakeGatewayFinalText("MCP authentication is required."),
@@ -3477,7 +3477,7 @@ describe("MCP remote authentication lifecycle", () => {
       const root = createRoot(auth);
       const credentialPath = seedExpiredCredentials(root, auth);
       gateway = startFakeGateway([
-        fakeGatewayToolCall("inspect_refresh_rejection", "mcp_search_tools", {
+        fakeGatewayToolCall("inspect_refresh_rejection", "capability_search", {
           query: "echo",
         }),
         fakeGatewayFinalText("Refresh failure handled."),
