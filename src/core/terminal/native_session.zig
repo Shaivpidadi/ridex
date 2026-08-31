@@ -8,6 +8,7 @@ const tmux_session = @import("tmux_session.zig");
 const host_capabilities = @import("../hosts/host.zig");
 const session_layout = @import("../session/session_layout.zig");
 const process_identity = @import("../execution/process_identity.zig");
+const managed_execution_contract = @import("../execution/managed_execution_contract.zig");
 const process_provider_mod = @import(
     "../execution/process_provider.zig",
 );
@@ -26,7 +27,8 @@ const Allocator = std.mem.Allocator;
 const launcher_mode = "--fx-internal-terminal-launcher";
 const control_mode = "--fx-internal-terminal-control";
 
-const max_sessions: usize = 16;
+const max_sessions = managed_execution_contract.max_live_entries;
+
 const max_read_bytes: usize = 64 * 1024;
 const launcher_config_bytes: usize = contracts.max_command_bytes * 6 +
     contracts.max_authority_text_bytes * 2 +

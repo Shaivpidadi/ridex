@@ -161,7 +161,7 @@ function terminalRecords(home: string): Array<Record<string, unknown>> {
 }
 
 async function cleanupTerminalHost(home: string): Promise<void> {
-  const identityPath = join(home, ".fx", "terminal-host", "host.json");
+  const identityPath = join(home, ".fx", "terminal-host-v6", "host.json");
   const deadline = Date.now() + 3_000;
   while (Date.now() < deadline) {
     if (!existsSync(identityPath)) return;
@@ -218,11 +218,88 @@ test.skipIf(!tmuxAvailable())(
     );
     expect(actions).toEqual(["run", "wait", "write", "stop", "list"]);
     expect(gateway.requests[0]!.body).not.toContain('"name":"terminal"');
+    const runResult = toolResultEnvelope(
+      gateway.requests[1]!.body,
+      "shell_run",
+    );
+    expect(runResult).toContain('\\"next_action\\":{\\"action\\":\\"wait\\"');
+    expect(runResult).toContain(`\\"session_id\\":\\"${sessionId}\\"`);
     const scrollback = await active.captureFullScrollback();
     expect(scrollback).toContain("Ran printf CAPTURED_READY");
     expect(scrollback).toContain("Finished waiting for session shell_run");
     expect(scrollback).not.toContain("Using terminal");
     expect(scrollback).not.toContain("Used terminal");
+    expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+  },
+  TIMEOUT,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "overlapping captured shell handles keep lifecycle output isolated",
+  async () => {
+    const fixture = createFixture("fx-shell-overlap-");
+    let firstSessionId = "";
+    let secondSessionId = "";
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("shell_overlap_first", "shell", {
+        request: {
+          action: "run",
+          command: "sleep 0.4; printf FIRST_OVERLAP",
+          profile: "clean",
+          yield_time_ms: 0,
+        },
+      }),
+      (body) => {
+        firstSessionId = findSessionId(JSON.parse(body)) ?? "";
+        return fakeGatewayToolCall("shell_overlap_second", "shell", {
+          request: {
+            action: "run",
+            command: "sleep 0.2; printf SECOND_OVERLAP",
+            profile: "clean",
+            yield_time_ms: 0,
+          },
+        });
+      },
+      (body) => {
+        secondSessionId = findSessionId(JSON.parse(body)) ?? "";
+        return fakeGatewayToolCall("shell_overlap_wait_first", "shell", {
+          request: {
+            action: "wait",
+            session_id: firstSessionId,
+            wait_ceiling_ms: 5_000,
+          },
+        });
+      },
+      () => fakeGatewayToolCall("shell_overlap_wait_second", "shell", {
+        request: {
+          action: "wait",
+          session_id: secondSessionId,
+          wait_ceiling_ms: 5_000,
+        },
+      }),
+      fakeGatewayFinalText("SHELL_OVERLAP_OK"),
+    ]);
+    gateways.push(gateway);
+    const active = await launch(fixture, gateway);
+    await active.sendText("Run both overlapping managed shell commands.");
+    await active.sendKeys("Enter");
+    await active.waitForText("SHELL_OVERLAP_OK", TIMEOUT);
+
+    expect(firstSessionId.length).toBeGreaterThan(0);
+    expect(secondSessionId.length).toBeGreaterThan(0);
+    expect(secondSessionId).not.toBe(firstSessionId);
+    const firstResult = toolResultEnvelope(
+      gateway.requests[3]!.body,
+      "shell_overlap_wait_first",
+    );
+    const secondResult = toolResultEnvelope(
+      gateway.requests[4]!.body,
+      "shell_overlap_wait_second",
+    );
+    expect(firstResult).toContain("FIRST_OVERLAP");
+    expect(firstResult).not.toContain("SECOND_OVERLAP");
+    expect(secondResult).toContain("SECOND_OVERLAP");
+    expect(secondResult).not.toContain("FIRST_OVERLAP");
     expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
   },
   TIMEOUT,
@@ -255,13 +332,6 @@ test.skipIf(!tmuxAvailable())(
           },
         });
       },
-      () => fakeGatewayToolCall("shell_tty_wait", "shell", {
-        request: {
-          action: "wait",
-          session_id: sessionId,
-          wait_ceiling_ms: 5_000,
-        },
-      }),
       fakeGatewayFinalText("SHELL_TTY_OK"),
     ]);
     gateways.push(gateway);
@@ -270,8 +340,13 @@ test.skipIf(!tmuxAvailable())(
     await active.sendKeys("Enter");
     await active.waitForText("SHELL_TTY_OK", TIMEOUT);
 
-    const waitRequest = gateway.requests[3]!.body;
-    expect(waitRequest).toContain("TTY_ECHO:violet comet");
+    const writeResult = toolResultEnvelope(
+      gateway.requests[2]!.body,
+      "shell_tty_write",
+    );
+    expect(writeResult).toContain("TTY_ECHO:violet comet");
+    expect(writeResult).toContain('\\"state\\":\\"completed\\"');
+    expect(writeResult).toContain('\\"exit_code\\":0');
     const records = terminalRecords(fixture.home);
     expect(records.some((record) =>
       record.session_id === sessionId && record.lifecycle === "closed"
@@ -282,7 +357,7 @@ test.skipIf(!tmuxAvailable())(
 );
 
 test.skipIf(!tmuxAvailable())(
-  "shell TTY waits advance one runtime-owned cursor without duplicate output",
+  "shell TTY writes advance one runtime-owned cursor without duplicate output",
   async () => {
     const fixture = createFixture("fx-shell-tty-cursor-");
     let sessionId = "";
@@ -308,25 +383,11 @@ test.skipIf(!tmuxAvailable())(
           },
         });
       },
-      () => fakeGatewayToolCall("shell_tty_wait_one", "shell", {
-        request: {
-          action: "wait",
-          session_id: sessionId,
-          wait_ceiling_ms: 50,
-        },
-      }),
       () => fakeGatewayToolCall("shell_tty_cursor_write_two", "shell", {
         request: {
           action: "write",
           session_id: sessionId,
           input: { kind: "text", text: "next\n" },
-        },
-      }),
-      () => fakeGatewayToolCall("shell_tty_wait_two", "shell", {
-        request: {
-          action: "wait",
-          session_id: sessionId,
-          wait_ceiling_ms: 5_000,
         },
       }),
       fakeGatewayFinalText("SHELL_TTY_CURSOR_OK"),
@@ -338,12 +399,12 @@ test.skipIf(!tmuxAvailable())(
     await active.waitForText("SHELL_TTY_CURSOR_OK", TIMEOUT);
 
     const first = toolResultEnvelope(
-      gateway.requests[3]!.body,
-      "shell_tty_wait_one",
+      gateway.requests[2]!.body,
+      "shell_tty_cursor_write",
     );
     const second = toolResultEnvelope(
-      gateway.requests[5]!.body,
-      "shell_tty_wait_two",
+      gateway.requests[3]!.body,
+      "shell_tty_cursor_write_two",
     );
     expect(first).toContain("CURSOR_FIRST");
     expect(first).not.toContain("CURSOR_SECOND");

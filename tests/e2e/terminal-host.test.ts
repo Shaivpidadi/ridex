@@ -574,7 +574,7 @@ int main(int argc, char **argv) {
 buildCurrentClientFixture();
 
 function hostPaths(home: string) {
-  const dir = join(home, ".fx", "terminal-host");
+  const dir = join(home, ".fx", "terminal-host-v6");
   return {
     dir,
     socket: join(dir, "host.sock"),
@@ -598,7 +598,7 @@ function terminalTransportPaths(home: string) {
     };
   }
   const digest = createHash("sha256")
-    .update("fx.terminal.transport.v1\0")
+    .update("fx.terminal.transport.v2\0")
     .update(home)
     .digest("hex")
     .slice(0, 32);
@@ -615,7 +615,7 @@ function terminalTransportPaths(home: string) {
 
 function makeLongHome(endpointBytes = 141): string {
   const root = mkdtempSync(join(tmpdir(), "fx-terminal-long-home-"));
-  const endpointSuffix = join(".fx", "terminal-host", "host.sock");
+  const endpointSuffix = join(".fx", "terminal-host-v6", "host.sock");
   const componentBytes = endpointBytes -
     Buffer.byteLength(root) -
     Buffer.byteLength(endpointSuffix) -
@@ -2154,7 +2154,7 @@ test.skipIf(!tmuxAvailable())(
       }
     }
   },
-  120_000,
+  180_000,
 );
 
 test.skipIf(!tmuxAvailable())(

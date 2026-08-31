@@ -9447,7 +9447,7 @@ test "pre-flush live command output chunks match consolidated row geometry" {
     try std.testing.expectEqualStrings(live, consolidated);
 }
 
-test "command output lifecycle mismatch cannot append to or complete the active block" {
+test "concurrent command output lifecycles remain isolated" {
     var sink = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), "/dev/null", .{ .mode = .write_only });
     defer sink.close(io_mod.getIo());
 
@@ -9461,27 +9461,35 @@ test "command output lifecycle mismatch cannot append to or complete the active 
     const foreign_id = types.ToolLifecycleId{ .turn_id = 7, .call_id = "foreign-command" };
 
     try runtime.writeCommandOutputChunkForLifecycle(alloc, &metrics, styles, active_id, .stdout, "active-one\n", true);
-    try std.testing.expectError(
-        error.CommandOutputLifecycleMismatch,
-        runtime.writeCommandOutputChunkForLifecycle(alloc, &metrics, styles, foreign_id, .stderr, "foreign\n", true),
+    try runtime.writeCommandOutputChunkForLifecycle(
+        alloc,
+        &metrics,
+        styles,
+        foreign_id,
+        .stderr,
+        "foreign\n",
+        true,
     );
     try runtime.flushCommandOutputSummaryForLifecycle(alloc, &metrics, styles, foreign_id, true);
 
-    try std.testing.expectEqual(@as(?usize, 0), runtime.command_output_display.open_command_block);
-    try std.testing.expectEqual(@as(usize, 1), runtime.command_output_blocks.items.len);
+    try std.testing.expect(runtime.command_output_display.open_command_block == null);
+    try std.testing.expectEqual(@as(usize, 2), runtime.command_output_blocks.items.len);
     try std.testing.expectEqual(@as(usize, 1), runtime.command_output_blocks.items[0].lines.items.len);
     try std.testing.expectEqualStrings("active-one", runtime.command_output_blocks.items[0].lines.items[0].text);
-    try std.testing.expect(std.mem.find(u8, runtime.transcript.items, "foreign") == null);
+    try std.testing.expectEqual(@as(usize, 1), runtime.command_output_blocks.items[1].lines.items.len);
+    try std.testing.expectEqualStrings("foreign", runtime.command_output_blocks.items[1].lines.items[0].text);
 
     try runtime.writeCommandOutputChunkForLifecycle(alloc, &metrics, styles, active_id, .stderr, "active-two\n", true);
     try runtime.flushCommandOutputSummaryForLifecycle(alloc, &metrics, styles, active_id, true);
 
     try std.testing.expect(runtime.command_output_display.open_command_block == null);
+    try std.testing.expectEqual(@as(usize, 2), runtime.command_output_blocks.items.len);
     try std.testing.expectEqual(@as(usize, 2), runtime.command_output_blocks.items[0].lines.items.len);
     try std.testing.expectEqual(command_output_content.Stream.stdout, runtime.command_output_blocks.items[0].lines.items[0].stream);
     try std.testing.expectEqual(command_output_content.Stream.stderr, runtime.command_output_blocks.items[0].lines.items[1].stream);
     try std.testing.expectEqualStrings("active-one", runtime.command_output_blocks.items[0].lines.items[0].text);
     try std.testing.expectEqualStrings("active-two", runtime.command_output_blocks.items[0].lines.items[1].text);
+    try std.testing.expectEqualStrings("foreign", runtime.command_output_blocks.items[1].lines.items[0].text);
 }
 
 test "command output display caps at five physical rows" {

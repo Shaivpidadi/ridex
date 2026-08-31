@@ -5,6 +5,7 @@ const command_environment = @import("../../core/execution/command_environment.zi
 const debug_trace = @import("../../core/shared/debug_trace.zig");
 const managed_execution = @import("../../core/execution/managed_execution.zig");
 const managed_contract = @import("../../core/execution/managed_execution_contract.zig");
+const io_mod = @import("../../core/shared/io.zig");
 const pathing = @import("../../core/workspace/pathing.zig");
 const terminal_identity = @import("../../core/terminal/identity.zig");
 const terminal_action_executor = @import("../../core/terminal/action_executor.zig");
@@ -16,8 +17,11 @@ const sort_utils = @import("../../core/shared/sort_utils.zig");
 const terminal_contracts = @import("../../core/terminal/contracts.zig");
 const tool_args = @import("../../core/tooling/tool_args.zig");
 const tool_dispatch = @import("../../core/tooling/tool_dispatch.zig");
+const tool_result_limits = @import("../../core/tooling/tool_result_limits.zig");
 const tool_result_errors = @import("../../core/tooling/tool_result_errors.zig");
+const text_utils = @import("../../core/shared/text_utils.zig");
 const result_commit = @import("../../core/tooling/result_commit.zig");
+const result_store = @import("../../core/session/result_store.zig");
 const types = @import("../../core/shared/types.zig");
 const workspace_access = @import("../../core/workspace/workspace_access.zig");
 
@@ -710,10 +714,24 @@ fn callWrite(
         },
     };
     release_needed = false;
+    io_mod.sleep(100 * std.time.ns_per_ms);
+    var observed = terminal_managed_observer.observe(
+        ttyObserverContext(ctx, runtime) orelse return unavailable(ctx),
+        session_id,
+        terminal_managed_observer.snapshotState(facts, null),
+        runtime.ttyCursorFor(session_id),
+    ) catch |err| return runtimeFailure(ctx, err);
+    defer observed.deinit(ctx.allocator);
+    finalizeCompletedTty(ctx, session_id, observed.state) catch |err|
+        return runtimeFailure(ctx, err);
     var prepared = runtime.updateTty(ctx.allocator, .{
         .execution_id = session_id,
         .command = "",
-        .state = terminal_managed_observer.snapshotState(facts, null),
+        .state = observed.state,
+        .output = observed.output,
+        .replay_output = observed.replay_output,
+        .next_cursor = observed.next_cursor,
+        .output_incomplete = observed.output_incomplete,
         .max_output_bytes = ctx.max_command_output_bytes,
         .published_running = true,
     }) catch |err| return runtimeFailure(ctx, err);
@@ -1020,10 +1038,11 @@ fn finishPreparedWithAccepted(
     prepared: *managed_execution.PreparedSnapshot,
     accepted_bytes: u32,
 ) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
-    const body = formatSnapshot(
+    const body = formatSnapshotWithLimit(
         ctx.allocator,
         prepared.snapshot,
         accepted_bytes,
+        ctx.max_tool_result_bytes,
     ) catch |err| {
         runtime.cancelDelivery(
             prepared.snapshot.execution_id,
@@ -1147,7 +1166,12 @@ fn finishPrepared(
     prepared: *managed_execution.PreparedSnapshot,
     action: enum { command, stop },
 ) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
-    const body = formatSnapshot(ctx.allocator, prepared.snapshot, null) catch |err| {
+    const body = formatSnapshotWithLimit(
+        ctx.allocator,
+        prepared.snapshot,
+        null,
+        ctx.max_tool_result_bytes,
+    ) catch |err| {
         runtime.cancelDelivery(
             prepared.snapshot.execution_id,
             prepared.reservation_id,
@@ -1214,7 +1238,12 @@ fn publishSnapshotMetadata(
         .available => |descriptor| ctx.allocator.free(@constCast(descriptor.handle)),
         .unavailable => {},
     };
-    if (projection.signal) |signal| {
+    const completed = switch (snapshot.state) {
+        .completed => true,
+        .running, .stopped, .lost => false,
+    };
+    if (completed and projection.signal != null) {
+        const signal = projection.signal.?;
         memory.command_process_presentation = .{ .signal = signal };
     } else if (timed_out) {
         memory.command_process_presentation = .timed_out;
@@ -1282,6 +1311,99 @@ fn formatSnapshot(
     snapshot: managed_execution.Snapshot,
     accepted_bytes: ?u32,
 ) ![]u8 {
+    return formatSnapshotWithLimit(
+        alloc,
+        snapshot,
+        accepted_bytes,
+        tool_result_limits.default_max_tool_result_bytes,
+    );
+}
+
+fn formatSnapshotWithLimit(
+    alloc: Allocator,
+    snapshot: managed_execution.Snapshot,
+    accepted_bytes: ?u32,
+    max_bytes: usize,
+) ![]u8 {
+    const inline_max_bytes = @min(
+        max_bytes,
+        result_store.large_result_threshold_bytes,
+    );
+    const full = try formatSnapshotRaw(
+        alloc,
+        snapshot,
+        accepted_bytes,
+        snapshot.output_delta,
+        snapshot.output_truncated,
+    );
+    if (full.len <= inline_max_bytes) return full;
+    alloc.free(full);
+
+    var minimum: usize = 0;
+    var maximum: usize = @min(snapshot.output_delta.len, inline_max_bytes);
+    var best: ?[]u8 = null;
+    errdefer if (best) |value| alloc.free(value);
+    while (minimum <= maximum) {
+        const content_budget = minimum + (maximum - minimum) / 2;
+        const marker = "\n... bytes omitted; use full_output_handle for exact output ...\n";
+        var projected_writer: std.Io.Writer.Allocating = .init(alloc);
+        defer projected_writer.deinit();
+        try text_utils.writeHeadTailBounded(
+            &projected_writer.writer,
+            snapshot.output_delta,
+            content_budget,
+            marker,
+            .up,
+        );
+        const projected = try projected_writer.toOwnedSlice();
+        defer alloc.free(projected);
+        const candidate = try formatSnapshotRaw(
+            alloc,
+            snapshot,
+            accepted_bytes,
+            projected,
+            true,
+        );
+        if (candidate.len <= inline_max_bytes) {
+            if (best) |value| alloc.free(value);
+            best = candidate;
+            minimum = content_budget + 1;
+        } else {
+            alloc.free(candidate);
+            if (content_budget == 0) break;
+            maximum = content_budget - 1;
+        }
+    }
+    if (best) |value| return value;
+    return formatSnapshotRaw(
+        alloc,
+        snapshot,
+        accepted_bytes,
+        "",
+        true,
+    );
+}
+
+fn formatSnapshotRaw(
+    alloc: Allocator,
+    snapshot: managed_execution.Snapshot,
+    accepted_bytes: ?u32,
+    output_delta: []const u8,
+    output_truncated: bool,
+) ![]u8 {
+    const NextAction = struct {
+        action: []const u8,
+        session_id: []const u8,
+        instruction: []const u8,
+    };
+    const next_action: ?NextAction = switch (snapshot.state) {
+        .running => .{
+            .action = "wait",
+            .session_id = snapshot.execution_id,
+            .instruction = "Execution is still running. Call shell.wait again with this session_id; do not rerun or stop it unless cancellation was requested.",
+        },
+        .completed, .stopped, .lost => null,
+    };
     const status = switch (snapshot.state) {
         .completed => |value| value,
         .stopped => |value| value,
@@ -1302,8 +1424,7 @@ fn formatSnapshot(
         .state = snapshotStateName(snapshot.state),
         .backend = @tagName(snapshot.backend),
         .persistence = @tagName(snapshot.persistence),
-        .output_delta = snapshot.output_delta,
-        .output_truncated = snapshot.output_truncated,
+        .output_truncated = output_truncated,
         .full_output_handle = snapshot.output_file,
         .exit_code = projection.exit_code,
         .signal = projection.signal,
@@ -1311,6 +1432,8 @@ fn formatSnapshot(
         .duration_ms = snapshot.duration_ms,
         .accepted_bytes = accepted_bytes,
         .@"error" = snapshot.error_name,
+        .next_action = next_action,
+        .output_delta = output_delta,
     }, .{}, &out.writer);
     return try out.toOwnedSlice();
 }
@@ -1453,13 +1576,6 @@ pub fn isIrreversible(_: tool_dispatch.ToolInput) bool {
     return false;
 }
 
-pub fn mapAuthorizedResult(
-    _: Allocator,
-    result: tool_dispatch.DispatchResult,
-) Allocator.Error!tool_dispatch.DispatchResult {
-    return result;
-}
-
 test "shell action fields are closed and command authority covers every run" {
     try std.testing.expectEqualSlices(
         []const u8,
@@ -1504,6 +1620,119 @@ test "shell decoder preserves null omission and rejects cross action fields" {
             try std.testing.expect(std.mem.find(u8, failure, "invalid_action_fields") != null);
         },
     }
+}
+
+test "shell decoder applies Codex parity observation defaults" {
+    const alloc = std.testing.allocator;
+    const ctx = tool_dispatch.DispatchContext{ .allocator = alloc };
+    const run_decoded = try decode(ctx, "{\"action\":\"run\",\"command\":\"true\"}");
+    switch (run_decoded) {
+        .failure => |failure| {
+            defer alloc.free(failure);
+            return error.TestUnexpectedResult;
+        },
+        .input => |input| {
+            defer input.deinit(alloc);
+            try std.testing.expectEqual(
+                @as(u32, 30_000),
+                input.as(OwnedInput).value.yield_time_ms,
+            );
+        },
+    }
+    const wait_decoded = try decode(
+        ctx,
+        "{\"action\":\"wait\",\"session_id\":\"shell-session\"}",
+    );
+    switch (wait_decoded) {
+        .failure => |failure| {
+            defer alloc.free(failure);
+            return error.TestUnexpectedResult;
+        },
+        .input => |input| {
+            defer input.deinit(alloc);
+            try std.testing.expectEqual(
+                @as(u32, 5_000),
+                input.as(OwnedInput).value.wait_ceiling_ms,
+            );
+        },
+    }
+}
+
+test "stopped execution is a successful shell observation without command failure metadata" {
+    const alloc = std.testing.allocator;
+    var memory: ?types.ToolResultMemory = null;
+    try publishSnapshotMetadata(.{
+        .allocator = alloc,
+        .tool_result_memory_sink = &memory,
+    }, .{
+        .execution_id = @constCast("shell-stopped"),
+        .command = @constCast("sleep 60"),
+        .cwd = @constCast("/tmp"),
+        .retained = true,
+        .state = .{ .stopped = .{ .signal = 15 } },
+        .output_delta = @constCast(""),
+        .output_truncated = false,
+    });
+    try std.testing.expect(memory != null);
+    try std.testing.expect(memory.?.command_process_presentation == null);
+}
+
+test "shell snapshot keeps bounded head tail and control metadata" {
+    const alloc = std.testing.allocator;
+    const output = "HEAD_SENTINEL\n" ++ ("x" ** (70 * 1024)) ++ "\nTAIL_SENTINEL";
+    const body = try formatSnapshot(alloc, .{
+        .execution_id = @constCast("shell-large"),
+        .command = @constCast("large-output"),
+        .cwd = @constCast("/tmp"),
+        .retained = true,
+        .state = .{ .completed = .{ .exit_code = 0 } },
+        .output_delta = @constCast(output),
+        .output_truncated = false,
+        .output_file = @constCast("fx-command-replay-large.bin"),
+    }, null);
+    defer alloc.free(body);
+
+    try std.testing.expect(body.len <= 16 * 1024);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    const object = parsed.value.object;
+    try std.testing.expectEqualStrings(
+        "fx-command-replay-large.bin",
+        object.get("full_output_handle").?.string,
+    );
+    try std.testing.expect(object.get("output_truncated").?.bool);
+    const projected = object.get("output_delta").?.string;
+    try std.testing.expect(std.mem.find(u8, projected, "HEAD_SENTINEL") != null);
+    try std.testing.expect(std.mem.find(u8, projected, "TAIL_SENTINEL") != null);
+    try std.testing.expect(std.mem.find(u8, projected, "bytes omitted") != null);
+}
+
+test "running shell snapshot directs the same handle to wait again" {
+    const alloc = std.testing.allocator;
+    const body = try formatSnapshot(alloc, .{
+        .execution_id = @constCast("shell-running"),
+        .command = @constCast("long-command"),
+        .cwd = @constCast("/tmp"),
+        .retained = true,
+        .state = .running,
+        .output_delta = @constCast(""),
+        .output_truncated = false,
+    }, null);
+    defer alloc.free(body);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    const next_action = parsed.value.object.get("next_action").?.object;
+    try std.testing.expectEqualStrings("wait", next_action.get("action").?.string);
+    try std.testing.expectEqualStrings(
+        "shell-running",
+        next_action.get("session_id").?.string,
+    );
+    try std.testing.expect(std.mem.find(
+        u8,
+        next_action.get("instruction").?.string,
+        "do not rerun or stop",
+    ) != null);
 }
 
 test "registered shell run yields and waits through one managed execution" {
@@ -1559,6 +1788,8 @@ test "registered shell run yields and waits through one managed execution" {
             .source = .yolo,
         },
     };
+    var start_status_detail: ?[]u8 = null;
+    defer if (start_status_detail) |detail| alloc.free(detail);
     const started = try tool_dispatch.dispatchAuthorizedToolCall(
         .{
             .allocator = alloc,
@@ -1580,11 +1811,23 @@ test "registered shell run yields and waits through one managed execution" {
             .name = "shell",
             .arguments_json = "{\"action\":\"run\",\"command\":\"printf ready; sleep 0.05; printf done\",\"cwd\":\"/tmp\",\"profile\":\"clean\",\"yield_time_ms\":0}",
         },
+        &start_status_detail,
     );
     defer started.deinit(alloc);
     try std.testing.expectEqual(tool_dispatch.DispatchResult.Status.success, started.status);
     try std.testing.expect(std.mem.find(u8, started.body, "\"state\":\"running\"") != null);
 
+    var wait_status_detail: ?[]u8 = null;
+    defer if (wait_status_detail) |detail| alloc.free(detail);
+    var command_result_json: ?[]const u8 = null;
+    defer if (command_result_json) |json| alloc.free(@constCast(json));
+    var tool_result_memory: ?types.ToolResultMemory = null;
+    defer if (tool_result_memory) |memory| {
+        if (memory.command_output_replay) |replay| switch (replay) {
+            .available => |descriptor| alloc.free(@constCast(descriptor.handle)),
+            .unavailable => {},
+        };
+    };
     const waited = try tool_dispatch.dispatchAuthorizedToolCall(
         .{
             .allocator = alloc,
@@ -1592,6 +1835,8 @@ test "registered shell run yields and waits through one managed execution" {
             .tool_call_id = "shell-wait",
             .managed_executions = &runtime,
             .max_command_output_bytes = 4096,
+            .command_result_json_sink = &command_result_json,
+            .tool_result_memory_sink = &tool_result_memory,
         },
         registry,
         .{
@@ -1599,6 +1844,7 @@ test "registered shell run yields and waits through one managed execution" {
             .name = "shell",
             .arguments_json = "{\"action\":\"wait\",\"session_id\":\"shell-integration\",\"wait_ceiling_ms\":2000}",
         },
+        &wait_status_detail,
     );
     defer waited.deinit(alloc);
     try std.testing.expectEqual(tool_dispatch.DispatchResult.Status.success, waited.status);
@@ -1608,10 +1854,10 @@ test "registered shell run yields and waits through one managed execution" {
     try std.testing.expectEqual(@as(usize, "readydone".len), streamed_bytes.load(.seq_cst));
     try std.testing.expect(std.mem.find(
         u8,
-        waited.command_result_json orelse return error.TestExpectedEqual,
+        command_result_json orelse return error.TestExpectedEqual,
         "\"kind\":\"command\"",
     ) != null);
-    const replay = waited.tool_result_memory.?.command_output_replay orelse
+    const replay = tool_result_memory.?.command_output_replay orelse
         return error.TestExpectedEqual;
     try std.testing.expect(replay == .available);
 }

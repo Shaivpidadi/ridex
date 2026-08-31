@@ -169,6 +169,13 @@ pub fn observe(
         cursor = page.next;
     }
 
+    observed_state = try resolveCompletedStatus(
+        ctx,
+        session_id,
+        observed_state,
+        authority.view(),
+    );
+
     const replay_output = try raw.toOwnedSlice(ctx.alloc);
     errdefer ctx.alloc.free(replay_output);
     const projected_output = if (std.mem.findScalar(u8, replay_output, 0x1b) != null)
@@ -187,6 +194,34 @@ pub fn observe(
             .offset = cursor.offset,
         },
         .output_incomplete = output_incomplete,
+    };
+}
+
+fn resolveCompletedStatus(
+    ctx: Context,
+    session_id: []const u8,
+    state: managed_execution.SnapshotState,
+    authority: contracts.AuthorityClaim,
+) !managed_execution.SnapshotState {
+    const status = switch (state) {
+        .completed => |value| value,
+        .running, .stopped, .lost => return state,
+    };
+    if (status != .finished) return state;
+
+    var waited = try execute(ctx, .{ .wait = .{
+        .session_id = session_id,
+        .return_when = .exit,
+        .safety_ceiling_ms = 1,
+        .authority = authority,
+    } });
+    defer waited.deinit(ctx.alloc);
+    return switch (waited.view()) {
+        .failure => state,
+        .success => |success| switch (success) {
+            .wait => |value| snapshotState(value.session, value.outcome),
+            else => error.InvalidTerminalResult,
+        },
     };
 }
 

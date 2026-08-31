@@ -3001,7 +3001,7 @@ test "execution memory codec preserves feedback and reads v1 results without it"
     try std.testing.expect(v2_decoded.assistant.execution.tool_steps[0].tool_results[0].command_process_presentation == null);
 }
 
-test "private codec preserves summary-only specialized turns" {
+test "private codec preserves summary-only interrupted turns" {
     const alloc = std.testing.allocator;
     const summary = types.TurnSummary{
         .started_at_ms = 100,
@@ -3011,18 +3011,10 @@ test "private codec preserves summary-only specialized turns" {
         .token_progress = .{ .input_tokens = 12, .output_tokens = 34 },
     };
 
-    const turns = [_]session.HistoryTurn{
-        .{ .background_command = .{
-            .user = .{ .text = @constCast("start server") },
-            .execution = .{ .turn_summary = summary },
-            .log_path = @constCast("/tmp/server.log"),
-            .expect_url = false,
-        } },
-        .{ .interrupted = .{
-            .user = .{ .text = @constCast("inspect repository") },
-            .execution = .{ .turn_summary = summary },
-        } },
-    };
+    const turns = [_]session.HistoryTurn{.{ .interrupted = .{
+        .user = .{ .text = @constCast("inspect repository") },
+        .execution = .{ .turn_summary = summary },
+    } }};
 
     for (turns) |turn| {
         var encoded: std.Io.Writer.Allocating = .init(alloc);

@@ -764,7 +764,7 @@ describe("gateway stream lifecycle", () => {
       expect(request.prompt[1]?.role).toBe("system");
       expect(contentText(request.prompt[1]?.content)).toBe(WEB_SEARCH_GUIDANCE);
       expect(toolByName(oracleRequest, "shell")?.description).toBe(
-        "Run every command with shell.run. Fast commands complete in one call; commands still running after yield_time_ms return one owned session_id. Use yield_time_ms=0 for an immediate managed background handle. Continue only with shell.wait, send input only to tty=true work with shell.write, stop owned work with shell.stop, and inspect live work with shell.list. Never detach with &, nohup, setsid, or double-forking.",
+        "Run every command with shell.run. Fast commands complete in one call; commands still running after yield_time_ms return one owned session_id. Use yield_time_ms=0 for an immediate managed background handle. Continue only with shell.wait, send input only to tty=true work with shell.write, stop owned work with shell.stop, and inspect live work with shell.list. For line input, send one text payload containing the trailing newline. Never detach with &, nohup, setsid, or double-forking.",
       );
       expect(toolByName(oracleRequest, "skill")?.description).toContain(
         "the task clearly matches one",

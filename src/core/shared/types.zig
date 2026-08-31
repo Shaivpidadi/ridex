@@ -1556,7 +1556,6 @@ pub const HistoryTurn = union(enum) {
 pub fn setHistoryTurnSummary(turn: *HistoryTurn, summary: TurnSummary) void {
     switch (turn.*) {
         .assistant => |*entry| entry.execution.turn_summary = summary,
-        .background_command => |*entry| entry.execution.turn_summary = summary,
         .interrupted => |*entry| entry.execution.turn_summary = summary,
         .compacted_summary => {},
     }
@@ -1565,7 +1564,6 @@ pub fn setHistoryTurnSummary(turn: *HistoryTurn, summary: TurnSummary) void {
 pub fn historyTurnSummary(turn: HistoryTurn) ?TurnSummary {
     return switch (turn) {
         .assistant => |entry| entry.execution.turn_summary,
-        .background_command => |entry| entry.execution.turn_summary,
         .interrupted => |entry| entry.execution.turn_summary,
         .compacted_summary => null,
     };

@@ -895,12 +895,16 @@ pub fn finishCancelledToolStatus(
     advertised_dynamic_tool_names: []const []const u8,
 ) !void {
     if (!status_started) return;
+    const label = if (try isShellWaitCall(arena, call))
+        "Stopped waiting for"
+    else
+        "Cancelled";
     const line = try hooks.describe_tool_action_denied(
         hooks.ctx,
         arena,
         call,
         display_target,
-        "Cancelled",
+        label,
         advertised_dynamic_tool_names,
     );
     const command_activity = activityKindForCall(
@@ -925,6 +929,33 @@ pub fn finishCancelledToolStatus(
         .result_memory = result.tool_result_memory,
         .command_artifact_handle = command_artifact_handle,
     } });
+}
+
+fn isShellWaitCall(arena: Allocator, call: ToolCall) Allocator.Error!bool {
+    if (!std.mem.eql(u8, call.name, "shell")) return false;
+    var parsed = std.json.parseFromSlice(
+        std.json.Value,
+        arena,
+        call.arguments_json,
+        .{},
+    ) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => false,
+    };
+    defer parsed.deinit();
+    const outer = switch (parsed.value) {
+        .object => |object| object,
+        else => return false,
+    };
+    const object = if (outer.get("request")) |request| switch (request) {
+        .object => |value| value,
+        else => return false,
+    } else outer;
+    const action = switch (object.get("action") orelse return false) {
+        .string => |value| value,
+        else => return false,
+    };
+    return std.mem.eql(u8, action, "wait");
 }
 
 pub fn finishExecutedToolStatus(
@@ -2480,4 +2511,41 @@ test "cancelled command ignores malformed artifact metadata" {
     const terminal = capture.events.items[0].terminal;
     try std.testing.expectEqual(types.ToolOutcomeKind.cancelled, terminal.outcome.kind);
     try std.testing.expect(terminal.command_artifact_handle == null);
+}
+
+test "cancelled shell wait names the observation instead of the process" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    var capture = ProvisionalStatusTestCapture{ .alloc = alloc };
+    defer capture.deinit();
+    const hooks = capture.hooks();
+
+    try finishCancelledToolStatus(
+        &hooks,
+        arena_state.allocator(),
+        5,
+        .{
+            .id = "shell-wait",
+            .name = "shell",
+            .arguments_json = "{\"action\":\"wait\",\"session_id\":\"shell-running\"}",
+        },
+        true,
+        "long-running command",
+        .{
+            .status = .failure,
+            .cancelled = true,
+            .model_output = "wait cancelled\n",
+        },
+        &.{},
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), capture.events.items.len);
+    const terminal = capture.events.items[0].terminal;
+    try std.testing.expectEqual(types.ToolOutcomeKind.cancelled, terminal.outcome.kind);
+    try std.testing.expect(std.mem.find(
+        u8,
+        terminal.outcome.summary,
+        "Stopped waiting for",
+    ) != null);
 }

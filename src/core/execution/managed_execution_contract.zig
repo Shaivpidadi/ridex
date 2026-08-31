@@ -1,11 +1,11 @@
 const std = @import("std");
 const command_contract = @import("command_contract.zig");
 
-pub const max_live_entries: usize = 16;
+pub const max_live_entries: usize = 64;
 pub const max_tombstones: usize = 32;
-pub const default_yield_time_ms: u32 = 1_000;
+pub const default_yield_time_ms: u32 = 30_000;
 pub const max_yield_time_ms: u32 = 30_000;
-pub const default_wait_ceiling_ms: u32 = 300_000;
+pub const default_wait_ceiling_ms: u32 = 5_000;
 pub const max_wait_ceiling_ms: u32 = 300_000;
 
 pub const Backend = enum {
@@ -259,10 +259,16 @@ test "stop is idempotent and terminal states absorb later effects" {
 }
 
 test "capacity and zero yield decisions happen before effects" {
+    try std.testing.expectEqual(@as(usize, 64), max_live_entries);
     try std.testing.expectEqual(Admission.admit, decideAdmission(max_live_entries - 1));
     try std.testing.expectEqual(Admission.capacity_exhausted, decideAdmission(max_live_entries));
     try std.testing.expectEqual(Presentation.return_running, initialPresentation(0));
     try std.testing.expectEqual(Presentation.observe_initially, initialPresentation(1));
+}
+
+test "managed execution defaults preserve ordinary and interactive observation windows" {
+    try std.testing.expectEqual(@as(u32, 30_000), default_yield_time_ms);
+    try std.testing.expectEqual(@as(u32, 5_000), default_wait_ceiling_ms);
 }
 
 test "delivery reservation prevents duplicate output and cancellation does not commit" {

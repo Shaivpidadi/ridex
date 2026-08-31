@@ -21,13 +21,13 @@ pub const internal_mode = "--fx-internal-terminal-host";
 pub const endpoint_name = "host.sock";
 pub const lock_name = "host.lock";
 const identity_name = "host.json";
-const host_dir_name = "terminal-host";
+const host_dir_name = "terminal-host-v6";
 const default_idle_grace_ms: u64 = 30_000;
 const identity_max_bytes: usize = 1024;
 const max_connection_requests: usize = 32;
 const listener_poll_ms = 50;
 const transport_hash_bytes: usize = 16;
-const transport_hash_context = "fx.terminal.transport.v1\x00";
+const transport_hash_context = "fx.terminal.transport.v2\x00";
 const socket_permissions: std.Io.File.Permissions = switch (builtin.os.tag) {
     .macos, .linux => .fromMode(0o600),
     else => .default_file,
@@ -1608,7 +1608,7 @@ test "endpoint selection preserves short homes and deterministically separates l
     try std.testing.expect(std.mem.endsWith(
         u8,
         first.authority_root,
-        "/.fx/terminal-host",
+        "/.fx/terminal-host-v6",
     ));
     try std.testing.expect(!std.mem.eql(
         u8,

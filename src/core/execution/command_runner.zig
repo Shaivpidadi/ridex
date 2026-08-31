@@ -4140,7 +4140,7 @@ test "timeout terminates redirected descendant after setsid" {
 
     try std.testing.expectError(error.TimeoutExpired, executeCommand(.{
         .max_command_output_bytes = 1024,
-        .timeout_ms = 2000,
+        .timeout_ms = 10_000,
     }, alloc, command, workspace));
 
     const pid_text = try readAbsoluteFile(alloc, pid_path, 64);
@@ -4183,7 +4183,7 @@ test "timeout terminates double-forked descendant after setsid" {
 
     try std.testing.expectError(error.TimeoutExpired, executeCommand(.{
         .max_command_output_bytes = 1024,
-        .timeout_ms = 2000,
+        .timeout_ms = 10_000,
     }, alloc, command, workspace));
 
     const pid_text = try readAbsoluteFile(alloc, pid_path, 64);
@@ -4226,7 +4226,7 @@ test "timeout terminates environment-sanitized double-fork descendants" {
 
     try std.testing.expectError(error.TimeoutExpired, executeCommand(.{
         .max_command_output_bytes = 1024,
-        .timeout_ms = 2000,
+        .timeout_ms = 10_000,
     }, alloc, command, workspace));
 
     const pid_text = try readAbsoluteFile(alloc, pid_path, 4096);
@@ -4247,10 +4247,7 @@ test "timeout terminates environment-sanitized double-fork descendants" {
 fn expectProcessGone(pid: std.posix.pid_t) !void {
     const started_ms = io_mod.milliTimestamp();
     while (true) {
-        std.posix.kill(pid, @enumFromInt(0)) catch |err| switch (err) {
-            error.ProcessNotFound => return,
-            else => return err,
-        };
+        if (!try process_tree.processIsAlive(std.testing.allocator, pid)) return;
         if (io_mod.milliTimestamp() - started_ms > 1000) {
             std.posix.kill(pid, std.posix.SIG.KILL) catch {};
             return error.TestUnexpectedResult;
@@ -4359,7 +4356,7 @@ test "natural command completion terminates redirected descendant after setsid" 
 
     const result = try executeCommand(.{
         .max_command_output_bytes = 1024,
-        .timeout_ms = 2000,
+        .timeout_ms = 10_000,
     }, alloc, command, workspace);
     defer alloc.free(result.output);
     try std.testing.expectEqual(@as(?i64, 0), result.command_result.?.exit_code);

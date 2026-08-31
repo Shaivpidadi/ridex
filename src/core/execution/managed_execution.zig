@@ -1469,30 +1469,14 @@ test "captured managed execution capacity rejects before spawn" {
     const alloc = std.testing.allocator;
     var runtime = Runtime.init(alloc);
     defer runtime.deinit();
-    var ids: [contract.max_live_entries][32]u8 = undefined;
-    var prepared: [contract.max_live_entries]PreparedSnapshot = undefined;
-    var prepared_len: usize = 0;
-    defer for (prepared[0..prepared_len]) |*snapshot| snapshot.deinit(alloc);
-    for (0..contract.max_live_entries) |index| {
-        const id = try std.fmt.bufPrint(&ids[index], "managed-capacity-{d}", .{index});
-        var input = StartCapturedInput{
-            .execution_id = id,
-            .command = "sleep 5",
-            .cwd = "/tmp",
-            .environment = .legacy,
-            .authority = undefined,
-            .max_output_bytes = 1024,
-            .timeout_ms = 10_000,
-            .command_artifact_dir = null,
-            .yield_time_ms = 0,
-        };
-        input.authority = testAuthority(input);
-        prepared[index] = try runtime.startCaptured(alloc, input);
-        prepared_len += 1;
-        try runtime.commitDelivery(
-            prepared[index].snapshot.execution_id,
-            prepared[index].reservation_id,
-        );
+    var reservations: usize = 0;
+    defer while (reservations != 0) {
+        runtime.releaseTtyCapacity();
+        reservations -= 1;
+    };
+    for (0..contract.max_live_entries) |_| {
+        try runtime.reserveTtyCapacity();
+        reservations += 1;
     }
     var overflow = StartCapturedInput{
         .execution_id = "managed-capacity-overflow",

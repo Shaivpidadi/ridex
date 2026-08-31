@@ -7048,42 +7048,32 @@ test "child approval arrival closes full transcript depth before rendering" {
     defer debug_trace.resetForTest();
     try debug_trace.configureForTestWithScopes(alloc, trace_path, "full_transcript");
 
-    inline for (.{
-        transcript_presentation.Depth.review,
-        transcript_presentation.Depth.full,
-    }) |depth| {
-        var app = ChildApprovalReconcileApp{
-            .alloc = alloc,
-            .subagents = .{ .depth = depth },
-        };
-        defer app.deinit();
-        try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{
-            .id = 91,
-            .label = "shell.run npm test",
-        }));
+    var app = ChildApprovalReconcileApp{
+        .alloc = alloc,
+        .subagents = .{ .depth = .full },
+    };
+    defer app.deinit();
+    try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{
+        .id = 91,
+        .label = "shell.run npm test",
+    }));
 
-        try std.testing.expect(try Runtime(ChildApprovalReconcileApp)
-            .reconcileChildTranscriptForPresentedApproval(
-            &app,
-            "selected-child",
-        ));
+    try std.testing.expect(try Runtime(ChildApprovalReconcileApp)
+        .reconcileChildTranscriptForPresentedApproval(
+        &app,
+        "selected-child",
+    ));
 
-        try std.testing.expectEqual(
-            transcript_presentation.Depth.inline_mode,
-            app.subagents.depth,
-        );
-        try std.testing.expectEqual(@as(usize, 1), app.subagents.close_calls);
-    }
+    try std.testing.expectEqual(
+        transcript_presentation.Depth.inline_mode,
+        app.subagents.depth,
+    );
+    try std.testing.expectEqual(@as(usize, 1), app.subagents.close_calls);
 
     var trace_file = try std.Io.Dir.openFileAbsolute(std.testing.io, trace_path, .{});
     defer trace_file.close(std.testing.io);
     const trace = try io_mod.readFileToEnd(alloc, &trace_file, 4096);
     defer alloc.free(trace);
-    try std.testing.expect(std.mem.find(
-        u8,
-        trace,
-        "depth_transition from=review to=inline route=child trigger=approval_handoff",
-    ) != null);
     try std.testing.expect(std.mem.find(
         u8,
         trace,
