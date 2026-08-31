@@ -3,6 +3,7 @@ const change_tracker = @import("../../core/workspace/change_tracker.zig");
 const io_mod = @import("../../core/shared/io.zig");
 const pathing = @import("../../core/workspace/pathing.zig");
 const permissions = @import("../../core/permissions/permissions.zig");
+const text_utils = @import("../../core/shared/text_utils.zig");
 const tool_dispatch = @import("../../core/tooling/tool_dispatch.zig");
 
 const Allocator = std.mem.Allocator;
@@ -10,6 +11,7 @@ const max_patch_bytes: usize = 4 * 1024 * 1024;
 const max_file_bytes: usize = 4 * 1024 * 1024;
 const max_operations: usize = 64;
 const max_hunks: usize = 256;
+const max_context_snippet_bytes: usize = 160;
 
 const Hunk = struct {
     old_text: []u8,
@@ -414,6 +416,17 @@ const ContentResult = union(enum) {
     failure: []const u8,
 };
 
+const MatchEvidence = struct {
+    count: usize = 0,
+    first_offset: usize = 0,
+    second_offset: usize = 0,
+};
+
+const AnchorEvidence = struct {
+    line: usize,
+    snippet: []const u8,
+};
+
 pub fn call(
     ctx: tool_dispatch.DispatchContext,
     erased: tool_dispatch.ToolInput,
@@ -637,36 +650,39 @@ fn applyHunks(
         if (std.mem.eql(u8, old_text, new_text)) continue;
         var matched_old_len = old_text.len;
         var replacement_text = new_text;
-        const match_start = if (std.mem.find(u8, current[search_start..], old_text)) |relative|
-            search_start + relative
+        const exact_matches = exactMatchEvidence(current, search_start, old_text);
+        const match_start = if (exact_matches.count > 0)
+            exact_matches.first_offset
         else if (eofMatchWithoutTrailingNewline(current, search_start, old_text)) |start| blk: {
             matched_old_len = current.len - start;
             replacement_text = withoutTrailingLineEnding(new_text) orelse new_text;
             break :blk start;
         } else {
-            return .{ .failure = try std.fmt.allocPrint(
+            return .{ .failure = try formatMissingContext(
                 alloc,
-                "PATCH_CONTEXT_MISSING hunk={d}: re-read before another mutation",
-                .{hunk_index + 1},
+                current,
+                old_text,
+                hunk_index + 1,
+                false,
             ) };
         };
         if (anchor_eof and hunk_index + 1 == hunks.len and
             match_start + matched_old_len != current.len)
         {
-            return .{ .failure = try std.fmt.allocPrint(
+            return .{ .failure = try formatMissingContext(
                 alloc,
-                "PATCH_CONTEXT_MISSING hunk={d}: expected end of file; re-read before another mutation",
-                .{hunk_index + 1},
+                current,
+                old_text,
+                hunk_index + 1,
+                true,
             ) };
         }
-        const second_search_start = match_start + 1;
-        if (second_search_start <= current.len and
-            std.mem.find(u8, current[second_search_start..], old_text) != null)
-        {
-            return .{ .failure = try std.fmt.allocPrint(
+        if (exact_matches.count > 1) {
+            return .{ .failure = try formatAmbiguousContext(
                 alloc,
-                "PATCH_CONTEXT_AMBIGUOUS hunk={d}: retry once with more unchanged surrounding lines",
-                .{hunk_index + 1},
+                current,
+                hunk_index + 1,
+                exact_matches,
             ) };
         }
         const new_len = std.math.add(
@@ -695,6 +711,117 @@ fn applyHunks(
         search_start = match_start + replacement_text.len;
     }
     return .{ .content = current };
+}
+
+fn exactMatchEvidence(content: []const u8, search_start: usize, needle: []const u8) MatchEvidence {
+    if (needle.len == 0 or search_start > content.len) return .{};
+    var evidence: MatchEvidence = .{};
+    var cursor = search_start;
+    while (cursor <= content.len) {
+        const relative = std.mem.find(u8, content[cursor..], needle) orelse break;
+        const offset = cursor + relative;
+        evidence.count += 1;
+        if (evidence.count == 1) evidence.first_offset = offset;
+        if (evidence.count == 2) evidence.second_offset = offset;
+        cursor = offset + 1;
+    }
+    return evidence;
+}
+
+fn formatMissingContext(
+    alloc: Allocator,
+    current: []const u8,
+    old_text: []const u8,
+    hunk_number: usize,
+    expected_eof: bool,
+) Allocator.Error![]const u8 {
+    const anchor = survivingAnchor(current, old_text);
+    if (anchor) |evidence| {
+        var encoded = try text_utils.encodeTerminalSafe(
+            alloc,
+            evidence.snippet,
+            max_context_snippet_bytes,
+        );
+        defer encoded.deinit(alloc);
+        return std.fmt.allocPrint(
+            alloc,
+            "PATCH_CONTEXT_MISSING reason=context_missing hunk={d} matches=0 anchor_line={d} current_snippet={s}; {s}",
+            .{
+                hunk_number,
+                evidence.line,
+                encoded.bytes,
+                if (expected_eof)
+                    "expected end of file; re-read before another mutation"
+                else
+                    "re-read before another mutation",
+            },
+        );
+    }
+    return std.fmt.allocPrint(
+        alloc,
+        "PATCH_CONTEXT_MISSING reason=context_missing hunk={d} matches=0 anchor_line=none; {s}",
+        .{
+            hunk_number,
+            if (expected_eof)
+                "expected end of file; re-read before another mutation"
+            else
+                "re-read before another mutation",
+        },
+    );
+}
+
+fn formatAmbiguousContext(
+    alloc: Allocator,
+    current: []const u8,
+    hunk_number: usize,
+    matches: MatchEvidence,
+) Allocator.Error![]const u8 {
+    const first_line = lineNumberAt(current, matches.first_offset);
+    const second_line = lineNumberAt(current, matches.second_offset);
+    const snippet = currentLineSnippet(current, matches.first_offset) orelse "unavailable";
+    var encoded = try text_utils.encodeTerminalSafe(alloc, snippet, max_context_snippet_bytes);
+    defer encoded.deinit(alloc);
+    return std.fmt.allocPrint(
+        alloc,
+        "PATCH_CONTEXT_AMBIGUOUS reason=context_ambiguous hunk={d} matches={d} candidate_lines={d},{d} current_snippet={s}; retry once with more distinctive unchanged surrounding lines",
+        .{ hunk_number, matches.count, first_line, second_line, encoded.bytes },
+    );
+}
+
+fn survivingAnchor(current: []const u8, old_text: []const u8) ?AnchorEvidence {
+    var best_line: []const u8 = "";
+    var best_offset: usize = 0;
+    var lines = std.mem.splitScalar(u8, old_text, '\n');
+    while (lines.next()) |raw_line| {
+        const line = std.mem.trimEnd(u8, raw_line, "\r");
+        if (line.len < 4 or line.len <= best_line.len) continue;
+        const offset = std.mem.find(u8, current, line) orelse continue;
+        best_line = line;
+        best_offset = offset;
+    }
+    if (best_line.len == 0) return null;
+    return .{
+        .line = lineNumberAt(current, best_offset),
+        .snippet = currentLineSnippet(current, best_offset) orelse return null,
+    };
+}
+
+fn lineNumberAt(content: []const u8, offset: usize) usize {
+    return std.mem.count(u8, content[0..@min(offset, content.len)], "\n") + 1;
+}
+
+fn currentLineSnippet(content: []const u8, offset: usize) ?[]const u8 {
+    if (offset > content.len) return null;
+    const line_start = if (std.mem.lastIndexOfScalar(u8, content[0..offset], '\n')) |newline|
+        newline + 1
+    else
+        0;
+    const line_end = if (std.mem.findScalar(u8, content[offset..], '\n')) |relative|
+        offset + relative
+    else
+        content.len;
+    const line = std.mem.trimEnd(u8, content[line_start..line_end], "\r");
+    return if (line.len == 0) null else line;
 }
 
 fn prefersCrLf(content: []const u8) bool {
@@ -1000,11 +1127,57 @@ test "apply_patch v3 validates every hunk before writing any file" {
     try std.testing.expect(std.mem.find(
         u8,
         result.failure,
-        "PATCH_CONTEXT_MISSING hunk=1: re-read before another mutation; file=b.txt",
+        "PATCH_CONTEXT_MISSING reason=context_missing hunk=1 matches=0 anchor_line=none",
     ) != null);
     const a = try readTestFile(std.testing.allocator, tmp.dir, "a.txt");
     defer std.testing.allocator.free(a);
     try std.testing.expectEqualStrings("one\n", a);
+}
+
+test "apply_patch v3 reports a surviving exact anchor for missing context" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestFile(tmp.dir, "a.txt", "header\nkeep line\nnew value\nfooter\n");
+    const root = try workspaceRoot(std.testing.allocator, tmp);
+    defer std.testing.allocator.free(root);
+    const input = try decodeInput(
+        \\{"patch":"*** Begin Patch\n*** Update File: a.txt\n@@\n keep line\n-old value\n+NEW VALUE\n footer\n*** End Patch"}
+    );
+    defer input.deinit(std.testing.allocator);
+    const result = try call(.{
+        .allocator = std.testing.allocator,
+        .workspace_root = root,
+    }, input);
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(std.meta.activeTag(result) == .failure);
+    try std.testing.expect(std.mem.find(
+        u8,
+        result.failure,
+        "reason=context_missing hunk=1 matches=0 anchor_line=2 current_snippet=keep line",
+    ) != null);
+}
+
+test "apply_patch v3 reports exact ambiguous match evidence" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestFile(tmp.dir, "a.txt", "head\nsame\nvalue\ntail\nsame\nvalue\n");
+    const root = try workspaceRoot(std.testing.allocator, tmp);
+    defer std.testing.allocator.free(root);
+    const input = try decodeInput(
+        \\{"patch":"*** Begin Patch\n*** Update File: a.txt\n@@\n same\n-value\n+VALUE\n*** End Patch"}
+    );
+    defer input.deinit(std.testing.allocator);
+    const result = try call(.{
+        .allocator = std.testing.allocator,
+        .workspace_root = root,
+    }, input);
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(std.meta.activeTag(result) == .failure);
+    try std.testing.expect(std.mem.find(
+        u8,
+        result.failure,
+        "reason=context_ambiguous hunk=1 matches=2 candidate_lines=2,5 current_snippet=same",
+    ) != null);
 }
 
 test "apply_patch v3 supports the standard end-of-file anchor" {

@@ -225,6 +225,51 @@ describe("fx ask presentation", () => {
     expect(result.stderr).toContain("Applying patch");
   }, TIMEOUT);
 
+  test("patch editor reports ambiguous match evidence and trace metadata", async () => {
+    const root = createRoot();
+    const target = join(root.workspace, "note.txt");
+    const tracePath = join(root.root, "trace.log");
+    writeFileSync(target, "head\nsame\nvalue\ntail\nsame\nvalue\n");
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("ambiguous_patch", "apply_patch", {
+        patch:
+          "*** Begin Patch\n" +
+          "*** Update File: note.txt\n" +
+          "@@\n" +
+          " same\n" +
+          "-value\n" +
+          "+VALUE\n" +
+          "*** End Patch",
+      }),
+      fakeGatewayFinalText("Patch needs wider context.\n"),
+    ]);
+    gateways.push(gateway);
+
+    const result = await runFx(
+      ["ask", "--json", "--yolo", "--no-save", "--no-color", "Update note.txt."],
+      {
+        cwd: root.workspace,
+        env: {
+          ...gatewayEnv(root.home, gateway),
+          FX_EXPERIMENT_X9_EDITOR: "patch_v3",
+          FX_TRACE_LOG: tracePath,
+          FX_TRACE_SCOPES: "tool",
+        },
+        timeoutMs: TIMEOUT,
+      },
+    );
+
+    expect(result.code).toBe(0);
+    expect(readFileSync(target, "utf8")).toBe("head\nsame\nvalue\ntail\nsame\nvalue\n");
+    expect(gateway.requests).toHaveLength(2);
+    expect(gateway.requests[1].body).toContain("reason=context_ambiguous");
+    expect(gateway.requests[1].body).toContain("matches=2");
+    expect(gateway.requests[1].body).toContain("candidate_lines=2,5");
+    const trace = readFileSync(tracePath, "utf8");
+    expect(trace).toContain("event=apply_patch_failure");
+    expect(trace).toContain("reason=context_ambiguous matches=2");
+  }, TIMEOUT);
+
   test("no-save advertises exec only and preserves terminal exec profiles", async () => {
     const configuredShell = userInfo().shell;
     if (!configuredShell.endsWith("/bash") && !configuredShell.endsWith("/zsh")) return;

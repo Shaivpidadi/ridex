@@ -3177,12 +3177,15 @@ fn processQueuedPromptLoop(
         !selection_changed and restored_attempts >= checkpoint.max_provider_attempts
     else
         false;
-    const semantic_limit = if (selection_changed or restored_budget_exhausted)
+    const configured_semantic_limit = if (selection_changed or restored_budget_exhausted)
         semanticAttemptLimit(config.max_provider_attempts)
     else if (job.recovery_checkpoint) |checkpoint|
         checkpoint.max_provider_attempts
     else
         semanticAttemptLimit(config.max_provider_attempts);
+    const semantic_limit = config.provider_retry_policy.attemptLimit(
+        configured_semantic_limit,
+    );
     var route_fast_mode = if (selection_changed)
         selected_fast_mode
     else if (job.recovery_checkpoint) |checkpoint|
@@ -3534,6 +3537,16 @@ fn processQueuedPromptLoop(
                 .stream = &stream_ctx,
                 .pending_status = &pending_auto_retry_status,
             };
+            const response_head_timeout_ms = config.provider_retry_policy.responseHeadTimeoutMs(
+                semantic_attempt,
+            );
+            debug_trace.eventf(
+                "gateway",
+                "provider_attempt_policy",
+                step_ctx,
+                "semantic_attempt={d}/{d} response_head_timeout_ms={d}",
+                .{ semantic_attempt + 1, semantic_limit, response_head_timeout_ms orelse 30_000 },
+            );
             var model_request = agent_stream_provider.ModelRequest{
                 .credential = .{
                     .secret = active_api_key,
@@ -3562,6 +3575,7 @@ fn processQueuedPromptLoop(
                     null,
                 .trace_ctx = step_ctx,
                 .content_capture_limit = null,
+                .response_head_timeout_ms = response_head_timeout_ms,
                 .cooperative_pulse = deps.cooperative_transport_pulse,
                 .delivery = &gateway_delivery,
                 .attempt_evidence = &gateway_attempt_evidence,
@@ -7464,6 +7478,7 @@ fn processQueuedPromptLoop(
                 return;
             }
 
+            runtime_telemetry.traceApplyPatchFailure(step_ctx, tool_call, safe_tool_output);
             debug_trace.eventf("tool", "after_tool_execution", step_ctx, "call_id={s} name={s} result_kind={s} model_output_bytes={d}", .{ tool_call.id, tool_call.name, runtime_telemetry.toolExecutionResultKind(execution), safe_tool_output.len });
             debug_trace.eventf("tool", "execution_result", step_ctx, "call_id={s} name={s} result_kind={s} model_output_bytes={d}", .{ tool_call.id, tool_call.name, runtime_telemetry.toolExecutionResultKind(execution), safe_tool_output.len });
             try runtime_gateway_step.recordSelectedDynamicTool(arena, &selected_dynamic_tool_names, &selected_dynamic_tools, execution);

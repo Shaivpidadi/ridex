@@ -242,6 +242,8 @@ class FxAskAgent(Agent):
         env.update(
             {
                 "FX_AUTO_UPGRADE": "0",
+                "FX_EXPERIMENT_X9_EDITOR": "patch_v3",
+                "FX_EXPERIMENT_X9_PROVIDER_RETRY": "adaptive_v1",
                 "FX_MODEL": model,
                 "FX_SOUND": "0",
                 "FX_TRACE_LOG": str(FX_TRACE_LOG),
