@@ -3517,7 +3517,8 @@ test "gateway_system_prompt: local workspace authority" {
 test "gateway_system_prompt: evidence-led scoped execution" {
     try expectDefaultPromptContains("gather local evidence before answering");
     try expectDefaultPromptContains("make at least one safe local inspection before the final answer");
-    try expectDefaultPromptContains("Start with direct file, search, or local git inspection when those capabilities are available.");
+    try expectDefaultPromptContains("Before generic inspection, load any available skill whose name and description clearly match the user's task.");
+    try expectDefaultPromptContains("When no skill clearly matches, start with direct file, search, or local git inspection.");
     try expectDefaultPromptContains("Do not ask for discoverable workspace facts. Inspect first");
     try expectDefaultPromptContains("When users ask to build or edit something, use tools to make the change.");
     try expectDefaultPromptContains("stay inside the requested scope");

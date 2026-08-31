@@ -704,6 +704,26 @@ pub fn Runtime(comptime App: type) type {
                     render_input.skillsMenuProjection(&app.skills)
                 else
                     .{},
+                .mcp_menu = if (comptime @hasField(App, "mcp")) blk: {
+                    const view = app.mcp.menuView();
+                    break :blk .{
+                        .state = view.state,
+                        .servers = if (view.health) |health| health.servers else &.{},
+                        .tools = view.tools,
+                        .resources = if (view.resources) |catalog| catalog.resources.items else &.{},
+                        .resource_templates = if (view.resources) |catalog| catalog.templates.items else &.{},
+                        .prompts = if (view.prompts) |catalog| catalog.items else &.{},
+                        .configuration_issue_count = if (view.health) |health| health.configuration_issues.len else 0,
+                        .preview = view.preview,
+                        .feedback = view.feedback,
+                        .add_name = view.add_form.name.items,
+                        .add_target = view.add_form.target.items,
+                        .add_arguments = view.add_form.arguments.items,
+                        .add_draft = app.input_runtime.edit_state.input.items,
+                        .arguments = view.argument_fields,
+                        .argument_draft = app.input_runtime.edit_state.input.items,
+                    };
+                } else .{},
                 .help_menu = render_input.helpMenuProjection(
                     &app.input_runtime.help_menu,
                     app.slashRegistry(),
@@ -1269,6 +1289,7 @@ pub fn Runtime(comptime App: type) type {
                 render_input.skillsMenuProjection(&app.skills)
             else
                 .{};
+            ctx.mcp_menu = .{};
             ctx.help_menu = .{};
             ctx.settings_menu.active = false;
             ctx.model_menu = if (comptime @hasField(App, "model_cache"))

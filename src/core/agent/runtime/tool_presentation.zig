@@ -1453,7 +1453,7 @@ test "provisional lifecycle preflight distinguishes unknown eligible and ineligi
         .ineligible => return error.TestExpectedEqual,
     }
 
-    for ([_][]const u8{ "perplexity_search", "parallel_search" }) |name| {
+    for ([_][]const u8{ "exa_search", "perplexity_search", "parallel_search" }) |name| {
         const provider_preflight = ProvisionalToolStatuses.preflight(test_tool_registry, name) orelse return error.TestExpectedEqual;
         switch (provider_preflight) {
             .eligible => |metadata| try std.testing.expectEqualStrings("Searching", metadata.action_label),
@@ -1474,6 +1474,10 @@ test "stream start execution certainty follows provider ownership" {
     try std.testing.expect(streamStartMayHaveExecutedAtProvider(
         provider_registry,
         "web_search",
+    ));
+    try std.testing.expect(streamStartMayHaveExecutedAtProvider(
+        test_tool_registry,
+        "exa_search",
     ));
     try std.testing.expect(streamStartMayHaveExecutedAtProvider(
         test_tool_registry,

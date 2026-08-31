@@ -101,7 +101,7 @@ const WEB_FETCH_TOOL = "web_fetch" as const;
 const WEB_SEARCH_TOOL = "web_search" as const;
 
 const MCP_DISCOVERY_TOOLS = [
-  "mcp_search_tools",
+  "capability_search",
   "mcp_select_tool",
 ] as const;
 
@@ -965,15 +965,15 @@ export const AGENT_QUALITY_BASELINE_MATRIX: readonly AgentQualityMatrixRow[] = [
     modelBackedEval: {
       required: true,
       reason:
-        "Choosing mcp_search_tools before mcp_select_tool and the final dynamic call is model-visible routing behavior.",
+        "Choosing scoped capability_search before mcp_select_tool and the final dynamic call is model-visible routing behavior.",
     },
     currentBaselineResult: {
       status: "known-gap",
       notes:
-        "Ready MCP schemas were previously advertised inline, so large MCP setups could bloat the main prompt instead of using a discovery flow.",
+        "A 13-server run with 28 ready Datadog tools made 18 unscoped searches without returning a Datadog tool.",
     },
     targetResult:
-      "First action is mcp_search_tools; the model exact-selects a returned dynamic tool before calling the selected MCP tool, with no web_search or clarification question.",
+      "First action is capability_search with kind=mcp and the exact server alias; the model pages if needed, exact-selects a result, and calls it without web_search or clarification.",
     coveredEntrypoints: [
       askEntrypoint("Depends on available_tools advertising only the MCP discovery tools until an exact select occurs."),
       interactiveEntrypoint("Interactive mode should use the same deferred discovery path with live MCP runtimes."),

@@ -293,16 +293,23 @@ Best for resize and SIGWINCH interactions. The helper in `tests/e2e/tmux-helpers
 cd tests/e2e && bun test tui-resize.test.ts
 ```
 
-### FX\_RECORD + fx replay (capture-and-replay)
+### Debug terminal recording and replay
 
-Run fx with `FX_RECORD=<path>` to dump every byte fx writes, every resize, and every Ctrl+C into a framed binary tape. Replay the tape through the built-in virtual terminal:
+Set `FX_DEBUG_RECORD=1` to create an automatic private tape under
+`~/.fx/recordings/`. Set `FX_DEBUG_RECORD_SILENT_BANNER=1` as well when the
+developer-only recording notice must stay out of the inline transcript during
+a screen share. The notice remains available in the Ctrl+O full transcript.
+Use `FX_RECORD=<path>` when a test or investigation needs an exact destination.
+Recording dumps every byte fx writes and every resize into a framed binary tape.
+Replay the tape through the built-in virtual terminal:
 
 ```bash
-FX_RECORD=/tmp/bug.fxtape fx        # user reproduces the glitch
-fx replay /tmp/bug.fxtape           # print the final cell grid
-fx replay /tmp/bug.fxtape --frames  # scrub through every intermediate frame
-fx replay /tmp/bug.fxtape --json    # structured frame metadata + grid
-fx replay /tmp/bug.fxtape --golden out.txt   # write grid to a file
+FX_DEBUG_RECORD=1 ./zig-out/bin/fx
+FX_RECORD=/tmp/bug.fxtape ./zig-out/bin/fx
+./zig-out/bin/fx replay /tmp/bug.fxtape
+./zig-out/bin/fx replay /tmp/bug.fxtape --frames
+./zig-out/bin/fx replay /tmp/bug.fxtape --json
+./zig-out/bin/fx replay /tmp/bug.fxtape --golden out.txt
 ```
 
 The tape is deterministic — any reviewer can replay it without a TTY, and a golden file can be checked in as a regression test.

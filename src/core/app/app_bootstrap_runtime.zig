@@ -83,7 +83,6 @@ pub fn Runtime(comptime App: type) type {
             default_model: []const u8,
             default_agent_step_limit: usize,
             resize_handler: app_lifecycle.ResizeHandler,
-            record_requested: bool,
             capability_providers: CapabilityProviders,
         ) !void {
             try bootstrapWithDeps(
@@ -92,7 +91,6 @@ pub fn Runtime(comptime App: type) type {
                 default_model,
                 default_agent_step_limit,
                 resize_handler,
-                record_requested,
                 defaultDeps(capability_providers),
             );
         }
@@ -182,7 +180,6 @@ pub fn Runtime(comptime App: type) type {
             default_model: []const u8,
             default_agent_step_limit: usize,
             resize_handler: app_lifecycle.ResizeHandler,
-            record_requested: bool,
             deps: BootstrapDeps(App),
         ) !void {
             errdefer app.deinit();
@@ -203,7 +200,6 @@ pub fn Runtime(comptime App: type) type {
                     host.unavailable_secret_store,
                 .resize_handler = resize_handler,
                 .fx_version = App.app_version,
-                .record_requested = record_requested,
             });
             defer startup.deinit(app.alloc);
 
@@ -396,13 +392,14 @@ pub fn Runtime(comptime App: type) type {
                 const recording_body = try std.fmt.allocPrint(
                     app.alloc,
                     "visual terminal capture: {s}\nvisible terminal content, including typed prompt text, is recorded",
-                    .{recording.active},
+                    .{recording.active.path},
                 );
                 defer app.alloc.free(recording_body);
                 try app.writeDomainNotice(.{
                     .topic = "recording",
                     .tone = .warning,
                     .body = recording_body,
+                    .visibility = if (recording.active.show_inline_notice) .compact_and_full else .full_only,
                 }, true);
             }
             {
@@ -856,7 +853,6 @@ fn runBootstrapForTest(app: *TestApp, capture: *TestCapture) !void {
         "default-model",
         24,
         resizeHandlerForTest,
-        false,
         testDeps(),
     );
 }

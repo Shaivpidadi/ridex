@@ -59,6 +59,7 @@ const tool_result_limits = @import("tool_result_limits.zig");
 const file_mutation_execution = @import("file_mutation_execution.zig");
 const tool_mcp_registry = @import("tool_mcp_registry.zig");
 const tool_mcp_runtime = @import("tool_mcp_runtime.zig");
+const capability_retrieval = @import("capability_retrieval.zig");
 const tool_mcp_feature_dispatch = @import("tool_mcp_feature_dispatch.zig");
 const tool_presentation = @import("tool_presentation.zig");
 const terminal_impl = @import("../../tools/terminal/terminal.zig");
@@ -330,7 +331,7 @@ pub fn validateToolCall(ctx: Context, arena: Allocator, call: ToolCall) !tool_co
     };
     switch (spec.executor_kind) {
         // Preserve execution-time argument failures for MCP control tool calls.
-        .mcp_search_tools, .mcp_select_tool, .mcp_features => return .{ .valid = .{} },
+        .mcp_select_tool, .mcp_features => return .{ .valid = .{} },
         // File mutation arguments are decoded once by shared permission preflight.
         .write_file, .edit_file => return .{ .valid = .{} },
         else => {},
@@ -2129,10 +2130,10 @@ const test_tool_registry = tool_dispatch.Registry{ .tools = &.{
     test_builtin_tools.web_fetch,
     test_builtin_tools.web_search,
     test_builtin_tools.terminal,
+    test_builtin_tools.capability_search,
     test_builtin_tools.skill,
     test_builtin_tools.install_skill,
     test_builtin_tools.subagent,
-    test_builtin_tools.mcp_search_tools,
     test_builtin_tools.mcp_select_tool,
     test_builtin_tools.ask_user_question,
     test_builtin_tools.read_tool_result,
@@ -3863,6 +3864,25 @@ test "tool runtime validates and executes only tools from supplied registry" {
     try std.testing.expect((try validateToolCall(read_rt.context(), arena, call)) == .valid);
 }
 
+test "legacy capability search tool names are not callable" {
+    var rt = TestRuntime{};
+    defer rt.deinit(std.testing.allocator);
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    for ([_][]const u8{ "skill_search", "mcp_search_tools" }) |name| {
+        const result = try executeToolCall(rt.context(), arena, .{
+            .id = "legacy-search",
+            .name = name,
+            .arguments_json = "{\"query\":\"review runtime\"}",
+        });
+        try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, result.status);
+        const expected = try std.fmt.allocPrint(arena, "Unsupported tool: {s}", .{name});
+        try std.testing.expectEqualStrings(expected, result.model_output);
+    }
+}
+
 fn registryOwnedWebFetchCall(
     ctx: tool_dispatch.DispatchContext,
     input: tool_dispatch.ToolInput,
@@ -3922,12 +3942,12 @@ fn registryOwnedInstallSkillCall(
     return .{ .success = try ctx.allocator.dupe(u8, "registry-owned install_skill") };
 }
 
-fn registryOwnedMcpSearchCall(
+fn registryOwnedCapabilitySearchCall(
     ctx: tool_dispatch.DispatchContext,
     input: tool_dispatch.ToolInput,
 ) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
     _ = input;
-    return .{ .success = try ctx.allocator.dupe(u8, "registry-owned mcp_search_tools") };
+    return .{ .success = try ctx.allocator.dupe(u8, "registry-owned capability_search") };
 }
 
 fn registryOwnedMcpSelectCall(
@@ -4178,7 +4198,7 @@ test "stateful local tool execution uses supplied registry entries" {
     }
 }
 
-test "MCP control tool execution preserves argument failures" {
+test "capability and MCP selection execution preserve argument failures" {
     const alloc = std.testing.allocator;
     var rt = TestRuntime{};
     defer rt.deinit(alloc);
@@ -4191,7 +4211,7 @@ test "MCP control tool execution preserves argument failures" {
         args: []const u8,
         expected: []const u8,
     }{
-        .{ .name = "mcp_search_tools", .args = "{\"query\":1}", .expected = "mcp_search_tools requires a string query." },
+        .{ .name = "capability_search", .args = "{\"query\":1}", .expected = "capability_search field \"query\" must be a string" },
         .{ .name = "mcp_select_tool", .args = "{\"name\":1}", .expected = "mcp_select_tool requires an exact dynamic tool name." },
     };
 
@@ -4206,14 +4226,14 @@ test "MCP control tool execution preserves argument failures" {
     }
 }
 
-test "MCP control tool execution uses supplied registry entries" {
+test "capability and MCP selection execution use supplied registry entries" {
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    var registered_search = test_builtin_tools.mcp_search_tools;
-    registered_search.call = registryOwnedMcpSearchCall;
+    var registered_search = test_builtin_tools.capability_search;
+    registered_search.call = registryOwnedCapabilitySearchCall;
     var registered_select = test_builtin_tools.mcp_select_tool;
     registered_select.call = registryOwnedMcpSelectCall;
     const tools = [_]tool_dispatch.Tool{ registered_search, registered_select };
@@ -4227,7 +4247,7 @@ test "MCP control tool execution uses supplied registry entries" {
         args: []const u8,
         expected: []const u8,
     }{
-        .{ .name = "mcp_search_tools", .args = "{\"query\":\"read\"}", .expected = "registry-owned mcp_search_tools" },
+        .{ .name = "capability_search", .args = "{\"query\":\"read\"}", .expected = "registry-owned capability_search" },
         .{ .name = "mcp_select_tool", .args = "{\"name\":\"mcp_fs_read\"}", .expected = "registry-owned mcp_select_tool" },
     };
 
@@ -7117,8 +7137,8 @@ const McpFixture = struct {
         return error.McpFixtureFailure;
     }
 
-    fn search(_: *anyopaque, arena: Allocator, query: *const tool_mcp_runtime.PreparedQuery, _: usize, _: types.PermissionRuleSet, _: context_limits.Values) anyerror!tool_mcp_runtime.SearchResult {
-        return .{ .model_output = try std.fmt.allocPrint(arena, "{{\"query\":\"{s}\",\"tools\":[{{\"name\":\"mcp_fs_read\",\"server\":\"fs\",\"description\":\"Read\",\"input_schema\":{{\"type\":\"object\"}},\"tags\":[\"fs\",\"read\"]}}],\"count\":1}}", .{query.raw}) };
+    fn search(_: *anyopaque, arena: Allocator, request: capability_retrieval.Request, _: types.PermissionRuleSet, _: context_limits.Values) anyerror!tool_mcp_runtime.SearchResult {
+        return .{ .model_output = try std.fmt.allocPrint(arena, "{{\"query\":\"{s}\",\"tools\":[{{\"name\":\"mcp_fs_read\",\"server\":\"fs\",\"description\":\"Read\",\"input_schema\":{{\"type\":\"object\"}},\"tags\":[\"fs\",\"read\"]}}],\"count\":1}}", .{request.query.raw}) };
     }
 
     fn schema(_: *anyopaque, arena: Allocator, name: []const u8, _: types.PermissionRuleSet, _: context_limits.Values, _: tool_mcp_runtime.Access) anyerror!?tool_mcp_runtime.ToolSchemaResult {
@@ -7126,10 +7146,10 @@ const McpFixture = struct {
         return .{ .selected = .{ .model_output = try arena.dupe(u8, "{\"type\":\"function\",\"name\":\"mcp_fs_read\",\"description\":\"Read <context_limit action='literal' />\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"context_limit_rejection\":{\"type\":\"string\"}}}}") } };
     }
 
-    fn searchRecordingRules(raw_ctx: *anyopaque, arena: Allocator, query: *const tool_mcp_runtime.PreparedQuery, _: usize, permission_rules: types.PermissionRuleSet, limits: context_limits.Values, _: tool_mcp_runtime.Access) anyerror!tool_mcp_runtime.SearchResult {
+    fn searchRecordingRules(raw_ctx: *anyopaque, arena: Allocator, request: capability_retrieval.Request, permission_rules: types.PermissionRuleSet, limits: context_limits.Values, _: tool_mcp_runtime.Access) anyerror!tool_mcp_runtime.SearchResult {
         const ctx: *PermissionContext = @ptrCast(@alignCast(raw_ctx));
         ctx.search_rule_count = permission_rules.rules.len;
-        return search(raw_ctx, arena, query, 0, permission_rules, limits);
+        return search(raw_ctx, arena, request, permission_rules, limits);
     }
 
     fn schemaRecordingRules(raw_ctx: *anyopaque, arena: Allocator, name: []const u8, permission_rules: types.PermissionRuleSet, limits: context_limits.Values, access: tool_mcp_runtime.Access) anyerror!?tool_mcp_runtime.ToolSchemaResult {
@@ -7139,7 +7159,7 @@ const McpFixture = struct {
     }
 };
 
-test "MCP control tools forward permission rules through registered execution" {
+test "capability search and MCP selection forward permission rules through registered execution" {
     var permission_context = McpFixture.PermissionContext{};
     var rules = [_]types.PermissionRule{
         .{ .permission = @constCast("mcp_other"), .pattern = @constCast("*"), .action = .deny },
@@ -7158,8 +7178,8 @@ test "MCP control tools forward permission rules through registered execution" {
 
     _ = try executeToolCall(rt.context(), arena, .{
         .id = "search",
-        .name = "mcp_search_tools",
-        .arguments_json = "{\"query\":\"read\"}",
+        .name = "capability_search",
+        .arguments_json = "{\"query\":\"read\",\"server\":\"fixture\"}",
     });
     _ = try executeToolCall(rt.context(), arena, .{
         .id = "select",
@@ -7174,8 +7194,8 @@ test "MCP control tools forward permission rules through registered execution" {
     permission_context = .{};
     _ = try executeToolCall(rt.context(), arena, .{
         .id = "yolo-search",
-        .name = "mcp_search_tools",
-        .arguments_json = "{\"query\":\"read\"}",
+        .name = "capability_search",
+        .arguments_json = "{\"query\":\"read\",\"server\":\"fixture\"}",
     });
     _ = try executeToolCall(rt.context(), arena, .{
         .id = "yolo-select",

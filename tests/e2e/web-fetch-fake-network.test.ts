@@ -309,7 +309,7 @@ describe("web_fetch Gateway fixture", () => {
           expect(gateway.requests).toHaveLength(1);
           expect(gateway.requests[0].headers.get("ai-language-model-id")).toBe(model);
           expectWebFetchSchema(gateway.requests[0]);
-          expect(gateway.requests[0].body).toContain("gateway.perplexity_search");
+          expect(gateway.requests[0].body).toContain("gateway.exa_search");
         } finally {
           gateway.stop();
           rmSync(root.root, { recursive: true, force: true });

@@ -382,10 +382,15 @@ test("my scenario", async () => {
 
 ### Tape-based test (replay a real capture)
 
-For bugs reported by a user, have them run fx with `FX_RECORD=<path>`. Drop the tape in `tests/e2e/tapes/<name>.fxtape` and assert against `fx replay --golden`:
+For bugs reported by a user, have them run the built binary with an exact
+`FX_RECORD=<path>`, or use `FX_DEBUG_RECORD=1` for an automatic private tape.
+`FX_DEBUG_RECORD_SILENT_BANNER=1` hides the developer-only startup notice from
+the inline transcript without disabling capture; Ctrl+O still shows it. Drop
+the tape in `tests/e2e/tapes/<name>.fxtape` and assert against the built replay
+command:
 
 ```bash
-fx replay tests/e2e/tapes/my-bug.fxtape --golden tests/e2e/tapes/my-bug.txt
+./zig-out/bin/fx replay tests/e2e/tapes/my-bug.fxtape --golden tests/e2e/tapes/my-bug.txt
 ```
 
 Check in the golden file and wire a regression test that re-runs `fx replay` in CI and diffs.

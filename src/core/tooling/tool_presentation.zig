@@ -34,7 +34,8 @@ pub const RunCommandActivity = struct {
 };
 
 pub fn isProviderSearchAlias(name: []const u8) bool {
-    return std.mem.eql(u8, name, "perplexity_search") or
+    return std.mem.eql(u8, name, "exa_search") or
+        std.mem.eql(u8, name, "perplexity_search") or
         std.mem.eql(u8, name, "parallel_search");
 }
 
@@ -834,6 +835,7 @@ test "tool presentation preserves plain action fallbacks" {
         .{ .call = .{ .id = "ask", .name = "ask_user_question", .arguments_json = "{}" }, .expected = "Asking " },
         .{ .call = .{ .id = "memory", .name = "memory", .arguments_json = "{\"action\":\"save\"}" }, .expected = "Remembering save" },
         .{ .call = .{ .id = "skill", .name = "skill", .arguments_json = "{\"name\":\"workflow\"}" }, .expected = "Loading skill workflow" },
+        .{ .call = .{ .id = "skill-resource", .name = "skill", .arguments_json = "{\"name\":\"workflow\",\"resource\":\"references/contract-design.md\"}" }, .expected = "Reading skill resource references/contract-design.md" },
         .{ .call = .{ .id = "install", .name = "install_skill", .arguments_json = "{\"source\":\"vercel-labs/agent-skills\",\"skill\":\"workflow\"}" }, .expected = "Installing skill vercel-labs/agent-skills" },
         .{ .call = .{ .id = "unknown", .name = "unknown_tool", .arguments_json = "{}" }, .expected = "Working: unknown_tool" },
     };
@@ -928,7 +930,7 @@ test "tool presentation frees all formatted output with a normal allocator" {
         .tool_registry = test_tool_registry,
         .call = .{
             .id = "provider_search",
-            .name = "perplexity_search",
+            .name = "exa_search",
             .arguments_json = "{}",
             .provenance = .provider_executed,
         },

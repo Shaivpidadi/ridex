@@ -1,5 +1,5 @@
 const std = @import("std");
-const lexical_relevance = @import("../shared/lexical_relevance.zig");
+const capability_retrieval = @import("capability_retrieval.zig");
 const types = @import("../shared/types.zig");
 const context_limits = @import("../config/context_limits.zig");
 const elicitation = @import("../mcp/elicitation.zig");
@@ -11,8 +11,8 @@ const Allocator = std.mem.Allocator;
 pub const HasToolFn = *const fn (*anyopaque, []const u8, Access) bool;
 pub const ValidateToolFn = *const fn (*anyopaque, Allocator, []const u8, []const u8, Access) anyerror!ValidationResult;
 pub const CallToolFn = *const fn (*anyopaque, Allocator, []const u8, []const u8, usize, CallOptions) anyerror!?CallResult;
-pub const PreparedQuery = lexical_relevance.PreparedQuery;
-pub const SearchToolsFn = *const fn (*anyopaque, Allocator, *const PreparedQuery, usize, types.PermissionRuleSet, context_limits.Values, Access) anyerror!SearchResult;
+pub const SearchRequest = capability_retrieval.Request;
+pub const SearchToolsFn = *const fn (*anyopaque, Allocator, SearchRequest, types.PermissionRuleSet, context_limits.Values, Access) anyerror!SearchResult;
 pub const ToolSchemaFn = *const fn (*anyopaque, Allocator, []const u8, types.PermissionRuleSet, context_limits.Values, Access) anyerror!?ToolSchemaResult;
 pub const FeatureCallFn = *const fn (
     *anyopaque,

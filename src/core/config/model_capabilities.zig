@@ -24,6 +24,12 @@ pub const ReasoningEffortOptions = struct {
     }
 };
 
+pub const ImageInputSupport = enum {
+    unknown,
+    non_native,
+    native,
+};
+
 pub const GatewayMetadata = struct {
     supports_reasoning: bool = false,
     reasoning_efforts: ReasoningEffortOptions = .{},
@@ -45,6 +51,7 @@ pub const Capabilities = struct {
     supports_tool_use: bool = false,
     supports_vision: bool = false,
     supports_file_input: bool = false,
+    image_input_support: ImageInputSupport = .unknown,
     supports_web_search: bool = false,
     supports_explicit_caching: bool = false,
     supports_implicit_caching: bool = false,
@@ -78,6 +85,10 @@ pub fn mergeCapabilities(capabilities_value: Capabilities, gateway_metadata: ?Ga
         capabilities.supports_tool_use = metadata.supports_tool_use;
         capabilities.supports_vision = metadata.supports_vision;
         capabilities.supports_file_input = metadata.supports_file_input;
+        capabilities.image_input_support = if (metadata.supports_vision and metadata.supports_file_input)
+            .native
+        else
+            .non_native;
         capabilities.supports_web_search = metadata.supports_web_search;
         capabilities.supports_explicit_caching = metadata.supports_explicit_caching;
         capabilities.supports_implicit_caching = metadata.supports_implicit_caching;
@@ -193,6 +204,25 @@ test "mergeCapabilities preserves provider controls and supplied fallback policy
     try std.testing.expect(capabilities.prompt_caching);
     try std.testing.expectEqual(@as(?u32, 300_000), capabilities.context_window);
     try std.testing.expectEqual(@as(?u32, 32_000), capabilities.max_output_tokens);
+}
+
+test "image input support distinguishes unknown native and non native capability" {
+    try std.testing.expectEqual(
+        ImageInputSupport.unknown,
+        capabilitiesForModel("provider/unknown").image_input_support,
+    );
+
+    const native = mergeCapabilities(.{}, .{
+        .supports_vision = true,
+        .supports_file_input = true,
+    });
+    try std.testing.expectEqual(ImageInputSupport.native, native.image_input_support);
+
+    const non_native = mergeCapabilities(.{}, .{
+        .supports_vision = true,
+        .supports_file_input = false,
+    });
+    try std.testing.expectEqual(ImageInputSupport.non_native, non_native.image_input_support);
 }
 
 test "reasoning effort picker helpers prepend default and preserve Gateway order" {

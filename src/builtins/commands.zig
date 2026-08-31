@@ -193,7 +193,7 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .session,
         .token = "session",
-        .usage = "session <last|id>|--id <id> [--json] | session resume [last|<id>] [--record] | session resume --id <id> [--record] | session migrate <id>|--id <id> [--allow-large] [--json] | session recover <id>|--id <id> [--json]",
+        .usage = "session <last|id>|--id <id> [--json] | session resume [last|<id>] | session resume --id <id> | session migrate <id>|--id <id> [--allow-large] [--json] | session recover <id>|--id <id> [--json]",
         .summary = "Inspect, resume, migrate, or recover saved sessions",
         .options = &.{
             .{ .flag = "last", .description = "Inspect the current workspace session" },
@@ -222,14 +222,13 @@ pub const top_level_specs = [_]TopLevelSpec{
         .token = "resume",
         .aliases = &.{ "--resume", "--resume-last", "--continue", "-c", "-r" },
         .hidden_from_top_level_help = true,
-        .usage = "session resume [last|<id>] [--record] | session resume --id <id> [--record] | --resume [last|<id>] [--record] | resume [last|<id>] [--record] | resume --id <id> [--record] | --resume-last | --continue | -c | -r | --resume-<id>",
+        .usage = "session resume [last|<id>] | session resume --id <id> | --resume [last|<id>] | resume [last|<id>] | resume --id <id> | --resume-last | --continue | -c | -r | --resume-<id>",
         .summary = "Continue a saved interactive session",
         .options = &.{
             .{ .flag = "-r", .description = "Choose the session to resume from a picker" },
             .{ .flag = "last", .description = "Resume the most recent session" },
             .{ .flag = "<id>", .description = "Resume a session by id" },
             .{ .flag = "--id <id>", .description = "Resume a session by exact id" },
-            .{ .flag = "--record", .description = "Capture visible terminal content while running" },
         },
     },
     .{
@@ -269,6 +268,7 @@ pub const top_level_specs = [_]TopLevelSpec{
         .token = "replay",
         .usage = "replay <tape> [--frames] [--json] [--golden <path>] [--frames-dir <path>]",
         .summary = "Replay a recorded terminal session",
+        .hidden_from_top_level_help = true,
         .options = &.{
             .{ .flag = "--frames", .description = "Render each captured frame" },
             .{ .flag = "--golden <path>", .description = "Write the final rendered grid to a file" },
@@ -312,7 +312,6 @@ pub const top_level_help_groups = [_]TopLevelHelpGroup{
         .{ .usage = "session resume [last|id]", .summary = "Resume the latest workspace session or a session by id" },
         .{ .usage = "session migrate <id>", .summary = "Migrate a saved session to the current format" },
         .{ .usage = "session recover <id>", .summary = "Copy a recoverable corrupt session" },
-        .{ .kind = .replay, .usage = "replay <tape>" },
     } },
     .{ .entries = &.{
         .{ .kind = .login, .usage = "login [vercel|codex|grok]" },
@@ -337,10 +336,6 @@ pub const top_level_help_groups = [_]TopLevelHelpGroup{
 };
 
 pub const top_level_flags = [_]TopLevelFlag{
-    .{
-        .usage = "--record",
-        .description = "Record terminal output",
-    },
     .{
         .usage = "--context-limit <spec>",
         .description = "Set name=bytes|off; repeatable",

@@ -1109,6 +1109,73 @@ test "responsive compact menus stay inline across the VT width matrix" {
     }
 }
 
+test "MCP menu stays inline across the VT width matrix and restores the composer" {
+    const alloc = std.testing.allocator;
+    const tools = [_][]const u8{
+        "mcp_fixture_echo",
+        "mcp_fixture_read_resource",
+    };
+
+    for ([_]u16{ 50, 80, 120 }) |width| {
+        var h = try Harness.init(alloc, width, 28, 4);
+        defer h.deinit();
+        var input = InputRuntime{};
+        defer input.deinit(alloc);
+        var approval = approval_prompt.ApprovalPrompt{};
+        defer approval.deinit(alloc);
+        try h.shell.initViewport(&h.metrics, 1);
+        try h.shell.writeTranscript(
+            alloc,
+            &h.metrics,
+            "MCP menu transcript remains visible\n",
+            true,
+        );
+
+        var ctx = defaultFooterContext(&input);
+        ctx.mcp_menu = .{
+            .state = .{
+                .active = true,
+                .section = .tools,
+                .selected_index = 1,
+                .load_state = .ready,
+            },
+            .tools = &tools,
+        };
+        try renderTestFooterWithContext(&h, &approval, &h.frame_redraw, ctx);
+        try h.flush();
+        try expectGridContains(&h, "MCP menu transcript remains visible");
+        try expectGridContains(&h, "MCP 0");
+        try expectGridContains(&h, "[Tools]");
+        try expectGridContains(&h, "mcp_fixture_read_resource");
+        try expectGridContains(&h, "Tab");
+        try expectGridContains(&h, "Esc");
+
+        ctx.mcp_menu = .{
+            .state = .{
+                .active = true,
+                .section = .resources,
+                .screen = .preview,
+                .load_state = .ready,
+            },
+            .preview = "MCP resource · untrusted content\n\nRESOURCE_TEXT: preview remains wrapped and scrollable",
+        };
+        h.frame_redraw = true;
+        try renderTestFooterWithContext(&h, &approval, &h.frame_redraw, ctx);
+        try h.flush();
+        try expectGridContains(&h, "untrusted content");
+        try expectGridContains(&h, "RESOURCE_TEXT:");
+        try expectGridContains(&h, "I Insert");
+
+        ctx.mcp_menu = .{};
+        h.frame_redraw = true;
+        try renderTestFooterWithContext(&h, &approval, &h.frame_redraw, ctx);
+        try h.flush();
+        try expectGridContains(&h, "MCP menu transcript remains visible");
+        try expectGridNotContains(&h, "[Resources]");
+        try expectGridNotContains(&h, "I Insert");
+    }
+}
+
 fn expectGridNotContains(h: *Harness, needle: []const u8) !void {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(h.alloc);

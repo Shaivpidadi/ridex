@@ -1336,9 +1336,9 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
       const stderrPath = join(root.root, "stderr.log");
       writeFileSync(stderrPath, "");
       activeSession = await TmuxSession.create({
-        cmd: `${FX_BIN} --record`,
+        cmd: FX_BIN,
         cwd: root.workspace,
-        env: gatewayEnv(root, gateway),
+        env: { ...gatewayEnv(root, gateway), FX_DEBUG_RECORD: "1" },
         stderrPath,
         width: 180,
         height: 40,

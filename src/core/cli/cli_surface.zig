@@ -133,7 +133,6 @@ pub const LaunchModifiers = struct {
 pub const InteractiveLaunch = struct {
     requested_resume: ?ResumeTarget = null,
     upgrade_relaunch: bool = false,
-    record_requested: bool = false,
     modifiers: LaunchModifiers = .{},
 
     pub fn deinit(self: *InteractiveLaunch, alloc: Allocator) void {
@@ -150,26 +149,7 @@ pub const RunResult = union(enum) {
     handled_exit: u8,
 };
 
-pub const record_modifier_usage = "usage: fx --record is only supported for interactive startup\n";
 const version_usage = "usage: fx --version\n";
-
-pub fn recordRequested(args: []const [:0]const u8) error{RecordModifierRequiresInteractive}!bool {
-    var count: usize = 0;
-    for (args) |arg| {
-        if (std.mem.eql(u8, arg, "--record")) count += 1;
-    }
-    if (count == 0) return false;
-    if (count != 1) return error.RecordModifierRequiresInteractive;
-    if (args.len == 1 and std.mem.eql(u8, args[0], "--record")) return true;
-    if (args.len >= 2 and
-        (std.mem.eql(u8, args[0], "resume") or std.mem.eql(u8, args[0], "--resume")) and
-        std.mem.eql(u8, args[args.len - 1], "--record")) return true;
-    if (args.len >= 3 and
-        std.mem.eql(u8, args[0], "session") and
-        std.mem.eql(u8, args[1], "resume") and
-        std.mem.eql(u8, args[args.len - 1], "--record")) return true;
-    return error.RecordModifierRequiresInteractive;
-}
 
 pub const Config = struct {
     version: []const u8 = "",
@@ -558,14 +538,6 @@ pub fn parseInteractiveLaunch(
         return .{ .interactive = .{ .modifiers = global_args.takeModifiers() } };
     }
 
-    const record_requested = try recordRequested(effective_args);
-    if (record_requested and effective_args.len == 1) {
-        return .{ .interactive = .{
-            .record_requested = true,
-            .modifiers = global_args.takeModifiers(),
-        } };
-    }
-
     const command = parse(command_catalog, effective_args);
     if (topLevelHelpRequest(command_catalog, effective_args) != null) {
         return .{ .noninteractive = .{
@@ -576,14 +548,10 @@ pub fn parseInteractiveLaunch(
     }
     switch (command) {
         .interactive => return .{ .interactive = .{
-            .record_requested = record_requested,
             .modifiers = global_args.takeModifiers(),
         } },
         .resume_session => |invocation| {
-            const resume_args = if (record_requested)
-                invocation.args[0 .. invocation.args.len - 1]
-            else
-                invocation.args;
+            const resume_args = invocation.args;
             const upgrade_relaunch = !invocation.top_level_alias and
                 resume_args.len == 2 and
                 std.mem.eql(u8, resume_args[1], upgrade_relaunch_arg);
@@ -600,7 +568,6 @@ pub fn parseInteractiveLaunch(
             return .{ .interactive = .{
                 .requested_resume = target,
                 .upgrade_relaunch = upgrade_relaunch,
-                .record_requested = record_requested,
                 .modifiers = global_args.takeModifiers(),
             } };
         },
@@ -640,10 +607,6 @@ fn runNoConfigIfRequestedWithDeps(
     command_catalog: CommandCatalog,
     deps: RunDeps,
 ) !bool {
-    _ = recordRequested(args) catch {
-        try writeStderr(deps, record_modifier_usage);
-        return true;
-    };
     if (args.len != 1 or !command_specs.matchesTopLevel(command_catalog, args[0], .help)) {
         return false;
     }
@@ -817,10 +780,6 @@ fn activateProviderSelection(
 
 fn runIfRequestedWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: RunDeps) !RunResult {
     const parsed_launch = parseInteractiveLaunch(alloc, args, cfg.command_catalog) catch |err| {
-        if (err == error.RecordModifierRequiresInteractive) {
-            try writeStderr(deps, record_modifier_usage);
-            return .handled_failure;
-        }
         if (err == error.InvalidResumeArgs) {
             try writeTopLevelUsage(cfg.command_catalog, deps, .@"resume");
             return .handled_failure;
@@ -4971,95 +4930,21 @@ test "workspace unknown directory errors keep stable json codes" {
     try std.testing.expectEqualStrings("", capture.stderr.written());
 }
 
-test "runIfRequested rejects record modifier outside interactive startup" {
+test "runIfRequested rejects removed record flag as unknown input" {
     var capture = CaptureOutput.init(std.testing.allocator);
     defer capture.deinit();
 
-    const result = try runIfRequestedWithDeps(
-        std.testing.allocator,
-        &.{ @constCast("help"), @constCast("--record") },
-        testConfig(),
-        capture.deps(),
+    try std.testing.expectError(
+        error.UnknownCliCommand,
+        runIfRequestedWithDeps(
+            std.testing.allocator,
+            &.{@constCast("--record")},
+            testConfig(),
+            capture.deps(),
+        ),
     );
 
-    try std.testing.expectEqual(RunResult.handled_failure, result);
-    try std.testing.expectEqualStrings("usage: fx --record is only supported for interactive startup\n", capture.stderr.written());
-}
-
-test "runIfRequested carries record intent through supported interactive launches" {
-    var capture = CaptureOutput.init(std.testing.allocator);
-    defer capture.deinit();
-
-    const plain = try runIfRequestedWithDeps(
-        std.testing.allocator,
-        &.{@constCast("--record")},
-        testConfig(),
-        capture.deps(),
-    );
-    switch (plain) {
-        .interactive => |launch| {
-            try std.testing.expect(launch.record_requested);
-            try std.testing.expect(launch.requested_resume == null);
-        },
-        else => return error.TestExpectedInteractiveLaunch,
-    }
-
-    const resumed = try runIfRequestedWithDeps(
-        std.testing.allocator,
-        &.{ @constCast("--resume"), @constCast("session-123"), @constCast("--record") },
-        testConfig(),
-        capture.deps(),
-    );
-    switch (resumed) {
-        .interactive => |launch_value| {
-            var launch = launch_value;
-            defer launch.deinit(std.testing.allocator);
-            try std.testing.expect(launch.record_requested);
-            switch (launch.requested_resume.?) {
-                .id => |id| try std.testing.expectEqualStrings("session-123", id),
-                .pick, .last => return error.TestExpectedResumeId,
-            }
-        },
-        else => return error.TestExpectedInteractiveLaunch,
-    }
-
-    const grouped = try runIfRequestedWithDeps(
-        std.testing.allocator,
-        &.{ @constCast("session"), @constCast("resume"), @constCast("session-123"), @constCast("--record") },
-        testConfig(),
-        capture.deps(),
-    );
-    switch (grouped) {
-        .interactive => |launch_value| {
-            var launch = launch_value;
-            defer launch.deinit(std.testing.allocator);
-            try std.testing.expect(launch.record_requested);
-            switch (launch.requested_resume.?) {
-                .id => |id| try std.testing.expectEqualStrings("session-123", id),
-                .pick, .last => return error.TestExpectedResumeId,
-            }
-        },
-        else => return error.TestExpectedInteractiveLaunch,
-    }
-}
-
-test "runIfRequested rejects record modifier before noninteractive handlers" {
-    const cases = [_][]const [:0]const u8{
-        &.{ @constCast("ask"), @constCast("--record"), @constCast("hello") },
-        &.{ @constCast("acp"), @constCast("--record") },
-        &.{ @constCast("pr"), @constCast("--record") },
-        &.{ @constCast("issue"), @constCast("--record") },
-        &.{ @constCast("--version"), @constCast("--record") },
-        &.{ @constCast("-v"), @constCast("--record") },
-    };
-    for (cases) |args| {
-        var capture = CaptureOutput.init(std.testing.allocator);
-        defer capture.deinit();
-
-        const result = try runIfRequestedWithDeps(std.testing.allocator, args, testConfig(), capture.deps());
-        try std.testing.expectEqual(RunResult.handled_failure, result);
-        try std.testing.expectEqualStrings(record_modifier_usage, capture.stderr.written());
-    }
+    try std.testing.expect(std.mem.find(u8, capture.stderr.written(), "fx: unknown subcommand: --record") != null);
 }
 
 test "runNoConfigIfRequested handles help without config" {
@@ -5323,7 +5208,7 @@ test "runIfRequested rejects malformed resume aliases with canonical usage" {
         );
         try std.testing.expectEqual(RunResult.handled_failure, result);
         try std.testing.expectEqualStrings(
-            "usage: fx session resume [last|<id>] [--record] | session resume --id <id> [--record] | --resume [last|<id>] [--record] | resume [last|<id>] [--record] | resume --id <id> [--record] | --resume-last | --continue | -c | -r | --resume-<id>\n",
+            "usage: fx session resume [last|<id>] | session resume --id <id> | --resume [last|<id>] | resume [last|<id>] | resume --id <id> | --resume-last | --continue | -c | -r | --resume-<id>\n",
             capture.stderr.written(),
         );
     }
@@ -5354,7 +5239,7 @@ test "runIfRequested invalid resume writes usage" {
     const result = try runIfRequestedWithDeps(std.testing.allocator, &.{ @constCast("resume"), @constCast("a"), @constCast("b") }, testConfig(), capture.deps());
     try std.testing.expectEqual(RunResult.handled_failure, result);
     try std.testing.expectEqualStrings(
-        "usage: fx session resume [last|<id>] [--record] | session resume --id <id> [--record] | --resume [last|<id>] [--record] | resume [last|<id>] [--record] | resume --id <id> [--record] | --resume-last | --continue | -c | -r | --resume-<id>\n",
+        "usage: fx session resume [last|<id>] | session resume --id <id> | --resume [last|<id>] | resume [last|<id>] | resume --id <id> | --resume-last | --continue | -c | -r | --resume-<id>\n",
         capture.stderr.written(),
     );
 }

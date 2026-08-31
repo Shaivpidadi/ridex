@@ -392,6 +392,17 @@ pub fn Handlers(comptime App: type) type {
             if (comptime !@hasDecl(App, "takeMcpReloadCompletion")) return;
             var completion = (try app.takeMcpReloadCompletion()) orelse return;
             defer completion.deinit(app.alloc);
+            if (comptime @hasDecl(App, "mcpReloadCompletionOrigin") and
+                @hasDecl(App, "applyMcpMenuReloadCompletion"))
+            {
+                switch (app.mcpReloadCompletionOrigin()) {
+                    .command => {},
+                    .menu => |generation| {
+                        try app.applyMcpMenuReloadCompletion(generation, &completion);
+                        return;
+                    },
+                }
+            }
             var warning = false;
             const body = switch (completion) {
                 .outcome => |outcome| switch (outcome) {
@@ -474,6 +485,17 @@ pub fn Handlers(comptime App: type) type {
             if (comptime !@hasDecl(App, "takeMcpAuthenticationCompletion")) return;
             var completion = (try app.takeMcpAuthenticationCompletion()) orelse return;
             defer completion.deinit(app.alloc);
+            if (comptime @hasDecl(App, "mcpAuthenticationCompletionOrigin") and
+                @hasDecl(App, "applyMcpMenuAuthenticationCompletion"))
+            {
+                switch (app.mcpAuthenticationCompletionOrigin()) {
+                    .command => {},
+                    .menu => |generation| {
+                        try app.applyMcpMenuAuthenticationCompletion(generation, &completion);
+                        return;
+                    },
+                }
+            }
 
             if (completion.result) |authentication| {
                 switch (authentication) {
@@ -1274,6 +1296,25 @@ pub fn Handlers(comptime App: type) type {
 
         fn commandHandleMcp(ctx: *anyopaque, rest: []const u8) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
+            if (std.mem.trim(u8, rest, " \t").len == 0 and
+                comptime @hasDecl(App, "openMcpMenu"))
+            {
+                closeModelMenuIfPresent(app);
+                closeHelpMenuIfPresent(app);
+                closeInlineCommandMenusIfPresent(app);
+                if (comptime @hasField(App, "skills")) app.skills.closeMenu();
+                if (comptime @hasField(App, "input_runtime")) {
+                    if (comptime @hasField(@TypeOf(app.input_runtime), "settings_menu")) {
+                        app.input_runtime.settings_menu.close();
+                    }
+                }
+                if (comptime @hasField(App, "session_persistence")) {
+                    app.session_persistence.session_picker.active = false;
+                }
+                try app.openMcpMenu();
+                app.shell.render_requests.request(.footer);
+                return;
+            }
             const result = try app.mcpCommandProvider().handle(app.alloc, rest, .{
                 .home = io_mod.getenv("HOME"),
                 .list_ctx = @ptrCast(app),
@@ -3668,6 +3709,9 @@ const McpCommandFakeApp = struct {
     reload_behavior: ReloadBehavior = .published_empty,
     reload_pending: bool = false,
     authentication_pending: bool = false,
+    completion_origin: app_mcp_runtime.PresentationOrigin = .command,
+    menu_reload_completions: usize = 0,
+    menu_authentication_completions: usize = 0,
 
     fn deinit(self: *McpCommandFakeApp) void {
         self.notice_body.deinit(self.alloc);
@@ -3759,6 +3803,19 @@ const McpCommandFakeApp = struct {
         };
     }
 
+    fn mcpReloadCompletionOrigin(self: *const McpCommandFakeApp) app_mcp_runtime.PresentationOrigin {
+        return self.completion_origin;
+    }
+
+    fn applyMcpMenuReloadCompletion(
+        self: *McpCommandFakeApp,
+        generation: u64,
+        _: *const app_mcp_runtime.ReloadCompletion,
+    ) !void {
+        try std.testing.expectEqual(@as(u64, 77), generation);
+        self.menu_reload_completions += 1;
+    }
+
     fn takeMcpAuthenticationCompletion(
         self: *McpCommandFakeApp,
     ) !?app_mcp_runtime.AuthenticationCompletion {
@@ -3768,6 +3825,19 @@ const McpCommandFakeApp = struct {
             .server_name = try self.alloc.dupe(u8, "fixture"),
             .result = .{ .authenticated = .{} },
         };
+    }
+
+    fn mcpAuthenticationCompletionOrigin(self: *const McpCommandFakeApp) app_mcp_runtime.PresentationOrigin {
+        return self.completion_origin;
+    }
+
+    fn applyMcpMenuAuthenticationCompletion(
+        self: *McpCommandFakeApp,
+        generation: u64,
+        _: *const app_mcp_runtime.AuthenticationCompletion,
+    ) !void {
+        try std.testing.expectEqual(@as(u64, 77), generation);
+        self.menu_authentication_completions += 1;
     }
 
     noinline fn writeDomainNotice(self: *McpCommandFakeApp, notice: types.SemanticNotice, _: bool) !void {
@@ -4264,6 +4334,28 @@ test "app_commands renders transactional status for explicit MCP reload" {
         app.notice_body.items,
         "MCP configuration reloaded. No servers are configured.",
     ));
+}
+
+test "menu-origin MCP completions never publish transcript notices" {
+    var reload_app = McpCommandFakeApp{
+        .alloc = std.testing.allocator,
+        .reload_pending = true,
+        .completion_origin = .{ .menu = 77 },
+    };
+    defer reload_app.deinit();
+    try Handlers(McpCommandFakeApp).collectMcpReloadFacts(&reload_app);
+    try std.testing.expectEqual(@as(usize, 1), reload_app.menu_reload_completions);
+    try std.testing.expectEqual(@as(usize, 0), reload_app.notice_count);
+
+    var authentication_app = McpCommandFakeApp{
+        .alloc = std.testing.allocator,
+        .authentication_pending = true,
+        .completion_origin = .{ .menu = 77 },
+    };
+    defer authentication_app.deinit();
+    try Handlers(McpCommandFakeApp).collectMcpAuthenticationFacts(&authentication_app);
+    try std.testing.expectEqual(@as(usize, 1), authentication_app.menu_authentication_completions);
+    try std.testing.expectEqual(@as(usize, 0), authentication_app.notice_count);
 }
 
 test "app_commands explains healthy and degraded MCP reloads without internal state" {

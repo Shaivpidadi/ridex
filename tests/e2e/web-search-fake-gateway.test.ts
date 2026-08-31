@@ -14,7 +14,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
 import {
-  AUTO_PERPLEXITY_WITHOUT_DURABLE_TOOLS_SERIALIZED_TOOL_NAMES,
+  AUTO_EXA_WITHOUT_DURABLE_TOOLS_SERIALIZED_TOOL_NAMES,
   customProviderGuidanceState,
   findUnavailableCapabilityReferences,
   parseGatewayRequest,
@@ -22,7 +22,6 @@ import {
   toolByName,
   toolShapesWithoutDescriptions,
   VERIFY_SERIALIZED_TOOL_NAMES,
-  WEB_PERPLEXITY_SERIALIZED_TOOL_NAMES,
   WEB_SEARCH_GUIDANCE,
   contentText,
 } from "./conditional-guidance-oracle";
@@ -143,7 +142,7 @@ function outerSearchCall(input: object = { query: "latest Zig release" }) {
   return outerToolCalls([{ id: "search_outer_1", name: "web_search", input }]);
 }
 
-function outerDirectProviderSearch(toolName = "perplexity_search", result: object = {
+function outerDirectProviderSearch(toolName = "exa_search", result: object = {
   results: [{ title: "Zig downloads", url: SOURCE_URL }],
 }) {
   return sse([
@@ -479,7 +478,7 @@ describe("web_search Gateway fixture", () => {
         const json = parseFxJson(result);
         expect(json.output).toContain("native search call was rejected");
         expect(gateway.requests).toHaveLength(2);
-        expect(gateway.requests[0].body).toContain("gateway.perplexity_search");
+        expect(gateway.requests[0].body).toContain("gateway.exa_search");
         expect(gateway.requests[1].body).toContain(
           "web_search is unavailable: no local runtime with a configured Gateway transport policy is installed",
         );
@@ -524,7 +523,7 @@ describe("web_search Gateway fixture", () => {
   );
 
   test(
-    "no-rule default uses direct Perplexity search and returns a linked source",
+    "no-rule default uses direct Exa search and returns a linked source",
     async () => {
       const root = createIsolatedRoot(null);
       const gateway = startFakeGateway();
@@ -546,8 +545,9 @@ describe("web_search Gateway fixture", () => {
         expect(gateway.requests).toHaveLength(2);
         expect(gateway.requests[0].headers.get("ai-language-model-id")).toBe(OUTER_MODEL);
         expect(gateway.requests[0].body).not.toContain('"name":"web_search"');
-        expect(gateway.requests[0].body).toContain("gateway.perplexity_search");
-        expect(gateway.requests[0].body).toContain('"name":"perplexity_search"');
+        expect(gateway.requests[0].body).toContain("gateway.exa_search");
+        expect(gateway.requests[0].body).toContain('"name":"exa_search"');
+        expect(gateway.requests[0].body).not.toContain('"name":"perplexity_search"');
         expect(gateway.requests[0].body).not.toContain('"name":"parallel_search"');
         expect(gateway.requests[0].body).not.toContain("google/gemini-3-flash");
         expect(gateway.requests[1].headers.get("ai-language-model-id")).toBe(OUTER_MODEL);
@@ -556,10 +556,10 @@ describe("web_search Gateway fixture", () => {
         const initial = parseGatewayRequest(gateway.requests[0]!.body);
         const continuing = parseGatewayRequest(gateway.requests[1]!.body);
         expect(serializedToolNames(initial)).toEqual(
-          AUTO_PERPLEXITY_WITHOUT_DURABLE_TOOLS_SERIALIZED_TOOL_NAMES,
+          AUTO_EXA_WITHOUT_DURABLE_TOOLS_SERIALIZED_TOOL_NAMES,
         );
         expect(serializedToolNames(continuing)).toEqual(
-          AUTO_PERPLEXITY_WITHOUT_DURABLE_TOOLS_SERIALIZED_TOOL_NAMES,
+          AUTO_EXA_WITHOUT_DURABLE_TOOLS_SERIALIZED_TOOL_NAMES,
         );
         expect(toolShapesWithoutDescriptions(continuing)).toEqual(
           toolShapesWithoutDescriptions(initial),
@@ -595,7 +595,7 @@ describe("web_search Gateway fixture", () => {
     async () => {
       const root = createIsolatedRoot();
       const gateway = startFakeGateway([
-        malformedDirectProviderResult("perplexity_search"),
+        malformedDirectProviderResult("exa_search"),
       ]);
       try {
         const result = await runFx(
@@ -623,7 +623,7 @@ describe("web_search Gateway fixture", () => {
     async () => {
       const root = createIsolatedRoot();
       const gateway = startFakeGateway([
-        malformedDirectProviderArguments("perplexity_search"),
+        malformedDirectProviderArguments("exa_search"),
       ]);
       try {
         const result = await runFx(
@@ -714,14 +714,15 @@ describe("web_search Gateway fixture", () => {
         expect(gateway.requests).toHaveLength(2);
         expect(gateway.requests[0].headers.get("ai-language-model-id")).toBe(PARALLEL_OUTER_MODEL);
         expect(gateway.requests[0].body).not.toContain('"name":"web_search"');
+        expect(gateway.requests[0].body).not.toContain('"name":"exa_search"');
         expect(gateway.requests[0].body).not.toContain('"name":"perplexity_search"');
         expect(gateway.requests[0].body).toContain("gateway.parallel_search");
         expect(gateway.requests[0].body).toContain('"name":"parallel_search"');
         expect(gateway.requests[0].body).not.toContain("gateway.perplexity_search");
         const request = parseGatewayRequest(gateway.requests[0]!.body);
         expect(serializedToolNames(request)).toEqual(
-          AUTO_PERPLEXITY_WITHOUT_DURABLE_TOOLS_SERIALIZED_TOOL_NAMES.map((name) =>
-            name === "perplexity_search" ? "parallel_search" : name
+          AUTO_EXA_WITHOUT_DURABLE_TOOLS_SERIALIZED_TOOL_NAMES.map((name) =>
+            name === "exa_search" ? "parallel_search" : name
           ),
         );
         expect(findUnavailableCapabilityReferences(request)).toEqual([]);
@@ -761,7 +762,8 @@ describe("web_search Gateway fixture", () => {
 
         parseFxJson(result);
         expect(gateway.requests).toHaveLength(2);
-        expect(gateway.requests[0].body).toContain('"name":"perplexity_search"');
+        expect(gateway.requests[0].body).toContain('"name":"exa_search"');
+        expect(gateway.requests[0].body).not.toContain('"name":"perplexity_search"');
         expect(gateway.requests[0].body).not.toContain('"name":"parallel_search"');
         expect(JSON.parse(gateway.requests[0].body)).toMatchObject({ reasoning: "high" });
         expect(JSON.parse(gateway.requests[1].body)).toMatchObject({ reasoning: "high" });
@@ -914,13 +916,14 @@ describe("web_search Gateway fixture", () => {
           expect(json.output).toContain("search capability unavailable");
           expect(json.tool_calls).toHaveLength(0);
           expect(gateway.requests).toHaveLength(1);
+          expect(gateway.requests[0].body).not.toContain("gateway.exa_search");
           expect(gateway.requests[0].body).not.toContain("gateway.perplexity_search");
           expect(gateway.requests[0].body).not.toContain("gateway.parallel_search");
           expect(gateway.requests[0].body).not.toContain('"name":"web_search"');
           const request = parseGatewayRequest(gateway.requests[0]!.body);
           expect(serializedToolNames(request)).toEqual(
-            AUTO_PERPLEXITY_WITHOUT_DURABLE_TOOLS_SERIALIZED_TOOL_NAMES.filter((name) =>
-              name !== "perplexity_search"
+            AUTO_EXA_WITHOUT_DURABLE_TOOLS_SERIALIZED_TOOL_NAMES.filter((name) =>
+              name !== "exa_search"
             ),
           );
           expect(findUnavailableCapabilityReferences(request)).toEqual([]);
@@ -942,7 +945,7 @@ describe("web_search Gateway fixture", () => {
     async () => {
       const root = createIsolatedRoot();
       const gateway = startFakeGateway([
-        outerDirectProviderSearch("perplexity_search", { results: [] }),
+        outerDirectProviderSearch("exa_search", { results: [] }),
         outerText("zero search handled"),
       ]);
       try {
@@ -1026,7 +1029,7 @@ describe("web_search Gateway fixture", () => {
         const updates = JSON.stringify(messages);
 
         expect(gateway.requests).toHaveLength(2);
-        expect(gateway.requests[0].body).toContain("gateway.perplexity_search");
+        expect(gateway.requests[0].body).toContain("gateway.exa_search");
         expect(gateway.requests[0].body).not.toContain('"name":"web_search"');
         const initial = parseGatewayRequest(gateway.requests[0]!.body);
         const continuing = parseGatewayRequest(gateway.requests[1]!.body);
@@ -1098,6 +1101,7 @@ describe("web_search Gateway fixture", () => {
         const messages = await runAcpPrompt(client, "Issue denied web search.");
 
         expect(gateway.requests).toHaveLength(1);
+        expect(gateway.requests[0].body).not.toContain("gateway.exa_search");
         expect(gateway.requests[0].body).not.toContain("gateway.perplexity_search");
         expect(gateway.requests[0].body).not.toContain('"name":"web_search"');
         const request = parseGatewayRequest(gateway.requests[0]!.body);

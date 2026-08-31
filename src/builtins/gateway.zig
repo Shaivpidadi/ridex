@@ -53,15 +53,31 @@ const oauth_request_timeout_ms: i64 = 15_000;
 const oauth_response_max_bytes: usize = 64 * 1024;
 
 const web_search_system_prompt = "Research the user's query with the web_search tool and preserve sources for citation.";
+const exa_search_backend_id = web_search_contract.SearchBackendId{ .value = "ai_gateway_exa_search" };
 const perplexity_search_backend_id = web_search_contract.SearchBackendId{ .value = "ai_gateway_perplexity_search" };
 const parallel_search_backend_id = web_search_contract.SearchBackendId{ .value = "ai_gateway_parallel_search" };
 const default_web_search_backend_order = [_]web_search_contract.SearchBackendId{
-    perplexity_search_backend_id,
+    exa_search_backend_id,
     parallel_search_backend_id,
 };
+const exa_search_backend = [_]web_search_contract.SearchBackendId{exa_search_backend_id};
 const perplexity_search_backend = [_]web_search_contract.SearchBackendId{perplexity_search_backend_id};
 const parallel_search_backend = [_]web_search_contract.SearchBackendId{parallel_search_backend_id};
 const default_web_search_backend_policies = [_]web_search_policy.BackendPolicy{
+    .{
+        .id = exa_search_backend_id,
+        .features = .{
+            .max_uses = .best_effort,
+            .allowed_domains = .pass_through,
+            .blocked_domains = .pass_through,
+            .ordered_sources = true,
+            .usage = true,
+            .terminal_incomplete = true,
+            .timeout = true,
+            .cancellation = true,
+            .result_bounds = .post_filter,
+        },
+    },
     .{
         .id = perplexity_search_backend_id,
         .features = .{
@@ -897,6 +913,7 @@ test "API key validator preserves Gateway status mapping" {
 pub fn preferredWebSearchBackendsOverride(raw: ?[]const u8) !?[]const web_search_contract.SearchBackendId {
     const value = raw orelse return null;
     if (value.len == 0) return null;
+    if (std.mem.eql(u8, value, "ai_gateway_exa_search")) return &exa_search_backend;
     if (std.mem.eql(u8, value, "ai_gateway_perplexity_search")) return &perplexity_search_backend;
     if (std.mem.eql(u8, value, "ai_gateway_parallel_search")) return &parallel_search_backend;
     return error.InvalidWebSearchBackend;
@@ -1137,7 +1154,21 @@ pub fn providerToolsJson(alloc: Allocator, input: ProviderToolInput) ![]u8 {
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-    if (input.backend.eql(perplexity_search_backend_id)) {
+    if (input.backend.eql(exa_search_backend_id)) {
+        const result_count = @max(@as(usize, input.max_results), 1);
+        const max_characters = @max(input.max_output_chars / result_count, 1);
+        try out.writer.print(
+            "[{{\"type\":\"provider\",\"id\":\"gateway.exa_search\",\"name\":\"exa_search\",\"args\":{{\"numResults\":{d}",
+            .{input.max_results},
+        );
+        if (hasValues(input.allowed_domains)) {
+            try writeExaDomains(&out.writer, "includeDomains", input.allowed_domains.?);
+        } else if (hasValues(input.blocked_domains)) {
+            try writeExaDomains(&out.writer, "excludeDomains", input.blocked_domains.?);
+        }
+        try out.writer.print(",\"contents\":{{\"highlights\":{{\"maxCharacters\":{d}", .{max_characters});
+        try out.writer.writeAll("}}}}]");
+    } else if (input.backend.eql(perplexity_search_backend_id)) {
         try out.writer.print(
             "[{{\"type\":\"provider\",\"id\":\"gateway.perplexity_search\",\"name\":\"perplexity_search\",\"args\":{{\"maxResults\":{d},\"maxTokens\":{d}",
             .{ input.max_results, input.max_output_tokens },
@@ -1378,6 +1409,7 @@ fn stringField(object: std.json.ObjectMap, names: []const []const u8) ?[]const u
 }
 
 fn selectedToolName(backend: web_search_contract.SearchBackendId) ![]const u8 {
+    if (backend.eql(exa_search_backend_id)) return "exa_search";
     if (backend.eql(perplexity_search_backend_id)) return "perplexity_search";
     if (backend.eql(parallel_search_backend_id)) return "parallel_search";
     return error.InvalidWebSearchBackend;
@@ -1394,6 +1426,15 @@ fn writePerplexityDomains(alloc: Allocator, writer: *std.Io.Writer, domains: []c
         } else {
             try std.json.Stringify.value(domain, .{}, writer);
         }
+    }
+    try writer.writeByte(']');
+}
+
+fn writeExaDomains(writer: *std.Io.Writer, name: []const u8, domains: []const []const u8) !void {
+    try writer.print(",\"{s}\":[", .{name});
+    for (domains, 0..) |domain, index| {
+        if (index > 0) try writer.writeByte(',');
+        try std.json.Stringify.value(domain, .{}, writer);
     }
     try writer.writeByte(']');
 }
@@ -1436,6 +1477,39 @@ test "built-in search rejects an unknown provider-owned backend identity" {
         .max_results = 1,
         .max_output_chars = 1024,
     }));
+}
+
+test "private exa worker advertises bounded results with allowed domains" {
+    const alloc = std.testing.allocator;
+    const allowed_domains = [_][]const u8{"ziglang.org"};
+    const tools_json = try providerToolsJson(alloc, .{
+        .backend = .{ .value = "ai_gateway_exa_search" },
+        .allowed_domains = &allowed_domains,
+        .max_results = 7,
+        .max_output_chars = 4096,
+    });
+    defer alloc.free(tools_json);
+
+    try std.testing.expect(std.mem.find(u8, tools_json, "gateway.exa_search") != null);
+    try std.testing.expect(std.mem.find(u8, tools_json, "\"name\":\"exa_search\"") != null);
+    try std.testing.expect(std.mem.find(u8, tools_json, "\"numResults\":7") != null);
+    try std.testing.expect(std.mem.find(u8, tools_json, "\"includeDomains\":[\"ziglang.org\"]") != null);
+    try std.testing.expect(std.mem.find(u8, tools_json, "\"maxCharacters\":585") != null);
+}
+
+test "private exa worker preserves blocked domains" {
+    const alloc = std.testing.allocator;
+    const blocked_domains = [_][]const u8{"example.com"};
+    const tools_json = try providerToolsJson(alloc, .{
+        .backend = .{ .value = "ai_gateway_exa_search" },
+        .blocked_domains = &blocked_domains,
+        .max_results = 5,
+        .max_output_chars = 6000,
+    });
+    defer alloc.free(tools_json);
+
+    try std.testing.expect(std.mem.find(u8, tools_json, "\"excludeDomains\":[\"example.com\"]") != null);
+    try std.testing.expect(std.mem.find(u8, tools_json, "\"maxCharacters\":1200") != null);
 }
 
 test "private perplexity worker advertises only selected gateway provider search tool" {
@@ -1579,11 +1653,17 @@ fn expectGatewayWorkerAdapterExecutes(backend: web_search_contract.SearchBackend
     var usage_snapshot = try usage.snapshot(alloc);
     defer usage_snapshot.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), usage_snapshot.pending.len);
-    if (backend.eql(perplexity_search_backend_id)) {
+    if (backend.eql(exa_search_backend_id)) {
+        try std.testing.expect(fake.saw_exa);
+        try std.testing.expect(!fake.saw_perplexity);
+        try std.testing.expect(!fake.saw_parallel);
+    } else if (backend.eql(perplexity_search_backend_id)) {
+        try std.testing.expect(!fake.saw_exa);
         try std.testing.expect(fake.saw_perplexity);
         try std.testing.expect(!fake.saw_parallel);
     } else {
         try std.testing.expect(backend.eql(parallel_search_backend_id));
+        try std.testing.expect(!fake.saw_exa);
         try std.testing.expect(!fake.saw_perplexity);
         try std.testing.expect(fake.saw_parallel);
     }
@@ -1593,6 +1673,10 @@ fn expectGatewayWorkerAdapterExecutes(backend: web_search_contract.SearchBackend
 
 test "gateway worker adapter executes private perplexity backend with bounded payload" {
     try expectGatewayWorkerAdapterExecutes(perplexity_search_backend_id);
+}
+
+test "gateway worker adapter executes private exa backend with bounded payload" {
+    try expectGatewayWorkerAdapterExecutes(.{ .value = "ai_gateway_exa_search" });
 }
 
 test "gateway worker adapter executes private parallel backend with bounded payload" {
@@ -1781,6 +1865,7 @@ const FakeStream = struct {
     fail_after_send: bool = false,
     team: ?[]const u8 = null,
     deadline: ?std.Io.Clock.Timestamp = null,
+    saw_exa: bool = false,
     saw_perplexity: bool = false,
     saw_parallel: bool = false,
     saw_inner_prompt: bool = false,
@@ -1811,12 +1896,18 @@ const FakeStream = struct {
         }
         self.team = team;
         self.deadline = deadline;
+        self.saw_exa = std.mem.find(u8, payload, "gateway.exa_search") != null;
         self.saw_perplexity = std.mem.find(u8, payload, "gateway.perplexity_search") != null;
         self.saw_parallel = std.mem.find(u8, payload, "gateway.parallel_search") != null;
         self.saw_inner_prompt = std.mem.find(u8, payload, "Research the user's query with the web_search tool and preserve sources for citation.") != null;
         self.saw_output_bound = std.mem.find(u8, payload, "\"maxOutputTokens\":4096") != null;
         self.saw_required_tool_choice = std.mem.find(u8, payload, "\"toolChoice\":{\"type\":\"required\"}") != null;
-        const tool_name = if (self.saw_parallel) "parallel_search" else "perplexity_search";
+        const tool_name = if (self.saw_exa)
+            "exa_search"
+        else if (self.saw_parallel)
+            "parallel_search"
+        else
+            "perplexity_search";
         self.saw_expected_provider_tool = std.mem.eql(u8, expected_provider_tool_name, tool_name);
         return .{
             .status = .ok,
@@ -2127,8 +2218,8 @@ test "built-in model catalog owns default and loopback target resolution" {
 
 test "built-in gateway owns the admitted web search provider policy" {
     try std.testing.expect(web_search_policy.hasAdmittedBackendPolicy(default_web_search_policy.backend_policies));
-    try std.testing.expectEqual(@as(usize, 2), default_web_search_policy.backend_policies.len);
-    try std.testing.expect(perplexity_search_backend_id.eql(default_web_search_policy.preferred_backends[0]));
+    try std.testing.expectEqual(@as(usize, 3), default_web_search_policy.backend_policies.len);
+    try std.testing.expectEqualStrings("ai_gateway_exa_search", default_web_search_policy.preferred_backends[0].value);
     try std.testing.expect(parallel_search_backend_id.eql(default_web_search_policy.preferred_backends[1]));
 
     for (default_web_search_policy.backend_policies) |backend| {
@@ -2167,6 +2258,7 @@ test "built-in web search provider preserves missing worker configuration error"
 test "built-in gateway web search override selects one backend and rejects unknown values" {
     try std.testing.expect((try preferredWebSearchBackendsOverride(null)) == null);
     try std.testing.expect((try preferredWebSearchBackendsOverride("")) == null);
+    try std.testing.expectEqualStrings("ai_gateway_exa_search", (try preferredWebSearchBackendsOverride("ai_gateway_exa_search")).?[0].value);
     try std.testing.expect(perplexity_search_backend_id.eql((try preferredWebSearchBackendsOverride("ai_gateway_perplexity_search")).?[0]));
     try std.testing.expect(parallel_search_backend_id.eql((try preferredWebSearchBackendsOverride("ai_gateway_parallel_search")).?[0]));
     try std.testing.expectError(error.InvalidWebSearchBackend, preferredWebSearchBackendsOverride("parallel_search"));

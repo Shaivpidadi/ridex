@@ -30,20 +30,20 @@ export const VERIFY_SERIALIZED_TOOL_NAMES = [
   "terminal",
 ] as const;
 
-export const WEB_PERPLEXITY_SERIALIZED_TOOL_NAMES = [
+export const WEB_EXA_SERIALIZED_TOOL_NAMES = [
   ...READ_ONLY_SERIALIZED_TOOL_NAMES,
   "web_fetch",
-  "perplexity_search",
+  "exa_search",
 ] as const;
 
-export const AUTO_PERPLEXITY_SERIALIZED_TOOL_NAMES = CANONICAL_BUILTIN_NAMES.map(
-  (name) => (name === "web_search" ? "perplexity_search" : name),
+export const AUTO_EXA_SERIALIZED_TOOL_NAMES = CANONICAL_BUILTIN_NAMES.map(
+  (name) => (name === "web_search" ? "exa_search" : name),
 );
 
 // Durable-only tools are capability-gated on a writable session. `terminal`
 // remains available because its exec action does not require a session store.
-export const AUTO_PERPLEXITY_WITHOUT_DURABLE_TOOLS_SERIALIZED_TOOL_NAMES =
-  AUTO_PERPLEXITY_SERIALIZED_TOOL_NAMES.filter((name) =>
+export const AUTO_EXA_WITHOUT_DURABLE_TOOLS_SERIALIZED_TOOL_NAMES =
+  AUTO_EXA_SERIALIZED_TOOL_NAMES.filter((name) =>
     name !== "subagent"
   );
 
@@ -118,7 +118,11 @@ export function contentText(content: unknown): string {
 }
 
 export function canonicalToolName(name: string): string {
-  if (name === "perplexity_search" || name === "parallel_search") {
+  if (
+    name === "exa_search" ||
+    name === "perplexity_search" ||
+    name === "parallel_search"
+  ) {
     return "web_search";
   }
   return name;

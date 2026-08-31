@@ -6,6 +6,7 @@ const app_session_runtime = @import("app_session_runtime.zig");
 const app_workspace_runtime = @import("app_workspace_runtime.zig");
 const app_commands = @import("app_commands.zig");
 const project_config = @import("../mcp/project_config.zig");
+const mcp_menu_state = @import("../mcp/menu_state.zig");
 const app_worker_runtime = @import("app_worker_runtime.zig");
 const app_render_runtime = @import("app_render_runtime.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
@@ -52,6 +53,7 @@ const interaction_state = @import("../../ui/footer/interaction_state.zig");
 const approval_prompt = @import("../permissions/approval_prompt.zig");
 const picker_presentation = @import("../../ui/footer/picker_presentation.zig");
 const compact_command_menu_presentation = @import("../../ui/footer/compact_command_menu_presentation.zig");
+const mcp_menu_presentation = @import("../../ui/footer/mcp_menu_presentation.zig");
 const render_input = @import("../../ui/footer/render_input.zig");
 const paste_blocks = @import("../input/pasted_blocks.zig");
 const registered_entities = @import("../input/registered_entities.zig");
@@ -1152,6 +1154,21 @@ pub fn Runtime(comptime App: type) type {
                 return .done;
             }
 
+            if (mcpMenuActive(app)) {
+                switch (resolved) {
+                    .cursor_up => _ = moveMcpMenu(app, -1),
+                    .cursor_down => _ = moveMcpMenu(app, 1),
+                    .cursor_left => _ = try cycleMcpMenuSection(app, -1),
+                    .cursor_right => _ = try cycleMcpMenuSection(app, 1),
+                    else => {},
+                }
+                if (resolved == .cursor_up or resolved == .cursor_down or
+                    resolved == .cursor_left or resolved == .cursor_right)
+                {
+                    return .done;
+                }
+            }
+
             if (settingsMenuActive(app) and
                 (resolved == .cursor_left or resolved == .cursor_right))
             {
@@ -1165,6 +1182,7 @@ pub fn Runtime(comptime App: type) type {
             if (try full_transcript_rt.routeComposerAction(app, resolved)) return .done;
 
             if (composer_shortcut) |action| {
+                if (routeMcpFilterShortcut(app, action)) return .done;
                 try routeComposerShortcutAction(app, action, max_input_len);
                 return .done;
             }
@@ -1349,6 +1367,51 @@ pub fn Runtime(comptime App: type) type {
                         .ignored => {},
                         .limit_exceeded => try input_limit_feedback.report(App, app, .approval_amendment, 1),
                     }
+                }
+                return true;
+            }
+            if (mcpMenuActive(app)) {
+                if (comptime @hasField(App, "mcp")) {
+                    if (app.mcp.menu.screen == .add) {
+                        return try handleMcpAddInput(app, byte, max_input_len);
+                    }
+                    if (app.mcp.menu.screen == .arguments) {
+                        return try handleMcpArgumentInput(app, byte, max_input_len);
+                    }
+                    if (app.mcp.menu.filter_active) {
+                        if (byte == 0x7f) {
+                            _ = applyMcpMenuEvent(app, .delete_filter_byte);
+                            return true;
+                        }
+                        if (byte >= 0x20 and byte < 0x7f and byte != '\r') {
+                            _ = applyMcpMenuEvent(app, .{ .append_filter_byte = byte });
+                            return true;
+                        }
+                    }
+                }
+                if (byte >= 0x80) {
+                    input_reset.resetPendingTextScalarWithTrace(
+                        &app.input_runtime.text_scalar,
+                        "mcp_menu_active",
+                    );
+                    return true;
+                }
+                switch (byte) {
+                    '\t' => _ = try cycleMcpMenuSection(app, 1),
+                    '\r' => _ = try submitMcpMenuSelection(app),
+                    'a', 'A' => _ = try handleMcpMenuPrimaryAction(app),
+                    'd', 'D' => _ = confirmMcpMenuAction(app, .remove),
+                    'l', 'L' => _ = confirmMcpMenuAction(app, .logout),
+                    'x', 'X' => _ = confirmMcpMenuAction(app, .trust_reject),
+                    'p', 'P' => _ = confirmMcpMenuAction(app, .trust_approve_all),
+                    'z', 'Z' => _ = confirmMcpMenuAction(app, .trust_reset),
+                    'c', 'C' => _ = applyMcpMenuEvent(app, .show_info),
+                    'r', 'R' => _ = try refreshMcpMenu(app),
+                    'i', 'I' => _ = try insertMcpMenuPreview(app, max_input_len),
+                    '/' => _ = applyMcpMenuEvent(app, .begin_filter),
+                    10 => _ = moveMcpMenu(app, 1),
+                    11 => _ = moveMcpMenu(app, -1),
+                    else => {},
                 }
                 return true;
             }
@@ -1865,6 +1928,402 @@ pub fn Runtime(comptime App: type) type {
 
         fn settingsMenuActive(app: *App) bool {
             return app.input_runtime.settings_menu.active;
+        }
+
+        fn mcpMenuActive(app: *App) bool {
+            if (comptime @hasField(App, "mcp")) {
+                return app.mcp.menu.active;
+            }
+            return false;
+        }
+
+        fn mcpMenuProjection(app: *App) render_input.McpMenuProjection {
+            if (comptime @hasField(App, "mcp")) {
+                const view = app.mcp.menuView();
+                return .{
+                    .state = view.state,
+                    .servers = if (view.health) |health| health.servers else &.{},
+                    .tools = view.tools,
+                    .resources = if (view.resources) |catalog| catalog.resources.items else &.{},
+                    .resource_templates = if (view.resources) |catalog| catalog.templates.items else &.{},
+                    .prompts = if (view.prompts) |catalog| catalog.items else &.{},
+                    .configuration_issue_count = if (view.health) |health| health.configuration_issues.len else 0,
+                    .preview = view.preview,
+                    .feedback = view.feedback,
+                    .add_name = view.add_form.name.items,
+                    .add_target = view.add_form.target.items,
+                    .add_arguments = view.add_form.arguments.items,
+                    .add_draft = app.input_runtime.edit_state.input.items,
+                    .arguments = view.argument_fields,
+                    .argument_draft = app.input_runtime.edit_state.input.items,
+                };
+            }
+            return .{};
+        }
+
+        fn applyMcpMenuEvent(app: *App, event: mcp_menu_state.Event) ?mcp_menu_state.Effect {
+            const effect = applyMcpMenuEventDeferred(app, event);
+            app.shell.render_requests.request(.footer);
+            return effect;
+        }
+
+        fn applyMcpMenuEventDeferred(app: *App, event: mcp_menu_state.Event) ?mcp_menu_state.Effect {
+            if (comptime @hasField(App, "mcp")) {
+                return mcp_menu_state.apply(&app.mcp.menu, event);
+            }
+            return null;
+        }
+
+        fn routeMcpFilterShortcut(app: *App, action: input_action.ShortcutAction) bool {
+            if (!mcpMenuActive(app)) return false;
+            if (comptime @hasField(App, "mcp")) {
+                if (!app.mcp.menu.filter_active) return false;
+                switch (action) {
+                    .delete_backward => _ = applyMcpMenuEvent(app, .delete_filter_byte),
+                    .delete_word_left, .delete_whitespace_word_left, .delete_to_line_start => _ = applyMcpMenuEvent(app, .clear_filter_text),
+                    else => return false,
+                }
+                return true;
+            }
+            return false;
+        }
+
+        fn startMcpMenuEffect(app: *App, effect: mcp_menu_state.Effect) !void {
+            if (comptime !@hasDecl(App, "beginMcpMenuEffect")) return;
+            app.beginMcpMenuEffect(effect) catch |err| {
+                const generation = switch (effect) {
+                    .load_catalog => |request| request.generation,
+                    .load_preview => |request| request.generation,
+                    .complete_argument => |request| request.generation,
+                    .action => |request| request.generation,
+                    .cancel => |value| value,
+                };
+                if (comptime @hasDecl(App, "recordMcpMenuEffectFailure")) {
+                    try app.recordMcpMenuEffectFailure(generation, err);
+                }
+            };
+        }
+
+        fn moveMcpMenu(app: *App, delta: i8) bool {
+            if (!mcpMenuActive(app)) return false;
+            const projection = mcpMenuProjection(app);
+            if (projection.state.screen == .preview) {
+                _ = applyMcpMenuEvent(app, .{ .scroll_preview = .{
+                    .delta = delta,
+                    .row_count = mcp_menu_presentation.previewVisualRowCount(
+                        projection.preview,
+                        app.shell.layout.cols,
+                    ),
+                } });
+                return true;
+            }
+            _ = applyMcpMenuEvent(app, .{ .move = .{
+                .delta = delta,
+                .item_count = projection.itemCount(),
+                .visible_count = mcp_menu_presentation.visibleItemsForBudget(
+                    mcp_menu_presentation.max_inline_rows,
+                ),
+            } });
+            return true;
+        }
+
+        fn cycleMcpMenuSection(app: *App, delta: i8) !bool {
+            if (!mcpMenuActive(app)) return false;
+            if (applyMcpMenuEventDeferred(app, .{ .cycle_section = delta })) |effect| {
+                try startMcpMenuEffect(app, effect);
+            }
+            if (comptime @hasField(App, "mcp")) {
+                if (app.mcp.menu.load_state == .loading) return true;
+            }
+            app.shell.render_requests.request(.footer);
+            return true;
+        }
+
+        fn submitMcpMenuSelection(app: *App) !bool {
+            if (!mcpMenuActive(app)) return false;
+            if (comptime @hasField(App, "mcp")) {
+                const state = app.mcp.menu;
+                if (state.screen == .browse and state.section == .servers and
+                    mcpMenuProjection(app).itemCount() > 0)
+                {
+                    _ = applyMcpMenuEvent(app, .show_details);
+                } else if (state.screen == .browse and state.section != .servers) {
+                    if (try app.mcp.prepareMenuArguments(app.alloc)) {
+                        app.input_runtime.inputResetState().clearCurrent(app.alloc);
+                        app.shell.render_requests.request(.footer);
+                    } else {
+                        if (applyMcpMenuEvent(app, .begin_preview)) |effect| {
+                            try startMcpMenuEffect(app, effect);
+                        }
+                    }
+                } else if (state.screen == .details) {
+                    const server = mcpMenuProjection(app).selectedServer() orelse return true;
+                    if (server.authentication == .required) {
+                        try authenticateMcpMenuServer(app);
+                    }
+                } else if (state.screen == .confirm) {
+                    if (state.confirmation_action) |action| {
+                        const effect = applyMcpMenuEvent(
+                            app,
+                            .{ .request_action = action },
+                        ) orelse return true;
+                        switch (effect) {
+                            .action => |request| try executeMcpMenuAction(app, request),
+                            .load_catalog, .load_preview, .complete_argument, .cancel => {},
+                        }
+                    }
+                }
+            }
+            return true;
+        }
+
+        fn insertMcpMenuPreview(app: *App, max_input_len: usize) !bool {
+            if (!mcpMenuActive(app)) return false;
+            if (comptime @hasField(App, "mcp")) {
+                const view = app.mcp.menuView();
+                const insert = view.insert orelse return true;
+                const effect = applyMcpMenuEvent(
+                    app,
+                    .{ .request_action = .insert_preview },
+                ) orelse return true;
+                switch (effect) {
+                    .action => |request| {
+                        if (request.action != .insert_preview) return true;
+                        switch (try insertComposerSliceBounded(
+                            app,
+                            insert,
+                            max_input_len,
+                            false,
+                        )) {
+                            .inserted => {
+                                if (comptime @hasDecl(App, "closeMcpMenu")) app.closeMcpMenu();
+                            },
+                            .limit_exceeded => try input_limit_feedback.report(
+                                App,
+                                app,
+                                .composer,
+                                insert.len,
+                            ),
+                            .inactive => {},
+                        }
+                        app.shell.render_requests.request(.footer);
+                    },
+                    .load_catalog, .load_preview, .complete_argument, .cancel => {},
+                }
+            }
+            return true;
+        }
+
+        fn refreshMcpMenu(app: *App) !bool {
+            if (!mcpMenuActive(app)) return false;
+            if (comptime @hasField(App, "mcp")) {
+                if (app.mcp.menu.screen != .browse or app.mcp.menu.section != .servers) return true;
+            }
+            const effect = applyMcpMenuEvent(
+                app,
+                .{ .request_action = .refresh },
+            ) orelse return true;
+            switch (effect) {
+                .action => |request| {
+                    if (request.action != .refresh) return true;
+                    if (comptime @hasDecl(App, "beginMcpMenuReload")) {
+                        app.beginMcpMenuReload(request.generation) catch |err| {
+                            if (comptime @hasDecl(App, "recordMcpMenuEffectFailure")) {
+                                try app.recordMcpMenuEffectFailure(request.generation, err);
+                            }
+                        };
+                    }
+                },
+                .load_catalog, .load_preview, .complete_argument, .cancel => {},
+            }
+            return true;
+        }
+
+        fn authenticateMcpMenuServer(app: *App) !void {
+            const effect = applyMcpMenuEvent(
+                app,
+                .{ .request_action = .authenticate },
+            ) orelse return;
+            switch (effect) {
+                .action => |request| {
+                    if (request.action == .authenticate) try executeMcpMenuAction(app, request);
+                },
+                .load_catalog, .load_preview, .complete_argument, .cancel => {},
+            }
+        }
+
+        fn confirmMcpMenuAction(app: *App, action: mcp_menu_state.Action) bool {
+            if (!mcpMenuActive(app)) return false;
+            if (comptime @hasField(App, "mcp")) {
+                if (app.mcp.menu.screen != .details and
+                    !(app.mcp.menu.screen == .browse and
+                        app.mcp.menu.section == .servers and
+                        (action == .trust_approve_all or action == .trust_reset))) return true;
+                _ = applyMcpMenuEvent(app, .{ .show_confirmation = action });
+            }
+            return true;
+        }
+
+        fn executeMcpMenuAction(
+            app: *App,
+            request: mcp_menu_state.ActionRequest,
+        ) !void {
+            const result = switch (request.action) {
+                .authenticate => if (comptime @hasDecl(App, "beginMcpMenuAuthentication"))
+                    app.beginMcpMenuAuthentication(request.generation)
+                else
+                    error.McpMenuActionUnavailable,
+                .remove => if (comptime @hasDecl(App, "removeMcpMenuServer"))
+                    app.removeMcpMenuServer(request.generation)
+                else
+                    error.McpMenuActionUnavailable,
+                .logout => if (comptime @hasDecl(App, "beginMcpMenuEffect"))
+                    app.beginMcpMenuEffect(.{ .action = request })
+                else
+                    error.McpMenuActionUnavailable,
+                .trust_approve, .trust_reject, .trust_approve_all, .trust_reset => if (comptime @hasDecl(App, "applyMcpMenuTrustAction"))
+                    app.applyMcpMenuTrustAction(request.generation, request.action)
+                else
+                    error.McpMenuActionUnavailable,
+                else => error.McpMenuActionUnavailable,
+            };
+            result catch |err| {
+                if (comptime @hasDecl(App, "recordMcpMenuEffectFailure")) {
+                    try app.recordMcpMenuEffectFailure(request.generation, err);
+                }
+            };
+        }
+
+        fn handleMcpMenuPrimaryAction(app: *App) !bool {
+            if (!mcpMenuActive(app)) return false;
+            if (comptime @hasField(App, "mcp")) {
+                if (app.mcp.menu.screen == .details) {
+                    const server = mcpMenuProjection(app).selectedServer() orelse return true;
+                    if (server.workspace_admission == .pending) {
+                        const effect = applyMcpMenuEvent(
+                            app,
+                            .{ .request_action = .trust_approve },
+                        ) orelse return true;
+                        switch (effect) {
+                            .action => |request| try executeMcpMenuAction(app, request),
+                            .load_catalog, .load_preview, .complete_argument, .cancel => {},
+                        }
+                    }
+                    return true;
+                }
+                if (app.mcp.menu.screen == .browse and app.mcp.menu.section == .servers) {
+                    _ = applyMcpMenuEvent(app, .show_add);
+                }
+            }
+            return true;
+        }
+
+        fn handleMcpAddInput(app: *App, byte: u8, max_input_len: usize) !bool {
+            if (comptime !@hasField(App, "mcp")) return false;
+            switch (byte) {
+                '\t' => {
+                    try commitMcpAddDraft(app);
+                    _ = applyMcpMenuEvent(app, .cycle_add_transport);
+                    app.input_runtime.inputResetState().clearCurrent(app.alloc);
+                },
+                '\r' => {
+                    try commitMcpAddDraft(app);
+                    app.input_runtime.inputResetState().clearCurrent(app.alloc);
+                    const field_count: usize = if (app.mcp.menu.add_transport == .local) 3 else 2;
+                    if (app.mcp.menu.add_field_index + 1 < field_count) {
+                        _ = applyMcpMenuEvent(app, .{ .move_add_field = .{
+                            .delta = 1,
+                            .field_count = field_count,
+                        } });
+                    } else {
+                        const action: mcp_menu_state.Action = if (app.mcp.menu.add_transport == .local)
+                            .add_local
+                        else
+                            .add_http;
+                        const effect = applyMcpMenuEvent(
+                            app,
+                            .{ .request_action = action },
+                        ) orelse return true;
+                        switch (effect) {
+                            .action => |request| {
+                                if (comptime @hasDecl(App, "saveMcpMenuAdd")) {
+                                    app.saveMcpMenuAdd(
+                                        request.generation,
+                                        app.mcp.menu.add_transport,
+                                    ) catch |err| {
+                                        if (comptime @hasDecl(App, "recordMcpMenuEffectFailure")) {
+                                            try app.recordMcpMenuEffectFailure(request.generation, err);
+                                        }
+                                    };
+                                }
+                            },
+                            .load_catalog, .load_preview, .complete_argument, .cancel => {},
+                        }
+                    }
+                    app.shell.render_requests.request(.footer);
+                },
+                else => try handleTextByte(app, .composer, byte, max_input_len),
+            }
+            return true;
+        }
+
+        fn commitMcpAddDraft(app: *App) !void {
+            if (comptime @hasField(App, "mcp")) {
+                try app.mcp.setMenuAddField(
+                    app.alloc,
+                    app.mcp.menu.add_field_index,
+                    app.input_runtime.edit_state.input.items,
+                );
+            }
+        }
+
+        fn handleMcpArgumentInput(app: *App, byte: u8, max_input_len: usize) !bool {
+            if (comptime !@hasField(App, "mcp")) return false;
+            if (app.mcp.menu.pending_generation != null) return true;
+            switch (byte) {
+                '\t' => {
+                    try commitMcpArgumentDraft(app);
+                    app.input_runtime.inputResetState().clearCurrent(app.alloc);
+                    const effect = applyMcpMenuEvent(app, .request_completion) orelse return true;
+                    try startMcpMenuEffect(app, effect);
+                },
+                '\r' => {
+                    try commitMcpArgumentDraft(app);
+                    app.input_runtime.inputResetState().clearCurrent(app.alloc);
+                    const field_count = mcpMenuProjection(app).arguments.len;
+                    if (app.mcp.menu.argument_index + 1 < field_count) {
+                        _ = applyMcpMenuEvent(app, .{ .move_argument = .{
+                            .delta = 1,
+                            .field_count = field_count,
+                        } });
+                    } else if (!app.mcp.menuArgumentsValid()) {
+                        try app.mcp.setMenuFeedback(app.alloc, "Complete every required MCP argument.");
+                        app.shell.render_requests.request(.footer);
+                    } else if (applyMcpMenuEvent(app, .begin_preview)) |effect| {
+                        try startMcpMenuEffect(app, effect);
+                    }
+                },
+                else => try handleTextByte(app, .composer, byte, max_input_len),
+            }
+            return true;
+        }
+
+        fn commitMcpArgumentDraft(app: *App) !void {
+            if (comptime @hasField(App, "mcp")) {
+                const draft = app.input_runtime.edit_state.input.items;
+                const arguments = mcpMenuProjection(app).arguments;
+                if (draft.len == 0 and
+                    app.mcp.menu.argument_index < arguments.len and
+                    arguments[app.mcp.menu.argument_index].value.items.len > 0)
+                {
+                    return;
+                }
+                try app.mcp.setMenuArgumentField(
+                    app.alloc,
+                    app.mcp.menu.argument_index,
+                    draft,
+                );
+            }
         }
 
         const CompactCommandMenuKind = enum {
@@ -2631,7 +3090,7 @@ pub fn Runtime(comptime App: type) type {
                     _ = disarmEscapeClear(app);
                     return;
                 }
-                if (cancelCompactCommandMenu(app) or cancelSettingsMenu(app) or cancelHelpMenu(app) or cancelModelMenu(app) or cancelSkillsMenu(app) or cancelSessionMenu(app)) {
+                if (cancelCompactCommandMenu(app) or cancelMcpMenu(app) or cancelSettingsMenu(app) or cancelHelpMenu(app) or cancelModelMenu(app) or cancelSkillsMenu(app) or cancelSessionMenu(app)) {
                     _ = disarmEscapeClear(app);
                     app.shell.render_requests.request(.footer);
                     return;
@@ -2670,7 +3129,7 @@ pub fn Runtime(comptime App: type) type {
                     return;
                 }
             }
-            if (cancelCompactCommandMenu(app) or cancelSettingsMenu(app) or cancelHelpMenu(app) or cancelModelMenu(app) or cancelSkillsMenu(app) or cancelSessionMenu(app)) {
+            if (cancelCompactCommandMenu(app) or cancelMcpMenu(app) or cancelSettingsMenu(app) or cancelHelpMenu(app) or cancelModelMenu(app) or cancelSkillsMenu(app) or cancelSessionMenu(app)) {
                 _ = disarmEscapeClear(app);
                 app.shell.render_requests.request(.footer);
                 return;
@@ -2743,6 +3202,30 @@ pub fn Runtime(comptime App: type) type {
 
         fn cancelHelpMenu(app: *App) bool {
             return closeHelpMenu(app, true);
+        }
+
+        fn cancelMcpMenu(app: *App) bool {
+            if (!mcpMenuActive(app)) return false;
+            if (comptime @hasField(App, "mcp")) {
+                if (app.mcp.menu.filter_active) {
+                    _ = applyMcpMenuEvent(app, .clear_filter);
+                    return true;
+                }
+                if (app.mcp.menu.screen != .browse) {
+                    if (app.mcp.menu.screen == .add or app.mcp.menu.screen == .arguments) {
+                        app.input_runtime.inputResetState().clearCurrent(app.alloc);
+                    }
+                    if (applyMcpMenuEvent(app, .back)) |effect| switch (effect) {
+                        .cancel => app.mcp.cancelMenuOperation(),
+                        .load_catalog, .load_preview, .complete_argument, .action => {},
+                    };
+                    return true;
+                }
+            }
+            if (comptime @hasDecl(App, "closeMcpMenu")) app.closeMcpMenu();
+            app.input_runtime.inputResetState().clearCurrent(app.alloc);
+            paste_blocks.clearBlocks(app.alloc, &app.input_runtime.entities.pasted_blocks);
+            return true;
         }
 
         fn cancelSettingsMenu(app: *App) bool {

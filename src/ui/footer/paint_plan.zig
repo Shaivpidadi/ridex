@@ -23,6 +23,7 @@ const model_menu_presentation = @import("model_menu_presentation.zig");
 const skills_menu_presentation = @import("skills_menu_presentation.zig");
 const help_menu_presentation = @import("help_menu_presentation.zig");
 const settings_menu_presentation = @import("settings_menu_presentation.zig");
+const mcp_menu_presentation = @import("mcp_menu_presentation.zig");
 const resume_menu_presentation = @import("resume_menu_presentation.zig");
 const question_ui = @import("question_ui.zig");
 const render_input = @import("render_input.zig");
@@ -97,6 +98,7 @@ pub const FooterPlannerInput = struct {
     picker_failed: bool = false,
     slash_completion_count: usize = 0,
     slash_menu_layout: ?picker_presentation.SlashMenuLayout = null,
+    prepared_slash_menu: ?*const picker_presentation.PreparedSlashMenu = null,
     picker_start_col: u16 = 1,
     transcript_state: ?FooterTranscriptState = null,
 };
@@ -842,6 +844,18 @@ pub fn composeFooterFrame(
                 );
                 try pushFooterBandRow(alloc, &frame, plan, rows.picker_start + menu_row_index, &menu_row);
             }
+        } else if (input.picker_kind == .mcp and ctx.mcp_menu.state.active) {
+            var menu_row_index: u16 = 0;
+            while (menu_row_index < input.picker_rows) : (menu_row_index += 1) {
+                var menu_row = try mcp_menu_presentation.composeMcpMenuRow(
+                    alloc,
+                    ctx.mcp_menu,
+                    menu_row_index,
+                    shell.layout.cols,
+                    input.picker_rows,
+                );
+                try pushFooterBandRow(alloc, &frame, plan, rows.picker_start + menu_row_index, &menu_row);
+            }
         } else if (input.picker_kind == .help and ctx.help_menu.active) {
             var menu_row_index: u16 = 0;
             while (menu_row_index < input.picker_rows) : (menu_row_index += 1) {
@@ -919,7 +933,10 @@ pub fn composeFooterFrame(
             }
         } else if (input.picker_kind == .slash) {
             const slash_prefix = input_presentation.slashInputPrefix(ctx.slash_registry, ctx.input.edit_state.input.items);
-            const count = picker_presentation.mixedSlashCompletionCount(ctx.slash_registry, slash_prefix, ctx.skills_menu.items);
+            const count = if (input.prepared_slash_menu) |prepared|
+                prepared.resultCount()
+            else
+                picker_presentation.mixedSlashCompletionCount(ctx.slash_registry, slash_prefix, ctx.skills_menu.items);
             if (count > 0) {
                 if (input.slash_menu_layout) |layout| {
                     var row = rows.picker_start;
@@ -933,26 +950,44 @@ pub fn composeFooterFrame(
                         row += 1;
                     }
 
-                    const column_widths = picker_presentation.mixedSlashMenuColumnWidths(
-                        ctx.slash_registry,
-                        slash_prefix,
-                        ctx.skills_menu.items,
-                        layout.window,
-                        ctx.input.slash_menu_categories,
-                    );
-                    var match_idx = layout.window.start;
-                    while (match_idx < layout.window.end) : (match_idx += 1) {
-                        var slash_row = try picker_presentation.composeSlashMenuOptionRow(
-                            alloc,
+                    const column_widths = if (input.prepared_slash_menu) |prepared|
+                        picker_presentation.preparedSlashMenuColumnWidths(
+                            prepared,
+                            layout.window,
+                            ctx.input.slash_menu_categories,
+                        )
+                    else
+                        picker_presentation.mixedSlashMenuColumnWidths(
                             ctx.slash_registry,
                             slash_prefix,
                             ctx.skills_menu.items,
-                            match_idx,
-                            match_idx == layout.selected,
-                            column_widths,
-                            shell.layout.cols,
+                            layout.window,
                             ctx.input.slash_menu_categories,
                         );
+                    var match_idx = layout.window.start;
+                    while (match_idx < layout.window.end) : (match_idx += 1) {
+                        var slash_row = if (input.prepared_slash_menu) |prepared|
+                            try picker_presentation.composePreparedSlashMenuOptionRow(
+                                alloc,
+                                prepared,
+                                match_idx,
+                                match_idx == layout.selected,
+                                column_widths,
+                                shell.layout.cols,
+                                ctx.input.slash_menu_categories,
+                            )
+                        else
+                            try picker_presentation.composeSlashMenuOptionRow(
+                                alloc,
+                                ctx.slash_registry,
+                                slash_prefix,
+                                ctx.skills_menu.items,
+                                match_idx,
+                                match_idx == layout.selected,
+                                column_widths,
+                                shell.layout.cols,
+                                ctx.input.slash_menu_categories,
+                            );
                         try pushFooterBandRow(alloc, &frame, plan, row, &slash_row);
                         row += 1;
                     }
@@ -1019,6 +1054,13 @@ pub fn composeFooterFrame(
         try input_presentation.composeSkillsMenuHintRow(alloc, shell.layout.cols, ctx.ctrl_c_pending)
     else if (input.show_picker and input.picker_kind == .settings)
         try input_presentation.composeSettingsMenuHintRow(alloc, shell.layout.cols, ctx.ctrl_c_pending)
+    else if (input.show_picker and input.picker_kind == .mcp)
+        try input_presentation.composeMcpMenuHintRow(
+            alloc,
+            shell.layout.cols,
+            ctx.ctrl_c_pending,
+            ctx.mcp_menu.state,
+        )
     else if (input.show_picker and input.picker_kind == .help)
         try input_presentation.composeHelpMenuHintRow(alloc, shell.layout.cols, ctx.ctrl_c_pending)
     else if (input.show_picker and input.picker_kind == .sessions)

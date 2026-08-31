@@ -888,12 +888,12 @@ describe("modern MCP Streamable HTTP", () => {
     const root = createRoot("cache-subscription", fixture);
     const freshTool = "mcp_fixture_fresh";
     gateway = startFakeGateway([
-      fakeGatewayToolCall("activate_subscription", "mcp_search_tools", {
+      fakeGatewayToolCall("activate_subscription", "capability_search", {
         query: "echo",
       }),
       async () => {
         await Bun.sleep(100);
-        return fakeGatewayToolCall("search_fresh", "mcp_search_tools", {
+        return fakeGatewayToolCall("search_fresh", "capability_search", {
           query: "fresh",
         });
       },
@@ -946,12 +946,12 @@ describe("modern MCP Streamable HTTP", () => {
     fixture = startModernMcpHttpFixture("cache_failed_refresh");
     const root = createRoot("cache-failed-refresh", fixture);
     gateway = startFakeGateway([
-      fakeGatewayToolCall("activate_failed_refresh", "mcp_search_tools", {
+      fakeGatewayToolCall("activate_failed_refresh", "capability_search", {
         query: "echo",
       }),
       async () => {
         await Bun.sleep(100);
-        return fakeGatewayToolCall("search_stale", "mcp_search_tools", {
+        return fakeGatewayToolCall("search_stale", "capability_search", {
           query: "echo",
         });
       },
@@ -1001,13 +1001,13 @@ describe("modern MCP Streamable HTTP", () => {
     const root = createRoot("cache-partial-ack", fixture);
     let callsAfterFirstSearch = 0;
     gateway = startFakeGateway([
-      fakeGatewayToolCall("activate_partial_ack", "mcp_search_tools", {
+      fakeGatewayToolCall("activate_partial_ack", "capability_search", {
         query: "echo",
       }),
       async () => {
         callsAfterFirstSearch = fixture!.toolsListCalls;
         await Bun.sleep(100);
-        return fakeGatewayToolCall("search_after_ttl", "mcp_search_tools", {
+        return fakeGatewayToolCall("search_after_ttl", "capability_search", {
           query: "echo",
         });
       },
@@ -1039,13 +1039,13 @@ describe("modern MCP Streamable HTTP", () => {
     const root = createRoot("cache-server-cancel", fixture);
     let callsAfterFirstSearch = 0;
     gateway = startFakeGateway([
-      fakeGatewayToolCall("activate_server_cancel", "mcp_search_tools", {
+      fakeGatewayToolCall("activate_server_cancel", "capability_search", {
         query: "echo",
       }),
       async () => {
         callsAfterFirstSearch = fixture!.toolsListCalls;
         await Bun.sleep(100);
-        return fakeGatewayToolCall("search_after_server_cancel", "mcp_search_tools", {
+        return fakeGatewayToolCall("search_after_server_cancel", "capability_search", {
           query: "echo",
         });
       },
@@ -1080,13 +1080,13 @@ describe("modern MCP Streamable HTTP", () => {
     const root = createRoot("cache-unexpected-ack", fixture);
     let callsAfterFirstSearch = 0;
     gateway = startFakeGateway([
-      fakeGatewayToolCall("activate_unexpected_ack", "mcp_search_tools", {
+      fakeGatewayToolCall("activate_unexpected_ack", "capability_search", {
         query: "echo",
       }),
       async () => {
         callsAfterFirstSearch = fixture!.toolsListCalls;
         await Bun.sleep(100);
-        return fakeGatewayToolCall("search_after_unexpected_ack", "mcp_search_tools", {
+        return fakeGatewayToolCall("search_after_unexpected_ack", "capability_search", {
           query: "echo",
         });
       },
@@ -1129,7 +1129,7 @@ describe("modern MCP Streamable HTTP", () => {
         await Bun.sleep(100);
         return fakeGatewayToolCall("call_old", TOOL_NAME, { text: "old" });
       },
-      fakeGatewayToolCall("search_fresh", "mcp_search_tools", {
+      fakeGatewayToolCall("search_fresh", "capability_search", {
         query: "fresh",
       }),
       fakeGatewayToolCall("select_fresh", "mcp_select_tool", {
@@ -1180,13 +1180,13 @@ describe("modern MCP Streamable HTTP", () => {
       fixture = startModernMcpHttpFixture(cacheCase.mode);
       const root = createRoot(cacheCase.mode, fixture);
       gateway = startFakeGateway([
-        fakeGatewayToolCall("activate_cache", "mcp_search_tools", {
+        fakeGatewayToolCall("activate_cache", "capability_search", {
           query: "echo",
         }),
         ...(cacheCase.delayMs > 0
           ? [async () => {
               await Bun.sleep(cacheCase.delayMs);
-              return fakeGatewayToolCall("search_cache", "mcp_search_tools", {
+              return fakeGatewayToolCall("search_cache", "capability_search", {
                 query: "echo",
               });
             }]
@@ -1228,7 +1228,7 @@ describe("modern MCP Streamable HTTP", () => {
     fixture = startModernMcpHttpFixture("cache_delayed_pagination");
     const root = createRoot("cache-delayed-pagination", fixture);
     gateway = startFakeGateway([
-      fakeGatewayToolCall("search_delayed_catalog", "mcp_search_tools", {
+      fakeGatewayToolCall("search_delayed_catalog", "capability_search", {
         query: "second",
       }),
       fakeGatewayFinalText("Delayed pagination expiry observed."),
@@ -1273,7 +1273,7 @@ describe("modern MCP Streamable HTTP", () => {
     fixture = startModernMcpHttpFixture("cache_empty_cursor");
     const root = createRoot("cache-empty-cursor", fixture);
     gateway = startFakeGateway([
-      fakeGatewayToolCall("search_empty_cursor_catalog", "mcp_search_tools", {
+      fakeGatewayToolCall("search_empty_cursor_catalog", "capability_search", {
         query: "second",
       }),
       fakeGatewayFinalText("Empty cursor pagination complete."),
@@ -1550,7 +1550,7 @@ describe("modern MCP Streamable HTTP", () => {
     fixture = startModernMcpHttpFixture("invalid_header_schema");
     const root = createRoot("invalid-header-schema", fixture);
     gateway = startFakeGateway([
-      fakeGatewayToolCall("inspect_invalid_schema", "mcp_search_tools", {
+      fakeGatewayToolCall("inspect_invalid_schema", "capability_search", {
         query: "echo",
       }),
       fakeGatewayFinalText("Invalid modern schema isolated."),

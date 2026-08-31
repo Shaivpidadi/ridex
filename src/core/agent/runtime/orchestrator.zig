@@ -20,6 +20,7 @@ const secret = @import("../../auth/secret.zig");
 const credentials = @import("../../auth/credentials.zig");
 const credential_authority = @import("../../auth/credential_authority.zig");
 const tool_dispatch = @import("../../tooling/tool_dispatch.zig");
+const tool_projection = @import("../../tooling/tool_projection.zig");
 const model_tool_schema = @import("../../tooling/model_tool_schema.zig");
 const command_result_mapping = @import("../../tooling/command_result_mapping.zig");
 const tool_result_errors = @import("../../tooling/tool_result_errors.zig");
@@ -68,8 +69,8 @@ const AgentRuntimeDeps = runtime_deps.AgentRuntimeDeps;
 const CredentialRefreshMode = runtime_deps.CredentialRefreshMode;
 
 const http_error_detail_max_bytes: usize = 4096;
-const assistant_prefill_recovery_prompt =
-    "Continue from the preceding tool result.";
+const post_tool_decision_prompt =
+    "Continue the original task. If work remains and you can proceed, briefly tell the user what you are doing next, then perform that action with the appropriate tool. Do not end the turn with only a progress update. If the task is complete, respond with the result. If a genuine blocker prevents further action, explain the blocker and what is needed to continue.";
 const repeated_terminal_validation_notice =
     "Repeated terminal validation failures stopped the tool loop. The invalid terminal calls were not executed and produced no terminal effect.";
 const repeated_malformed_arguments_notice =
@@ -80,6 +81,40 @@ const PreparedToolCall = runtime_lifecycle.PreparedToolCall;
 const TurnFinalizationGuard = runtime_finalization.TurnFinalizationGuard;
 const PromptFinishTrace = runtime_finalization.PromptFinishTrace;
 const ToolExecutionResult = runtime_tool_contracts.ToolExecutionResult;
+
+fn append_post_tool_decision_prompt(
+    alloc: Allocator,
+    messages: []const ChatMessage,
+    pending: bool,
+) ![]const ChatMessage {
+    if (!pending) return messages;
+    const projected = try alloc.alloc(ChatMessage, messages.len + 1);
+    @memcpy(projected[0..messages.len], messages);
+    projected[messages.len] = .{
+        .role = .user,
+        .content = post_tool_decision_prompt,
+        .cache_policy = .no_cache,
+    };
+    return projected;
+}
+
+test "append_post_tool_decision_prompt appends one no-cache user message only when pending" {
+    const alloc = std.testing.allocator;
+    const source = [_]ChatMessage{.{ .role = .system, .content = "system" }};
+
+    const unchanged = try append_post_tool_decision_prompt(alloc, &source, false);
+    try std.testing.expectEqual(@as(usize, 1), unchanged.len);
+
+    const projected = try append_post_tool_decision_prompt(alloc, &source, true);
+    defer alloc.free(projected);
+    try std.testing.expectEqual(@as(usize, 2), projected.len);
+    try std.testing.expectEqual(types.ChatRole.user, projected[1].role);
+    try std.testing.expectEqualStrings(
+        "Continue the original task. If work remains and you can proceed, briefly tell the user what you are doing next, then perform that action with the appropriate tool. Do not end the turn with only a progress update. If the task is complete, respond with the result. If a genuine blocker prevents further action, explain the blocker and what is needed to continue.",
+        projected[1].content.?,
+    );
+    try std.testing.expectEqual(types.ChatCachePolicy.no_cache, projected[1].cache_policy);
+}
 
 fn terminal_request_schema_advertised(
     advertised_functions: []const model_tool_schema.FunctionSchema,
@@ -2143,22 +2178,6 @@ fn failureHttpStatus(kind: agent_stream_provider.FailureKind) std.http.Status {
     };
 }
 
-fn isPostVisionAssistantPrefillRejection(
-    status: std.http.Status,
-    detail: []const u8,
-    messages: []const ChatMessage,
-) bool {
-    if (status != .bad_request or messages.len == 0) return false;
-    const tail = messages[messages.len - 1];
-    if (tail.role != .tool or
-        !std.mem.eql(u8, tail.tool_name orelse return false, "vision"))
-    {
-        return false;
-    }
-    return std.mem.find(u8, detail, "does not support assistant message prefill") != null and
-        std.mem.find(u8, detail, "must end with a user message") != null;
-}
-
 fn recovery_deadline(delay_ns: u64) std.Io.Clock.Timestamp {
     const started = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
     return .{
@@ -2674,24 +2693,56 @@ fn appendPermissionFeedbackAfterToolResult(
 
 fn requiresResolvedRequestCapabilities(
     has_images: bool,
+    vision_policy_needs_capabilities: bool,
     effort: types.ReasoningEffort,
     fast_mode: bool,
     available: model_capabilities.Capabilities,
 ) bool {
     return has_images or
         available.context_window == null or
+        (vision_policy_needs_capabilities and available.image_input_support == .unknown) or
         (!effort.isDefault() and !model_capabilities.reasoningEffortSupported(available, effort)) or
         (fast_mode and !available.supports_fast_mode);
 }
 
-test "request capabilities resolve before automatic capacity planning" {
+test "request capabilities resolve before capacity planning and Vision routing" {
     try std.testing.expect(requiresResolvedRequestCapabilities(
+        false,
+        true,
+        .auto,
+        false,
+        .{},
+    ));
+    try std.testing.expect(requiresResolvedRequestCapabilities(
+        false,
         false,
         .auto,
         false,
         .{},
     ));
+    try std.testing.expect(requiresResolvedRequestCapabilities(
+        false,
+        true,
+        .auto,
+        false,
+        .{ .context_window = 128_000 },
+    ));
     try std.testing.expect(!requiresResolvedRequestCapabilities(
+        false,
+        true,
+        .auto,
+        false,
+        .{ .context_window = 128_000, .image_input_support = .non_native },
+    ));
+    try std.testing.expect(!requiresResolvedRequestCapabilities(
+        false,
+        true,
+        .auto,
+        false,
+        .{ .context_window = 128_000, .image_input_support = .native },
+    ));
+    try std.testing.expect(!requiresResolvedRequestCapabilities(
+        false,
         false,
         .auto,
         false,
@@ -2796,9 +2847,12 @@ fn processQueuedPromptInner(
     if (deps.append_static_context) |append_static_context| {
         try append_static_context(deps.ctx, arena, &stable_prefix);
     }
+    const vision_fallback_available = config.provider_capabilities.vision_fallback and
+        deps.tool_registry.lookup("vision") != null;
     var request_capabilities = deps.available_model_capabilities(deps.ctx, job.model);
     if (requiresResolvedRequestCapabilities(
         job.images.len > 0 or job.authorized_image_catalog.len > 0,
+        vision_fallback_available,
         config.effort,
         config.fast_mode,
         request_capabilities,
@@ -2982,18 +3036,6 @@ fn appendAuthorizedVisionAttemptIds(
     return true;
 }
 
-fn visionCallUsesPaths(alloc: Allocator, call: ToolCall) !bool {
-    const request = runtime_vision_contracts.parse_vision_request(
-        alloc,
-        call.arguments_json,
-    ) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return false,
-    };
-    defer request.deinit(alloc);
-    return request.paths() != null;
-}
-
 fn containsImageId(image_ids: []const usize, candidate: usize) bool {
     for (image_ids) |image_id| {
         if (image_id == candidate) return true;
@@ -3080,14 +3122,34 @@ fn buildToolExecutionRootUserContext(
     );
 }
 
-fn visionFallbackMode(
-    available: bool,
+const ImageRoute = enum {
+    native,
+    fallback,
+    unavailable,
+};
+
+const VisionPolicy = struct {
+    route: ImageRoute,
+    mode: runtime_gateway_step.VisionToolMode,
+};
+
+fn visionPolicy(
+    image_input_support: model_capabilities.ImageInputSupport,
+    fallback_available: bool,
     tool_registered: bool,
-) runtime_gateway_step.VisionToolMode {
-    if (!available or !tool_registered) {
-        return .unavailable;
-    }
-    return .optional;
+    pending_images: bool,
+) VisionPolicy {
+    return switch (image_input_support) {
+        .native => .{ .route = .native, .mode = .unavailable },
+        .unknown => .{ .route = .unavailable, .mode = .unavailable },
+        .non_native => if (!fallback_available or !tool_registered)
+            .{ .route = .unavailable, .mode = .unavailable }
+        else
+            .{
+                .route = .fallback,
+                .mode = if (pending_images) .required else .optional,
+            },
+    };
 }
 
 fn buildGatewayMessagesForCompactionWindow(
@@ -3166,19 +3228,68 @@ fn commitContextCompaction(
     return deps.propagate_history_turn(deps.ctx, .{ .compacted_summary = summary });
 }
 
-test "vision fallback follows the selected provider capability" {
-    try std.testing.expectEqual(
-        runtime_gateway_step.VisionToolMode.optional,
-        visionFallbackMode(true, true),
-    );
-    try std.testing.expectEqual(
-        runtime_gateway_step.VisionToolMode.unavailable,
-        visionFallbackMode(true, false),
-    );
-    try std.testing.expectEqual(
-        runtime_gateway_step.VisionToolMode.unavailable,
-        visionFallbackMode(false, true),
-    );
+test "vision policy keeps image route and tool visibility coherent" {
+    const cases = [_]struct {
+        image_input_support: model_capabilities.ImageInputSupport,
+        fallback_available: bool,
+        tool_registered: bool,
+        pending_images: bool,
+        expected_route: ImageRoute,
+        expected_mode: runtime_gateway_step.VisionToolMode,
+    }{
+        .{ .image_input_support = .native, .fallback_available = true, .tool_registered = true, .pending_images = true, .expected_route = .native, .expected_mode = .unavailable },
+        .{ .image_input_support = .native, .fallback_available = false, .tool_registered = false, .pending_images = false, .expected_route = .native, .expected_mode = .unavailable },
+        .{ .image_input_support = .non_native, .fallback_available = true, .tool_registered = true, .pending_images = true, .expected_route = .fallback, .expected_mode = .required },
+        .{ .image_input_support = .non_native, .fallback_available = true, .tool_registered = true, .pending_images = false, .expected_route = .fallback, .expected_mode = .optional },
+        .{ .image_input_support = .non_native, .fallback_available = false, .tool_registered = true, .pending_images = true, .expected_route = .unavailable, .expected_mode = .unavailable },
+        .{ .image_input_support = .non_native, .fallback_available = true, .tool_registered = false, .pending_images = false, .expected_route = .unavailable, .expected_mode = .unavailable },
+        .{ .image_input_support = .unknown, .fallback_available = true, .tool_registered = true, .pending_images = true, .expected_route = .unavailable, .expected_mode = .unavailable },
+    };
+
+    for (cases) |case| {
+        const policy = visionPolicy(
+            case.image_input_support,
+            case.fallback_available,
+            case.tool_registered,
+            case.pending_images,
+        );
+        try std.testing.expectEqual(case.expected_route, policy.route);
+        try std.testing.expectEqual(case.expected_mode, policy.mode);
+        try std.testing.expect((policy.route == .fallback) == (policy.mode != .unavailable));
+    }
+
+    const support_values = [_]model_capabilities.ImageInputSupport{
+        .unknown,
+        .non_native,
+        .native,
+    };
+    const boolean_values = [_]bool{ false, true };
+    for (support_values) |support| {
+        for (boolean_values) |fallback_available| {
+            for (boolean_values) |tool_registered| {
+                for (boolean_values) |pending_images| {
+                    const policy = visionPolicy(
+                        support,
+                        fallback_available,
+                        tool_registered,
+                        pending_images,
+                    );
+                    try std.testing.expect((policy.route == .fallback) == (policy.mode != .unavailable));
+                    if (support == .native) {
+                        try std.testing.expectEqual(ImageRoute.native, policy.route);
+                        try std.testing.expectEqual(runtime_gateway_step.VisionToolMode.unavailable, policy.mode);
+                    }
+                    if (support == .unknown) {
+                        try std.testing.expectEqual(ImageRoute.unavailable, policy.route);
+                        try std.testing.expectEqual(runtime_gateway_step.VisionToolMode.unavailable, policy.mode);
+                    }
+                    if (!fallback_available or !tool_registered) {
+                        try std.testing.expect(policy.mode == .unavailable or support == .native);
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn processQueuedPromptLoop(
@@ -3330,6 +3441,10 @@ fn processQueuedPromptLoop(
     else
         .none;
     var restore_recovery_source = job.recovery_checkpoint != null;
+    var post_tool_decision_pending = if (job.recovery_checkpoint) |checkpoint|
+        checkpoint.execution.tool_steps.len > 0
+    else
+        false;
     var step: usize = 0;
     while (agent_steps.allowsStep(config.agent_step_limit, step)) : (step += 1) {
         current_step_index = step + 1;
@@ -3378,7 +3493,9 @@ fn processQueuedPromptLoop(
             active_compaction_history_tail,
             compacted_suffix_len,
         );
-        last_gateway_message_count = gateway_messages.items.len;
+        const initial_decision_pending = post_tool_decision_pending or
+            recovery_strategy == .continue_after_confirmed_tool;
+        last_gateway_message_count = gateway_messages.items.len + @intFromBool(initial_decision_pending);
         const history_start_index = stable_prefix.items.len + ephemeral_overlay.items.len;
         const current_user_message_index = history_start_index + if (active_compaction_handoff == null)
             history_messages.items.len
@@ -3422,7 +3539,6 @@ fn processQueuedPromptLoop(
         var successful_vision_mode: runtime_gateway_step.VisionToolMode = .unavailable;
         var reset_stream_for_next_attempt = false;
         var auth_retry_used = false;
-        var assistant_prefill_recovery_used = false;
         var skip_next_preflight_refresh = false;
         var recovery_has_unexecuted_tool_start = false;
         var successful_recovery_strategy: ?model_response_recovery.Strategy = null;
@@ -3558,10 +3674,29 @@ fn processQueuedPromptLoop(
                 compacted_suffix_len,
             );
             debug_trace.eventf("agent", "before_provider_preflight", step_ctx, "model={s} messages={d}", .{ gateway_model, gateway_messages.items.len });
-            var vision_route: runtime_vision_contracts.VisionRoute = .native_images;
-            var vision_mode = visionFallbackMode(
+            const vision_policy = visionPolicy(
+                request_capabilities.image_input_support,
                 config.provider_capabilities.vision_fallback,
                 deps.tool_registry.lookup("vision") != null,
+                pending_image_ids.len > 0,
+            );
+            const vision_route: runtime_vision_contracts.VisionRoute = if (vision_policy.route == .fallback)
+                .text_only
+            else
+                .native_images;
+            const vision_mode = vision_policy.mode;
+            debug_trace.eventf(
+                "agent",
+                "vision_policy",
+                step_ctx,
+                "model={s} image_support={s} route={s} mode={s} pending_images={d}",
+                .{
+                    gateway_model,
+                    @tagName(request_capabilities.image_input_support),
+                    @tagName(vision_policy.route),
+                    @tagName(vision_mode),
+                    pending_image_ids.len,
+                },
             );
             const recovery_source_messages = try appendReadFailureRecoveryContext(
                 overlay_arena,
@@ -3573,31 +3708,39 @@ fn processQueuedPromptLoop(
                     stream_ctx.raw_text.items,
                 ),
             );
+            const decision_source_messages = try append_post_tool_decision_prompt(
+                overlay_arena,
+                recovery_source_messages,
+                post_tool_decision_pending or
+                    recovery_strategy == .continue_after_confirmed_tool,
+            );
             const projected_request_messages = blk: {
                 if (job.authorized_image_catalog.len == 0 and job.images.len == 0) {
-                    break :blk recovery_source_messages;
+                    break :blk decision_source_messages;
                 }
-                if (request_capabilities.supports_vision and request_capabilities.supports_file_input) {
-                    break :blk try runtime_vision_contracts.project_native_messages(
+                break :blk switch (vision_policy.route) {
+                    .native => try runtime_vision_contracts.project_native_messages(
                         overlay_arena,
-                        recovery_source_messages,
+                        decision_source_messages,
                         current_user_message_index,
-                    );
-                }
-                if (!config.provider_capabilities.vision_fallback) {
-                    return error.SubscriptionNativeImageUnavailable;
-                }
-                if (job.authorized_image_catalog.len == 0) {
-                    return error.MissingAuthorizedImageCatalog;
-                }
-                vision_route = .text_only;
-                vision_mode = if (pending_image_ids.len > 0) .required else .optional;
-                break :blk try runtime_vision_contracts.project_text_only_messages(
-                    overlay_arena,
-                    recovery_source_messages,
-                    current_user_message_index,
-                    job.authorized_image_catalog,
-                );
+                    ),
+                    .fallback => fallback: {
+                        if (job.authorized_image_catalog.len == 0) {
+                            return error.MissingAuthorizedImageCatalog;
+                        }
+                        break :fallback try runtime_vision_contracts.project_text_only_messages(
+                            overlay_arena,
+                            decision_source_messages,
+                            current_user_message_index,
+                            job.authorized_image_catalog,
+                        );
+                    },
+                    .unavailable => switch (request_capabilities.image_input_support) {
+                        .unknown => return error.ModelImageCapabilityUnavailable,
+                        .non_native => return error.SubscriptionNativeImageUnavailable,
+                        .native => unreachable,
+                    },
+                };
             };
             const terminal_request_eligible = terminal_request_normalization_eligible(
                 base_nested_terminal_advertised,
@@ -3620,7 +3763,7 @@ fn processQueuedPromptLoop(
                 .auto;
             var verified_images: std.ArrayList(image_attachments.VerifiedSnapshot) = .empty;
             if (job.provider != .gateway and job.images.len > 0 and
-                request_capabilities.supports_vision and request_capabilities.supports_file_input)
+                vision_policy.route == .native)
             {
                 try verified_images.ensureTotalCapacity(overlay_arena, job.images.len);
                 for (job.images) |attachment| {
@@ -3631,13 +3774,19 @@ fn processQueuedPromptLoop(
                     ));
                 }
             }
+            const turn_tool_projection = try tool_projection.projectForTurn(
+                arena,
+                config.advertised_tool_names,
+                config.advertised_functions,
+                within_turn_suffix.items,
+            );
             const request_data = agent_stream_provider.RequestData{
                 .model = gateway_model,
                 .messages = request_messages,
                 .tools = .{
                     .registry = deps.tool_registry,
-                    .advertised_names = config.advertised_tool_names,
-                    .advertised_functions = config.advertised_functions,
+                    .advertised_names = turn_tool_projection.advertised_names,
+                    .advertised_functions = turn_tool_projection.advertised_functions,
                     .selected_dynamic = selected_dynamic_tools.items,
                 },
                 .tool_choice = tool_choice,
@@ -4459,36 +4608,6 @@ fn processQueuedPromptLoop(
             const gateway_wait_finished_ms = io_mod.milliTimestamp();
             summary_accumulator.addThinkingWait(gateway_wait_started_ms, stream_ctx.first_model_output_at_ms orelse gateway_wait_finished_ms);
 
-            if (!assistant_prefill_recovery_used and
-                semantic_attempt + 1 < semantic_limit and
-                streamReplaySafe(&stream_ctx) and
-                isPostVisionAssistantPrefillRejection(
-                    if (response_failure) |failure| failureHttpStatus(failure.kind) else .ok,
-                    if (response_failure) |failure| failure.detail orelse "" else "",
-                    request_messages,
-                ))
-            {
-                try within_turn_suffix.append(arena, .{
-                    .role = .user,
-                    .content = assistant_prefill_recovery_prompt,
-                    .cache_policy = .no_cache,
-                });
-                debug_trace.eventf(
-                    "gateway",
-                    "assistant_prefill_recovery",
-                    step_ctx,
-                    "tool_name=vision provider_attempt={d}/{d}",
-                    .{ semantic_attempt + 1, semantic_limit },
-                );
-                stream_result.deinit(arena);
-                stream_result_set = false;
-                assistant_prefill_recovery_used = true;
-                semantic_attempt += 1;
-                retry_pacing = .idle;
-                reset_stream_for_next_attempt = true;
-                continue;
-            }
-
             if (response_failure) |failure| if (isRetryableModelFailure(failure.kind)) {
                 const cause: model_response_recovery.FailureCause = if (failure.kind == .rate_limited)
                     .rate_limited
@@ -4917,6 +5036,7 @@ fn processQueuedPromptLoop(
             if (vision_mode != .required) configured_first_tool_choice_pending = false;
             break;
         }
+        post_tool_decision_pending = false;
         defer if (stream_result_set) stream_result.deinit(arena);
 
         var completion = streamCompletion(stream_result);
@@ -4950,6 +5070,7 @@ fn processQueuedPromptLoop(
                     recovery_strategy = null;
                     recovery_cause = .transport_interrupted;
                     preserved_tool_evidence = .none;
+                    post_tool_decision_pending = true;
                     continue;
                 }
                 completion.finish_reason = .stop;
@@ -5436,8 +5557,7 @@ fn processQueuedPromptLoop(
                 continue;
             }
             if (std.mem.eql(u8, tool_call.name, "vision") and
-                successful_vision_route != .text_only and
-                !try visionCallUsesPaths(arena, tool_call))
+                successful_vision_mode == .unavailable)
             {
                 const owned_call = try types.dupeToolCall(arena, tool_call);
                 errdefer types.freeToolCall(arena, owned_call);
@@ -5448,7 +5568,11 @@ fn processQueuedPromptLoop(
                         .{
                             .tool_name = "vision",
                             .message = runtime_vision_contracts.native_route_unavailable_message,
-                            .suggestion = "Continue using the model's native image input without Vision.",
+                            .suggestion = if (request_capabilities.image_input_support == .native or
+                                (request_capabilities.image_input_support == .unknown and job.provider != .gateway))
+                                "Continue using the model's native image input without Vision."
+                            else
+                                "Continue without Vision.",
                         },
                     ),
                     .kind = .route_unavailable,
@@ -7848,6 +7972,7 @@ fn processQueuedPromptLoop(
             &within_turn_suffix,
             &step_batch,
         );
+        post_tool_decision_pending = true;
         if (malformed_arguments_retry.finishBatch()) {
             debug_trace.eventf(
                 "agent",

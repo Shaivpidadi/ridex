@@ -1647,25 +1647,26 @@ test "top-level help renders flags as compact aligned rows" {
     const narrow = try renderTopLevelHelp(std.testing.allocator, testTopLevelRegistry(), 60, "9.8.7");
     defer std.testing.allocator.free(narrow);
 
-    try std.testing.expect(lineContainsBoth(wide, "--record", "Record terminal output"));
     try std.testing.expect(lineContainsBoth(wide, "--context-limit <spec>", "Set name=bytes|off; repeatable"));
     try std.testing.expect(lineContainsBoth(wide, "--add-dir <path>", "Add a workspace directory; repeatable"));
     try std.testing.expect(lineContainsBoth(wide, "-c, --continue", "Resume the latest workspace session"));
     try std.testing.expect(lineContainsBoth(wide, "-r", "Open the saved-session picker"));
     try std.testing.expect(lineContainsBoth(wide, "--resume [last|<id>]", "Resume the latest workspace session or an exact ID"));
     try std.testing.expect(lineContainsBoth(wide, "--resume-last", "Resume the latest workspace session"));
-    try std.testing.expect(std.mem.find(u8, wide, "Record terminal output\n\n  --context-limit") == null);
     try std.testing.expect(std.mem.find(u8, wide, "Print the 𝒇x version and exit\n\nExamples:") != null);
     try expectAllLinesFit(narrow, 60);
+}
 
-    var lines = std.mem.splitScalar(u8, wide, '\n');
-    while (lines.next()) |line| {
-        const description_start = std.mem.find(u8, line, "Record terminal output") orelse continue;
-        try std.testing.expect(display_width.visibleWidth(line[0..description_start]) <= 28);
-        break;
-    } else {
-        return error.TestExpectedEqual;
-    }
+test "top-level help hides developer recording surfaces" {
+    const text = try renderTopLevelHelp(std.testing.allocator, testTopLevelRegistry(), 120, "9.8.7");
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.find(u8, text, "--record") == null);
+    try std.testing.expect(std.mem.find(u8, text, "replay <tape>") == null);
+
+    const replay = try renderTopLevelCommandHelp(std.testing.allocator, testTopLevelRegistry(), .replay);
+    defer std.testing.allocator.free(replay);
+    try std.testing.expect(std.mem.find(u8, replay, "fx replay") != null);
 }
 
 test "default top-level help styles fit the startup buffer" {
@@ -1689,13 +1690,13 @@ test "per-command help renders header usage options and details" {
     try std.testing.expect(std.mem.find(u8, text, "Modes:") != null);
 }
 
-test "per-command help preserves long resume usage outside top-level index" {
+test "per-command help preserves long resume usage without debug recording" {
     const text = try renderTopLevelCommandHelp(std.testing.allocator, testTopLevelRegistry(), .@"resume");
     defer std.testing.allocator.free(text);
 
-    try std.testing.expect(std.mem.find(u8, text, "Usage:\n  fx session resume [last|<id>] [--record] | session resume --id <id> [--record] | --resume [last|<id>] [--record] | resume [last|<id>] [--record] | resume --id <id> [--record] | --resume-last | --continue | -c | -r | --resume-<id>") != null);
+    try std.testing.expect(std.mem.find(u8, text, "Usage:\n  fx session resume [last|<id>] | session resume --id <id> | --resume [last|<id>] | resume [last|<id>] | resume --id <id> | --resume-last | --continue | -c | -r | --resume-<id>") != null);
     try std.testing.expect(std.mem.find(u8, text, "Options:") != null);
-    try std.testing.expect(std.mem.find(u8, text, "--record") != null);
+    try std.testing.expect(std.mem.find(u8, text, "--record") == null);
 }
 
 test "ACP help documents accepted options" {

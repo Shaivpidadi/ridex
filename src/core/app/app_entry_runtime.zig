@@ -138,10 +138,6 @@ fn runWithDeps(comptime App: type, alloc: Allocator, args: []const [:0]const u8,
 }
 
 pub fn runBeforeInteractive(alloc: Allocator, args: []const [:0]const u8, cfg: Config) !BeforeInteractiveResult {
-    _ = cli_surface.recordRequested(args) catch {
-        writeStderr(.{}, cli_surface.record_modifier_usage);
-        return .{ .exit = 1 };
-    };
     const run_result = cli_surface.runIfRequested(alloc, args, cliSurfaceConfig(cfg)) catch |err| switch (err) {
         error.UnknownCliCommand => return .{ .exit = 1 },
         else => {
@@ -163,10 +159,6 @@ pub fn runNoConfigBeforeInteractive(
 }
 
 fn runBeforeInteractiveWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: RunDeps) !BeforeInteractiveResult {
-    _ = cli_surface.recordRequested(args) catch {
-        writeStderr(deps, cli_surface.record_modifier_usage);
-        return .{ .exit = 1 };
-    };
     const run_result = deps.run_if_requested(deps.cli_ctx, alloc, args, cliSurfaceConfig(cfg)) catch |err| switch (err) {
         error.UnknownCliCommand => return .{ .exit = 1 },
         else => {

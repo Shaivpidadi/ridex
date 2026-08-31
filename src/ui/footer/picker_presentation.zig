@@ -692,6 +692,46 @@ pub fn slashMenuLayout(
     if (command_specs.argCompletionAnchor(prefix) != 0) return null;
     const command_count = command_specs.slashCompletionCount(registry, prefix);
     const result_count = mixedSlashCompletionCount(registry, prefix, skills);
+    return slashMenuLayoutForCounts(
+        command_count,
+        result_count,
+        selection_index,
+        current_window_start,
+        terminal_rows,
+        input_extra,
+        banner_rows,
+    );
+}
+
+pub fn preparedSlashMenuLayout(
+    prepared: *const PreparedSlashMenu,
+    selection_index: usize,
+    current_window_start: usize,
+    terminal_rows: u16,
+    input_extra: u16,
+    banner_rows: u16,
+) ?SlashMenuLayout {
+    if (command_specs.argCompletionAnchor(prepared.prefix) != 0) return null;
+    return slashMenuLayoutForCounts(
+        prepared.commandCount(),
+        prepared.resultCount(),
+        selection_index,
+        current_window_start,
+        terminal_rows,
+        input_extra,
+        banner_rows,
+    );
+}
+
+fn slashMenuLayoutForCounts(
+    command_count: usize,
+    result_count: usize,
+    selection_index: usize,
+    current_window_start: usize,
+    terminal_rows: u16,
+    input_extra: u16,
+    banner_rows: u16,
+) ?SlashMenuLayout {
     if (result_count == 0) return null;
 
     const row_budget = inlinePickerRowBudget(terminal_rows, input_extra, banner_rows);
@@ -752,7 +792,7 @@ pub noinline fn composePickerOptionRow(
     // pickers keep the filled row.
     const selected_style = switch (kind) {
         .model_stage, .models => ui_render.selected_completion_style,
-        .file, .slash, .skills, .help, .settings, .sessions, .auth => ui_render.approval_button_inactive_style,
+        .file, .slash, .skills, .help, .settings, .sessions, .mcp, .auth => ui_render.approval_button_inactive_style,
     };
     try row.appendSlice(alloc, if (selected) selected_style else ui_render.dim_style);
 
@@ -826,6 +866,7 @@ pub fn composePickerStatusRow(
         .help => "no matching commands",
         .settings => "no matching settings",
         .sessions => "no matching sessions",
+        .mcp => "no MCP items available",
         .auth => "authentication actions unavailable",
     };
 
@@ -986,6 +1027,69 @@ const MixedSlashCompletionEntry = union(enum) {
     skill: skill_runtime.Skill,
 };
 
+const PreparedSlashMenuEntry = union(enum) {
+    command: usize,
+    skill: *const skill_runtime.Skill,
+};
+
+pub const PreparedSlashMenu = struct {
+    registry: command_specs.SlashRegistry = .{},
+    prefix: []const u8 = "",
+    command_count: usize = 0,
+    skill_matches: std.ArrayList(*const skill_runtime.Skill) = .empty,
+
+    pub fn deinit(self: *PreparedSlashMenu, alloc: Allocator) void {
+        self.skill_matches.deinit(alloc);
+        self.* = .{};
+    }
+
+    pub fn commandCount(self: *const PreparedSlashMenu) usize {
+        return self.command_count;
+    }
+
+    pub fn resultCount(self: *const PreparedSlashMenu) usize {
+        return self.command_count + self.skill_matches.items.len;
+    }
+
+    fn entryAt(self: *const PreparedSlashMenu, index: usize) ?PreparedSlashMenuEntry {
+        if (index < self.command_count) return .{ .command = index };
+        const skill_index = index - self.command_count;
+        if (skill_index >= self.skill_matches.items.len) return null;
+        return .{ .skill = self.skill_matches.items[skill_index] };
+    }
+};
+
+pub fn prepareSlashMenu(
+    alloc: Allocator,
+    registry: command_specs.SlashRegistry,
+    prefix: []const u8,
+    skills: []const skill_runtime.Skill,
+) !PreparedSlashMenu {
+    var prepared = PreparedSlashMenu{
+        .registry = registry,
+        .prefix = prefix,
+        .command_count = command_specs.slashCompletionCount(registry, prefix),
+    };
+    errdefer prepared.deinit(alloc);
+
+    if (command_specs.argCompletionAnchor(prefix) != 0 or
+        prefix.len == 0 or prefix[0] != '/' or skills.len == 0)
+    {
+        return prepared;
+    }
+
+    try prepared.skill_matches.resize(alloc, skills.len);
+    const written = skill_runtime.fillSkillMenuRangeAtQuery(
+        skills,
+        .all,
+        prefix[1..],
+        0,
+        prepared.skill_matches.items,
+    );
+    prepared.skill_matches.shrinkRetainingCapacity(written);
+    return prepared;
+}
+
 pub fn mixedSlashCompletionCount(registry: command_specs.SlashRegistry, prefix: []const u8, skills: []const skill_runtime.Skill) usize {
     const command_count = command_specs.slashCompletionCount(registry, prefix);
     if (command_specs.argCompletionAnchor(prefix) != 0) return command_count;
@@ -1120,6 +1224,28 @@ fn slashMenuRowContent(
     };
 }
 
+fn preparedSlashMenuRowContent(
+    prepared: *const PreparedSlashMenu,
+    match_idx: usize,
+    include_metadata: bool,
+) ?SlashMenuRowContent {
+    return switch (prepared.entryAt(match_idx) orelse return null) {
+        .command => |command_idx| .{
+            .label = command_specs.nthSlashCompletionLabel(prepared.registry, prepared.prefix, command_idx) orelse return null,
+            .description = command_specs.nthSlashCompletionDescription(prepared.registry, prepared.prefix, command_idx) orelse "",
+            .metadata = if (include_metadata)
+                if (command_specs.nthSlashCompletionCategory(prepared.registry, prepared.prefix, command_idx)) |category| category.label() else ""
+            else
+                "",
+        },
+        .skill => |skill| .{
+            .label = skill.name,
+            .description = skill.description,
+            .metadata = if (include_metadata) skill_runtime.skillSourceShortLabel(skill.source) else "",
+        },
+    };
+}
+
 pub fn mixedSlashMenuColumnWidths(
     registry: command_specs.SlashRegistry,
     prefix: []const u8,
@@ -1131,6 +1257,21 @@ pub fn mixedSlashMenuColumnWidths(
     var match_idx = window.start;
     while (match_idx < window.end) : (match_idx += 1) {
         const content = slashMenuRowContent(registry, prefix, skills, match_idx, include_metadata) orelse continue;
+        widths.label = @max(widths.label, display_width.visibleWidth(content.label));
+        widths.metadata = @max(widths.metadata, display_width.visibleWidth(content.metadata));
+    }
+    return widths;
+}
+
+pub fn preparedSlashMenuColumnWidths(
+    prepared: *const PreparedSlashMenu,
+    window: PickerWindow,
+    include_metadata: bool,
+) SlashMenuColumnWidths {
+    var widths: SlashMenuColumnWidths = .{ .label = 0, .metadata = 0 };
+    var match_idx = window.start;
+    while (match_idx < window.end) : (match_idx += 1) {
+        const content = preparedSlashMenuRowContent(prepared, match_idx, include_metadata) orelse continue;
         widths.label = @max(widths.label, display_width.visibleWidth(content.label));
         widths.metadata = @max(widths.metadata, display_width.visibleWidth(content.metadata));
     }
@@ -1149,7 +1290,29 @@ pub noinline fn composeSlashMenuOptionRow(
     include_metadata: bool,
 ) !std.ArrayList(u8) {
     const content = slashMenuRowContent(registry, prefix, skills, match_idx, include_metadata) orelse return .empty;
+    return composeSlashMenuRow(alloc, content, selected, column_widths, width);
+}
 
+pub noinline fn composePreparedSlashMenuOptionRow(
+    alloc: Allocator,
+    prepared: *const PreparedSlashMenu,
+    match_idx: usize,
+    selected: bool,
+    column_widths: SlashMenuColumnWidths,
+    width: u16,
+    include_metadata: bool,
+) !std.ArrayList(u8) {
+    const content = preparedSlashMenuRowContent(prepared, match_idx, include_metadata) orelse return .empty;
+    return composeSlashMenuRow(alloc, content, selected, column_widths, width);
+}
+
+fn composeSlashMenuRow(
+    alloc: Allocator,
+    content: SlashMenuRowContent,
+    selected: bool,
+    column_widths: SlashMenuColumnWidths,
+    width: u16,
+) !std.ArrayList(u8) {
     var row: std.ArrayList(u8) = .empty;
     errdefer row.deinit(alloc);
     if (width == 0) return row;
@@ -1551,6 +1714,49 @@ test "mixed slash completion ranks substring commands before skill metadata" {
         "workflow-helper",
         nthMixedSlashCompletionSkill(registry, "/name", &skills, 1).?.name,
     );
+}
+
+test "prepared slash menu preserves command-first relevance order" {
+    const specs = [_]command_specs.SlashSpec{
+        .{ .kind = .rename_session, .command = "/rename", .help_entry = "/rename <title>", .completion_description = "rename session", .presentation_category = .session },
+    };
+    const registry = command_specs.SlashRegistry{ .commands = specs[0..] };
+    const skills = [_]skill_runtime.Skill{.{
+        .name = "workflow-helper",
+        .description = "manage named workflows",
+        .path = "/tmp/.codex/skills/workflow-helper",
+        .source = .global_codex,
+    }};
+
+    var prepared = try prepareSlashMenu(std.testing.allocator, registry, "/name", &skills);
+    defer prepared.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), prepared.commandCount());
+    try std.testing.expectEqual(@as(usize, 2), prepared.resultCount());
+    const window = edgeScrollPickerWindow(prepared.resultCount(), 0, 6);
+    const column_widths = preparedSlashMenuColumnWidths(&prepared, window, true);
+    var command_row = try composePreparedSlashMenuOptionRow(std.testing.allocator, &prepared, 0, true, column_widths, 80, true);
+    defer command_row.deinit(std.testing.allocator);
+    var skill_row = try composePreparedSlashMenuOptionRow(std.testing.allocator, &prepared, 1, false, column_widths, 80, true);
+    defer skill_row.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.find(u8, command_row.items, "/rename") != null);
+    try std.testing.expect(std.mem.find(u8, skill_row.items, "workflow-helper") != null);
+}
+
+test "prepared slash menu keeps skills out of argument completions" {
+    const skills = [_]skill_runtime.Skill{.{
+        .name = "permissions-helper",
+        .description = "permissions help",
+        .path = "/tmp/.codex/skills/permissions-helper",
+        .source = .global_codex,
+    }};
+
+    var prepared = try prepareSlashMenu(std.testing.allocator, picker_test_slash_registry, "/permissions ", &skills);
+    defer prepared.deinit(std.testing.allocator);
+
+    const command_count = command_specs.slashCompletionCount(picker_test_slash_registry, "/permissions ");
+    try std.testing.expectEqual(command_count, prepared.commandCount());
+    try std.testing.expectEqual(command_count, prepared.resultCount());
 }
 
 test "registry-aware mixed slash completion maps skills after injected commands" {

@@ -1334,7 +1334,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
           allowedBaseline = allowedBefore.filter((entry) =>
             entry.message.method === "tools/list"
           ).length;
-          return fakeGatewayToolCall("scoped_refresh_search", "mcp_search_tools", {
+          return fakeGatewayToolCall("scoped_refresh_search", "capability_search", {
             query: "echo",
           });
         }
@@ -1647,12 +1647,12 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
     });
     const freshTool = "mcp_fixture_fresh";
     gateway = startFakeGateway([
-      fakeGatewayToolCall("search_initial", "mcp_search_tools", {
+      fakeGatewayToolCall("search_initial", "capability_search", {
         query: "echo",
       }),
       async () => {
         await Bun.sleep(200);
-        return fakeGatewayToolCall("search_fresh", "mcp_search_tools", {
+        return fakeGatewayToolCall("search_fresh", "capability_search", {
           query: "fresh",
         });
       },
@@ -1704,13 +1704,13 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
     });
     const freshTool = "mcp_fixture_fresh";
     gateway = startFakeGateway([
-      fakeGatewayToolCall("search_initial", "mcp_search_tools", {
+      fakeGatewayToolCall("search_initial", "capability_search", {
         query: "echo",
       }),
       async () => {
         writeFileSync(root.invalidationReleasePath, "ready");
         await Bun.sleep(100);
-        return fakeGatewayToolCall("search_fresh", "mcp_search_tools", {
+        return fakeGatewayToolCall("search_fresh", "capability_search", {
           query: "fresh",
         });
       },
@@ -1929,7 +1929,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
         restartLimit: 0,
       });
       gateway = startFakeGateway([
-        fakeGatewayToolCall("search_malformed", "mcp_search_tools", {
+        fakeGatewayToolCall("search_malformed", "capability_search", {
           query: "fixture",
         }),
         fakeGatewayFinalText("Malformed stdio fixture isolated."),
@@ -3979,7 +3979,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
       recordLaunchAttempts: true,
     });
     const activeGateway = startFakeGateway([
-      fakeGatewayToolCall("search_stalled_startup", "mcp_search_tools", {
+      fakeGatewayToolCall("search_stalled_startup", "capability_search", {
         query: "fixture",
       }),
       fakeGatewayFinalText("Startup timeout bounded."),

@@ -1190,6 +1190,12 @@ fn expectedProviderToolName(alloc: std.mem.Allocator, payload: []const u8) !?[]c
         const name = tool.object.get("name") orelse continue;
         if (tool_type != .string or id != .string or name != .string) continue;
         if (std.mem.eql(u8, tool_type.string, "provider") and
+            std.mem.eql(u8, id.string, "gateway.exa_search") and
+            std.mem.eql(u8, name.string, "exa_search"))
+        {
+            return "exa_search";
+        }
+        if (std.mem.eql(u8, tool_type.string, "provider") and
             std.mem.eql(u8, id.string, "gateway.perplexity_search") and
             std.mem.eql(u8, name.string, "perplexity_search"))
         {
@@ -1206,15 +1212,31 @@ fn expectedProviderToolName(alloc: std.mem.Allocator, payload: []const u8) !?[]c
 }
 
 test "expected provider tool name only trusts advertised provider schemas" {
-    const direct_payload =
-        \\{"tools":[{"type":"provider","id":"gateway.perplexity_search","name":"perplexity_search"}]}
-    ;
-    const expected = try expectedProviderToolName(std.testing.allocator, direct_payload);
-    try std.testing.expect(expected != null);
-    try std.testing.expectEqualStrings("perplexity_search", expected.?);
+    const cases = [_]struct {
+        payload: []const u8,
+        name: []const u8,
+    }{
+        .{
+            .payload = "{\"tools\":[{\"type\":\"provider\",\"id\":\"gateway.exa_search\",\"name\":\"exa_search\"}]}",
+            .name = "exa_search",
+        },
+        .{
+            .payload = "{\"tools\":[{\"type\":\"provider\",\"id\":\"gateway.perplexity_search\",\"name\":\"perplexity_search\"}]}",
+            .name = "perplexity_search",
+        },
+        .{
+            .payload = "{\"tools\":[{\"type\":\"provider\",\"id\":\"gateway.parallel_search\",\"name\":\"parallel_search\"}]}",
+            .name = "parallel_search",
+        },
+    };
+    for (cases) |case| {
+        const expected = try expectedProviderToolName(std.testing.allocator, case.payload);
+        try std.testing.expect(expected != null);
+        try std.testing.expectEqualStrings(case.name, expected.?);
+    }
 
     const prompt_only_payload =
-        \\{"prompt":"call gateway.perplexity_search with name perplexity_search","tools":[]}
+        \\{"prompt":"call gateway.exa_search with name exa_search","tools":[]}
     ;
     try std.testing.expect((try expectedProviderToolName(std.testing.allocator, prompt_only_payload)) == null);
 }

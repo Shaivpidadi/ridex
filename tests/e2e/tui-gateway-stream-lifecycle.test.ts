@@ -18,7 +18,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, REPO_ROOT } from "../evals/eval-helpers";
 import {
-  AUTO_PERPLEXITY_SERIALIZED_TOOL_NAMES,
+  AUTO_EXA_SERIALIZED_TOOL_NAMES,
   customProviderGuidanceState,
   findUnavailableCapabilityReferences,
   parseGatewayRequest,
@@ -6977,7 +6977,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           {
             type: "tool-call",
             toolCallId: "provider_search_direct",
-            toolName: "perplexity_search",
+            toolName: "exa_search",
             input: {},
           },
           {
@@ -6993,7 +6993,13 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           },
         ]),
         fakeGatewayFinalText(finalText),
-      ]);
+      ], {
+        models: [{
+          id: MODEL,
+          type: "language",
+          tags: ["vision", "file-input", "tool-use"],
+        }],
+      });
       gateway = providerGateway;
 
       session = await TmuxSession.create({
@@ -7029,19 +7035,18 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       const initialRequest = parseGatewayRequest(providerGateway.requests[0]!.body);
       const continuingRequest = parseGatewayRequest(providerGateway.requests[1]!.body);
-      expect(serializedToolNames(initialRequest)).toEqual(
-        AUTO_PERPLEXITY_SERIALIZED_TOOL_NAMES,
+      const expectedToolNames = AUTO_EXA_SERIALIZED_TOOL_NAMES.filter(
+        (name) => name !== "vision",
       );
-      expect(serializedToolNames(continuingRequest)).toEqual(
-        AUTO_PERPLEXITY_SERIALIZED_TOOL_NAMES,
-      );
+      expect(serializedToolNames(initialRequest)).toEqual(expectedToolNames);
+      expect(serializedToolNames(continuingRequest)).toEqual(expectedToolNames);
       expect(toolShapesWithoutDescriptions(continuingRequest)).toEqual(
         toolShapesWithoutDescriptions(initialRequest),
       );
       for (const request of [initialRequest, continuingRequest]) {
         const toolNames = serializedToolNames(request);
         expect(toolNames.filter((name) => name === "terminal")).toHaveLength(1);
-        expect(toolNames.filter((name) => name === "perplexity_search"))
+        expect(toolNames.filter((name) => name === "exa_search"))
           .toHaveLength(1);
         expect(findUnavailableCapabilityReferences(request)).toEqual([]);
         expect(customProviderGuidanceState(request)).toEqual({
@@ -7059,7 +7064,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(compact).toContain("● 1 tool call · 1 read");
       expect(compact).toContain("└ Searched web");
       expect(compact).not.toContain("● Running");
-      expect(compact).not.toContain("Working perplexity_search");
+      expect(compact).not.toContain("Working exa_search");
 
       await session.sendKeys("C-o");
       const detail = await session.waitForText(sourceUrl, TIMEOUT);
@@ -7071,7 +7076,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       });
       expect(replay).toContain("● 1 tool call · 1 read");
       expect(replay).toContain("└ Searched web");
-      expect(replay).not.toContain("Working perplexity_search");
+      expect(replay).not.toContain("Working exa_search");
       expect(existsSync(tracePath)).toBe(true);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     },

@@ -252,7 +252,6 @@ pub const BootstrapConfig = struct {
     secret_store: host.SecretStore,
     resize_handler: ResizeHandler,
     fx_version: []const u8 = "",
-    record_requested: bool = false,
 };
 
 pub fn loadStartupState(
@@ -479,11 +478,9 @@ pub fn bootstrapInteractiveApp(cfg: BootstrapConfig) !StartupState {
 
     record_tape.configureFromEnv(
         cfg.alloc,
-        state.workspace_root,
         cfg.shell.layout.cols,
         cfg.shell.layout.rows,
         cfg.fx_version,
-        cfg.record_requested,
     ) catch |err| {
         debug_trace.logf("record", "startup recording failed err={s}", .{@errorName(err)});
         return error.RecordingStartFailed;

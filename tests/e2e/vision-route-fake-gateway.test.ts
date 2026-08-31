@@ -18,11 +18,17 @@ import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, REPO_ROOT, runFx } from "../evals/eval-helpers";
-import { hasEmptyComposer, TmuxSession, tmuxAvailable } from "./tmux-helpers";
+import {
+  hasEmptyComposer,
+  POST_TOOL_DECISION_PROMPT,
+  TmuxSession,
+  tmuxAvailable,
+} from "./tmux-helpers";
 
 const TIMEOUT = 15_000;
 const GLM_MODEL = "zai/glm-5.2-fast";
 const GEMINI_MODEL = "google/gemini-2.5-flash";
+const KIMI_MODEL = "moonshotai/kimi-k3";
 const IMAGE_PATH = join(REPO_ROOT, "tests/e2e/fixtures/placeholder-logo.png");
 
 type CapturedRequest = {
@@ -201,6 +207,7 @@ function expectVisionResponseFormat(body: string, imageCount: number) {
 function startImageGateway(
   responses: Response[],
   onChatRequest?: (index: number, body: string) => void,
+  catalogResponse?: Response,
 ) {
   const chatRequests: CapturedRequest[] = [];
   let catalogRequests = 0;
@@ -210,10 +217,16 @@ function startImageGateway(
       const url = new URL(req.url);
       if (url.pathname === "/coding-agent/v1/models") {
         catalogRequests += 1;
+        if (catalogResponse) return catalogResponse.clone();
         return Response.json({
           data: [
             {
               id: GEMINI_MODEL,
+              type: "language",
+              tags: ["vision", "file-input", "tool-use"],
+            },
+            {
+              id: KIMI_MODEL,
               type: "language",
               tags: ["vision", "file-input", "tool-use"],
             },
@@ -527,7 +540,11 @@ function textFromContent(content: unknown): string {
 
 function lastUserText(body: string): string {
   const parsed = JSON.parse(body) as { prompt: Array<{ role?: string; content?: unknown }> };
-  const users = parsed.prompt.filter((entry) => entry.role === "user");
+  const users = parsed.prompt.filter(
+    (entry) =>
+      entry.role === "user" &&
+      textFromContent(entry.content) !== POST_TOOL_DECISION_PROMPT,
+  );
   expect(users.length).toBeGreaterThan(0);
   return textFromContent(users[users.length - 1].content);
 }
@@ -716,20 +733,10 @@ describe("Vision route fake Gateway", () => {
   );
 
   test(
-    "fx ask recovers when the model rejects the post-Vision prompt as assistant prefill",
+    "fx ask ends the post-Vision prompt with user decision guidance",
     async () => {
       const root = createIsolatedRoot();
       const fixture = createScopedImageFixture(root);
-      const prefillRejection = new Response(
-        JSON.stringify({
-          error: {
-            message:
-              "AI_APICallError: This model does not support assistant message prefill. " +
-              "The conversation must end with a user message.",
-          },
-        }),
-        { status: 400, headers: { "content-type": "application/json" } },
-      );
       const gateway = startImageGateway([
         sseToolCall(
           "vision",
@@ -737,7 +744,6 @@ describe("Vision route fake Gateway", () => {
           "vision_prefill_recovery",
         ),
         sseText(VISION_RESULT),
-        prefillRejection,
         sseText("Recovered final image answer"),
       ]);
       try {
@@ -761,14 +767,12 @@ describe("Vision route fake Gateway", () => {
         const json = parseFxJson(result);
         expect(json.exit_code).toBe(0);
         expect(json.output).toContain("Recovered final image answer");
-        expect(gateway.chatRequests).toHaveLength(4);
+        expect(gateway.chatRequests).toHaveLength(3);
 
-        const rejectedPrompt = JSON.parse(gateway.chatRequests[2].body).prompt;
-        expect(rejectedPrompt.at(-1)).toMatchObject({ role: "tool" });
-        const retryPrompt = JSON.parse(gateway.chatRequests[3].body).prompt;
-        expect(retryPrompt.at(-1)).toMatchObject({ role: "user" });
-        expect(JSON.stringify(retryPrompt.at(-1))).toContain(
-          "Continue from the preceding tool result.",
+        const selectedPrompt = JSON.parse(gateway.chatRequests[2].body).prompt;
+        expect(selectedPrompt.at(-1)).toMatchObject({ role: "user" });
+        expect(JSON.stringify(selectedPrompt.at(-1))).toContain(
+          POST_TOOL_DECISION_PROMPT,
         );
         expect(result.stderr).toBe("Inspecting images\n");
       } finally {
@@ -1051,6 +1055,49 @@ describe("Vision route fake Gateway", () => {
         expect(gateway.chatRequests).toHaveLength(1);
         expect(gateway.chatRequests[0].headers.get("ai-language-model-id")).toBe(GEMINI_MODEL);
         expect(gateway.chatRequests[0].body).toContain('"type":"file"');
+        expect(gateway.chatRequests[0].body).not.toContain('"name":"vision"');
+        expectScopedImageContext(gateway.chatRequests[0].body, fixture);
+        expect(gateway.chatRequests[0].body).not.toContain(fixture.imagePath);
+      } finally {
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "fx ask uses Kimi native vision without Vision tool",
+    async () => {
+      const root = createIsolatedRoot();
+      const fixture = createScopedImageFixture(root);
+      const gateway = startImageGateway([sseText("Kimi native image answer")]);
+      try {
+        const result = await runFx(
+          [
+            "ask",
+            "--json",
+            "--no-save",
+            "--no-color",
+            "--image",
+            fixture.imagePath,
+            "Describe the attached image.",
+          ],
+          {
+            cwd: root.workspace,
+            env: fakeGatewayEnv(root, gateway, KIMI_MODEL),
+            timeoutMs: TIMEOUT,
+          },
+        );
+
+        const json = parseFxJson(result);
+        expect(json.exit_code).toBe(0);
+        expect(json.output).toContain("Kimi native image answer");
+        expect(gateway.catalogRequests).toBe(1);
+        expect(gateway.chatRequests).toHaveLength(1);
+        expect(gateway.chatRequests[0].headers.get("ai-language-model-id")).toBe(KIMI_MODEL);
+        expect(gateway.chatRequests[0].body).toContain('"type":"file"');
+        expect(gateway.chatRequests[0].body).not.toContain('"name":"vision"');
         expectScopedImageContext(gateway.chatRequests[0].body, fixture);
         expect(gateway.chatRequests[0].body).not.toContain(fixture.imagePath);
       } finally {
@@ -1136,7 +1183,7 @@ describe("Vision route fake Gateway", () => {
   );
 
   test(
-    "saved native ID rejection recovers immediately and is filtered after resume",
+    "saved unadvertised native Vision rejection recovers and is filtered after resume",
     async () => {
       const root = createIsolatedRoot();
       const fixture = createScopedImageFixture(root);
@@ -1170,8 +1217,7 @@ describe("Vision route fake Gateway", () => {
         expect(first.stderr).not.toContain("Inspecting images");
         expect(first.stderr).not.toContain("Vision is unavailable right now");
         expect(gateway.chatRequests).toHaveLength(2);
-        expect(gateway.chatRequests[0].body).toContain('"name":"vision"');
-        expect(gateway.chatRequests[0].body).toContain('"paths":{"type":"array"');
+        expect(gateway.chatRequests[0].body).not.toContain('"name":"vision"');
         expect(gateway.chatRequests[0].body).not.toContain('"toolChoice":{"type":"required"}');
         expect(gateway.chatRequests[0].body).toContain('"type":"file"');
 
@@ -1226,8 +1272,7 @@ describe("Vision route fake Gateway", () => {
         expect(gateway.chatRequests).toHaveLength(3);
         const resumedRequest = gateway.chatRequests[2];
         expect(filePartCount(resumedRequest.body)).toBe(1);
-        expect(resumedRequest.body).toContain('"name":"vision"');
-        expect(resumedRequest.body).toContain('"paths":{"type":"array"');
+        expect(resumedRequest.body).not.toContain('"name":"vision"');
         expect(resumedRequest.body).not.toContain('"toolChoice":{"type":"required"}');
         expect(resumedRequest.body).not.toContain('"toolName":"vision"');
         expect(resumedRequest.body).not.toContain("native_vision");
@@ -1433,7 +1478,7 @@ describe("Vision route fake Gateway", () => {
   );
 
   test(
-    "text-only GLM ask resolves context capacity without Vision IO",
+    "text-only non-native ask resolves capacity and exposes Vision",
     async () => {
       const root = createIsolatedRoot();
       const gateway = startImageGateway([sseText("text only answer")]);
@@ -1454,6 +1499,146 @@ describe("Vision route fake Gateway", () => {
         expect(gateway.chatRequests).toHaveLength(1);
         expect(gateway.chatRequests[0].headers.get("ai-language-model-id")).toBe(GLM_MODEL);
         expect(gateway.chatRequests[0].body).not.toContain('"type":"file"');
+        expect(gateway.chatRequests[0].body).toContain('"name":"vision"');
+      } finally {
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "text-only Kimi ask resolves capability and hides Vision",
+    async () => {
+      const root = createIsolatedRoot();
+      const gateway = startImageGateway([sseText("Kimi text only answer")]);
+      try {
+        const result = await runFx(
+          ["ask", "--json", "--no-save", "--no-color", "Reply exactly OK."],
+          {
+            cwd: root.workspace,
+            env: fakeGatewayEnv(root, gateway, KIMI_MODEL),
+            timeoutMs: TIMEOUT,
+          },
+        );
+
+        const json = parseFxJson(result);
+        expect(json.exit_code).toBe(0);
+        expect(json.output).toContain("Kimi text only answer");
+        expect(gateway.catalogRequests).toBe(1);
+        expect(gateway.chatRequests).toHaveLength(1);
+        expect(gateway.chatRequests[0].headers.get("ai-language-model-id")).toBe(KIMI_MODEL);
+        expect(gateway.chatRequests[0].body).not.toContain('"type":"file"');
+        expect(gateway.chatRequests[0].body).not.toContain('"name":"vision"');
+      } finally {
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "catalog failure hides Vision and rejects unresolved image input",
+    async () => {
+      const textRoot = createIsolatedRoot();
+      const textGateway = startImageGateway(
+        [sseText("text answer without Vision")],
+        undefined,
+        new Response("catalog unavailable", { status: 503 }),
+      );
+      try {
+        const textResult = await runFx(
+          ["ask", "--json", "--no-save", "--no-color", "Reply exactly OK."],
+          {
+            cwd: textRoot.workspace,
+            env: fakeGatewayEnv(textRoot, textGateway, KIMI_MODEL),
+            timeoutMs: TIMEOUT,
+          },
+        );
+        const textJson = parseFxJson(textResult);
+        expect(textJson.exit_code).toBe(0);
+        expect(textJson.output).toContain("text answer without Vision");
+        expect(textGateway.catalogRequests).toBe(1);
+        expect(textGateway.chatRequests).toHaveLength(1);
+        expect(textGateway.chatRequests[0].body).not.toContain('"name":"vision"');
+      } finally {
+        textGateway.stop();
+        rmSync(textRoot.root, { recursive: true, force: true });
+      }
+
+      const imageRoot = createIsolatedRoot();
+      const fixture = createScopedImageFixture(imageRoot);
+      const imageGateway = startImageGateway(
+        [],
+        undefined,
+        new Response("catalog unavailable", { status: 503 }),
+      );
+      try {
+        const imageResult = await runFx(
+          [
+            "ask",
+            "--json",
+            "--no-save",
+            "--no-color",
+            "--image",
+            fixture.imagePath,
+            "Describe the attached image.",
+          ],
+          {
+            cwd: imageRoot.workspace,
+            env: fakeGatewayEnv(imageRoot, imageGateway, KIMI_MODEL),
+            timeoutMs: TIMEOUT,
+          },
+        );
+        const imageJson = parseFxErrorJson(imageResult);
+        expect(imageJson.error).toContain("ModelImageCapabilityUnavailable");
+        expect(imageGateway.catalogRequests).toBe(1);
+        expect(imageGateway.chatRequests).toHaveLength(0);
+      } finally {
+        imageGateway.stop();
+        rmSync(imageRoot.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "catalog failure explains unresolved image capability in text mode",
+    async () => {
+      const root = createIsolatedRoot();
+      const fixture = createScopedImageFixture(root);
+      const gateway = startImageGateway(
+        [],
+        undefined,
+        new Response("catalog unavailable", { status: 503 }),
+      );
+      try {
+        const result = await runFx(
+          [
+            "ask",
+            "--no-save",
+            "--no-color",
+            "--image",
+            fixture.imagePath,
+            "Describe the attached image.",
+          ],
+          {
+            cwd: root.workspace,
+            env: fakeGatewayEnv(root, gateway, KIMI_MODEL),
+            timeoutMs: TIMEOUT,
+          },
+        );
+
+        expect(result.code).toBe(1);
+        expect(result.stdout).toBe("");
+        expect(result.stderr).toBe(
+          "fx ask: Unable to verify image support for this model, so the image was not sent. Try again later, choose another model, or remove the image.\n",
+        );
+        expect(result.stderr).not.toContain("ModelImageCapabilityUnavailable");
+        expect(gateway.catalogRequests).toBe(1);
+        expect(gateway.chatRequests).toHaveLength(0);
       } finally {
         gateway.stop();
         rmSync(root.root, { recursive: true, force: true });
@@ -1613,8 +1798,7 @@ describe("Vision route fake Gateway", () => {
         expect(gateway.chatRequests[0].body).toContain('"toolChoice":{"type":"required"}');
         expect(gateway.chatRequests[0].body).toContain("[Image #1]");
         expect(gateway.chatRequests[3].headers.get("ai-language-model-id")).toBe(GEMINI_MODEL);
-        expect(gateway.chatRequests[3].body).toContain('"name":"vision"');
-        expect(gateway.chatRequests[3].body).toContain('"paths":{"type":"array"');
+        expect(gateway.chatRequests[3].body).not.toContain('"name":"vision"');
         expect(gateway.chatRequests[3].body).not.toContain('"toolChoice":{"type":"required"}');
         expect(gateway.chatRequests[3].body).not.toContain('"toolName":"vision"');
         expect(gateway.chatRequests[3].body).not.toContain("first image evidence");
@@ -1711,8 +1895,7 @@ describe("Vision route fake Gateway", () => {
         expect(nativeJson.tool_calls).toHaveLength(0);
         expect(gateway.chatRequests).toHaveLength(1);
         expect(gateway.chatRequests[0].headers.get("ai-language-model-id")).toBe(GEMINI_MODEL);
-        expect(gateway.chatRequests[0].body).toContain('"name":"vision"');
-        expect(gateway.chatRequests[0].body).toContain('"paths":{"type":"array"');
+        expect(gateway.chatRequests[0].body).not.toContain('"name":"vision"');
         expect(gateway.chatRequests[0].body).not.toContain('"toolChoice":{"type":"required"}');
         expect(filePartCount(gateway.chatRequests[0].body)).toBe(5);
         expect(gateway.chatRequests[0].body).toContain("Legacy first image: [Image #1]");
@@ -2781,6 +2964,7 @@ describe("Vision route fake Gateway", () => {
         expect(gateway.chatRequests).toHaveLength(3);
         const selectedFollowup = gateway.chatRequests[2].body;
         expect(lastUserText(selectedFollowup)).toBe(feedback);
+        expect(selectedFollowup).toContain(POST_TOOL_DECISION_PROMPT);
         expect(selectedFollowup.split("<available_images>")).toHaveLength(2);
         expect(selectedFollowup).toContain(rootRequest);
         expect(selectedFollowup).not.toContain(imagePath);
