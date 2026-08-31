@@ -33,15 +33,13 @@ try {
       FX_MODEL: "native/test-model",
     },
   });
-  const session = await agent.createSession();
-  const turn = session.prompt("stall");
+  const turn = agent.prompt("stall");
   await Promise.race([fetchStarted, timeout("stalled gateway fetch")]);
   turn.cancel();
   const result = await Promise.race([turn.result, timeout("native cancellation")]);
   assert.equal(result.stopReason, "cancelled");
   assert.equal(aborted, true, "turn cancellation must abort Node fetch");
-  await session.close();
-  assert.equal(await agent.close(), 0);
+  assert.equal(await agent.close(), undefined);
   console.log("native core cancellation passed: stalled request cancelled and runtime closed");
 } finally {
   server.closeAllConnections();

@@ -974,13 +974,15 @@ pub const NormalAgentError = error{
 };
 
 pub fn runNormalAgentTurn(
+    agent: *agent_runtime.Agent,
     deps: *const runtime_deps.AgentRuntimeDeps,
     semantic_presentation: ?runtime_assistant_stream.SemanticPresentationSink,
     lifecycle: runtime_lifecycle.LifecycleContext,
     config: runtime_config.Config,
     prompt: worker_runtime.QueuedPrompt,
 ) NormalAgentError!void {
-    agent_runtime.processQueuedPrompt(
+    agent_runtime.processAgentPrompt(
+        agent,
         deps,
         semantic_presentation,
         lifecycle,

@@ -132,6 +132,12 @@ pub fn writeAgentMessageChunk(w: *std.Io.Writer, text: []const u8) !void {
     try w.writeAll("}}");
 }
 
+pub fn writeAgentThoughtChunk(w: *std.Io.Writer, text: []const u8) !void {
+    try w.writeAll("{\"sessionUpdate\":\"agent_thought_chunk\",\"content\":{\"type\":\"text\",\"text\":");
+    try writeJsonStr(text, w);
+    try w.writeAll("}}");
+}
+
 pub fn writeUserMessageChunk(w: *std.Io.Writer, text: []const u8) !void {
     try w.writeAll("{\"sessionUpdate\":\"user_message_chunk\",\"content\":{\"type\":\"text\",\"text\":");
     try writeJsonStr(text, w);
@@ -209,6 +215,32 @@ pub fn writePromptResponse(w: *std.Io.Writer, reason: StopReason) !void {
     try w.writeAll("{\"stopReason\":");
     try writeJsonStr(reason.jsonString(), w);
     try w.writeAll("}");
+}
+
+pub fn writePromptResponseWithUsage(
+    w: *std.Io.Writer,
+    reason: StopReason,
+    usage: core_types.Usage,
+) !void {
+    try w.writeAll("{\"stopReason\":");
+    try writeJsonStr(reason.jsonString(), w);
+    try w.writeAll(",\"usage\":{");
+    var first = true;
+    inline for (.{
+        .{ "inputTokens", usage.input_tokens },
+        .{ "outputTokens", usage.output_tokens },
+        .{ "cacheReadTokens", usage.cache_read_tokens },
+        .{ "cacheWriteTokens", usage.cache_write_tokens },
+        .{ "reasoningTokens", usage.reasoning_tokens },
+    }) |field| {
+        if (field[1]) |value| {
+            if (!first) try w.writeByte(',');
+            first = false;
+            try writeJsonStr(field[0], w);
+            try w.print(":{d}", .{value});
+        }
+    }
+    try w.writeAll("}}");
 }
 
 pub fn writeAvailableCommandsUpdate(w: *std.Io.Writer, commands_json: []const u8) !void {

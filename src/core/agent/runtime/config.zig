@@ -8,6 +8,7 @@ const workspace_access = @import("../../workspace/workspace_access.zig");
 const model_response_recovery = @import("model_response_recovery.zig");
 const provider_set = @import("../../gateway/provider_set.zig");
 const model_tool_schema = @import("../../tooling/model_tool_schema.zig");
+const stream_provider = @import("../stream_provider.zig");
 
 const ReasoningEffort = types.ReasoningEffort;
 
@@ -34,6 +35,7 @@ pub const Config = struct {
     gateway_chat_url: []const u8,
     advertised_tool_names: []const []const u8 = &.{},
     advertised_functions: []const model_tool_schema.FunctionSchema = &.{},
+    initial_dynamic_tools: []const stream_provider.DynamicFunctionTool = &.{},
     provider_capabilities: provider_set.Bundle.Capabilities = .{
         .fx_search = true,
         .vision_fallback = true,

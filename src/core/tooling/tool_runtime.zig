@@ -161,6 +161,7 @@ pub const Context = struct {
     effort: types.ReasoningEffort = .auto,
     first_call_tool_choice: types.ToolChoice = .auto,
     tool_registry: tool_dispatch.Registry = .{},
+    host_tool_provider: ?tool_dispatch.HostToolProvider = null,
     subagent_host: ?*subagent_tool_host.Runtime = null,
     subagent_caller_id: ?[]const u8 = null,
     permission_mode: PermissionMode,
@@ -458,6 +459,37 @@ pub fn executeToolCallAuthorized(
     if (request.command_replay_capture) |continued| {
         replay_continuation_transferred = result.command_replay_capture == continued;
     }
+    return result;
+}
+
+pub fn executeHostToolCallAuthorized(
+    ctx: Context,
+    request: tool_contracts.ToolExecutionRequest,
+) !ToolExecutionResult {
+    const spec = ctx.tool_registry.lookup(request.call.name) orelse
+        return error.InvalidToolArguments;
+    if (spec.executor_kind != .host) return error.InvalidToolArguments;
+
+    var execution_ctx = ctx;
+    if (request.permission_mode) |permission_mode| {
+        execution_ctx.permission_mode = permission_mode;
+    }
+    execution_ctx.max_tool_result_bytes = request.max_tool_result_bytes;
+    var dispatch_ctx = typedDispatchContextForCall(
+        execution_ctx,
+        request.result_allocator,
+        request.call,
+    );
+    dispatch_ctx.execution_authority = request.authority;
+    var status_detail: ?[]u8 = null;
+    const dispatched = try tool_dispatch.dispatchAuthorizedToolCall(
+        dispatch_ctx,
+        execution_ctx.tool_registry,
+        request.call,
+        &status_detail,
+    );
+    var result = toolExecutionResultFromDispatch(dispatched, .{});
+    result.status_detail = status_detail;
     return result;
 }
 
@@ -933,6 +965,7 @@ fn typedDispatchContext(ctx: Context, arena: Allocator) tool_dispatch.DispatchCo
         .on_web_search_progress = ctx.on_web_search_progress,
         .web_fetch_progress_ctx = ctx.web_fetch_progress_ctx,
         .on_web_fetch_progress = ctx.on_web_fetch_progress,
+        .host_tool_provider = ctx.host_tool_provider,
         .mcp_ctx = ctx.mcp_ctx,
         .mcp_call_tool = ctx.mcp_call_tool,
         .mcp_search_tools = ctx.mcp_search_tools,
@@ -1832,7 +1865,7 @@ fn executeSubagentProvider(
     else switch (try persistedSubagentIdentity(
         arena,
         ctx.current_turn_messages,
-        ctx.session.history.items,
+        ctx.session.agent.history.items,
         invocation_id,
     )) {
         .absent => host.issueOperationIdentity(

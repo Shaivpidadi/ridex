@@ -2342,10 +2342,10 @@ test "worker bridge history append fallback updates runtime history" {
     try std.testing.expectEqual(@as(usize, 1), app.session.historyLen());
     try std.testing.expectEqualStrings(
         "persist me",
-        app.session.history.items[0].assistant.user.text,
+        app.session.agent.history.items[0].assistant.user.text,
     );
     try std.testing.expectEqualStrings(
         "saved",
-        app.session.history.items[0].assistant.assistant,
+        app.session.agent.history.items[0].assistant.assistant,
     );
 }

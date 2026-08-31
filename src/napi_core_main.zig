@@ -469,6 +469,8 @@ const Runtime = struct {
                 .workspace_root_override = self.workspace_root,
                 .allow_acp_mcp = false,
                 .allow_native_tools = false,
+                .allow_native_skills = false,
+                .minimal_kernel = true,
             },
             jsonrpc.Reader.initCallback(self, Runtime.readInput),
             jsonrpc.Writer.initCallback(self, Runtime.writeOutput),
@@ -589,15 +591,28 @@ fn getNamedString(
     max_len: usize,
 ) !?[]u8 {
     var present = false;
-    if (c.napi_has_named_property(env, object, name, &present) != c.napi_ok or !present) return null;
+    if (c.napi_has_named_property(env, object, name, &present) != c.napi_ok) {
+        if (exceptionPending(env)) return error.JavaScriptException;
+        return error.InvalidArgument;
+    }
+    if (!present) return null;
     var value: c.napi_value = undefined;
-    if (c.napi_get_named_property(env, object, name, &value) != c.napi_ok) return error.InvalidArgument;
+    if (c.napi_get_named_property(env, object, name, &value) != c.napi_ok) {
+        if (exceptionPending(env)) return error.JavaScriptException;
+        return error.InvalidArgument;
+    }
     var value_type: c.napi_valuetype = undefined;
     if (c.napi_typeof(env, value, &value_type) != c.napi_ok or value_type != c.napi_string) return error.InvalidArgument;
     return try stringArg(env, value, alloc, max_len);
 }
 
+fn exceptionPending(env: c.napi_env) bool {
+    var pending = false;
+    return c.napi_is_exception_pending(env, &pending) == c.napi_ok and pending;
+}
+
 const CreateError = error{
+    JavaScriptException,
     TooManyRuntimes,
     InvalidApiKey,
     InvalidModel,
@@ -613,27 +628,32 @@ fn createRuntime(env: c.napi_env, options: c.napi_value) CreateError!*Runtime {
     errdefer releaseRuntimeSlot();
     const alloc = std.heap.c_allocator;
     const credential = getNamedString(env, options, "apiKey", alloc, max_api_key_bytes) catch |err| switch (err) {
+        error.JavaScriptException => return error.JavaScriptException,
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.InvalidApiKey,
     };
     const api_key = credential orelse return error.InvalidApiKey;
     errdefer alloc.free(api_key);
     const model = getNamedString(env, options, "model", alloc, max_model_bytes) catch |err| switch (err) {
+        error.JavaScriptException => return error.JavaScriptException,
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.InvalidModel,
     };
     errdefer if (model) |value| alloc.free(value);
     const home = (getNamedString(env, options, "home", alloc, max_path_bytes) catch |err| switch (err) {
+        error.JavaScriptException => return error.JavaScriptException,
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.InvalidHome,
     }) orelse return error.InvalidHome;
     errdefer alloc.free(home);
     const workspace_root = (getNamedString(env, options, "workspaceRoot", alloc, max_path_bytes) catch |err| switch (err) {
+        error.JavaScriptException => return error.JavaScriptException,
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.InvalidWorkspaceRoot,
     }) orelse return error.InvalidWorkspaceRoot;
     errdefer alloc.free(workspace_root);
     const gateway_chat_url = (getNamedString(env, options, "gatewayChatUrl", alloc, max_url_bytes) catch |err| switch (err) {
+        error.JavaScriptException => return error.JavaScriptException,
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.InvalidGatewayUrl,
     }) orelse (alloc.dupe(u8, builtin_gateway.default_chat_url) catch return error.OutOfMemory);
@@ -668,6 +688,7 @@ fn createRuntime(env: c.napi_env, options: c.napi_value) CreateError!*Runtime {
 
 fn throwCreateError(env: c.napi_env, err: CreateError) c.napi_value {
     return switch (err) {
+        error.JavaScriptException => null,
         error.TooManyRuntimes => throw(env, "LIBFX_NATIVE_LIMIT", "too many active native runtimes"),
         error.InvalidApiKey => throw(env, "LIBFX_INVALID_ARGUMENT", "apiKey is required and must be a bounded string"),
         error.InvalidModel => throw(env, "LIBFX_INVALID_ARGUMENT", "model must be a bounded string"),

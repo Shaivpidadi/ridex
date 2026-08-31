@@ -200,6 +200,11 @@ pub fn onStreamReasoningChunk(ctx: *anyopaque, chunk: []const u8) void {
             debug_trace.logf("agent", "token progress publication failed source=reasoning err={s}", .{@errorName(err)});
         };
     }
+    if (stream_ctx.hooks.push_reasoning_delta) |push| {
+        push(stream_ctx.hooks.ctx, chunk) catch |err| {
+            debug_trace.logf("agent", "reasoning publication failed err={s}", .{@errorName(err)});
+        };
+    }
 }
 
 pub fn publishTurnPhase(stream_ctx: *StreamChunkContext, phase: types.TurnPhase) void {

@@ -26,8 +26,7 @@ try {
           FX_MODEL: "native/test-model",
         },
       });
-      const session = await agent.createSession();
-      session.prompt("stall during worker termination");
+      agent.prompt("stall during worker termination");
       parentPort.postMessage("started");
     })().catch((error) => { throw error; });
   `, {

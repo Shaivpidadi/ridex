@@ -36,6 +36,51 @@ const Allocator = std.mem.Allocator;
 const ErrorCode = jsonrpc.ErrorCode;
 const writeJsonStr = jsonrpc.writeJsonStr;
 
+pub fn handleNewLibfxSession(
+    state: *server.ServerState,
+    alloc: Allocator,
+    msg: *jsonrpc.Message,
+) !void {
+    try server.releaseActiveSession(state);
+    const session_id = try session_store.generateSessionId(alloc);
+    var session_id_owned = true;
+    defer if (session_id_owned) alloc.free(session_id);
+    const model = try alloc.dupe(u8, state.selected_model);
+    var model_owned = true;
+    defer if (model_owned) alloc.free(model);
+    var session_rt = session_runtime.SessionRuntime.initWithProviders(
+        state.cfg.max_history_turns,
+        state.cfg.provider_set.deferredUsageProviders(),
+    );
+    var session_rt_owned = true;
+    defer if (session_rt_owned) session_rt.deinit(alloc);
+
+    state.active_session = .{
+        .session_id = session_id,
+        .model = model,
+        .provider = state.provider,
+        .mode = state.cfg.mode_registry.default_mode_id,
+        .workspace_root = state.workspace_root,
+        .api_key = state.api_key,
+        .credential_source = state.credential_source,
+        .account_id = state.account_id,
+        .agent_step_limit = state.agent_step_limit,
+        .max_tool_result_bytes = state.max_tool_result_bytes,
+        .fast_mode = state.fast_mode,
+        .effort = state.effort,
+        .first_call_tool_choice = state.first_call_tool_choice,
+        .permission_mode = state.permission_mode,
+        .permission_rules = state.permission_rules,
+        .session_rt = session_rt,
+        .cancel_flag = std.atomic.Value(bool).init(false),
+        .pending_prompt_id = null,
+    };
+    session_id_owned = false;
+    model_owned = false;
+    session_rt_owned = false;
+    try writeNewSessionResponse(state, alloc, msg, session_id);
+}
+
 pub fn handleNewWasmSession(state: *server.ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void {
     try server.releaseActiveSession(state);
 
@@ -305,7 +350,7 @@ pub fn handleLoadWasmSession(state: *server.ServerState, alloc: Allocator, msg: 
 
     if (state.active_session) |*active| {
         if (sameSessionId(active.session_id, session_id)) {
-            for (active.session_rt.history.items) |turn| try sendHistoryTurnAsUpdates(state, alloc, session_id, turn);
+            for (active.session_rt.agent.history.items) |turn| try sendHistoryTurnAsUpdates(state, alloc, session_id, turn);
             return writeLoadSessionResponse(state, alloc, msg, active.model);
         }
     }
@@ -366,7 +411,7 @@ pub fn handleLoadWasmSession(state: *server.ServerState, alloc: Allocator, msg: 
     sid_owned = false;
     model_owned = false;
     session_rt_owned = false;
-    for (state.active_session.?.session_rt.history.items) |turn| try sendHistoryTurnAsUpdates(state, alloc, session_id, turn);
+    for (state.active_session.?.session_rt.agent.history.items) |turn| try sendHistoryTurnAsUpdates(state, alloc, session_id, turn);
     try writeLoadSessionResponse(state, alloc, msg, state.active_session.?.model);
 }
 
@@ -517,7 +562,7 @@ fn handleRestoreSession(
             }
             server.enableSubagentHost(state);
             if (kind.replaysHistory()) {
-                for (active.session_rt.history.items) |turn| {
+                for (active.session_rt.agent.history.items) |turn| {
                     try sendHistoryTurnAsUpdates(state, alloc, session_id, turn);
                 }
             }

@@ -74,21 +74,19 @@ const agent = await Promise.race([
 ]);
 
 try {
-  const session = await agent.createSession();
   const prompt = [
     `Begin your response with the exact token ${nonce}.`,
     "Then write four short, distinct sentences explaining why incremental token streaming improves an interactive coding assistant.",
     "Do not use tools or Markdown.",
   ].join(" ");
-  const turn = session.prompt(prompt);
+  const turn = agent.prompt(prompt);
   const chunks = [];
   let firstAcpChunkAt = null;
   const timeout = setTimeout(() => turn.cancel(), 45000);
   try {
     for await (const update of turn) {
-      if (update.sessionUpdate !== "agent_message_chunk") continue;
-      const text = update.content?.text;
-      if (!text || text.startsWith("[context]")) continue;
+      if (update.type !== "text_delta") continue;
+      const text = update.delta;
       if (firstAcpChunkAt === null) firstAcpChunkAt = performance.now();
       chunks.push(text);
     }
@@ -100,8 +98,8 @@ try {
 
   if (responseStatus !== 200) throw new Error(`live gateway returned HTTP ${responseStatus}`);
   if (fetchCalls !== 1) throw new Error(`expected one live gateway fetch, got ${fetchCalls}`);
-  if (requestedSessionId !== session.id) throw new Error(`live gateway request used unexpected session id: ${requestedSessionId}`);
-  if (requestedSessionAffinity !== session.id) throw new Error(`live gateway request used unexpected session affinity: ${requestedSessionAffinity}`);
+  if (!requestedSessionId) throw new Error("live gateway request omitted session id");
+  if (requestedSessionAffinity !== requestedSessionId) throw new Error(`live gateway affinity disagreed with session id: ${requestedSessionAffinity}`);
   if (!text.includes(nonce)) {
     const responsePreview = new TextDecoder().decode(Buffer.concat(responsePreviewChunks.map((chunk) => Buffer.from(chunk))));
     throw new Error(`live model response did not include the per-run nonce; ACP text=${JSON.stringify(text.slice(0, 500))}; SSE preview=${JSON.stringify(responsePreview.slice(0, 1000))}`);
@@ -114,10 +112,10 @@ try {
   const elapsedMs = Math.round(performance.now() - startedAt);
   const firstBodyMs = firstResponseBodyChunkAt === null ? "n/a" : Math.round(firstResponseBodyChunkAt - startedAt);
   const firstAcpMs = firstAcpChunkAt === null ? "n/a" : Math.round(firstAcpChunkAt - startedAt);
-  console.log(`live core SDK ACP stream passed (${session.id})`);
+  console.log(`live core SDK stream passed (${requestedSessionId})`);
   console.log(`gateway HTTP ${responseStatus}; body chunks=${responseBodyChunks}; ACP text chunks=${chunks.length}`);
   console.log(`first body chunk=${firstBodyMs}ms; first ACP chunk=${firstAcpMs}ms; total=${elapsedMs}ms`);
   console.log(`model echoed nonce ${nonce}; response bytes=${new TextEncoder().encode(text).length}`);
 } finally {
-  agent.abort();
+  await agent.close();
 }

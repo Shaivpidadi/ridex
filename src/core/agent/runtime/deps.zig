@@ -203,6 +203,7 @@ pub const AgentRuntimeDeps = struct {
     propagate_grant: *const fn (ctx: *anyopaque, tool_name: []const u8, target_path: []const u8) anyerror!void,
     push_event: *const fn (ctx: *anyopaque, event: WorkerEvent) anyerror!void,
     push_text: *const fn (ctx: *anyopaque, emission: TextEmission) anyerror!void,
+    push_reasoning_delta: ?*const fn (ctx: *anyopaque, delta: []const u8) anyerror!void = null,
     push_tool_lifecycle: *const fn (ctx: *anyopaque, event: types.ToolLifecycleEvent) anyerror!void = discardToolLifecycle,
     push_diff_block: *const fn (ctx: *anyopaque, payload: DiffEntryPayload) anyerror!void,
     push_system_notice: *const fn (ctx: *anyopaque, text: []const u8) anyerror!void,

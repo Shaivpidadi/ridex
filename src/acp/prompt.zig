@@ -6,6 +6,10 @@ const credentials = @import("../core/auth/credentials.zig");
 const model_provider = @import("../core/config/model_provider.zig");
 const host = @import("../core/hosts/host.zig");
 const host_target = @import("../core/hosts/target.zig");
+const js_host_tools = if (host_target.is_wasm)
+    @import("../core/hosts/js_host_tools.zig")
+else
+    struct {};
 const io_mod = @import("../core/shared/io.zig");
 const jsonrpc = @import("jsonrpc.zig");
 const acp_types = @import("types.zig");
@@ -292,6 +296,7 @@ const AcpContext = struct {
             .permission_grants = session.session_grants,
             .permission_rules = session.permission_rules,
             .tool_registry = self.toolRegistry(),
+            .host_tool_provider = hostToolProvider(self.state),
             .permission_reviewer_provider = self.state.cfg.provider_set.select(session.provider).permission_reviewer,
             .auto_classifier = self.auto_classifier,
             .subagent_host = self.state.subagent_host,
@@ -363,8 +368,93 @@ const AcpContext = struct {
 };
 
 fn activeToolSet(state: *const server.ServerState) tool_set_contract.ToolSet {
+    if (state.host_tools.tools.len > 0) return state.host_tools.toolSet();
     if (comptime host_target.is_wasm) return tool_set_contract.empty;
     return if (state.cfg.allow_native_tools) builtin_tools.advertisement_set else tool_set_contract.empty;
+}
+
+fn hostToolProvider(state: *server.ServerState) ?tool_dispatch.HostToolProvider {
+    if (state.host_tools.tools.len == 0) return null;
+    if (comptime host_target.is_wasm) return js_host_tools.provider();
+    return .{
+        .context = @ptrCast(state),
+        .call_fn = callHostTool,
+    };
+}
+
+fn callHostTool(
+    raw_state: *anyopaque,
+    alloc: Allocator,
+    name: []const u8,
+    arguments_json: []const u8,
+    max_result_bytes: usize,
+    cancel_flag: ?*std.atomic.Value(bool),
+) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
+    const state: *server.ServerState = @ptrCast(@alignCast(raw_state));
+    if (cancel_flag) |flag| if (flag.load(.seq_cst)) return error.Cancelled;
+    const outbound_id = (server.beginOutboundRequest(state, .host_tool) catch
+        return .{ .failure = try alloc.dupe(u8, "Host tool request failed") }) orelse
+        return .{ .failure = try alloc.dupe(u8, "Host tool request limit reached") };
+    var awaiting = true;
+    errdefer if (awaiting) {
+        server.cancelOutboundRequest(state, outbound_id);
+        if (server.awaitOutboundResponse(state, outbound_id, .host_tool)) |owned| {
+            var abandoned = owned;
+            abandoned.deinit(state.alloc);
+        }
+    };
+
+    var params: std.Io.Writer.Allocating = .init(alloc);
+    defer params.deinit();
+    params.writer.writeAll("{\"sessionId\":") catch return error.OutOfMemory;
+    std.json.Stringify.value(
+        if (state.active_session) |*session| session.session_id else "",
+        .{},
+        &params.writer,
+    ) catch return error.OutOfMemory;
+    params.writer.writeAll(",\"name\":") catch return error.OutOfMemory;
+    std.json.Stringify.value(name, .{}, &params.writer) catch return error.OutOfMemory;
+    params.writer.writeAll(",\"input\":") catch return error.OutOfMemory;
+    params.writer.writeAll(arguments_json) catch return error.OutOfMemory;
+    params.writer.writeByte('}') catch return error.OutOfMemory;
+    state.writer.writeRequest(
+        alloc,
+        .{ .integer = @intCast(outbound_id) },
+        "libfx/tool_call",
+        params.written(),
+    ) catch return .{ .failure = try alloc.dupe(u8, "Host tool request failed") };
+
+    var response = server.awaitOutboundResponse(state, outbound_id, .host_tool) orelse
+        return .{ .failure = try alloc.dupe(u8, "Host tool request failed") };
+    awaiting = false;
+    defer response.deinit(state.alloc);
+    if (cancel_flag) |flag| if (flag.load(.seq_cst)) return error.Cancelled;
+    if (response.cancelled) {
+        if (cancel_flag) |flag| flag.store(true, .seq_cst);
+        return error.Cancelled;
+    }
+    if (response.error_json != null) {
+        return .{ .failure = try alloc.dupe(u8, "Host tool failed") };
+    }
+    const raw = response.result_json orelse
+        return .{ .failure = try alloc.dupe(u8, "Host tool returned no result") };
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, raw, .{}) catch
+        return .{ .failure = try alloc.dupe(u8, "Host tool returned an invalid result") };
+    defer parsed.deinit();
+    if (parsed.value != .object) {
+        return .{ .failure = try alloc.dupe(u8, "Host tool returned an invalid result") };
+    }
+    const content = parsed.value.object.get("content") orelse
+        return .{ .failure = try alloc.dupe(u8, "Host tool returned an invalid result") };
+    if (content != .string or content.string.len > @min(state.max_tool_result_bytes, max_result_bytes)) {
+        return .{ .failure = try alloc.dupe(u8, "Host tool result exceeded the configured limit") };
+    }
+    const owned = try alloc.dupe(u8, content.string);
+    const is_error = if (parsed.value.object.get("isError")) |value|
+        value == .bool and value.bool
+    else
+        false;
+    return if (is_error) .{ .failure = owned } else .{ .success = owned };
 }
 
 const AcpElicitationResponderContext = struct {
@@ -590,6 +680,15 @@ pub fn handlePrompt(
     if (bounded_skills.diagnostic_notice) |notice| try pushContextNotice(@ptrCast(&ctx), notice);
     for (state.context_snapshot.notices) |notice| try pushContextNotice(@ptrCast(&ctx), notice);
     const skills_section = bounded_skills.text;
+    const combined_skills_section = if (state.host_instructions.len == 0)
+        skills_section
+    else if (skills_section.len == 0)
+        state.host_instructions
+    else
+        try std.fmt.allocPrint(alloc, "{s}\n\n{s}", .{ skills_section, state.host_instructions });
+    defer if (state.host_instructions.len > 0 and skills_section.len > 0) {
+        alloc.free(@constCast(combined_skills_section));
+    };
 
     var explicit_skills = try skill_invocation.buildExplicitPromptSection(
         alloc,
@@ -610,7 +709,7 @@ pub fn handlePrompt(
     const root_user_intent_context = try auto_classifier_context.buildCanonicalRootUserContext(
         alloc,
         owned_prompt,
-        session.session_rt.history.items,
+        session.session_rt.agent.history.items,
     );
     defer alloc.free(root_user_intent_context);
 
@@ -664,7 +763,7 @@ pub fn handlePrompt(
     defer session.session_rt.usage.configureCheckpointSink(null);
     const deps = agentRuntimeDeps(&ctx);
     var agent_config = buildAgentConfig(state, session, .{
-        .skills_prompt_section = skills_section,
+        .skills_prompt_section = combined_skills_section,
         .explicit_skills_prompt_section = explicit_skills.text,
         .advertised_tool_names = tool_projection.advertised_names,
         .advertised_functions = tool_projection.advertised_functions,
@@ -674,7 +773,7 @@ pub fn handlePrompt(
         writable.childCapability() catch null
     else
         null;
-    agent_runtime.processQueuedPrompt(&deps, null, .{
+    agent_runtime.processAgentPrompt(&session.session_rt.agent, &deps, null, .{
         .view = state.lifecycle_view,
         .scope = .{
             .kind = .acp,
@@ -809,6 +908,7 @@ fn buildAgentConfig(state: *server.ServerState, session: *server.ActiveSessionSt
         .gateway_chat_url = state.cfg.gateway_chat_url,
         .advertised_tool_names = sections.advertised_tool_names,
         .advertised_functions = sections.advertised_functions,
+        .initial_dynamic_tools = state.host_tools.dynamic_tools,
         .provider_capabilities = state.cfg.provider_set.select(session.provider).capabilities,
         .custom_tool_guidance = sections.custom_tool_guidance,
         .agent_step_limit = session.agent_step_limit,
@@ -1042,7 +1142,7 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
         .describe_tool_action_completed = describeToolActionCompleted,
         .describe_tool_action_denied = describeToolActionDenied,
         .permission_target_for_call = permissionTargetForCall,
-        .execute_tool_call = if (comptime host_target.is_wasm) executeWebToolCall else executeToolCall,
+        .execute_tool_call = executeToolCall,
         .publish_committed_file_handoff = publishCommittedFileHandoff,
         .publish_deferred_tool_completion = publishDeferredToolCompletion,
         .propagate_history_turn = propagateHistoryTurn,
@@ -1055,6 +1155,7 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
         .propagate_grant = retainAcpGrant,
         .push_event = pushEvent,
         .push_text = pushText,
+        .push_reasoning_delta = pushReasoningDelta,
         .push_route_recovery_status = pushRouteRecoveryStatus,
         .push_tool_lifecycle = pushToolLifecycle,
         .push_diff_block = pushDiffBlock,
@@ -1494,13 +1595,6 @@ fn permissionTargetForCall(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall
     return tool_admission.permissionTargetForCall(tool_ctx.admissionInput(), arena, call);
 }
 
-fn executeWebToolCall(
-    _: *anyopaque,
-    request: agent_runtime.ToolExecutionRequest,
-) !ToolExecutionResult {
-    return agent_runtime.unavailableHostToolResult(request.result_allocator);
-}
-
 fn executeToolCall(
     raw_ctx: *anyopaque,
     request: agent_runtime.ToolExecutionRequest,
@@ -1530,10 +1624,10 @@ fn executeToolCall(
     tool_ctx.session_grants = request.session_grants;
     tool_ctx.advertised_dynamic_tool_names = request.advertised_dynamic_tool_names;
     tool_ctx.max_tool_result_bytes = request.max_tool_result_bytes;
-    const result = tool_runtime.executeToolCallAuthorized(
-        tool_ctx,
-        request,
-    ) catch |err| {
+    const result = (if (comptime host_target.is_wasm)
+        tool_runtime.executeHostToolCallAuthorized(tool_ctx, request)
+    else
+        tool_runtime.executeToolCallAuthorized(tool_ctx, request)) catch |err| {
         const err_text = try formatToolExecutionError(
             raw_ctx,
             request.result_allocator,
@@ -1712,7 +1806,7 @@ fn persistAcpHistoryTurn(
     defer session.session_write_mutex.unlock(io_mod.getIo());
     try session.session_rt.appendHistoryEntry(alloc, turn);
     if (comptime host_target.is_wasm) {
-        try sessions.commitWasmSessionLocked(alloc, session);
+        if (session.wasm_state != null) try sessions.commitWasmSessionLocked(alloc, session);
         return;
     }
     const writable = if (session.writable) |*value| value else return;
@@ -1833,7 +1927,7 @@ test "ACP degraded history repair commits the finished turn once" {
     try persistAcpHistoryTurn(alloc, &session, turn);
 
     try std.testing.expect(session.writable.?.degradedTail() == null);
-    try std.testing.expectEqual(@as(usize, 1), session.session_rt.history.items.len);
+    try std.testing.expectEqual(@as(usize, 1), session.session_rt.agent.history.items.len);
     try std.testing.expectEqual(@as(usize, 1), session.writable.?.state.history.len);
     try std.testing.expectEqualStrings(
         "done",
@@ -1957,6 +2051,14 @@ fn pushText(raw_ctx: *anyopaque, emission: agent_runtime.TextEmission) !void {
     };
     if (text.len == 0) return;
     ctx.sendAgentText(text) catch {};
+}
+
+fn pushReasoningDelta(raw_ctx: *anyopaque, delta: []const u8) !void {
+    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    var update: std.Io.Writer.Allocating = .init(ctx.alloc);
+    defer update.deinit();
+    try acp_types.writeAgentThoughtChunk(&update.writer, delta);
+    try ctx.sendUpdate(update.written());
 }
 
 fn pushToolLifecycle(raw_ctx: *anyopaque, event: types.ToolLifecycleEvent) !void {

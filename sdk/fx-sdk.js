@@ -50,7 +50,7 @@ function utf8Prefix(value, limit) {
   return value.subarray(0, end);
 }
 
-export const fxSdkApiVersion = 1;
+export const fxSdkApiVersion = 2;
 
 export function supportsJspi() {
   return typeof WebAssembly.Suspending === "function" &&
@@ -90,35 +90,6 @@ export function xtermAdapter(term) {
     get rows() { return term.rows; },
     onResize(callback) { const disposable = term.onResize(callback); return () => disposable.dispose(); },
   };
-}
-
-function createMemorySessionStore() {
-  const records = new Map();
-  let nextRevision = 1;
-  return {
-    async load(id) {
-      const record = records.get(id);
-      return record ? { bytes: record.bytes.slice(), revision: record.revision } : null;
-    },
-    async commit(id, bytes, expectedRevision) {
-      const current = records.get(id);
-      if ((current?.revision) !== expectedRevision) throw revisionConflict();
-      const revision = String(nextRevision++);
-      records.set(id, { bytes: bytes.slice(), revision, updatedAtMs: Date.now() });
-      return { revision };
-    },
-    async list() {
-      return [...records.entries()].map(([id, record]) => ({ id, updatedAtMs: record.updatedAtMs }))
-        .sort((a, b) => b.updatedAtMs - a.updatedAtMs);
-    },
-    async remove(id) { records.delete(id); },
-  };
-}
-
-function revisionConflict() {
-  const error = new Error("session revision conflict");
-  error.code = "FX_SESSION_REVISION_CONFLICT";
-  return error;
 }
 
 class ByteQueue {
@@ -455,6 +426,22 @@ function createRuntime(options) {
     }).catch(() => -1);
   }
 
+  function hostToolCall(namePtr, nameLen, argumentsPtr, argumentsLen, outputPtr, outputCap, statusPtr) {
+    if (typeof options.hostToolExecutor !== "function") return -1;
+    if (options.traceWasi) console.error("fx host tool call start");
+    let input;
+    try { input = JSON.parse(text(argumentsPtr, argumentsLen)); } catch { return -1; }
+    return Promise.resolve(options.hostToolExecutor(text(namePtr, nameLen), input)).then((result) => {
+      if (options.traceWasi) console.error("fx host tool call settled", result.cancelled, result.isError);
+      if (result.cancelled) return -2;
+      const output = encoder.encode(result.content);
+      if (output.length > outputCap) return -3;
+      bytes(outputPtr, output.length).set(output);
+      bytes(statusPtr, 1)[0] = result.isError ? 1 : 0;
+      return output.length;
+    }).catch(() => -1);
+  }
+
   function openUrl(urlPtr, urlLen) {
     if (typeof options.openUrl !== "function") return 0;
     return Promise.resolve().then(() => options.openUrl(text(urlPtr, urlLen))).then((accepted) =>
@@ -774,6 +761,7 @@ function createRuntime(options) {
     fx_http_stream_next: new WebAssembly.Suspending(streamNext),
     fx_http_stream_close(handle) { const state = streams.get(handle); state?.controller.abort(); streams.delete(handle); },
     fx_http_request: new WebAssembly.Suspending(httpRequest),
+    fx_host_tool_call: new WebAssembly.Suspending(hostToolCall),
     fx_open_url: new WebAssembly.Suspending(openUrl),
     fx_oauth_session_load: new WebAssembly.Suspending(oauthSessionLoad),
     fx_oauth_session_commit: new WebAssembly.Suspending(oauthSessionCommit),
@@ -930,20 +918,108 @@ function normalizePromptInput(input) {
   });
 }
 
-export async function createFxAgent(options) {
-  options = { ...options, sessionStore: options.sessionStore || createMemorySessionStore() };
+function normalizeHostTools(value) {
+  if (value === undefined) return { descriptors: [], executors: new Map() };
+  if (!Array.isArray(value)) throw new TypeError("tools must be an array");
+  if (value.length > 64) throw new RangeError("tools cannot contain more than 64 entries");
+  const descriptors = [];
+  const executors = new Map();
+  for (const [index, tool] of value.entries()) {
+    if (!tool || typeof tool !== "object") throw new TypeError(`tool ${index} must be an object`);
+    const { name, description, inputSchema, execute } = tool;
+    if (typeof name !== "string" || !/^[A-Za-z0-9_-]{1,64}$/.test(name)) {
+      throw new TypeError(`tool ${index} has an invalid name`);
+    }
+    if (executors.has(name)) throw new TypeError(`duplicate tool name: ${name}`);
+    if (typeof description !== "string") throw new TypeError(`tool ${name} requires a description`);
+    if (typeof execute !== "function") throw new TypeError(`tool ${name} requires execute()`);
+    if (!inputSchema || typeof inputSchema !== "object" || Array.isArray(inputSchema)) {
+      throw new TypeError(`tool ${name} requires an object inputSchema`);
+    }
+    let schema;
+    try { schema = JSON.parse(JSON.stringify(inputSchema)); } catch {
+      throw new TypeError(`tool ${name} inputSchema must be JSON-serializable`);
+    }
+    descriptors.push({ name, description, inputSchema: schema });
+    executors.set(name, execute);
+  }
+  return { descriptors, executors };
+}
+
+function normalizeInstructions(value) {
+  if (value === undefined) return "";
+  if (typeof value === "string") return value;
+  if (Array.isArray(value) && value.every((entry) => typeof entry === "string")) {
+    return value.filter(Boolean).join("\n\n");
+  }
+  throw new TypeError("instructions must be a string or an array of strings");
+}
+
+function hostToolContent(value) {
+  if (typeof value === "string") return value;
+  if (value === undefined) return "null";
+  const encoded = JSON.stringify(value);
+  return encoded === undefined ? "null" : encoded;
+}
+
+function checkpointBytes(value) {
+  if (value === undefined) return null;
+  if (value instanceof Uint8Array) return value.slice();
+  if (value instanceof ArrayBuffer) return new Uint8Array(value.slice(0));
+  if (ArrayBuffer.isView(value)) {
+    return new Uint8Array(value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength));
+  }
+  throw new TypeError("checkpoint must be an ArrayBuffer or typed array");
+}
+
+function bytesToBase64(value) {
+  let binary = "";
+  for (let offset = 0; offset < value.length; offset += 0x8000) {
+    binary += String.fromCharCode(...value.subarray(offset, offset + 0x8000));
+  }
+  return btoa(binary);
+}
+
+function base64ToBytes(value) {
+  const binary = atob(value);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index++) bytes[index] = binary.charCodeAt(index);
+  return bytes;
+}
+
+export async function createFxAgent(options = {}) {
+  options = { ...options };
+  const hostTools = normalizeHostTools(options.tools);
+  const instructions = normalizeInstructions(options.instructions);
+  const initialCheckpoint = checkpointBytes(options.checkpoint);
   const pending = new Map();
   const turns = new Map();
   let nextId = 1;
   let activeSession = null;
-  let loadingSessionId = null;
-  let loadingUpdates = [];
   let closing = false;
   const emit = (type, detail = {}) => {
     try { options.onEvent?.({ type, timestamp: performance.now(), ...detail }); } catch {}
   };
+  const executeHostTool = async (name, input, sessionId) => {
+    const execute = hostTools.executors.get(name);
+    const turn = sessionId ? turns.get(sessionId) : turns.values().next().value;
+    const controller = new AbortController();
+    turn?.toolControllers.add(controller);
+    let content;
+    let isError = false;
+    try {
+      if (!execute) throw new Error(`unknown host tool: ${String(name)}`);
+      content = hostToolContent(await execute(input, { signal: controller.signal }));
+    } catch (error) {
+      isError = true;
+      content = error instanceof Error ? error.message : String(error);
+    } finally {
+      turn?.toolControllers.delete(controller);
+    }
+    return { content, isError, cancelled: controller.signal.aborted };
+  };
   emit("runtime.start");
-  const runtimeOptions = { ...options, args: ["acp"] };
+  const runtimeOptions = { ...options, args: ["acp"], hostToolExecutor: executeHostTool };
   const runtime = options.runtimeFactory
     ? await options.runtimeFactory(runtimeOptions)
     : await instantiate(runtimeOptions);
@@ -969,7 +1045,6 @@ export async function createFxAgent(options) {
     if (message.method === "session/update") {
       const turn = turns.get(message.params.sessionId);
       if (turn) turn.push(message.params.update);
-      else if (loadingSessionId === message.params.sessionId) loadingUpdates.push(message.params.update);
       return;
     }
     if (message.method === "session/request_permission") {
@@ -980,83 +1055,125 @@ export async function createFxAgent(options) {
       send({ jsonrpc: "2.0", id: message.id, result: optionId ? { outcome: { outcome: "selected", optionId } } : { outcome: { outcome: "cancelled" } } });
       return;
     }
+    if (message.method === "libfx/tool_call") {
+      const { content, isError } = await executeHostTool(
+        message.params?.name,
+        message.params?.input,
+        message.params?.sessionId,
+      );
+      send({ jsonrpc: "2.0", id: message.id, result: { content, isError } });
+      return;
+    }
     const waiter = pending.get(message.id); if (!waiter) return; pending.delete(message.id);
     if (message.error) waiter.reject(new Error(message.error.message)); else waiter.resolve(message.result);
   });
-  await request("initialize", { protocolVersion: 1, clientCapabilities: {} });
+  await request("initialize", {
+    protocolVersion: 1,
+    clientCapabilities: {
+      ...(hostTools.descriptors.length || instructions
+        ? { libfx: { tools: hostTools.descriptors, instructions } }
+        : {}),
+    },
+  });
+
+  const sessionResult = await request("libfx/new");
+  activeSession = await makeSession(sessionResult);
+  if (initialCheckpoint) {
+    await request("libfx/restore", {
+      sessionId: activeSession.id,
+      checkpoint: bytesToBase64(initialCheckpoint),
+    });
+  }
 
   const agent = {
-    exited: runtime.exited,
-    abort() { closing = true; runtime.abort(); },
+    prompt(input, promptOptions) {
+      if (closing || !activeSession) throw new Error("fx agent is closed");
+      return normalizeTurn(activeSession.prompt(input, promptOptions));
+    },
+    async checkpoint() {
+      if (closing || !activeSession) throw new Error("fx agent is closed");
+      return activeSession.checkpoint();
+    },
     async close() {
-      if (closing) return runtime.exited;
+      if (closing) { await runtime.exited; return; }
       if (activeSession) await activeSession.close();
       closing = true;
       runtime.closeStdin();
-      return runtime.exited;
-    },
-    async createSession() {
-      if (activeSession) await activeSession.close();
-      const result = await request("session/new");
-      activeSession = await makeSession(result);
-      return activeSession;
-    },
-    async listSessions() {
-      return (await request("session/list")).sessions || [];
-    },
-    async openSession(id) {
-      if (activeSession) await activeSession.close();
-      loadingSessionId = id;
-      loadingUpdates = [];
-      try {
-        const result = await request("session/load", { sessionId: id });
-        activeSession = await makeSession({ sessionId: id, history: loadingUpdates, ...result });
-        return activeSession;
-      } finally {
-        loadingSessionId = null;
-        loadingUpdates = [];
-      }
+      await runtime.exited;
     },
   };
   return agent;
 
+  function normalizeTurn(rawTurn) {
+    const toolNames = new Map();
+    const started = new Set();
+    const eventFor = (update) => {
+      if (update.sessionUpdate === "agent_message_chunk") {
+        const delta = update.content?.text;
+        if (!delta || delta.startsWith("[context]")) return null;
+        return { type: "text_delta", delta };
+      }
+      if (update.sessionUpdate === "agent_thought_chunk") {
+        const delta = update.content?.text;
+        return delta ? { type: "reasoning_delta", delta } : null;
+      }
+      if (update.sessionUpdate === "tool_call") {
+        toolNames.set(update.toolCallId, update.name || update.toolName || update.title || "tool");
+        if (started.has(update.toolCallId)) return null;
+        started.add(update.toolCallId);
+        return {
+          type: "tool_start",
+          id: update.toolCallId,
+          name: toolNames.get(update.toolCallId),
+        };
+      }
+      if (update.sessionUpdate === "tool_call_update" &&
+        (update.status === "completed" || update.status === "failed")) {
+        const content = update.content?.find((entry) => entry.content?.type === "text")?.content?.text;
+        return {
+          type: "tool_end",
+          id: update.toolCallId,
+          name: toolNames.get(update.toolCallId) || "tool",
+          ...(content === undefined ? {} : { content }),
+          isError: update.status === "failed",
+        };
+      }
+      return null;
+    };
+    return {
+      cancel() { rawTurn.cancel(); },
+      async *[Symbol.asyncIterator]() {
+        for await (const update of rawTurn) {
+          const event = eventFor(update);
+          if (event) yield event;
+        }
+      },
+      result: rawTurn.result.then((result) => ({
+        stopReason: result.stopReason,
+        usage: normalizeTurnUsage(result.usage),
+      })),
+    };
+  }
+
+  function normalizeTurnUsage(usage) {
+    const result = {};
+    if (Number.isSafeInteger(usage?.inputTokens)) result.inputTokens = usage.inputTokens;
+    if (Number.isSafeInteger(usage?.outputTokens)) result.outputTokens = usage.outputTokens;
+    if (Number.isSafeInteger(usage?.cacheReadTokens)) result.cacheReadTokens = usage.cacheReadTokens;
+    if (Number.isSafeInteger(usage?.cacheWriteTokens)) result.cacheWriteTokens = usage.cacheWriteTokens;
+    if (Number.isSafeInteger(usage?.reasoningTokens)) result.reasoningTokens = usage.reasoningTokens;
+    return result;
+  }
+
   async function makeSession(result) {
-    let configOptions = result.configOptions || [];
     let closed = false;
     let activeTurn = null;
     const assertOpen = () => {
       if (closed) throw new Error("fx session is closed");
       if (activeSession !== session) throw new Error("fx session is no longer active");
     };
-    const updateConfig = (response) => {
-      configOptions = response.configOptions || configOptions;
-      return configOptions;
-    };
     const session = {
       id: result.sessionId,
-      modes: result.modes,
-      history: result.history || [],
-      get configOptions() { return configOptions; },
-      async setConfigOption(configId, value, source = "sdk") {
-        assertOpen();
-        const previousValue = configOptions.find((option) => option.id === configId)?.currentValue;
-        const updated = updateConfig(await request("session/set_config_option", { sessionId: result.sessionId, configId, value }));
-        const accepted = updated.find((option) => option.id === configId)?.currentValue;
-        if (configId === "mode" && accepted) this.modes.currentModeId = accepted;
-        if (accepted === value) {
-          if (options.configStore?.set) {
-            try { await options.configStore.set(configId, value); } catch (error) { emit("config.persist_error", { configId, error }); }
-          }
-          emit("config.changed", { configId, previousValue, value: accepted, source });
-        }
-        return updated;
-      },
-      setModel(value) { return this.setConfigOption("model", value); },
-      setMode(value) { return this.setConfigOption("mode", value); },
-      async setConfig(config) {
-        for (const [key, value] of Object.entries(config)) await this.setConfigOption(key, value);
-        return configOptions;
-      },
       async close() {
         if (closed) return;
         activeTurn?.cancel();
@@ -1065,11 +1182,12 @@ export async function createFxAgent(options) {
         activeTurn = null;
         if (activeSession === session) activeSession = null;
       },
-      async remove() {
-        if (activeTurn) throw new Error("cannot remove a session while a prompt is active");
-        await request("session/remove", { sessionId: result.sessionId });
-        closed = true;
-        if (activeSession === session) activeSession = null;
+      async checkpoint() {
+        assertOpen();
+        if (activeTurn) throw new Error("cannot checkpoint while a prompt is active");
+        const response = await request("libfx/checkpoint", { sessionId: result.sessionId });
+        if (typeof response?.checkpoint !== "string") throw new Error("fx returned an invalid checkpoint");
+        return base64ToBytes(response.checkpoint);
       },
       prompt(input, promptOptions = {}) {
         assertOpen();
@@ -1079,14 +1197,17 @@ export async function createFxAgent(options) {
         if (signal !== undefined && (typeof signal?.addEventListener !== "function" || typeof signal?.removeEventListener !== "function")) throw new TypeError("prompt signal must be an AbortSignal");
         const queue = [];
         const waiters = [];
+        const toolControllers = new Set();
         let finished = false;
         let cancelled = false;
         const turn = {
           push(update) { const waiter = waiters.shift(); if (waiter) waiter({ value: update, done: false }); else queue.push(update); },
+          toolControllers,
           cancel() {
             if (finished || cancelled) return;
             cancelled = true;
             send({ jsonrpc: "2.0", method: "session/cancel", params: { sessionId: result.sessionId } });
+            for (const controller of toolControllers) controller.abort();
             runtime.abortHostEffects();
           },
           [Symbol.asyncIterator]() { return { next() { if (queue.length) return Promise.resolve({ value: queue.shift(), done: false }); if (finished) return Promise.resolve({ done: true }); return new Promise((resolve) => waiters.push(resolve)); } }; },
@@ -1096,7 +1217,7 @@ export async function createFxAgent(options) {
         const abort = () => turn.cancel();
         signal?.addEventListener("abort", abort, { once: true });
         turn.result = request("session/prompt", { sessionId: result.sessionId, prompt })
-          .then((response) => ({ stopReason: response.stopReason }))
+          .then((response) => ({ stopReason: response.stopReason, usage: response.usage }))
           .catch((error) => {
             if (error.message === "Cancelled") return { stopReason: "cancelled" };
             throw error;
@@ -1106,24 +1227,13 @@ export async function createFxAgent(options) {
             signal?.removeEventListener("abort", abort);
             turns.delete(result.sessionId);
             if (activeTurn === turn) activeTurn = null;
+            toolControllers.clear();
             waiters.splice(0).forEach((resolve) => resolve({ done: true }));
           });
-        turn.stopReason = turn.result.then((turnResult) => turnResult.stopReason);
-        void turn.stopReason.catch(() => {});
         if (signal?.aborted) turn.cancel();
         return turn;
       },
     };
-    if (options.configStore?.get) {
-      activeSession = session;
-      for (const config of [...configOptions]) {
-        let value;
-        try { value = await options.configStore.get(config.id); } catch (error) { emit("config.restore_error", { configId: config.id, error }); continue; }
-        if (typeof value !== "string" || value === config.currentValue) continue;
-        try { await session.setConfigOption(config.id, value, "restore"); } catch (error) { emit("config.restore_error", { configId: config.id, error }); }
-      }
-    }
-    session.modes.currentModeId = configOptions.find((option) => option.id === "mode")?.currentValue || session.modes.currentModeId;
     return session;
   }
 }

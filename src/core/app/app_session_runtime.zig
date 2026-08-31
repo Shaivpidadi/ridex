@@ -2962,7 +2962,7 @@ pub fn Runtime(comptime App: type) type {
             if (app.session_title.items.len > 0) return;
             var display = session_display_metadata.deriveFromHistory(
                 app.alloc,
-                app.session.history.items,
+                app.session.agent.history.items,
             ) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => return,
@@ -8892,7 +8892,7 @@ test "appendFinishedPrompt transfers snapshot ownership after history acceptance
             .turn_duration_ms = 150,
             .token_progress = .{ .input_tokens = 2, .output_tokens = 3 },
         }),
-        types.historyTurnSummary(app.session.history.items[0]),
+        types.historyTurnSummary(app.session.agent.history.items[0]),
     );
     try std.testing.expectEqual(@as(usize, 1), probe.transfers);
 }

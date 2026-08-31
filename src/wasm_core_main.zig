@@ -52,6 +52,13 @@ pub fn main(init: std.process.Init) !void {
         .max_history_turns = 100,
         .context_registry = .{ .default_provider = builtin_context.provider },
         .mode_registry = builtin_modes.registry,
+        .credential_override = io_mod.getenv("AI_GATEWAY_API_KEY"),
+        .model_override = io_mod.getenv("FX_MODEL"),
+        .workspace_root_override = "/",
+        .allow_acp_mcp = false,
+        .allow_native_tools = false,
+        .allow_native_skills = false,
+        .minimal_kernel = true,
     });
 }
 

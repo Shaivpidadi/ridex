@@ -77,15 +77,11 @@ const agent = await Promise.race([
   initializeTimeout.promise,
 ]).finally(() => initializeTimeout.cancel());
 
-const session = await agent.createSession();
-const turn = session.prompt("say hello");
+const turn = agent.prompt("say hello");
 const chunks = [];
 const notices = [];
 for await (const update of turn) {
-  if (update.sessionUpdate !== "agent_message_chunk") continue;
-  const text = update.content.text;
-  if (text.startsWith("[context]")) notices.push(text);
-  else chunks.push(text);
+  if (update.type === "text_delta") chunks.push(update.delta);
 }
 const resultTimeout = timeout("prompt result");
 const result = await Promise.race([turn.result, resultTimeout.promise]).finally(() => resultTimeout.cancel());

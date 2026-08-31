@@ -290,6 +290,30 @@ pub fn loadEmbeddedStartupState(
     );
 }
 
+pub fn loadLibfxStartupState(
+    alloc: Allocator,
+    workspace_root: []const u8,
+    model: []const u8,
+    default_agent_step_limit: usize,
+) Allocator.Error!StartupState {
+    const owned_workspace = try alloc.dupe(u8, workspace_root);
+    errdefer alloc.free(owned_workspace);
+    const selected_model = try alloc.dupe(u8, model);
+    errdefer alloc.free(selected_model);
+    const configured_model = try alloc.dupe(u8, model);
+    return .{
+        .workspace_root = owned_workspace,
+        .selected_model = selected_model,
+        .configured_model = configured_model,
+        .permission_mode = .auto,
+        .agent_step_limit = default_agent_step_limit,
+        .context_enabled = false,
+        .auto_upgrade = false,
+        .prompt_history_enabled = false,
+        .prompt_history_store_allowed = false,
+    };
+}
+
 pub fn loadCatalogStartupState(
     alloc: Allocator,
     secret_store: host.SecretStore,

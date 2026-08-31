@@ -149,6 +149,38 @@ pub const ToolResult = union(enum) {
     }
 };
 
+pub const HostToolProviderFn = *const fn (
+    *anyopaque,
+    Allocator,
+    []const u8,
+    []const u8,
+    usize,
+    ?*std.atomic.Value(bool),
+) DispatchError!ToolResult;
+
+pub const HostToolProvider = struct {
+    context: *anyopaque,
+    call_fn: HostToolProviderFn,
+
+    pub fn call(
+        self: HostToolProvider,
+        alloc: Allocator,
+        name: []const u8,
+        arguments_json: []const u8,
+        max_result_bytes: usize,
+        cancel_flag: ?*std.atomic.Value(bool),
+    ) DispatchError!ToolResult {
+        return self.call_fn(
+            self.context,
+            alloc,
+            name,
+            arguments_json,
+            max_result_bytes,
+            cancel_flag,
+        );
+    }
+};
+
 /// Result of decoding a raw JSON argument buffer into a typed input.
 pub const DecodeResult = union(enum) {
     input: ToolInput,
@@ -234,6 +266,7 @@ pub const DispatchContext = struct {
     run_command_backend: ?RunCommandBackend = null,
     subagent_provider: ?subagent_tool_provider.Provider = null,
     vision_provider: ?VisionProvider = null,
+    host_tool_provider: ?HostToolProvider = null,
     ask_question_ctx: ?*anyopaque = null,
     ask_question_batch: ?AskQuestionBatchFn = null,
     tool_capabilities: ToolCapabilities = .{},
@@ -387,6 +420,7 @@ pub const ExecutorKind = enum {
     mcp_features,
     ask_user_question,
     vision,
+    host,
 };
 
 pub const ApprovalPolicy = enum {

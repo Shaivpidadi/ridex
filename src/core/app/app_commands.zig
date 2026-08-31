@@ -2216,7 +2216,7 @@ fn buildTraceReport(app: anytype) ![]u8 {
 
     try writeCurrentStateSummary(&out.writer, app, app.alloc);
     try writeProblemsSummary(&out.writer, app, app.alloc);
-    try writeLastInterruptedDetail(&out.writer, app.session.history.items, app.alloc);
+    try writeLastInterruptedDetail(&out.writer, app.session.agent.history.items, app.alloc);
     try writeNetworkCallsSummary(&out.writer);
     try writeToolCallsSummary(&out.writer, app.alloc, app.session.history.items);
     try writeSubagentsSummary(&out.writer, app.alloc, &app.subagents);
@@ -2499,7 +2499,7 @@ fn writeProblemsSummary(writer: *std.Io.Writer, app: anytype, alloc: std.mem.All
         }
     }
 
-    if (lastInterruptedTurn(app.session.history.items)) |entry| {
+    if (lastInterruptedTurn(app.session.agent.history.items)) |entry| {
         count += 1;
         try writer.writeAll("- interrupted turn");
         if (entry.tool_call) |call| try writer.print(" in_flight_tool={s}", .{traceToolDisplayName(call.name)});
