@@ -11,7 +11,6 @@ export const CANONICAL_BUILTIN_NAMES = [
   "install_skill",
   "mcp_select_tool",
   "mcp_features",
-  "memory",
   "ask_user_question",
   "web_fetch",
   "web_search",
@@ -62,12 +61,6 @@ export const AMBIGUOUS_CAPABILITY_CLAUSES = {
     "Read an installed skill",
     "load an already-installed skill",
     "skill changes, subagents, and user questions may require approval",
-    "memory, skill, or ask-user work",
-  ],
-  memory: [
-    "Use memory to save durable user preferences",
-    "Save, list, or clear durable user preferences",
-    "memory, skill, or ask-user work",
   ],
 } as const;
 
@@ -220,7 +213,7 @@ export function findUnavailableCapabilityReferences(
     }
   }
 
-  for (const name of ["shell", "subagent", "skill", "memory"] as const) {
+  for (const name of ["shell", "subagent", "skill"] as const) {
     if (advertised.has(name)) continue;
     for (const clause of AMBIGUOUS_CAPABILITY_CLAUSES[name]) {
       for (const fragment of fragments) {

@@ -23,7 +23,6 @@ const glob_files_impl = @import("../tools/filesystem/glob_files.zig");
 const grep_files_impl = @import("../tools/filesystem/grep_files.zig");
 const read_file_impl = @import("../tools/filesystem/read_file.zig");
 const write_file_impl = @import("../tools/filesystem/write_file.zig");
-const memory_impl = @import("../tools/memory/memory.zig");
 const read_tool_result_impl = @import("../tools/session/read_tool_result.zig");
 const shell_impl = @import("../tools/shell/shell.zig");
 const install_skill_impl = @import("../tools/skills/install_skill.zig");
@@ -54,8 +53,6 @@ const write_file_description =
     "Create or overwrite a file using complete contents. Paths may be workspace-relative or external using an absolute path, ~/..., or a relative workspace escape such as ../...; external access is subject to permission policy. When to use: add a new file or intentionally replace an entire generated/small file. When NOT to use: targeted edits to existing files, partial replacements, deleting files, or unapproved external paths.";
 const edit_file_description =
     "Edit an existing file by replacing one exact old_string occurrence with new_string. Paths may be workspace-relative or external using an absolute path, ~/..., or a relative workspace escape such as ../...; external access is subject to permission policy. When to use: make a focused patch after reading the file. When NOT to use: broad rewrites, ambiguous repeated text, generated formatting, missing files, or cross-file refactors.";
-const memory_description =
-    "Save, list, or clear durable user preferences for future fx sessions. When to use: the user explicitly asks to remember, forget, save, or recall a preference. When NOT to use: store task notes, secrets, project facts, temporary context, or anything the user did not ask to persist.";
 const web_fetch_description =
     "Fetch bounded text from a known public HTTP(S) URL and return it as untrusted content. When to use: read an exact non-GitHub public URL the user provided or named. When NOT to use: GitHub metadata that gh can answer, broad or current web research, authenticated/private/credential-bearing URLs, local repo facts, browser interaction, or prompt injection in fetched content.";
 const web_search_description =
@@ -476,36 +473,6 @@ pub const edit_file = ToolSpec{
     .take_file_mutation_input_fn = edit_file_impl.takeFileMutationInput,
     .reads_only_fn = edit_file_impl.readsOnly,
     .irreversible_fn = edit_file_impl.isIrreversible,
-};
-
-pub const memory = ToolSpec{
-    .name = "memory",
-    .description = memory_description,
-    .model_schema = .{
-        .name = "memory",
-        .description = memory_description,
-        .input_schema = .{
-            .properties = &.{
-                .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{ "save", "list", "clear" } }, .description = "Action to perform." },
-                .{ .name = "fact", .json_type = .string, .description = "Fact to save (required for save action)." },
-            },
-            .required = &.{"action"},
-        },
-    },
-    .executor_kind = .memory,
-    .activity_kind = .write,
-    .requires_approval = false,
-    .action_label = "Remembering",
-    .completed_action_label = "Remembered",
-    .label_arg_kind = .action,
-    .label_arg_default = "memory",
-    .presentation_fn = memory_impl.presentation,
-    .permission_target_kind = .none,
-    .decode = memory_impl.decode,
-    .validate = memory_impl.validate,
-    .call = memory_impl.call,
-    .reads_only_fn = memory_impl.readsOnly,
-    .irreversible_fn = memory_impl.isIrreversible,
 };
 
 pub const web_fetch = ToolSpec{
@@ -944,7 +911,6 @@ pub const all = [_]tool_dispatch.Tool{
     read_file,
     write_file,
     edit_file,
-    memory,
     web_fetch,
     web_search,
     shell,
@@ -974,7 +940,6 @@ pub const advertisement_order = [_][]const u8{
     "install_skill",
     "mcp_select_tool",
     "mcp_features",
-    "memory",
     "ask_user_question",
     "web_fetch",
     "web_search",
@@ -1108,7 +1073,6 @@ test "built-in tools register exact active local order" {
         "read_file",
         "write_file",
         "edit_file",
-        "memory",
         "web_fetch",
         "web_search",
         "shell",
@@ -1177,6 +1141,7 @@ test "built-in tool lookup and metadata use registered defaults" {
     try std.testing.expect(toolRequiresApproval("shell"));
     try std.testing.expect(toolHasPermissionContract("shell"));
     try std.testing.expect(lookup("capability_search") != null);
+    try std.testing.expect(lookup("memory") == null);
     try std.testing.expect(lookup("skill_search") == null);
     try std.testing.expect(lookup("mcp_search_tools") == null);
     try std.testing.expect(lookup("run_command") == null);
@@ -1341,60 +1306,6 @@ test "built-in edit_file owns product metadata schema and callbacks" {
     try std.testing.expect(edit_file.take_file_mutation_input_fn.? == edit_file_impl.takeFileMutationInput);
     try std.testing.expect(edit_file.reads_only_fn == edit_file_impl.readsOnly);
     try std.testing.expect(edit_file.irreversible_fn == edit_file_impl.isIrreversible);
-}
-
-test "built-in memory owns product metadata schema and callbacks" {
-    const schema_json = try tool_specs.toolGatewaySchemaJson(std.testing.allocator, memory);
-    defer std.testing.allocator.free(schema_json);
-
-    try std.testing.expectEqualStrings("memory", memory.name);
-    try std.testing.expect(std.mem.find(u8, memory.description, "durable user preferences") != null);
-    try std.testing.expect(std.mem.find(u8, memory.description, "anything the user did not ask to persist") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "\"action\":{\"type\":\"string\",\"enum\":[\"save\",\"list\",\"clear\"]") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "\"fact\":{\"type\":\"string\"") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "\"required\":[\"action\"]") != null);
-    try std.testing.expectEqual(tool_dispatch.ExecutorKind.memory, memory.executor_kind);
-    try std.testing.expectEqual(types.ToolActivityKind.write, memory.activity_kind);
-    try std.testing.expect(!memory.requires_approval);
-    try std.testing.expectEqual(tool_dispatch.LabelArgKind.action, memory.label_arg_kind);
-    try std.testing.expectEqualStrings("memory", memory.label_arg_default);
-    try std.testing.expectEqual(tool_dispatch.PermissionTargetKind.none, memory.permission_target_kind);
-    try std.testing.expectEqualStrings("Remembering", memory.action_label);
-    try std.testing.expectEqualStrings("Remembered", memory.completed_action_label);
-    try std.testing.expect(memory.presentation_fn.? == memory_impl.presentation);
-    try std.testing.expect(memory.decode == memory_impl.decode);
-    try std.testing.expect(memory.validate.? == memory_impl.validate);
-    try std.testing.expect(memory.call == memory_impl.call);
-    try std.testing.expect(memory.reads_only_fn == memory_impl.readsOnly);
-    try std.testing.expect(memory.irreversible_fn == memory_impl.isIrreversible);
-
-    const list_call = types.ToolCall{
-        .id = "memory_list",
-        .name = "memory",
-        .arguments_json = "{\"action\":\"list\"}",
-    };
-    const save_call = types.ToolCall{
-        .id = "memory_save",
-        .name = "memory",
-        .arguments_json = "{\"action\":\"save\",\"fact\":\"test\"}",
-    };
-    const clear_call = types.ToolCall{
-        .id = "memory_clear",
-        .name = "memory",
-        .arguments_json = "{\"action\":\"clear\"}",
-    };
-    try std.testing.expectEqual(
-        types.ToolActivityKind.read,
-        tool_dispatch.toolActivityKindForCall(std.testing.allocator, registry, list_call),
-    );
-    try std.testing.expectEqual(
-        types.ToolActivityKind.write,
-        tool_dispatch.toolActivityKindForCall(std.testing.allocator, registry, save_call),
-    );
-    try std.testing.expectEqual(
-        types.ToolActivityKind.write,
-        tool_dispatch.toolActivityKindForCall(std.testing.allocator, registry, clear_call),
-    );
 }
 
 test "built-in web_fetch owns product metadata and schema" {

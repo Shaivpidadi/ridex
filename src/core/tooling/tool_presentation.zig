@@ -531,14 +531,13 @@ const test_tools = [_]tool_dispatch.Tool{
     test_builtin_tools.edit_file,
     test_web_search,
     test_builtin_tools.shell,
-    test_builtin_tools.memory,
     test_builtin_tools.skill,
     test_install_skill,
     test_builtin_tools.ask_user_question,
 };
 const test_tool_registry = tool_dispatch.Registry{ .tools = test_tools[0..] };
 const custom_presentation_tool = blk: {
-    var tool = test_builtin_tools.memory;
+    var tool = test_builtin_tools.read_file;
     tool.name = "custom_presentation";
     tool.action_label = "Inspecting";
     tool.label_arg_kind = .name;
@@ -834,7 +833,6 @@ test "tool presentation preserves plain action fallbacks" {
         .{ .call = .{ .id = "read", .name = "read_file", .arguments_json = "{\"path\":\"src/main.zig\"}" }, .expected = "Reading src/main.zig" },
         .{ .call = .{ .id = "command", .name = "run_command", .arguments_json = "{\"command\":\"zig build\"}" }, .expected = "Running zig build" },
         .{ .call = .{ .id = "ask", .name = "ask_user_question", .arguments_json = "{}" }, .expected = "Asking " },
-        .{ .call = .{ .id = "memory", .name = "memory", .arguments_json = "{\"action\":\"save\"}" }, .expected = "Remembering save" },
         .{ .call = .{ .id = "skill", .name = "skill", .arguments_json = "{\"name\":\"workflow\"}" }, .expected = "Loading skill workflow" },
         .{ .call = .{ .id = "skill-resource", .name = "skill", .arguments_json = "{\"name\":\"workflow\",\"resource\":\"references/contract-design.md\"}" }, .expected = "Reading skill resource references/contract-design.md" },
         .{ .call = .{ .id = "install", .name = "install_skill", .arguments_json = "{\"source\":\"vercel-labs/agent-skills\",\"skill\":\"workflow\"}" }, .expected = "Installing skill vercel-labs/agent-skills" },
@@ -946,14 +944,6 @@ test "tool presentation frees all formatted output with a normal allocator" {
     });
     defer alloc.free(command);
     try expectContains(command, "risk: command may discard version-control state");
-
-    const fallback = try formatPermissionLabel(alloc, test_tool_registry, .{
-        .id = "malformed",
-        .name = "memory",
-        .arguments_json = "{",
-    });
-    defer alloc.free(fallback);
-    try std.testing.expectEqualStrings("memory", fallback);
 
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, "{\"query\":\"current Zig release\",\"blocked_domains\":[\"spam.example\"]}", .{});
     defer parsed.deinit();
