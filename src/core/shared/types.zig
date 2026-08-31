@@ -919,9 +919,12 @@ pub const FileEvidence = struct {
 pub const ExecutionMemory = struct {
     tool_steps: []ToolExecutionStep = &.{},
     files: []FileEvidence = &.{},
+    /// User guidance consumed between model steps, in presentation order.
+    steering: [][]u8 = &.{},
+    turn_summary: ?TurnSummary = null,
 
     pub fn isEmpty(self: ExecutionMemory) bool {
-        return self.tool_steps.len == 0 and self.files.len == 0;
+        return self.tool_steps.len == 0 and self.files.len == 0 and self.steering.len == 0;
     }
 };
 
@@ -1000,6 +1003,8 @@ pub const ToolUsage = struct {
 };
 
 pub const TurnSummary = struct {
+    started_at_ms: i64 = 0,
+    completed_at_ms: i64 = 0,
     thinking_duration_ms: u64 = 0,
     turn_duration_ms: u64 = 0,
     token_progress: TurnTokenProgress = .{},
@@ -1563,6 +1568,24 @@ pub const HistoryTurn = union(enum) {
     interrupted: InterruptedHistoryTurn,
 };
 
+pub fn setHistoryTurnSummary(turn: *HistoryTurn, summary: TurnSummary) void {
+    switch (turn.*) {
+        .assistant => |*entry| entry.execution.turn_summary = summary,
+        .background_command => |*entry| entry.execution.turn_summary = summary,
+        .interrupted => |*entry| entry.execution.turn_summary = summary,
+        .compacted_summary => {},
+    }
+}
+
+pub fn historyTurnSummary(turn: HistoryTurn) ?TurnSummary {
+    return switch (turn) {
+        .assistant => |entry| entry.execution.turn_summary,
+        .background_command => |entry| entry.execution.turn_summary,
+        .interrupted => |entry| entry.execution.turn_summary,
+        .compacted_summary => null,
+    };
+}
+
 pub const FinishedPromptProjection = enum {
     history_default,
     assistant_text,
@@ -2019,15 +2042,20 @@ pub fn dupeExecutionMemory(alloc: std.mem.Allocator, memory: ExecutionMemory) !E
     const tool_steps = try dupeToolExecutionSteps(alloc, memory.tool_steps);
     errdefer freeToolExecutionSteps(alloc, tool_steps);
     const files = try dupeFileEvidenceSlice(alloc, memory.files);
+    errdefer freeFileEvidenceSlice(alloc, files);
+    const steering = try dupePermissionFeedback(alloc, memory.steering);
     return .{
         .tool_steps = tool_steps,
         .files = files,
+        .steering = steering,
+        .turn_summary = memory.turn_summary,
     };
 }
 
 pub fn freeExecutionMemory(alloc: std.mem.Allocator, memory: ExecutionMemory) void {
     freeToolExecutionSteps(alloc, memory.tool_steps);
     freeFileEvidenceSlice(alloc, memory.files);
+    freePermissionFeedback(alloc, memory.steering);
 }
 
 pub fn dupeToolExecutionSteps(alloc: std.mem.Allocator, steps: []const ToolExecutionStep) ![]ToolExecutionStep {

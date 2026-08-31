@@ -13,10 +13,24 @@ pub const PreparedQuery = struct {
     tokens: [max_query_tokens][]const u8,
     token_count: usize,
 
-    fn tokenSlice(self: *const PreparedQuery) []const []const u8 {
+    pub fn tokenSlice(self: *const PreparedQuery) []const []const u8 {
         return self.tokens[0..self.token_count];
     }
 };
+
+inline fn failPreparedQuery(err: anytype) @TypeOf(err)!PreparedQuery {
+    return @errorCast(failPreparedQueryDynamic(err));
+}
+
+noinline fn failPreparedQueryDynamic(err: anyerror) anyerror!PreparedQuery {
+    return err;
+}
+
+test "prepared query failures preserve exact error types and identities" {
+    const too_long = failPreparedQuery(error.QueryTooLong);
+    try std.testing.expect(@TypeOf(too_long) == error{QueryTooLong}!PreparedQuery);
+    try std.testing.expectError(error.QueryTooLong, too_long);
+}
 
 pub const Score = struct {
     exact_identity: bool = false,
@@ -25,7 +39,7 @@ pub const Score = struct {
 };
 
 pub fn prepare(query: []const u8) PrepareError!PreparedQuery {
-    if (query.len > max_query_bytes) return error.QueryTooLong;
+    if (query.len > max_query_bytes) return failPreparedQuery(error.QueryTooLong);
 
     var prepared = PreparedQuery{
         .raw = query,
@@ -142,7 +156,7 @@ fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
     return false;
 }
 
-fn containsCompleteIdentity(raw: []const u8, identities: []const []const u8) bool {
+pub fn containsCompleteIdentity(raw: []const u8, identities: []const []const u8) bool {
     for (raw, 0..) |_, start| {
         for (identities) |identity| {
             if (identity.len == 0 or identity.len > raw.len - start) continue;

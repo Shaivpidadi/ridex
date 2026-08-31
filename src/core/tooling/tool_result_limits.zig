@@ -39,6 +39,28 @@ pub fn prepareModelOutput(
     return try alloc.dupe(u8, capped);
 }
 
+pub fn modelProjectionPreservesText(
+    request_scratch: Allocator,
+    raw: []const u8,
+) error{OutOfMemory}!bool {
+    const sanitized = try text_utils.sanitizeModelText(request_scratch, raw);
+    const masked = text_utils.maskSecrets(request_scratch, sanitized) catch |err| switch (err) {
+        error.OutOfMemory, error.WriteFailed => return error.OutOfMemory,
+    };
+    return std.mem.eql(u8, raw, masked);
+}
+
+test "model projection stability rejects sanitized and secret-bearing identities" {
+    var scratch_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer scratch_state.deinit();
+    const scratch = scratch_state.allocator();
+    const invalid_utf8 = [_]u8{0xff};
+
+    try std.testing.expect(try modelProjectionPreservesText(scratch, "mcp_datadog_list_incidents"));
+    try std.testing.expect(!try modelProjectionPreservesText(scratch, &invalid_utf8));
+    try std.testing.expect(!try modelProjectionPreservesText(scratch, "token=secret-value"));
+}
+
 pub const PreparedInlineResult = struct {
     model_output: []u8,
     memory: types.ToolResultMemory,

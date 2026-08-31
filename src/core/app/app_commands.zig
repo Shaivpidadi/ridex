@@ -392,6 +392,17 @@ pub fn Handlers(comptime App: type) type {
             if (comptime !@hasDecl(App, "takeMcpReloadCompletion")) return;
             var completion = (try app.takeMcpReloadCompletion()) orelse return;
             defer completion.deinit(app.alloc);
+            if (comptime @hasDecl(App, "mcpReloadCompletionOrigin") and
+                @hasDecl(App, "applyMcpMenuReloadCompletion"))
+            {
+                switch (app.mcpReloadCompletionOrigin()) {
+                    .command => {},
+                    .menu => |generation| {
+                        try app.applyMcpMenuReloadCompletion(generation, &completion);
+                        return;
+                    },
+                }
+            }
             var warning = false;
             const body = switch (completion) {
                 .outcome => |outcome| switch (outcome) {
@@ -437,6 +448,17 @@ pub fn Handlers(comptime App: type) type {
                 },
                 .failed => |err| failed: {
                     warning = true;
+                    if (err == error.McpAuthorityReducedReloadFailed) {
+                        debug_trace.logf(
+                            "mcp",
+                            "authority-reducing reload left MCP unavailable",
+                            .{},
+                        );
+                        break :failed try app.alloc.dupe(
+                            u8,
+                            "MCP configuration could not be reloaded after project authority was reduced. MCP is unavailable; check the configuration and run /mcp reload.",
+                        );
+                    }
                     debug_trace.logf(
                         "mcp",
                         "profile reload retained current runtime err={s}",
@@ -454,12 +476,26 @@ pub fn Handlers(comptime App: type) type {
                 .tone = if (warning) .warning else .neutral,
                 .body = body,
             }, true);
+            if (comptime @hasDecl(App, "presentProjectMcpPrompt")) {
+                try app.presentProjectMcpPrompt();
+            }
         }
 
         pub fn collectMcpAuthenticationFacts(app: *App) !void {
             if (comptime !@hasDecl(App, "takeMcpAuthenticationCompletion")) return;
             var completion = (try app.takeMcpAuthenticationCompletion()) orelse return;
             defer completion.deinit(app.alloc);
+            if (comptime @hasDecl(App, "mcpAuthenticationCompletionOrigin") and
+                @hasDecl(App, "applyMcpMenuAuthenticationCompletion"))
+            {
+                switch (app.mcpAuthenticationCompletionOrigin()) {
+                    .command => {},
+                    .menu => |generation| {
+                        try app.applyMcpMenuAuthenticationCompletion(generation, &completion);
+                        return;
+                    },
+                }
+            }
 
             if (completion.result) |authentication| {
                 switch (authentication) {
@@ -1260,6 +1296,25 @@ pub fn Handlers(comptime App: type) type {
 
         fn commandHandleMcp(ctx: *anyopaque, rest: []const u8) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
+            if (std.mem.trim(u8, rest, " \t").len == 0 and
+                comptime @hasDecl(App, "openMcpMenu"))
+            {
+                closeModelMenuIfPresent(app);
+                closeHelpMenuIfPresent(app);
+                closeInlineCommandMenusIfPresent(app);
+                if (comptime @hasField(App, "skills")) app.skills.closeMenu();
+                if (comptime @hasField(App, "input_runtime")) {
+                    if (comptime @hasField(@TypeOf(app.input_runtime), "settings_menu")) {
+                        app.input_runtime.settings_menu.close();
+                    }
+                }
+                if (comptime @hasField(App, "session_persistence")) {
+                    app.session_persistence.session_picker.active = false;
+                }
+                try app.openMcpMenu();
+                app.shell.render_requests.request(.footer);
+                return;
+            }
             const result = try app.mcpCommandProvider().handle(app.alloc, rest, .{
                 .home = io_mod.getenv("HOME"),
                 .list_ctx = @ptrCast(app),
@@ -1286,6 +1341,10 @@ pub fn Handlers(comptime App: type) type {
             var reload_notice: ?[]u8 = null;
             defer if (reload_notice) |notice| app.alloc.free(notice);
             var reload_warning = false;
+            if (result.project_action) |action| {
+                try applyProjectMcpAction(app, action, command_body);
+                return;
+            }
             if (result.reload) {
                 app.beginMcpReload() catch |err| {
                     reload_warning = true;
@@ -1321,6 +1380,70 @@ pub fn Handlers(comptime App: type) type {
                 .tone = if (reload_warning) .warning else .neutral,
                 .body = body,
             }, true);
+        }
+
+        pub fn applyProjectMcpAction(
+            app: *App,
+            action: @import("../mcp/project_config.zig").ProjectMcpAction,
+            success_body: []const u8,
+        ) !void {
+            if (comptime !@hasField(App, "workspace_root") or
+                !@hasDecl(App, "beginMcpAuthorityReduction"))
+            {
+                return error.McpProjectChoicesUnavailable;
+            } else {
+                const reducing_requested = switch (action) {
+                    .reject, .reset => true,
+                    .approve, .approve_all => false,
+                };
+                var attempt = config_runtime.attemptProjectMcpMutation(
+                    app.alloc,
+                    app.workspace_root,
+                    action,
+                );
+                defer attempt.deinit(app.alloc);
+                var warning = false;
+                var owned_notice: ?[]u8 = null;
+                defer if (owned_notice) |notice| app.alloc.free(notice);
+                switch (attempt) {
+                    .outcome => |outcome| switch (outcome) {
+                        .unchanged => {},
+                        .committed => |committed| {
+                            if (committed.authority_reduced) {
+                                try app.beginMcpAuthorityReduction(true);
+                            } else {
+                                try app.beginMcpReload();
+                            }
+                        },
+                    },
+                    .failure => |failure| {
+                        warning = true;
+                        if (failure.err == error.SettingsCommitIndeterminate and reducing_requested) {
+                            try app.beginMcpAuthorityReduction(false);
+                            owned_notice = try app.alloc.dupe(
+                                u8,
+                                "Project MCP choices may have been saved, so live MCP authority was retired. Run /mcp reload after checking settings.json.",
+                            );
+                        } else {
+                            owned_notice = try std.fmt.allocPrint(
+                                app.alloc,
+                                "Project MCP choices were not applied: {s}.",
+                                .{@errorName(failure.err)},
+                            );
+                        }
+                    },
+                }
+                try app.writeDomainNotice(.{
+                    .topic = "mcp",
+                    .tone = if (warning) .warning else .neutral,
+                    .body = owned_notice orelse success_body,
+                }, true);
+                if (warning and owned_notice != null and
+                    comptime @hasDecl(App, "presentProjectMcpPrompt"))
+                {
+                    try app.presentProjectMcpPrompt();
+                }
+            }
         }
 
         fn listMcpServersAndTools(ctx: *anyopaque, alloc: std.mem.Allocator) ![]u8 {
@@ -1581,6 +1704,7 @@ pub fn Handlers(comptime App: type) type {
                 .removed = result.removed,
                 .revocation_failed = result.revocation_failed,
                 .repaired_entries = result.repaired_entries,
+                .local_only = result.local_only,
             };
         }
 
@@ -3351,6 +3475,9 @@ pub fn settingsCatalogSnapshot(app: anytype) settings_catalog.Snapshot {
             snapshot.slash_menu_categories = app.input_runtime.slash_menu_categories;
         }
     }
+    if (comptime @hasField(App, "shell") and @hasField(@TypeOf(app.shell), "collapse_tool_calls")) {
+        snapshot.collapse_tool_calls = app.shell.collapse_tool_calls;
+    }
     if (comptime @hasField(App, "statusline_context")) snapshot.statusline_context = app.statusline_context;
     if (comptime @hasField(App, "statusline_session")) snapshot.statusline_session = app.statusline_session;
     if (comptime @hasField(App, "workspace_identity")) snapshot.statusline_workspace = app.workspace_identity.enabled;
@@ -3411,6 +3538,21 @@ pub fn applySettingsCatalogChange(app: anytype, change: settings_catalog.Change)
             if (enabled != statuslineItemEnabled(app, item)) {
                 try applyStatuslineItem(app, item, enabled, .announce);
             }
+        },
+        .collapse_tool_calls => {
+            const enabled = parseOnOff(change.value) orelse return error.InvalidSettingsCatalogValue;
+            const runtime_changed = enabled != app.shell.collapse_tool_calls;
+            if (runtime_changed) {
+                app.shell.collapse_tool_calls = enabled;
+                app.shell.markTranscriptStructureDirty();
+                app.shell.render_requests.request(.transcript);
+            }
+            try persistUserPreferences(
+                app,
+                "collapse tool calls",
+                .{ .collapse_tool_calls = enabled },
+                runtime_changed,
+            );
         },
         .slash_menu_categories => {
             const enabled = parseOnOff(change.value) orelse return error.InvalidSettingsCatalogValue;
@@ -3544,6 +3686,9 @@ const McpCommandFakeApp = struct {
     reload_behavior: ReloadBehavior = .published_empty,
     reload_pending: bool = false,
     authentication_pending: bool = false,
+    completion_origin: app_mcp_runtime.PresentationOrigin = .command,
+    menu_reload_completions: usize = 0,
+    menu_authentication_completions: usize = 0,
 
     fn deinit(self: *McpCommandFakeApp) void {
         self.notice_body.deinit(self.alloc);
@@ -3635,6 +3780,19 @@ const McpCommandFakeApp = struct {
         };
     }
 
+    fn mcpReloadCompletionOrigin(self: *const McpCommandFakeApp) app_mcp_runtime.PresentationOrigin {
+        return self.completion_origin;
+    }
+
+    fn applyMcpMenuReloadCompletion(
+        self: *McpCommandFakeApp,
+        generation: u64,
+        _: *const app_mcp_runtime.ReloadCompletion,
+    ) !void {
+        try std.testing.expectEqual(@as(u64, 77), generation);
+        self.menu_reload_completions += 1;
+    }
+
     fn takeMcpAuthenticationCompletion(
         self: *McpCommandFakeApp,
     ) !?app_mcp_runtime.AuthenticationCompletion {
@@ -3644,6 +3802,19 @@ const McpCommandFakeApp = struct {
             .server_name = try self.alloc.dupe(u8, "fixture"),
             .result = .{ .authenticated = .{} },
         };
+    }
+
+    fn mcpAuthenticationCompletionOrigin(self: *const McpCommandFakeApp) app_mcp_runtime.PresentationOrigin {
+        return self.completion_origin;
+    }
+
+    fn applyMcpMenuAuthenticationCompletion(
+        self: *McpCommandFakeApp,
+        generation: u64,
+        _: *const app_mcp_runtime.AuthenticationCompletion,
+    ) !void {
+        try std.testing.expectEqual(@as(u64, 77), generation);
+        self.menu_authentication_completions += 1;
     }
 
     noinline fn writeDomainNotice(self: *McpCommandFakeApp, notice: types.SemanticNotice, _: bool) !void {
@@ -4140,6 +4311,28 @@ test "app_commands renders transactional status for explicit MCP reload" {
         app.notice_body.items,
         "MCP configuration reloaded. No servers are configured.",
     ));
+}
+
+test "menu-origin MCP completions never publish transcript notices" {
+    var reload_app = McpCommandFakeApp{
+        .alloc = std.testing.allocator,
+        .reload_pending = true,
+        .completion_origin = .{ .menu = 77 },
+    };
+    defer reload_app.deinit();
+    try Handlers(McpCommandFakeApp).collectMcpReloadFacts(&reload_app);
+    try std.testing.expectEqual(@as(usize, 1), reload_app.menu_reload_completions);
+    try std.testing.expectEqual(@as(usize, 0), reload_app.notice_count);
+
+    var authentication_app = McpCommandFakeApp{
+        .alloc = std.testing.allocator,
+        .authentication_pending = true,
+        .completion_origin = .{ .menu = 77 },
+    };
+    defer authentication_app.deinit();
+    try Handlers(McpCommandFakeApp).collectMcpAuthenticationFacts(&authentication_app);
+    try std.testing.expectEqual(@as(usize, 1), authentication_app.menu_authentication_completions);
+    try std.testing.expectEqual(@as(usize, 0), authentication_app.notice_count);
 }
 
 test "app_commands explains healthy and degraded MCP reloads without internal state" {

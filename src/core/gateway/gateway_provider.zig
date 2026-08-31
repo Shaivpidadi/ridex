@@ -174,7 +174,7 @@ pub const CapabilityResolver = struct {
                             "model catalog lookup outcome=cancelled model={s}",
                             .{model},
                         );
-                        return error.Cancelled;
+                        return failCapabilities(error.Cancelled);
                     }
                     self.state = .failed;
                     debug_trace.logf(
@@ -252,6 +252,22 @@ pub const CapabilityResolver = struct {
         self.state = .ready;
     }
 };
+
+inline fn failCapabilities(err: anytype) @TypeOf(err)!model_capabilities.Capabilities {
+    return @errorCast(failCapabilitiesDynamic(err));
+}
+
+noinline fn failCapabilitiesDynamic(err: anyerror) anyerror!model_capabilities.Capabilities {
+    return err;
+}
+
+test "capability failure writer preserves exact error type and identity" {
+    const failure = failCapabilities(error.Cancelled);
+    try std.testing.expect(
+        @TypeOf(failure) == error{Cancelled}!model_capabilities.Capabilities,
+    );
+    try std.testing.expectError(error.Cancelled, failure);
+}
 
 const FakeCatalog = struct {
     outcome: enum {
@@ -421,6 +437,7 @@ test "capability resolver uses provider catalog metadata" {
 
     try std.testing.expect(capabilities.supports_vision);
     try std.testing.expect(capabilities.supports_file_input);
+    try std.testing.expectEqual(model_capabilities.ImageInputSupport.native, capabilities.image_input_support);
     try std.testing.expectEqual(@as(?u32, 256_000), capabilities.context_window);
     try std.testing.expectEqual(@as(?u32, 32_000), capabilities.max_output_tokens);
 
@@ -436,6 +453,7 @@ test "capability resolver uses provider catalog metadata" {
     );
     try std.testing.expect(!missing.supports_fast_mode);
     try std.testing.expect(!missing.supports_vision);
+    try std.testing.expectEqual(model_capabilities.ImageInputSupport.unknown, missing.image_input_support);
 }
 
 test "capability resolver retries rejected authenticated catalog access anonymously" {
@@ -477,6 +495,7 @@ test "capability resolver degrades terminal catalog failures to local capabiliti
         .{},
     );
     try std.testing.expect(!capabilities.supports_fast_mode);
+    try std.testing.expectEqual(model_capabilities.ImageInputSupport.unknown, capabilities.image_input_support);
 
     fake.outcome = .ready;
     const cached_failure = try resolver.resolve(
@@ -490,5 +509,6 @@ test "capability resolver degrades terminal catalog failures to local capabiliti
         .{},
     );
     try std.testing.expect(!cached_failure.supports_vision);
+    try std.testing.expectEqual(model_capabilities.ImageInputSupport.unknown, cached_failure.image_input_support);
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
 }

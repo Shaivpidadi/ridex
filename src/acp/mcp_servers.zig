@@ -123,14 +123,14 @@ pub fn prepare(
             config.deinit(alloc);
             return switch (err) {
                 error.OutOfMemory => error.OutOfMemory,
-                error.McpConfigScopeMismatch => unreachable,
+                error.McpConfigScopeMismatch, error.McpConfigAdmissionMismatch => unreachable,
             };
         };
     }
-    runtime.connectAll(builtin_tools.registry);
+    runtime.connectAllForAcp(builtin_tools.registry);
 
     for (runtime.servers.items) |server_state| {
-        if (server_state.state == .ready) continue;
+        if (server_state.state == .ready or !server_state.config.required) continue;
         const reason = server_state.last_error orelse @tagName(server_state.state);
         const acp_reason = if (std.mem.startsWith(
             u8,

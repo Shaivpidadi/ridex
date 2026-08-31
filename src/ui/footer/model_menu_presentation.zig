@@ -99,7 +99,7 @@ pub fn visibleNavigationItemsForBudget(projection: ModelMenuProjection, row_budg
     return ModelMenuLayout.build(projection, row_budget).visible_items;
 }
 
-pub fn composeModelMenuRow(
+pub inline fn composeModelMenuRow(
     alloc: Allocator,
     projection: ModelMenuProjection,
     row_index: u16,

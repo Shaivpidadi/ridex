@@ -33,6 +33,7 @@ const FakeGateway = test_support.FakeGateway;
 const FakeAgentRuntimeDeps = test_support.FakeAgentRuntimeDeps;
 const ModelCapabilityOverride = test_support.ModelCapabilityOverride;
 const PromptFixture = test_support.PromptFixture;
+const ToolExecutionOverride = test_support.ToolExecutionOverride;
 const VisionAgentToolRuntime = test_support.VisionAgentToolRuntime;
 const ExecuteDelegate = test_support.ExecuteDelegate;
 const ToolExecutionRequest = runtime_tool_contracts.ToolExecutionRequest;
@@ -2325,6 +2326,7 @@ test "processQueuedPrompt keeps native image parts for vision route model" {
     const capability_overrides = [_]ModelCapabilityOverride{.{
         .model = "google/gemini-2.5-flash",
         .capabilities = .{
+            .image_input_support = .native,
             .supports_vision = true,
             .supports_file_input = true,
         },
@@ -2363,7 +2365,7 @@ test "processQueuedPrompt never uses the vision fallback for Codex" {
     var images = [_]types.ImageAttachment{image};
     const capability_overrides = [_]ModelCapabilityOverride{.{
         .model = "gpt-5.6-sol",
-        .capabilities = .{},
+        .capabilities = .{ .image_input_support = .non_native },
     }};
     var gateway = FakeGateway.init(alloc, &.{});
     defer gateway.deinit();
@@ -2415,6 +2417,7 @@ test "processQueuedPrompt routes images natively only when vision and file input
         const capability_overrides = [_]ModelCapabilityOverride{.{
             .model = model,
             .capabilities = .{
+                .image_input_support = if (entry.expect_native) .native else .non_native,
                 .supports_vision = entry.supports_vision,
                 .supports_file_input = entry.supports_file_input,
             },
@@ -2460,7 +2463,7 @@ test "processQueuedPrompt routes images natively only when vision and file input
             try std.testing.expectEqual(@as(usize, 1), gateway.request_bodies.items.len);
             try expectBodyContains(&gateway, 0, "\"type\":\"file\"");
             try expectBodyContains(&gateway, 0, "iVBORw0KGgpmaXh0dXJlIGltYWdlIGJ5dGVz");
-            try expectBodyContains(&gateway, 0, "\"name\":\"vision\"");
+            try expectBodyNotContains(&gateway, 0, "\"name\":\"vision\"");
             try std.testing.expectEqualStrings("Native route answer", hooks.finish_assistant_text.?);
         } else {
             try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
@@ -2481,7 +2484,7 @@ test "processQueuedPrompt routes images natively only when vision and file input
     }
 }
 
-test "processQueuedPrompt rejects native-route attachment ID Vision calls before permission or execution" {
+test "processQueuedPrompt rejects unadvertised native-route Vision calls before permission or execution" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2506,6 +2509,7 @@ test "processQueuedPrompt rejects native-route attachment ID Vision calls before
     const capability_overrides = [_]ModelCapabilityOverride{.{
         .model = "native/test-vision",
         .capabilities = .{
+            .image_input_support = .native,
             .supports_vision = true,
             .supports_file_input = true,
         },
@@ -2531,7 +2535,7 @@ test "processQueuedPrompt rejects native-route attachment ID Vision calls before
     try std.testing.expectEqualStrings("native/test-vision", gateway.request_models.items[0]);
     try std.testing.expectEqualStrings("native/test-vision", gateway.request_models.items[1]);
     try expectBodyContains(&gateway, 0, "\"type\":\"file\"");
-    try expectBodyContains(&gateway, 0, "\"name\":\"vision\"");
+    try expectBodyNotContains(&gateway, 0, "\"name\":\"vision\"");
     try expectBodyNotContains(&gateway, 1, image_path);
     try std.testing.expectEqual(@as(usize, 0), hooks.permission_names.items.len);
     try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
@@ -6243,4 +6247,57 @@ test "processQueuedPrompt assigns trace lineage to subagent runs" {
         trace[prompt_start..prompt_line_end],
         "subagent_id=",
     ) != null);
+}
+
+test "processQueuedPrompt trace emits one canonical result for tool execution errors" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const trace_path = try std.fs.path.join(alloc, &.{ root, "tool-error-trace.log" });
+    defer alloc.free(trace_path);
+
+    debug_trace.resetForTest();
+    defer debug_trace.resetForTest();
+    try debug_trace.configureForTestWithScopes(alloc, trace_path, "tool");
+
+    const calls = [_]ToolCall{toolCall("call_error", "read_file", "{\"path\":\"missing.txt\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls, .finish_reason = .tool_calls },
+        .{ .content = "Done" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    const FailingExecution = struct {
+        fn execute(_: *anyopaque, _: ToolExecutionRequest) !ToolExecutionResult {
+            return error.SystemResources;
+        }
+    };
+    var override_context: u8 = 0;
+    hooks.tool_execution_override = ToolExecutionOverride{
+        .context = &override_context,
+        .execute_fn = FailingExecution.execute,
+    };
+    var fixture = PromptFixture{};
+    var job = fixture.job();
+    job.permission_mode = .auto;
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+    debug_trace.shutdown();
+
+    const trace = try readTraceFile(alloc, trace_path, 65536);
+    defer alloc.free(trace);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countNeedle(trace, "event=after_tool_execution"),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countNeedle(trace, "event=execution_result"),
+    );
+    try std.testing.expect(std.mem.find(u8, trace, "err=SystemResources") != null);
+    try std.testing.expect(std.mem.find(u8, trace, "model_output_bytes=") != null);
 }

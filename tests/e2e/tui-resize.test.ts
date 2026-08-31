@@ -809,6 +809,26 @@ async function waitForTraceCount(
   );
 }
 
+async function waitForTapeOutputCount(
+  tapePath: string,
+  text: string,
+  minimumCount: number,
+  timeoutMs = 30_000,
+): Promise<number> {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const output = Buffer.concat(
+      stdoutFrames(tapePath).map((frame) => frame.payload),
+    ).toString();
+    const count = countOccurrences(output, text);
+    if (count >= minimumCount) return count;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  throw new Error(
+    `Timed out waiting for ${minimumCount} copies of ${JSON.stringify(text)} in the tape.`,
+  );
+}
+
 async function waitForQueuedPromptBytes(
   tracePath: string,
   timeoutMs = 30_000,
@@ -4044,7 +4064,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
       const initialInputRows = (await session.capturePaneGrid()).filter(isInputRow);
       expect(initialInputRows).toEqual(["┃"]);
       await session.sendText("Record a theme reset transcript marker.");
-      await session.waitForText("THEME_RESET_FIRST_RESPONSE", TIMEOUT);
+      await session.waitForText(inlineTailMarker, TIMEOUT);
 
       const resetCountBefore = countOccurrences(
         Buffer.concat(stdoutFrames(tapePath).map((frame) => frame.payload)).toString(),
@@ -4100,6 +4120,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
         ...responseFence,
       ]);
       await waitForTraceText(tracePath, "theme_update_settled light=true rgb=terminal");
+      await waitForTapeOutputCount(tapePath, "\x1b[3J", resetCountBefore + 1);
 
       const replayed = await session.waitForText(inlineTailMarker, TIMEOUT);
       expect(replayed).not.toContain("?997");
@@ -4149,10 +4170,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
       ]);
       await waitForTraceText(tracePath, "theme_update_settled light=false rgb=terminal");
       expect(
-        countOccurrences(
-          Buffer.concat(stdoutFrames(tapePath).map((frame) => frame.payload)).toString(),
-          "\x1b[3J",
-        ),
+        await waitForTapeOutputCount(tapePath, "\x1b[3J", resetCountBefore + 2),
       ).toBe(resetCountBefore + 2);
 
       await session.sendText("Confirm input survives the theme reset.");

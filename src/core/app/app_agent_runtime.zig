@@ -441,10 +441,10 @@ pub fn Runtime(comptime App: type) type {
             return app.callMcpTool(arena, name, arguments_json, max_tool_result_bytes, options);
         }
 
-        fn searchMcpTools(raw_ctx: *anyopaque, arena: Allocator, query: *const tool_mcp_runtime.PreparedQuery, limit: usize, permission_rules: types.PermissionRuleSet, _: @import("../config/context_limits.zig").Values, access: tool_mcp_runtime.Access) anyerror!tool_mcp_runtime.SearchResult {
+        fn searchMcpTools(raw_ctx: *anyopaque, arena: Allocator, request: tool_mcp_runtime.SearchRequest, permission_rules: types.PermissionRuleSet, _: @import("../config/context_limits.zig").Values, access: tool_mcp_runtime.Access) anyerror!tool_mcp_runtime.SearchResult {
             const app: *App = @ptrCast(@alignCast(raw_ctx));
             if (comptime @hasDecl(App, "searchMcpTools")) {
-                return app.searchMcpTools(arena, query, limit, permission_rules, access);
+                return app.searchMcpTools(arena, request, permission_rules, access);
             }
             return .{ .model_output = try arena.dupe(u8, "{\"tools\":[],\"count\":0}") };
         }
@@ -861,12 +861,12 @@ pub fn Runtime(comptime App: type) type {
                     if (should_emit) {
                         const body = try types.renderContextNoticeBody(app.alloc, notice);
                         defer app.alloc.free(body);
-                        try app.writeDomainNotice(.{
+                        app.writeDomainNotice(.{
                             .topic = "context",
                             .tone = .warning,
                             .body = body,
                             .visibility = .full_only,
-                        }, true);
+                        }, true) catch return error.WriteFailed;
                     }
                 }
             }
@@ -910,8 +910,9 @@ pub fn Runtime(comptime App: type) type {
                 try appendClaimedContextNotice(app, &preflight_context_notices.writer, notice);
             }
 
-            var bounded_skills = try app.skills.buildBoundedSystemPromptSection(
+            var bounded_skills = try app.skills.buildRoutedSystemPromptSection(
                 std.heap.c_allocator,
+                job.prompt,
                 if (comptime @hasField(App, "context_limits")) app.context_limits else .{},
             );
             defer bounded_skills.deinit(std.heap.c_allocator);
@@ -1030,8 +1031,9 @@ pub fn Runtime(comptime App: type) type {
             ) catch
                 return error.OutOfMemory;
             defer child_projection.deinit(alloc);
-            var bounded_skills = app.skills.buildBoundedSystemPromptSection(
+            var bounded_skills = app.skills.buildRoutedSystemPromptSection(
                 alloc,
+                message.content,
                 if (comptime @hasField(App, "context_limits")) app.context_limits else .{},
             ) catch return error.OutOfMemory;
             defer bounded_skills.deinit(alloc);
@@ -1293,7 +1295,7 @@ const test_tools = [_]tool_dispatch.Tool{
     test_builtin_tools.web_search,
     test_builtin_tools.terminal,
     test_builtin_tools.memory,
-    test_builtin_tools.semantic_search,
+    test_builtin_tools.grep_files,
     test_builtin_tools.skill,
     test_builtin_tools.install_skill,
     test_builtin_tools.subagent,
@@ -2216,38 +2218,6 @@ test "tool labels preserve memory action value and invalid argument fallback" {
     try std.testing.expect(std.mem.find(u8, invalid, "Working") != null);
 }
 
-test "tool labels preserve semantic_search query value and default fallback" {
-    const alloc = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    var app = try FakeApp.init(alloc);
-    defer app.deinit();
-
-    const search_call: ToolCall = .{
-        .id = "semantic_search",
-        .name = "semantic_search",
-        .arguments_json = "{\"query\":\"state machines\"}",
-    };
-    const active = try app.describeToolAction(arena, search_call);
-    try std.testing.expect(std.mem.find(u8, active, "Searching") != null);
-    try std.testing.expect(std.mem.find(u8, active, "state machines") != null);
-
-    const completed = try app.describeToolActionCompleted(arena, search_call);
-    try std.testing.expect(std.mem.find(u8, completed, "Searched") != null);
-    try std.testing.expect(std.mem.find(u8, completed, "state machines") != null);
-
-    const defaulted_call: ToolCall = .{
-        .id = "semantic_search_default",
-        .name = "semantic_search",
-        .arguments_json = "{\"query\":3}",
-    };
-    const defaulted = try app.describeToolAction(arena, defaulted_call);
-    try std.testing.expect(std.mem.find(u8, defaulted, "Searching") != null);
-    try std.testing.expect(std.mem.find(u8, defaulted, "query") != null);
-}
-
 test "native web_search labels preserve bounded query and domain filters" {
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
@@ -2317,6 +2287,21 @@ test "tool labels preserve skill name value" {
     const completed = try app.describeToolActionCompleted(arena, skill_call);
     try std.testing.expect(std.mem.find(u8, completed, "Loaded skill") != null);
     try std.testing.expect(std.mem.find(u8, completed, "workflow") != null);
+
+    const resource_call: ToolCall = .{
+        .id = "skill_resource",
+        .name = "skill",
+        .arguments_json = "{\"name\":\"workflow\",\"resource\":\"references/contract-design.md\"}",
+    };
+    const resource_active = try app.describeToolAction(arena, resource_call);
+    try std.testing.expect(std.mem.find(u8, resource_active, "Reading skill resource") != null);
+    try std.testing.expect(std.mem.find(u8, resource_active, "references/contract-design.md") != null);
+    try std.testing.expect(std.mem.find(u8, resource_active, "Loading skill workflow") == null);
+
+    const resource_completed = try app.describeToolActionCompleted(arena, resource_call);
+    try std.testing.expect(std.mem.find(u8, resource_completed, "Read skill resource") != null);
+    try std.testing.expect(std.mem.find(u8, resource_completed, "references/contract-design.md") != null);
+    try std.testing.expect(std.mem.find(u8, resource_completed, "Loaded skill workflow") == null);
 
     const install_call: ToolCall = .{
         .id = "install_skill",

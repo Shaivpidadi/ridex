@@ -79,56 +79,6 @@ const test_read_file = blk: {
     break :blk spec;
 };
 
-const test_file_info = blk: {
-    var spec = test_read_file;
-    spec.name = "file_info";
-    spec.description = "Test file metadata. When to use: exercise registered metadata projection. When NOT to use: assert product-specific filesystem behavior.";
-    spec.model_schema = .{
-        .name = "file_info",
-        .description = spec.description,
-        .input_schema = .{
-            .properties = &.{
-                .{ .name = "path", .json_type = .string },
-            },
-            .required = &.{"path"},
-        },
-    };
-    spec.executor_kind = .file_info;
-    spec.activity_kind = .read;
-    spec.requires_approval = false;
-    spec.action_label = "Inspecting";
-    spec.completed_action_label = "Inspected";
-    spec.label_arg_kind = .path;
-    spec.label_arg_default = "path";
-    spec.permission_target_kind = .path_existing;
-    break :blk spec;
-};
-
-const test_open_file = blk: {
-    var spec = test_read_file;
-    spec.name = "open_file";
-    spec.description = "Test file open. When to use: exercise registered launcher projection. When NOT to use: assert product-specific filesystem behavior.";
-    spec.model_schema = .{
-        .name = "open_file",
-        .description = spec.description,
-        .input_schema = .{
-            .properties = &.{
-                .{ .name = "path", .json_type = .string },
-            },
-            .required = &.{"path"},
-        },
-    };
-    spec.executor_kind = .open_file;
-    spec.activity_kind = .open;
-    spec.requires_approval = true;
-    spec.action_label = "Opening";
-    spec.completed_action_label = "Opened";
-    spec.label_arg_kind = .path;
-    spec.label_arg_default = "file";
-    spec.permission_target_kind = .path_existing;
-    break :blk spec;
-};
-
 const test_memory = blk: {
     var spec = test_read_file;
     spec.name = "memory";
@@ -152,32 +102,6 @@ const test_memory = blk: {
     spec.label_arg_kind = .action;
     spec.label_arg_default = "memory";
     spec.permission_target_kind = .none;
-    break :blk spec;
-};
-
-const test_semantic_search = blk: {
-    var spec = test_read_file;
-    spec.name = "semantic_search";
-    spec.description = "Test lexical search. When to use: exercise registered search projection. When NOT to use: assert product-specific search behavior.";
-    spec.model_schema = .{
-        .name = "semantic_search",
-        .description = spec.description,
-        .input_schema = .{
-            .properties = &.{
-                .{ .name = "query", .json_type = .string },
-                .{ .name = "path", .json_type = .string },
-            },
-            .required = &.{"query"},
-        },
-    };
-    spec.executor_kind = .semantic_search;
-    spec.activity_kind = .read;
-    spec.requires_approval = false;
-    spec.action_label = "Searching";
-    spec.completed_action_label = "Searched";
-    spec.label_arg_kind = .query;
-    spec.label_arg_default = "query";
-    spec.permission_target_kind = .path_optional_existing;
     break :blk spec;
 };
 
@@ -234,132 +158,8 @@ const test_edit_file = blk: {
     break :blk spec;
 };
 
-const test_delete_file = blk: {
-    var spec = test_read_file;
-    spec.name = "delete_file";
-    spec.description = "Test file deletion. When to use: exercise registered delete projection. When NOT to use: assert product-specific filesystem behavior.";
-    spec.model_schema = .{
-        .name = "delete_file",
-        .description = spec.description,
-        .input_schema = .{
-            .properties = &.{
-                .{ .name = "path", .json_type = .string },
-            },
-            .required = &.{"path"},
-        },
-    };
-    spec.executor_kind = .delete_file;
-    spec.activity_kind = .write;
-    spec.requires_approval = true;
-    spec.action_label = "Deleting";
-    spec.completed_action_label = "Deleted";
-    spec.label_arg_kind = .path;
-    spec.label_arg_default = "file";
-    spec.permission_target_kind = .path_existing;
-    break :blk spec;
-};
-
-const test_rename_file = blk: {
-    var spec = test_read_file;
-    spec.name = "rename_file";
-    spec.description = "Test file rename. When to use: exercise registered rename projection. When NOT to use: assert product-specific filesystem behavior.";
-    spec.model_schema = .{
-        .name = "rename_file",
-        .description = spec.description,
-        .input_schema = .{
-            .properties = &.{
-                .{ .name = "old_path", .json_type = .string },
-                .{ .name = "new_path", .json_type = .string },
-            },
-            .required = &.{ "old_path", "new_path" },
-        },
-    };
-    spec.executor_kind = .rename_file;
-    spec.activity_kind = .write;
-    spec.requires_approval = true;
-    spec.action_label = "Renaming";
-    spec.completed_action_label = "Renamed";
-    spec.label_arg_kind = .old_path;
-    spec.label_arg_default = "file";
-    spec.permission_target_kind = .none;
-    break :blk spec;
-};
-
-const test_copy_file = blk: {
-    var spec = test_read_file;
-    spec.name = "copy_file";
-    spec.description = "Test file copying. When to use: exercise registered copy projection. When NOT to use: assert product-specific filesystem behavior.";
-    spec.model_schema = .{
-        .name = "copy_file",
-        .description = spec.description,
-        .input_schema = .{
-            .properties = &.{
-                .{ .name = "source", .json_type = .string },
-                .{ .name = "destination", .json_type = .string },
-            },
-            .required = &.{ "source", "destination" },
-        },
-    };
-    spec.executor_kind = .copy_file;
-    spec.activity_kind = .write;
-    spec.requires_approval = true;
-    spec.action_label = "Copying";
-    spec.completed_action_label = "Copied";
-    spec.label_arg_kind = .source;
-    spec.label_arg_default = "file";
-    spec.permission_target_kind = .none;
-    break :blk spec;
-};
-
-const test_create_folder = blk: {
-    var spec = test_read_file;
-    spec.name = "create_folder";
-    spec.description = "Test folder creation. When to use: exercise registered creation projection. When NOT to use: assert product-specific filesystem behavior.";
-    spec.model_schema = .{
-        .name = "create_folder",
-        .description = spec.description,
-        .input_schema = .{
-            .properties = &.{
-                .{ .name = "path", .json_type = .string },
-            },
-            .required = &.{"path"},
-        },
-    };
-    spec.executor_kind = .create_folder;
-    spec.activity_kind = .write;
-    spec.requires_approval = true;
-    spec.action_label = "Creating";
-    spec.completed_action_label = "Created";
-    spec.label_arg_kind = .path;
-    spec.label_arg_default = "folder";
-    spec.permission_target_kind = .path_create_parent;
-    break :blk spec;
-};
-
-const test_list_files = blk: {
-    var spec = test_read_file;
-    spec.name = "list_files";
-    spec.description = "Test directory listing. When to use: exercise registered list projection. When NOT to use: assert product-specific filesystem behavior.";
-    spec.model_schema = .{
-        .name = "list_files",
-        .description = spec.description,
-        .input_schema = .{ .properties = &.{
-            .{ .name = "path", .json_type = .string },
-        } },
-    };
-    spec.executor_kind = .list_files;
-    spec.activity_kind = .list;
-    spec.requires_approval = false;
-    spec.action_label = "Listing";
-    spec.completed_action_label = "Listed";
-    spec.label_arg_kind = .path;
-    spec.label_arg_default = ".";
-    spec.permission_target_kind = .path_optional_existing;
-    break :blk spec;
-};
-
 const test_glob_files = blk: {
-    var spec = test_list_files;
+    var spec = test_read_file;
     spec.name = "glob_files";
     spec.description = "Test filename matching. When to use: exercise registered search projection. When NOT to use: assert product-specific filesystem behavior.";
     spec.model_schema = .{
@@ -374,6 +174,7 @@ const test_glob_files = blk: {
         },
     };
     spec.executor_kind = .glob_files;
+    spec.activity_kind = .list;
     spec.action_label = "Matching";
     spec.completed_action_label = "Matched";
     spec.label_arg_kind = .pattern;
@@ -704,26 +505,77 @@ pub const EffectiveToolProjection = struct {
     }
 };
 
+pub const TurnToolProjection = struct {
+    advertised_names: []const []const u8,
+    advertised_functions: []const model_tool_schema.FunctionSchema,
+};
+
+pub fn projectForTurn(
+    arena: Allocator,
+    advertised_names: []const []const u8,
+    advertised_functions: []const model_tool_schema.FunctionSchema,
+    current_turn_messages: []const types.ChatMessage,
+) Allocator.Error!TurnToolProjection {
+    if (!latestToolGroupHasTerminalCapabilityNoMatch(current_turn_messages)) {
+        return .{
+            .advertised_names = advertised_names,
+            .advertised_functions = advertised_functions,
+        };
+    }
+
+    const names = try arena.alloc([]const u8, advertised_names.len);
+    errdefer arena.free(names);
+    var name_count: usize = 0;
+    for (advertised_names) |name| {
+        if (std.mem.eql(u8, name, "capability_search")) continue;
+        names[name_count] = name;
+        name_count += 1;
+    }
+    const functions = try arena.alloc(
+        model_tool_schema.FunctionSchema,
+        advertised_functions.len,
+    );
+    var function_count: usize = 0;
+    for (advertised_functions) |function| {
+        if (std.mem.eql(u8, function.name, "capability_search")) continue;
+        functions[function_count] = function;
+        function_count += 1;
+    }
+    return .{
+        .advertised_names = names[0..name_count],
+        .advertised_functions = functions[0..function_count],
+    };
+}
+
+fn latestToolGroupHasTerminalCapabilityNoMatch(
+    messages: []const types.ChatMessage,
+) bool {
+    var index = messages.len;
+    while (index > 0 and messages[index - 1].role == .tool) {
+        index -= 1;
+        const message = messages[index];
+        const tool_name = message.tool_name orelse continue;
+        if (!std.mem.eql(u8, tool_name, "capability_search")) continue;
+        const content = message.content orelse continue;
+        if (std.mem.find(u8, content, "\"state\":\"no_match\"") != null) {
+            return true;
+        }
+    }
+    return false;
+}
+
 pub fn containsName(names: []const []const u8, expected: []const u8) bool {
     for (names) |name| if (std.mem.eql(u8, name, expected)) return true;
     return false;
 }
 
 const test_all_tools = [_]tool_dispatch.Tool{
-    test_list_files,
     test_glob_files,
     test_grep_files,
     test_read_file,
     test_write_file,
     test_edit_file,
-    test_delete_file,
-    test_rename_file,
-    test_copy_file,
-    test_create_folder,
-    test_file_info,
     test_memory,
-    test_semantic_search,
-    test_open_file,
     test_web_fetch,
     test_web_search,
     test_terminal,
@@ -743,15 +595,8 @@ const test_order = [_][]const u8{
     "read_file",
     "glob_files",
     "grep_files",
-    "list_files",
-    "file_info",
-    "semantic_search",
     "edit_file",
     "write_file",
-    "delete_file",
-    "rename_file",
-    "copy_file",
-    "create_folder",
     "terminal",
     "subagent",
     "capability_search",
@@ -760,7 +605,6 @@ const test_order = [_][]const u8{
     "mcp_select_tool",
     "memory",
     "ask_user_question",
-    "open_file",
     "web_fetch",
     "web_search",
 };
@@ -769,7 +613,6 @@ const test_read_only_names = [_][]const u8{
     "read_file",
     "glob_files",
     "grep_files",
-    "list_files",
 };
 
 const test_tool_set = tool_set_contract.ToolSet{
@@ -777,6 +620,50 @@ const test_tool_set = tool_set_contract.ToolSet{
     .order = test_order[0..],
     .read_only_tool_names = test_read_only_names[0..],
 };
+
+test "terminal capability no-match suppresses only the next tool group" {
+    const names = [_][]const u8{ "capability_search", "read_file" };
+    const functions = [_]model_tool_schema.FunctionSchema{
+        test_capability_search.model_schema,
+        test_read_file.model_schema,
+    };
+    const terminal_messages = [_]types.ChatMessage{
+        .{ .role = .assistant },
+        .{
+            .role = .tool,
+            .tool_name = "capability_search",
+            .content = "{\"state\":\"no_match\"}",
+        },
+    };
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const suppressed = try projectForTurn(
+        arena_state.allocator(),
+        &names,
+        &functions,
+        &terminal_messages,
+    );
+    try std.testing.expectEqual(@as(usize, 1), suppressed.advertised_names.len);
+    try std.testing.expectEqualStrings("read_file", suppressed.advertised_names[0]);
+    try std.testing.expectEqual(@as(usize, 1), suppressed.advertised_functions.len);
+    try std.testing.expectEqualStrings(
+        "read_file",
+        suppressed.advertised_functions[0].name,
+    );
+
+    const later_messages = terminal_messages ++ [_]types.ChatMessage{
+        .{ .role = .assistant },
+        .{ .role = .tool, .tool_name = "read_file", .content = "local evidence" },
+    };
+    const restored = try projectForTurn(
+        arena_state.allocator(),
+        &names,
+        &functions,
+        &later_messages,
+    );
+    try std.testing.expectEqual(@as(usize, 2), restored.advertised_names.len);
+    try std.testing.expect(containsName(restored.advertised_names, "capability_search"));
+}
 
 fn testToolSetForRegistry(tools: []const tool_dispatch.Tool) tool_set_contract.ToolSet {
     return .{

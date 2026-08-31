@@ -93,6 +93,7 @@ pub fn Runtime(comptime App: type) type {
             switch (err) {
                 error.ConnectionSetupTimedOut => return alloc.dupe(u8, "Connection setup timed out after 30 seconds."),
                 error.TlsInitializationFailed => return alloc.dupe(u8, "Connection setup failed: TLS could not be initialized."),
+                error.ModelImageCapabilityUnavailable => return alloc.dupe(u8, image_attachments.model_image_capability_unavailable_notice),
                 else => {},
             }
             if (detailedErrorSummary(err)) |detail| {
@@ -171,6 +172,23 @@ test "formatErrorBody describes an interrupted provider response without present
     try std.testing.expect(std.mem.find(u8, body, "StreamInterrupted") != null);
     try std.testing.expect(std.mem.find(u8, body, "\x1b[") == null);
     try std.testing.expect(!std.mem.endsWith(u8, body, "\n"));
+}
+
+test "formatErrorBody explains unresolved image capability" {
+    const alloc = std.testing.allocator;
+    const Rt = Runtime(DummyApp);
+    const body = try Rt.formatErrorBody(
+        alloc,
+        "request failed",
+        error.ModelImageCapabilityUnavailable,
+    );
+    defer alloc.free(body);
+
+    try std.testing.expectEqualStrings(
+        "Unable to verify image support for this model, so the image was not sent. Try again later, choose another model, or remove the image.",
+        body,
+    );
+    try std.testing.expect(std.mem.find(u8, body, "ModelImageCapabilityUnavailable") == null);
 }
 
 test "formatErrorBody describes terminal connection setup failures plainly" {
