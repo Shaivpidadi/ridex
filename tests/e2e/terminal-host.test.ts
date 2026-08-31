@@ -5921,6 +5921,13 @@ test.skipIf(!tmuxAvailable())(
       8_000,
     );
     const recovered = await handshake(paths.socket, { minimum: 4, current: 5 });
+    success(await requestAction(
+      recovered.client,
+      recovered.revision!,
+      341,
+      "write",
+      { session_id: siblingId, payload: { text: "after-restart\n" } },
+    ), "write");
     expect(readdirSync(stateDir)).not.toContain(transactionName);
     expect(existsSync(tmuxSocket)).toBe(true);
     const names = execFileSync(
@@ -5929,13 +5936,6 @@ test.skipIf(!tmuxAvailable())(
       { encoding: "utf8" },
     ).trim().split("\n");
     expect(names).toEqual([`fx-${siblingIdentity}`]);
-    success(await requestAction(
-      recovered.client,
-      recovered.revision!,
-      341,
-      "write",
-      { session_id: siblingId, payload: { text: "after-restart\n" } },
-    ), "write");
     const afterRestart = success(await requestAction(
       recovered.client,
       recovered.revision!,
