@@ -24,6 +24,8 @@ const identity_name = "host.json";
 const host_dir_name = "terminal-host-v7";
 const default_idle_grace_ms: u64 = 30_000;
 const identity_max_bytes: usize = 1024;
+// macOS GUI apps commonly inherit 256, below the host's 64-session budget.
+const desired_file_descriptor_limit: u64 = 1024;
 const max_connection_requests: usize = 32;
 const listener_poll_ms = 50;
 const transport_hash_bytes: usize = 16;
@@ -377,7 +379,50 @@ const IdentityRecord = struct {
 
 pub fn run(alloc: Allocator, config: Config) !void {
     if (comptime !isSupported()) return error.TerminalHostUnsupported;
-    return runSupported(alloc, config);
+    ensureFileDescriptorBudget();
+    return runSupported(alloc, config) catch |err| {
+        debug_trace.logf(
+            "terminal_host",
+            "host startup failed err={s}",
+            .{@errorName(err)},
+        );
+        return err;
+    };
+}
+
+fn fileDescriptorLimitTarget(current: u64, maximum: u64) ?u64 {
+    const target = @min(maximum, desired_file_descriptor_limit);
+    return if (current < target) target else null;
+}
+
+fn ensureFileDescriptorBudget() void {
+    if (comptime builtin.os.tag != .macos and builtin.os.tag != .linux) return;
+    var limits = std.posix.getrlimit(.NOFILE) catch |err| {
+        debug_trace.logf(
+            "terminal_host",
+            "host file descriptor limit unavailable err={s}",
+            .{@errorName(err)},
+        );
+        return;
+    };
+    const target = fileDescriptorLimitTarget(
+        @intCast(limits.cur),
+        @intCast(limits.max),
+    ) orelse return;
+    limits.cur = @intCast(target);
+    std.posix.setrlimit(.NOFILE, limits) catch |err| {
+        debug_trace.logf(
+            "terminal_host",
+            "host file descriptor limit unchanged target={d} err={s}",
+            .{ target, @errorName(err) },
+        );
+        return;
+    };
+    debug_trace.logf(
+        "terminal_host",
+        "host file descriptor limit raised soft={d}",
+        .{target},
+    );
 }
 
 fn runSupported(alloc: Allocator, config: Config) !void {
@@ -451,7 +496,14 @@ fn runSupported(alloc: Allocator, config: Config) !void {
         startup.ready.set(io_mod.getIo());
         accept_thread.join();
         accept_joined = true;
-        _ = drainConnectedClients(&state, client_drain_timeout_ms);
+        if (!drainConnectedClients(&state, client_drain_timeout_ms)) {
+            debug_trace.logf(
+                "terminal_host",
+                "host startup failed with {d} client thread(s) still running; preserving shared state until process exit",
+                .{state.connected_clients.load(.acquire)},
+            );
+            std.process.exit(1);
+        }
     };
 
     debug_trace.logf(
@@ -460,6 +512,9 @@ fn runSupported(alloc: Allocator, config: Config) !void {
         .{ std.c.getpid(), config.hello.range.minimum, config.hello.range.current },
     );
     maybeDelayForTest("FX_TERMINAL_TEST_STARTUP_RECOVERY_DELAY_MS");
+    if (io_mod.getenv("FX_TERMINAL_TEST_STARTUP_RECOVERY_FAILURE") != null) {
+        return error.TerminalHostStartupRecoveryFailed;
+    }
     var persistent_store = try terminal_store.ProfileStore.init(
         alloc,
         home,
@@ -1526,6 +1581,21 @@ test "terminal host selection follows canonical platform support" {
         );
     }
     try std.testing.expectEqual(isSupportedForOs(builtin.os.tag), isSupported());
+}
+
+test "terminal host file descriptor target is bounded by the hard limit" {
+    try std.testing.expectEqual(
+        @as(?u64, desired_file_descriptor_limit),
+        fileDescriptorLimitTarget(256, std.math.maxInt(u64)),
+    );
+    try std.testing.expectEqual(
+        @as(?u64, 512),
+        fileDescriptorLimitTarget(256, 512),
+    );
+    try std.testing.expectEqual(
+        @as(?u64, null),
+        fileDescriptorLimitTarget(desired_file_descriptor_limit, 4096),
+    );
 }
 
 test "host identity capture and reconciliation use the injected provider" {

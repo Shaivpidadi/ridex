@@ -33,6 +33,7 @@ import {
   fakeGatewaySerializedToolCall,
   fakeGatewaySse,
   fakeGatewayToolCall,
+  fakeShellRun,
   POST_TOOL_DECISION_PROMPT,
   startDynamicFakeGateway,
   startFakeGateway,
@@ -144,8 +145,10 @@ function lengthLimitedCommandCall(command: string) {
     {
       type: "tool-call",
       toolCallId: "command_1",
-      toolName: "terminal",
-      input: { action: "exec", timeout_ms: 600_000, command },
+      toolName: "shell",
+      input: {
+        request: { action: "run", yield_time_ms: 30_000, timeout_ms: 600_000, command },
+      },
     },
     {
       type: "finish",
@@ -7154,10 +7157,8 @@ describe("acp: model-independent", () => {
         JSON.stringify({ permission: { bash: { "printf *": "ask" } } }),
       );
       const gateway = startFakeGateway([
-        fakeGatewayToolCall("approved_command_1", "terminal", {
-          action: "exec",
+        fakeShellRun("approved_command_1", `printf approved > '${marker}'`, {
           timeout_ms: 600_000,
-          command: `printf approved > '${marker}'`,
         }),
         finalText("command approval complete"),
       ]);
@@ -7938,11 +7939,11 @@ describe("acp: model-independent", () => {
       const heldReview = deferred<Response>();
       const gateway = startFakeGateway(
         [
-          fakeGatewayToolCall("cancelled_review_command", "terminal", {
-            action: "exec",
-            timeout_ms: 600_000,
-            command: `printf cancelled > ${JSON.stringify(marker)}`,
-          }),
+          fakeShellRun(
+            "cancelled_review_command",
+            `printf cancelled > ${JSON.stringify(marker)}`,
+            { timeout_ms: 600_000 },
+          ),
           finalText("follow-up after ACP review cancellation"),
         ],
         { classifierResponses: [() => heldReview.promise] },

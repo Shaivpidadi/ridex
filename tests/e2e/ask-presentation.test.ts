@@ -19,6 +19,7 @@ import {
   fakeGatewaySse,
   fakeGatewaySerializedToolCall,
   fakeGatewayToolCall,
+  fakeShellRun,
   startDynamicFakeGateway,
   startFakeGateway,
   terminalFixtureShell,
@@ -758,10 +759,8 @@ describe("fx ask presentation", () => {
       symlinkSync(instructions, join(root.workspace, "AGENTS.md"));
       const gateway = startFakeGateway(
         [
-          fakeGatewayToolCall("write_fixture", "terminal", {
-            action: "exec",
+          fakeShellRun("write_fixture", "printf notice-test > ask-notice.txt", {
             timeout_ms: 600_000,
-            command: "printf notice-test > ask-notice.txt",
           }),
           fakeGatewayFinalText("Notice filtering complete.\n"),
         ],

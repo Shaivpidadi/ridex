@@ -1723,6 +1723,24 @@ test("fatal host drain timeout exits before shared-state teardown", async () => 
   expect(existsSync(paths.identity)).toBe(false);
 }, 15_000);
 
+test("startup recovery failure exits before stalled client teardown", async () => {
+  const home = makeHome();
+  const paths = hostPaths(home);
+  const host = startHost(home, undefined, 10_000, {
+    FX_TERMINAL_TEST_STARTUP_RECOVERY_DELAY_MS: "1000",
+    FX_TERMINAL_TEST_STARTUP_RECOVERY_FAILURE: "1",
+  });
+  await waitFor(() => existsSync(paths.socket) && existsSync(paths.identity));
+
+  const stalled = await FrameClient.connect(paths.socket);
+  expect(await waitForExit(host)).toBe(1);
+  expect(await streamText(host.stdout)).toBe("");
+  expect(await streamText(host.stderr)).toBe("");
+  expect(existsSync(paths.socket)).toBe(true);
+  expect(existsSync(paths.identity)).toBe(true);
+  stalled.close();
+}, 15_000);
+
 test("client reconciles an idle-retiring host before admitting a request", async () => {
   const home = makeHome();
   const paths = hostPaths(home);

@@ -1877,7 +1877,6 @@ fn approvalQuestion(label: []const u8, dynamic_mcp: bool) []const u8 {
 fn approvalTarget(label: []const u8) []const u8 {
     const prefixes = [_][]const u8{
         "shell.run ",
-        "shell.run ",
         "write_file ",
         "edit_file ",
         "task ",
@@ -1977,7 +1976,6 @@ fn approvalAlwaysChoice(approval: ApprovalProjection, label: []const u8) []const
 }
 
 fn commandLabelPrefix(label: []const u8) ?[]const u8 {
-    if (std.mem.startsWith(u8, label, "shell.run ")) return "shell.run ";
     if (std.mem.startsWith(u8, label, "shell.run ")) return "shell.run ";
     return null;
 }

@@ -96,34 +96,8 @@ afterEach(async () => {
 });
 
 function sse(events: object[]) {
-  const projected = events.map((event) => {
-    const candidate = event as {
-      type?: string;
-      toolName?: string;
-      input?: Record<string, unknown>;
-    };
-    if (candidate.toolName !== "terminal") return event;
-    if (candidate.type === "tool-input-start") {
-      return { ...candidate, toolName: "shell" };
-    }
-    if (candidate.type !== "tool-call" || candidate.input?.action !== "exec") {
-      return event;
-    }
-    const { action: _, ...fields } = candidate.input;
-    return {
-      ...candidate,
-      toolName: "shell",
-      input: {
-        request: {
-          action: "run",
-          yield_time_ms: 30_000,
-          ...fields,
-        },
-      },
-    };
-  });
   return new Response(
-    `${projected.map((event) => `data: ${JSON.stringify(event)}\n\n`).join("")}data: [DONE]\n\n`,
+    `${events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join("")}data: [DONE]\n\n`,
     { headers: { "content-type": "text/event-stream" } },
   );
 }
@@ -1430,13 +1404,20 @@ describe("effect-aware command permissions", () => {
       const streamText = "DIRECT_NO_NOTICE_STREAM_TEXT";
       const gateway = startFakeGateway([
         sse([
-          { type: "tool-input-start", id: "command_1", toolName: "terminal" },
+          { type: "tool-input-start", id: "command_1", toolName: "shell" },
           { type: "text-delta", id: "answer_1", delta: streamText },
           {
             type: "tool-call",
             toolCallId: "command_1",
-            toolName: "terminal",
-            input: { action: "exec", timeout_ms: 600_000, command: "pwd" },
+            toolName: "shell",
+            input: {
+              request: {
+                action: "run",
+                yield_time_ms: 30_000,
+                timeout_ms: 600_000,
+                command: "pwd",
+              },
+            },
           },
           {
             type: "finish",
@@ -1533,7 +1514,7 @@ describe("effect-aware command permissions", () => {
           ...calls.map((call) => ({
             type: "tool-input-start",
             id: call.id,
-            toolName: "terminal",
+            toolName: "shell",
           })),
           {
             type: "text-delta",
@@ -1543,8 +1524,15 @@ describe("effect-aware command permissions", () => {
           ...calls.map((call) => ({
             type: "tool-call",
             toolCallId: call.id,
-            toolName: "terminal",
-            input: { action: "exec", timeout_ms: 600_000, command: call.command },
+            toolName: "shell",
+            input: {
+              request: {
+                action: "run",
+                yield_time_ms: 30_000,
+                timeout_ms: 600_000,
+                command: call.command,
+              },
+            },
           })),
           {
             type: "finish",
@@ -2246,13 +2234,20 @@ describe("effect-aware command permissions", () => {
             {
               type: "tool-input-start",
               id: "scrollback_command",
-              toolName: "terminal",
+              toolName: "shell",
             },
             {
               type: "tool-call",
               toolCallId: "scrollback_command",
-              toolName: "terminal",
-              input: { action: "exec", timeout_ms: 600_000, command: "seq 1 1" },
+              toolName: "shell",
+              input: {
+                request: {
+                  action: "run",
+                  yield_time_ms: 30_000,
+                  timeout_ms: 600_000,
+                  command: "seq 1 1",
+                },
+              },
             },
             {
               type: "finish",
@@ -4645,11 +4640,11 @@ describe("effect-aware command permissions", () => {
           return finalText("INTERACTIVE_CHILD_DENIED_COMPLETE");
         }
         if (userText.includes(childPrompt)) {
-          return gatewayToolCall("terminal", {
-            action: "exec",
-            timeout_ms: 600_000,
-            command: `/usr/bin/touch ${shellQuote(markerPath)}`,
-          }, childCommandCallId);
+          return toolCall(
+            `/usr/bin/touch ${shellQuote(markerPath)}`,
+            {},
+            childCommandCallId,
+          );
         }
         if (body.includes(`\"toolCallId\":\"${rootProbeCallId}\"`) &&
             body.includes('"type":"tool-result"')) {
@@ -4793,11 +4788,11 @@ describe("effect-aware command permissions", () => {
           childRequestCount += 1;
           if (childRequestCount <= 4) {
             if (childRequestCount > 1) expect(body).toContain("review_caution");
-            return gatewayToolCall("terminal", {
-              action: "exec",
-              timeout_ms: 600_000,
-              command: `/usr/bin/touch ${shellQuote(markerPath)}`,
-            }, `child_auto_command_${childRequestCount}`);
+            return toolCall(
+              `/usr/bin/touch ${shellQuote(markerPath)}`,
+              {},
+              `child_auto_command_${childRequestCount}`,
+            );
           }
           if (childRequestCount === 5) {
             return finalText("INTERACTIVE_AUTO_CAUTION_CHILD_COMPLETE");

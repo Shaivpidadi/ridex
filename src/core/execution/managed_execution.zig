@@ -1504,13 +1504,15 @@ test "captured managed execution yields one handle and delivers ordered output o
     try runtime.commitDelivery(repeated.snapshot.execution_id, repeated.reservation_id);
 }
 
-test "captured execution identity rejects a different command" {
+test "generated captured execution identities do not depend on provider call ids" {
     if (comptime builtin.os.tag == .wasi) return;
     const alloc = std.testing.allocator;
     var runtime = Runtime.init(alloc);
     defer runtime.deinit();
+    var first_id_buffer: [64]u8 = undefined;
+    const first_id = try runtime.generatedId(&first_id_buffer);
     var first = StartCapturedInput{
-        .execution_id = "managed-identity",
+        .execution_id = first_id,
         .command = "sleep 1",
         .cwd = "/tmp",
         .environment = .legacy,
@@ -1525,13 +1527,17 @@ test "captured execution identity rejects a different command" {
     defer started.deinit(alloc);
     try runtime.commitDelivery(started.snapshot.execution_id, started.reservation_id);
 
-    var conflicting = first;
-    conflicting.command = "printf should-not-run";
-    conflicting.authority = testAuthority(conflicting);
-    try std.testing.expectError(
-        error.ExecutionIdentityConflict,
-        runtime.startCaptured(alloc, conflicting),
-    );
+    var second_id_buffer: [64]u8 = undefined;
+    const second_id = try runtime.generatedId(&second_id_buffer);
+    try std.testing.expect(!std.mem.eql(u8, first_id, second_id));
+
+    var second = first;
+    second.execution_id = second_id;
+    second.command = "printf should-run";
+    second.authority = testAuthority(second);
+    var next = try runtime.startCaptured(alloc, second);
+    defer next.deinit(alloc);
+    try runtime.commitDelivery(next.snapshot.execution_id, next.reservation_id);
 }
 
 test "captured managed execution capacity rejects before spawn" {

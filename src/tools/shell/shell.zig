@@ -387,8 +387,11 @@ fn callRun(
             .{@errorName(err)},
         ) };
     };
+    var execution_id_buffer: [64]u8 = undefined;
+    const execution_id = runtime.generatedId(&execution_id_buffer) catch |err|
+        return runtimeFailure(ctx, err);
     var prepared = runtime.startCaptured(ctx.allocator, .{
-        .execution_id = ctx.tool_call_id,
+        .execution_id = execution_id,
         .command = command,
         .cwd = cwd,
         .environment = environment,
@@ -1871,6 +1874,19 @@ test "registered shell run yields and waits through one managed execution" {
     try std.testing.expectEqual(tool_dispatch.DispatchResult.Status.success, started.status);
     try std.testing.expect(std.mem.find(u8, started.body, "\"state\":\"running\"") != null);
 
+    const executions = try runtime.list(alloc);
+    defer {
+        for (executions) |*execution| execution.deinit(alloc);
+        alloc.free(executions);
+    }
+    try std.testing.expectEqual(@as(usize, 1), executions.len);
+    const wait_arguments = try std.fmt.allocPrint(
+        alloc,
+        "{{\"action\":\"wait\",\"session_id\":\"{s}\",\"wait_ceiling_ms\":2000}}",
+        .{executions[0].execution_id},
+    );
+    defer alloc.free(wait_arguments);
+
     var wait_status_detail: ?[]u8 = null;
     defer if (wait_status_detail) |detail| alloc.free(detail);
     var command_result_json: ?[]const u8 = null;
@@ -1896,7 +1912,7 @@ test "registered shell run yields and waits through one managed execution" {
         .{
             .id = "shell-wait",
             .name = "shell",
-            .arguments_json = "{\"action\":\"wait\",\"session_id\":\"shell-integration\",\"wait_ceiling_ms\":2000}",
+            .arguments_json = wait_arguments,
         },
         &wait_status_detail,
     );

@@ -177,6 +177,15 @@ async function cleanupTerminalHost(home: string): Promise<void> {
   }
 }
 
+async function waitForFile(path: string): Promise<void> {
+  const deadline = Date.now() + TIMEOUT;
+  while (Date.now() < deadline) {
+    if (existsSync(path)) return;
+    await Bun.sleep(25);
+  }
+  throw new Error(`Timed out waiting for ${path}`);
+}
+
 test.skipIf(!tmuxAvailable())(
   "shell captured execution yields one handle and waits without respawn",
   async () => {
@@ -227,12 +236,64 @@ test.skipIf(!tmuxAvailable())(
     expect(runResult).toContain(`\\"session_id\\":\\"${sessionId}\\"`);
     const scrollback = await active.captureFullScrollback();
     expect(scrollback).toContain("Ran printf CAPTURED_READY");
-    expect(scrollback).toContain("Finished waiting for session shell_run");
+    expect(scrollback).toContain(`Finished waiting for session ${sessionId}`);
     expect(scrollback).not.toContain("Using terminal");
     expect(scrollback).not.toContain("Used terminal");
     expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
   },
   TIMEOUT,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "reused provider call ids start distinct captured commands",
+  async () => {
+    const fixture = createFixture("fx-shell-reused-call-id-");
+    const firstMarker = join(fixture.workspace, "first-command.txt");
+    const secondMarker = join(fixture.workspace, "second-command.txt");
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("reused_shell_call", "shell", {
+        request: {
+          action: "run",
+          command: `printf first > ${JSON.stringify(firstMarker)}; sleep 30`,
+          profile: "clean",
+          yield_time_ms: 0,
+        },
+      }),
+      fakeGatewayFinalText("FIRST_REUSED_CALL_DONE"),
+      fakeGatewayToolCall("reused_shell_call", "shell", {
+        request: {
+          action: "run",
+          command: `printf second > ${JSON.stringify(secondMarker)}; sleep 30`,
+          profile: "clean",
+          yield_time_ms: 0,
+        },
+      }),
+      fakeGatewayFinalText("SECOND_REUSED_CALL_DONE"),
+    ]);
+    gateways.push(gateway);
+    const active = await launch(fixture, gateway);
+
+    await active.sendText("Run the first captured command.");
+    await active.sendKeys("Enter");
+    await active.waitForText("FIRST_REUSED_CALL_DONE", TIMEOUT);
+    await active.sendText("Run the second captured command.");
+    await active.sendKeys("Enter");
+    await active.waitForText("SECOND_REUSED_CALL_DONE", TIMEOUT);
+
+    const firstSessionId = findSessionId(JSON.parse(gateway.requests[1]!.body));
+    const secondSessionId = findSessionId(JSON.parse(gateway.requests[3]!.body));
+    expect(firstSessionId).not.toBeNull();
+    expect(secondSessionId).not.toBeNull();
+    expect(firstSessionId).not.toBe(secondSessionId);
+    await Promise.all([waitForFile(firstMarker), waitForFile(secondMarker)]);
+    expect(readFileSync(firstMarker, "utf8")).toBe("first");
+    expect(readFileSync(secondMarker, "utf8")).toBe("second");
+
+    await active.sendText("/quit");
+    expect(await active.waitForSessionEnd(TIMEOUT)).toBe(true);
+    expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+  },
+  60_000,
 );
 
 test.skipIf(!tmuxAvailable())(
@@ -622,6 +683,37 @@ test.skipIf(!tmuxAvailable())(
     expect(terminalRecords(fixture.home).some((record) =>
       record.lifecycle === "running" &&
       String(record.command).includes("DIRECT_READY")
+    )).toBe(true);
+    expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+  },
+  TIMEOUT,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "resumed fx restores a durable direct human command to Ctrl-X",
+  async () => {
+    const fixture = createFixture("fx-shell-direct-resume-");
+    const gateway = startFakeGateway([]);
+    gateways.push(gateway);
+    const first = await launch(fixture, gateway);
+
+    await first.sendText("!printf 'DIRECT_RESUME_READY\\n'; sleep 30");
+    await first.sendKeys("Enter");
+    await first.waitForText("Running", TIMEOUT);
+    await first.sendText("/quit");
+    expect(await first.waitForSessionEnd(TIMEOUT)).toBe(true);
+
+    const resumed = await launch(fixture, gateway, `${FX_BIN} --resume-last`);
+    await resumed.sendKeys("C-x");
+    await resumed.waitForPane(
+      (pane) =>
+        pane.includes("Background processes") &&
+        pane.includes("printf 'DIRECT_RESUME_READY"),
+      TIMEOUT,
+    );
+    expect(terminalRecords(fixture.home).some((record) =>
+      record.lifecycle === "running" &&
+      String(record.command).includes("DIRECT_RESUME_READY")
     )).toBe(true);
     expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
   },

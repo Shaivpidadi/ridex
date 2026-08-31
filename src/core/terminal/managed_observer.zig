@@ -216,7 +216,7 @@ pub fn syncOwned(ctx: Context) !void {
         },
     };
     for (sessions) |facts| {
-        if (!facts.model_managed or facts.lifecycle == .closed or
+        if (facts.lifecycle == .closed or
             ctx.managed_runtime.backendFor(facts.session_id) != null)
         {
             continue;

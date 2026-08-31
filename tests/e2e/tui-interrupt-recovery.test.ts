@@ -16,7 +16,7 @@ import { readTrace } from "./tui-render-assertions";
 import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
-  fakeGatewayToolCall,
+  fakeShellRun,
   startFakeGateway,
   TmuxSession,
   tmuxAvailable,
@@ -340,10 +340,8 @@ while :; do sleep 1; done
       chmodSync(scriptPath, 0o755);
 
       gateway = startFakeGateway([
-        fakeGatewayToolCall("workspace-cancel-hold", "terminal", {
-          action: "exec",
+        fakeShellRun("workspace-cancel-hold", "./hold-workspace-cancel.sh", {
           timeout_ms: 600_000,
-          command: "./hold-workspace-cancel.sh",
         }),
       ]);
       session = await TmuxSession.create({

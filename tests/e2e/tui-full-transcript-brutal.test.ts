@@ -20,7 +20,7 @@ import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
   fakeGatewaySse,
-  fakeGatewayToolCall,
+  fakeShellRun,
   startFakeGateway,
   TmuxSession,
   tmuxAvailable,
@@ -389,10 +389,8 @@ done
     responses.push(batchResponse(batch, config));
   }
   responses.push(fakeGatewayFinalText(`${HISTORY_DONE}\n${TAIL_SENTINEL}`));
-  responses.push(fakeGatewayToolCall("ctrl-o-brutal-live", "terminal", {
-    action: "exec",
+  responses.push(fakeShellRun("ctrl-o-brutal-live", "./ctrl-o-live.sh", {
     timeout_ms: 600_000,
-    command: "./ctrl-o-live.sh",
   }));
   responses.push(fakeGatewayFinalText(LIVE_DONE));
 

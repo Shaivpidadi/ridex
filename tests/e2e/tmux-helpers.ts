@@ -125,34 +125,8 @@ export function hasEmptyComposer(pane: string): boolean {
 }
 
 export function fakeGatewaySse(events: object[]) {
-  const projected = events.map((event) => {
-    const candidate = event as {
-      type?: string;
-      toolName?: string;
-      input?: Record<string, unknown>;
-    };
-    if (
-      candidate.type !== "tool-call" ||
-      candidate.toolName !== "terminal" ||
-      candidate.input?.action !== "exec"
-    ) {
-      return event;
-    }
-    const { action: _, ...fields } = candidate.input;
-    return {
-      ...candidate,
-      toolName: "shell",
-      input: {
-        request: {
-          action: "run",
-          yield_time_ms: 30_000,
-          ...fields,
-        },
-      },
-    };
-  });
   return new Response(
-    `${projected.map((event) => `data: ${JSON.stringify(event)}\n\n`).join("")}data: [DONE]\n\n`,
+    `${events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join("")}data: [DONE]\n\n`,
     { headers: { "content-type": "text/event-stream" } },
   );
 }
@@ -174,6 +148,21 @@ export function fakeGatewayToolCall(
       finishReason: { unified: "tool-calls", raw: "tool-calls" },
     },
   ]);
+}
+
+export function fakeShellRun(
+  id: string,
+  command: string,
+  options: Record<string, unknown> = {},
+) {
+  return fakeGatewayToolCall(id, "shell", {
+    request: {
+      yield_time_ms: 30_000,
+      ...options,
+      action: "run",
+      command,
+    },
+  });
 }
 
 export function fakeGatewayPermissionDecision(
