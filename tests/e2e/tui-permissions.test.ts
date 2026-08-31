@@ -1680,7 +1680,7 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
       const gateway = startFakeGateway([
         chunkedWriteToolCall("maximum_write", "maximum.txt", content),
         finalText(
-          "# Objective\nFinish the maximum-size write workflow.\n\n# Completed effects\nmaximum.txt was written once.\n\n# Next action\nReport completion.",
+          '{"objective":{"text":"Finish the maximum-size write workflow.","sources":["S0"]},"constraints":[],"obligations":[],"next_action":{"kind":"none","text":"Continue the active turn.","sources":["S0"]}}',
         ),
         finalText("maximum write complete"),
       ]);
@@ -1715,7 +1715,7 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
       const gateway = startFakeGateway([
         chunkedWriteToolCall("oversized_write", "oversized.txt", content),
         finalText(
-          "# Objective\nReport the rejected oversized write.\n\n# Failures\nwrite_file rejected content above the 4 MiB limit.\n\n# Next action\nReport completion without retrying.",
+          '{"objective":{"text":"Report the rejected oversized write.","sources":["S0"]},"constraints":[],"obligations":[],"next_action":{"kind":"none","text":"Continue without retrying.","sources":["S0"]}}',
         ),
         finalText("oversized write complete"),
       ]);

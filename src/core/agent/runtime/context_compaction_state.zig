@@ -7,6 +7,7 @@ pub const max_item_text_bytes: usize = 160;
 pub const max_item_sources: usize = 8;
 pub const max_constraints: usize = 12;
 pub const max_obligations: usize = 12;
+const max_inline_arguments_bytes: usize = 1024;
 
 pub const SourceRole = enum {
     user,
@@ -519,10 +520,7 @@ pub fn renderCheckpoint(
     for (sources) |source| {
         if (source.role == .assistant) {
             for (source.tool_calls) |call| {
-                try out.writer.print(
-                    "- [S{d}] call id={s} name={s} arguments={s}\n",
-                    .{ source.id, call.id, call.name, call.arguments_json },
-                );
+                try writeToolCallEvidence(&out.writer, source.id, call);
             }
         }
         if (source.role == .tool) {
@@ -549,6 +547,25 @@ pub fn renderCheckpoint(
             "Do not repeat completed effects or invent absent evidence.",
     );
     return out.toOwnedSlice() catch return error.OutOfMemory;
+}
+
+fn writeToolCallEvidence(
+    writer: *std.Io.Writer,
+    source_id: usize,
+    call: types.ToolCall,
+) RenderError!void {
+    try writer.print("- [S{d}] call id={s} name={s}", .{ source_id, call.id, call.name });
+    if (call.arguments_json.len <= max_inline_arguments_bytes) {
+        try writer.print(" arguments={s}\n", .{call.arguments_json});
+        return;
+    }
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(call.arguments_json, &digest, .{});
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    try writer.print(
+        " arguments_bytes={d} arguments_sha256={s}\n",
+        .{ call.arguments_json.len, &hex },
+    );
 }
 
 pub fn deriveCurrentUserFacts(
@@ -761,6 +778,30 @@ test "operation lineage requires exact call identity and successful result" {
     const none = try deriveOperationLineage(alloc, &changed_sources);
     defer alloc.free(none);
     try std.testing.expectEqual(@as(usize, 0), none.len);
+}
+
+test "checkpoint renders oversized tool arguments as bounded identity evidence" {
+    const alloc = std.testing.allocator;
+    const calls = [_]types.ToolCall{.{
+        .id = "large",
+        .name = "write_file",
+        .arguments_json = "x" ** (max_inline_arguments_bytes + 1),
+    }};
+    const sources = [_]SourceRecord{
+        .{ .id = 0, .role = .user, .content = "write the fixture" },
+        .{ .id = 1, .role = .assistant, .tool_calls = &calls },
+    };
+    const state = OperationalState{
+        .objective = .{ .text = "finish", .source_ids = &.{0} },
+        .constraints = &.{},
+        .obligations = &.{},
+        .next_action = .{ .kind = .none, .text = "wait", .source_ids = &.{0} },
+    };
+    const rendered = try renderCheckpoint(alloc, state, &sources, &.{});
+    defer alloc.free(rendered);
+    try std.testing.expect(std.mem.find(u8, rendered, "arguments_bytes=1025") != null);
+    try std.testing.expect(std.mem.find(u8, rendered, "arguments_sha256=") != null);
+    try std.testing.expect(rendered.len < max_inline_arguments_bytes);
 }
 
 test "lineage rejects an active resolved failure and repair action" {

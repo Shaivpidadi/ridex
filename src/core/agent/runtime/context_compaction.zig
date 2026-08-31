@@ -217,7 +217,7 @@ pub fn compact(
             errdefer while (joined < launched) {
                 futures[joined].await(io_mod.getIo());
                 if (workers[joined].result) |call| {
-                    std.heap.smp_allocator.free(call.text);
+                    std.heap.c_allocator.free(call.text);
                 } else |_| {}
                 joined += 1;
             };
@@ -248,7 +248,7 @@ pub fn compact(
                 const worker = &workers[joined];
                 joined += 1;
                 const call = try worker.result;
-                defer std.heap.smp_allocator.free(call.text);
+                defer std.heap.c_allocator.free(call.text);
                 if (wordCount(call.text) > block_summary_word_limit) {
                     return error.CompactionHandoffTooLarge;
                 }
@@ -357,7 +357,7 @@ const BlockWorker = struct {
     }
 
     fn execute(self: *BlockWorker) !SemanticCall {
-        const alloc = std.heap.smp_allocator;
+        const alloc = std.heap.c_allocator;
         const source_text = try compaction_state.formatSourceMessages(
             alloc,
             self.sources,
