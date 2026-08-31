@@ -1433,7 +1433,7 @@ describe("Vision route fake Gateway", () => {
   );
 
   test(
-    "text-only GLM ask skips image capability and Vision IO",
+    "text-only GLM ask resolves context capacity without Vision IO",
     async () => {
       const root = createIsolatedRoot();
       const gateway = startImageGateway([sseText("text only answer")]);
@@ -1450,7 +1450,7 @@ describe("Vision route fake Gateway", () => {
         const json = parseFxJson(result);
         expect(json.exit_code).toBe(0);
         expect(json.output).toContain("text only answer");
-        expect(gateway.catalogRequests).toBe(0);
+        expect(gateway.catalogRequests).toBe(1);
         expect(gateway.chatRequests).toHaveLength(1);
         expect(gateway.chatRequests[0].headers.get("ai-language-model-id")).toBe(GLM_MODEL);
         expect(gateway.chatRequests[0].body).not.toContain('"type":"file"');
