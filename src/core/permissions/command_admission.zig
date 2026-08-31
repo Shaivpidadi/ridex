@@ -5,11 +5,17 @@ const command_environment = @import("../execution/command_environment.zig");
 const file_mutation_contract = @import("../tooling/file_mutation_contract.zig");
 const types = @import("../shared/types.zig");
 
+pub const CommandExecutionMode = enum {
+    captured,
+    tty,
+};
+
 pub const CommandContext = struct {
     command: []const u8,
     resolved_cwd: []const u8,
     target_os: std.Target.Os.Tag,
     environment: command_environment.Environment = .legacy,
+    execution_mode: CommandExecutionMode = .captured,
 };
 
 pub const AdmissionFingerprint = struct {
@@ -17,6 +23,7 @@ pub const AdmissionFingerprint = struct {
     resolved_cwd: []const u8,
     target_os: std.Target.Os.Tag,
     environment: command_environment.Environment = .legacy,
+    execution_mode: CommandExecutionMode = .captured,
 
     pub fn init(ctx: CommandContext) AdmissionFingerprint {
         return .{
@@ -24,6 +31,7 @@ pub const AdmissionFingerprint = struct {
             .resolved_cwd = ctx.resolved_cwd,
             .target_os = ctx.target_os,
             .environment = ctx.environment,
+            .execution_mode = ctx.execution_mode,
         };
     }
 
@@ -31,7 +39,8 @@ pub const AdmissionFingerprint = struct {
         return std.mem.eql(u8, self.command, ctx.command) and
             std.mem.eql(u8, self.resolved_cwd, ctx.resolved_cwd) and
             self.target_os == ctx.target_os and
-            self.environment.eql(ctx.environment);
+            self.environment.eql(ctx.environment) and
+            self.execution_mode == ctx.execution_mode;
     }
 
     pub fn eql(self: AdmissionFingerprint, other: AdmissionFingerprint) bool {
@@ -40,6 +49,7 @@ pub const AdmissionFingerprint = struct {
             .resolved_cwd = other.resolved_cwd,
             .target_os = other.target_os,
             .environment = other.environment,
+            .execution_mode = other.execution_mode,
         });
     }
 };
@@ -114,11 +124,12 @@ pub fn defaultForRunCommand(
     command_ctx: CommandContext,
     permission_mode: types.PermissionMode,
 ) DefaultApproval {
-    const requires_shell_authority = switch (command_ctx.environment) {
-        .user => true,
-        .clean => permission_mode != .auto,
-        .legacy, .workspace_clean => false,
-    };
+    const requires_shell_authority = command_ctx.execution_mode == .tty or
+        switch (command_ctx.environment) {
+            .user => true,
+            .clean => permission_mode != .auto,
+            .legacy, .workspace_clean => false,
+        };
     if (requires_shell_authority) {
         return .{ .approval_required = .dynamic_shell };
     }

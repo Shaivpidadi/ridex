@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const command_admission = @import("../../core/permissions/command_admission.zig");
 const command_contract = @import("../../core/execution/command_contract.zig");
 const command_environment = @import("../../core/execution/command_environment.zig");
@@ -185,15 +186,7 @@ fn normalizeCompositeArgument(
     field_name: []const u8,
 ) !void {
     const value = root.object.getPtr(field_name) orelse return;
-    if (value.* != .string) return;
-    const decoded = try std.json.parseFromSliceLeaky(
-        std.json.Value,
-        alloc,
-        value.string,
-        .{ .allocate = .alloc_always },
-    );
-    if (decoded != .object) return error.InvalidCompositeArgument;
-    value.* = decoded;
+    try tool_args.normalizeCompositeObjectValue(alloc, value);
 }
 
 fn inputDeinit(ptr: *anyopaque, alloc: Allocator) void {
@@ -506,9 +499,6 @@ fn callTtyRun(
     input: Input,
 ) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
     const runtime = ctx.managed_executions orelse return unavailable(ctx);
-    runtime.reserveTtyCapacity() catch |err| return runtimeFailure(ctx, err);
-    var capacity_reserved = true;
-    defer if (capacity_reserved) runtime.releaseTtyCapacity();
     const owner = ctx.session_child_capability orelse return unavailable(ctx);
     const durable_session_id = ctx.terminal_owner_session_id orelse return unavailable(ctx);
     const command = input.command orelse return unavailable(ctx);
@@ -517,6 +507,27 @@ fn callTtyRun(
         return runtimeFailure(ctx, err);
     };
     defer ctx.allocator.free(@constCast(cwd));
+    var shell_arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer shell_arena_state.deinit();
+    var login_shell_buffer: [4096]u8 = undefined;
+    const configured = shell_resolver.configuredLoginShellInto(&login_shell_buffer);
+    const shell = ttyShell(shell_arena_state.allocator(), input, configured) catch |err|
+        return runtimeFailure(ctx, err);
+    const environment = shell_resolver.environmentForShellSpec(
+        shell_arena_state.allocator(),
+        configured,
+        shell,
+    ) catch |err| return runtimeFailure(ctx, err);
+    requireTtyShellAuthority(ctx, .{
+        .command = command,
+        .resolved_cwd = cwd,
+        .target_os = builtin.os.tag,
+        .environment = environment,
+        .execution_mode = .tty,
+    }) catch |err| return runtimeFailure(ctx, err);
+    runtime.reserveTtyCapacity() catch |err| return runtimeFailure(ctx, err);
+    var capacity_reserved = true;
+    defer if (capacity_reserved) runtime.releaseTtyCapacity();
     var profile_user_buffer: [64]u8 = undefined;
     const profile_user = terminal_identity.profileUser(&profile_user_buffer) orelse
         return unavailable(ctx);
@@ -532,13 +543,10 @@ fn callTtyRun(
         .lifetime = .session,
     }) catch |err| return runtimeFailure(ctx, err);
     defer persistence.deinit();
-    var shell_arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
-    defer shell_arena_state.deinit();
     const request = terminal_contracts.ActionRequest{ .start = .{
         .cwd = cwd,
         .command = command,
-        .shell = ttyShell(shell_arena_state.allocator(), input) catch |err|
-            return runtimeFailure(ctx, err),
+        .shell = shell,
         .backend = .native,
         .return_when = if (input.yield_time_ms == 0) .started else .exit,
         .wait_ceiling_ms = @max(@as(u64, 1), input.yield_time_ms),
@@ -838,14 +846,36 @@ fn callTtyStop(
 fn ttyShell(
     alloc: Allocator,
     input: Input,
+    configured_login_shell: ?[]const u8,
 ) !terminal_contracts.ShellSpec {
     if (input.shell) |shell| return .{ .executable = .{
         .path = shell.path,
         .clean_start = shell.clean_start,
     } };
-    var login_shell_buffer: [4096]u8 = undefined;
-    const configured = shell_resolver.configuredLoginShellInto(&login_shell_buffer);
-    return shell_resolver.profileShell(alloc, configured, input.profile orelse .user);
+    return shell_resolver.profileShell(
+        alloc,
+        configured_login_shell,
+        input.profile orelse .user,
+    );
+}
+
+fn requireTtyShellAuthority(
+    ctx: tool_dispatch.DispatchContext,
+    command_ctx: command_admission.CommandContext,
+) !void {
+    const execution_authority = ctx.execution_authority orelse
+        return error.CommandAuthorityContextMismatch;
+    const command_authority = switch (execution_authority) {
+        .run_command => |value| value,
+        .ordinary, .file_mutation, .vision_paths => return error.CommandAuthorityContextMismatch,
+    };
+    const shell_allowed = switch (command_authority) {
+        .shell_allowed => |value| value,
+        .direct_only => return error.CommandAdmissionChanged,
+    };
+    if (!shell_allowed.fingerprint.matches(command_ctx)) {
+        return error.CommandAuthorityContextMismatch;
+    }
 }
 
 fn executeTerminal(
@@ -1619,6 +1649,46 @@ test "shell action fields are closed and command authority covers every run" {
         []const u8,
         &.{ "action", "session_id", "wait_ceiling_ms" },
         actionFieldContract(.wait).allowed,
+    );
+}
+
+test "TTY execution requires matching shell authority" {
+    const command_ctx = command_admission.CommandContext{
+        .command = "pwd",
+        .resolved_cwd = "/workspace",
+        .target_os = builtin.os.tag,
+        .environment = .{ .clean = "/bin/bash" },
+        .execution_mode = .tty,
+    };
+    try std.testing.expectError(
+        error.CommandAdmissionChanged,
+        requireTtyShellAuthority(.{
+            .allocator = std.testing.allocator,
+            .execution_authority = .{ .run_command = .{
+                .direct_only = .init(command_ctx),
+            } },
+        }, command_ctx),
+    );
+
+    try requireTtyShellAuthority(.{
+        .allocator = std.testing.allocator,
+        .execution_authority = .{ .run_command = .{ .shell_allowed = .{
+            .fingerprint = .init(command_ctx),
+            .source = .auto_classifier,
+        } } },
+    }, command_ctx);
+
+    var changed = command_ctx;
+    changed.environment = .{ .user = "/bin/bash" };
+    try std.testing.expectError(
+        error.CommandAuthorityContextMismatch,
+        requireTtyShellAuthority(.{
+            .allocator = std.testing.allocator,
+            .execution_authority = .{ .run_command = .{ .shell_allowed = .{
+                .fingerprint = .init(command_ctx),
+                .source = .auto_classifier,
+            } } },
+        }, changed),
     );
 }
 

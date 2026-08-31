@@ -100,6 +100,19 @@ function cleanCommandCall(command: string, id: string) {
   });
 }
 
+function cleanTtyCommandCall(command: string, id: string) {
+  return fakeGatewayToolCall(id, "shell", {
+    request: {
+      action: "run",
+      command,
+      profile: "clean",
+      tty: true,
+      yield_time_ms: 0,
+      timeout_ms: 5_000,
+    },
+  });
+}
+
 function toolResultText(
   body: string,
   toolCallId: string,
@@ -395,6 +408,119 @@ describe("lean auto mode reliability", () => {
       expect(terminalStatuses.filter((status) => status === "success")).toHaveLength(2);
       expect(terminalStatuses.filter((status) => status === "error")).toHaveLength(1);
       expect(result.stdout).toContain("Clean command group complete.");
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "clean TTY reads require shell review before execution",
+    async () => {
+      const root = createIsolatedRoot();
+      const tracePath = join(root.root, "trace.log");
+      const gateway = startGateway(
+        [
+          cleanTtyCommandCall("git status --short --branch", "clean_tty_status"),
+          (body) => {
+            expect(
+              toolResultText(body, "clean_tty_status", "execution-denied"),
+            ).toContain("review_caution");
+            return fakeGatewayFinalText("clean TTY review blocked execution");
+          },
+        ],
+        [fakeGatewayPermissionDecision("caution", "tty_requires_shell_review")],
+      );
+
+      const result = await runFx(
+        ["ask", "--quiet", "--json", "Inspect the working directory in a TTY."],
+        {
+          cwd: root.workspace,
+          env: {
+            ...gatewayEnv(root, gateway),
+            FX_TRACE_LOG: tracePath,
+            FX_TRACE_SCOPES: "permission,tool,terminal",
+          },
+          timeoutMs: TIMEOUT,
+        },
+      );
+
+      expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+      expect(gateway.classifierRequests).toHaveLength(1);
+      expect(gateway.requests).toHaveLength(2);
+      const json = JSON.parse(result.stdout.trim()) as {
+        tool_calls: Array<{ name: string; status: string }>;
+      };
+      expect(json.tool_calls).toContainEqual(
+        expect.objectContaining({ name: "shell", status: "error" }),
+      );
+      const trace = readFileSync(tracePath, "utf8");
+      expect(trace).toContain(
+        "event=auto_review_start tool_name=shell action_kind=command " +
+          "call_id=clean_tty_status",
+      );
+      expect(trace).not.toContain(
+        "event=execution_start turn_id=1 step_id=1 " +
+          "call_id=clean_tty_status name=shell",
+      );
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "reviewed clean TTY reads execute with shell authority",
+    async () => {
+      const root = createIsolatedRoot();
+      const tracePath = join(root.root, "trace.log");
+      const gateway = startGateway(
+        [
+          cleanTtyCommandCall("printf 'TTY_REVIEWED_OK\\n'", "reviewed_clean_tty"),
+          (body) => {
+            const started = JSON.parse(
+              toolResultText(body, "reviewed_clean_tty"),
+            ) as { session_id: string; state: string };
+            expect(started.state).toBe("running");
+            return fakeGatewayToolCall("wait_reviewed_clean_tty", "shell", {
+              request: {
+                action: "wait",
+                session_id: started.session_id,
+                wait_ceiling_ms: 5_000,
+              },
+            });
+          },
+          (body) => {
+            expect(toolResultText(body, "wait_reviewed_clean_tty")).toContain(
+              "TTY_REVIEWED_OK",
+            );
+            return fakeGatewayFinalText("reviewed clean TTY complete");
+          },
+        ],
+        [fakeGatewayPermissionDecision("clear", "tty_shell_review_clear")],
+      );
+
+      const result = await runFx(
+        ["ask", "--quiet", "--json", "Inspect through the reviewed clean TTY."],
+        {
+          cwd: root.workspace,
+          env: {
+            ...gatewayEnv(root, gateway),
+            FX_TRACE_LOG: tracePath,
+            FX_TRACE_SCOPES: "core,permission,tool,terminal",
+          },
+          timeoutMs: TIMEOUT,
+        },
+      );
+
+      expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+      expect(gateway.classifierRequests).toHaveLength(1);
+      expect(gateway.requests).toHaveLength(3);
+      const json = JSON.parse(result.stdout.trim()) as {
+        tool_calls: Array<{ name: string; status: string }>;
+      };
+      expect(json.tool_calls).toContainEqual(
+        expect.objectContaining({ name: "shell", status: "success" }),
+      );
+      expect(readFileSync(tracePath, "utf8")).toContain(
+        "approval_source=auto_classifier",
+      );
     },
     TIMEOUT,
   );

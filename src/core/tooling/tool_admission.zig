@@ -15,6 +15,7 @@ const diff_mod = @import("../output/diff.zig");
 const pathing = @import("../workspace/pathing.zig");
 const permission_auto_classifier = @import("../permissions/auto_classifier.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
+const terminal_contracts = @import("../terminal/contracts.zig");
 const permission_prompter = @import("../permissions/permission_prompter.zig");
 const permission_request = @import("../permissions/permission_request.zig");
 const permissions = @import("../permissions/permissions.zig");
@@ -1103,11 +1104,13 @@ fn resolveOrdinaryPermissionOutcome(
     if (permission_mode == .auto) {
         if (command_call) {
             const command = try runCommandContext(input, arena, call);
-            if (try command_effect.knownReversibleAutoCommand(
-                arena,
-                command.command,
-                false,
-            )) {
+            if (command.execution_mode == .captured and
+                try command_effect.knownReversibleAutoCommand(
+                    arena,
+                    command.command,
+                    false,
+                ))
+            {
                 return shellPermissionOutcome(
                     command,
                     .once,
@@ -2039,6 +2042,8 @@ pub fn runCommandContext(
     if (!try isRunCommandCall(input, arena, call)) return error.NotRunCommand;
     const args = try tool_args.parseToolArgsObject(arena, call.arguments_json);
     const command = try tool_args.requiredStringArg(args, "command");
+    const execution_mode: command_admission.CommandExecutionMode =
+        if (tool_args.optionalBoolArg(args, "tty") orelse false) .tty else .captured;
     const tool = registeredTool(input, call.name) orelse return error.NotRunCommand;
     const cwd = switch (tool.captured_command_host) {
         .workspace_clean => try arena.dupe(u8, input.workspace_root),
@@ -2052,24 +2057,56 @@ pub fn runCommandContext(
     };
     const environment_value: command_environment.Environment = switch (tool.captured_command_host) {
         .workspace_clean => .workspace_clean,
-        .native => blk: {
-            const profile_raw = tool_args.nullablePlaceholderStringArg(args, "profile");
-            const profile: ?command_environment.Profile = if (profile_raw) |raw|
-                std.meta.stringToEnum(command_environment.Profile, raw) orelse
-                    return error.InvalidCommandProfile
-            else
-                null;
-            var login_shell_buffer: [4096]u8 = undefined;
-            const configured = shell_resolver.configuredLoginShellInto(&login_shell_buffer);
-            break :blk try shell_resolver.environment(arena, configured, profile);
-        },
+        .native => try nativeCommandEnvironment(arena, args, execution_mode),
     };
     return .{
         .command = command,
         .resolved_cwd = cwd,
         .target_os = builtin.os.tag,
         .environment = environment_value,
+        .execution_mode = execution_mode,
     };
+}
+
+fn nativeCommandEnvironment(
+    arena: Allocator,
+    args: std.json.ObjectMap,
+    execution_mode: command_admission.CommandExecutionMode,
+) !command_environment.Environment {
+    var login_shell_buffer: [4096]u8 = undefined;
+    const configured = shell_resolver.configuredLoginShellInto(&login_shell_buffer);
+    if (execution_mode == .tty) {
+        if (try explicitTtyShell(arena, args)) |shell| {
+            return shell_resolver.environmentForShellSpec(arena, configured, shell);
+        }
+    }
+    const profile_raw = tool_args.nullablePlaceholderStringArg(args, "profile");
+    const profile: ?command_environment.Profile = if (profile_raw) |raw|
+        std.meta.stringToEnum(command_environment.Profile, raw) orelse
+            return error.InvalidCommandProfile
+    else
+        null;
+    return shell_resolver.environment(arena, configured, profile);
+}
+
+fn explicitTtyShell(
+    arena: Allocator,
+    args: std.json.ObjectMap,
+) !?terminal_contracts.ShellSpec {
+    var value = args.get("shell") orelse return null;
+    if (value == .null or
+        (value == .string and tool_args.isNullPlaceholderText(value.string)))
+    {
+        return null;
+    }
+    try tool_args.normalizeCompositeObjectValue(arena, &value);
+    if (value != .object) return error.InvalidToolArguments;
+    const kind = try tool_args.requiredStringArg(value.object, "kind");
+    if (!std.mem.eql(u8, kind, "executable")) return error.InvalidToolArguments;
+    return .{ .executable = .{
+        .path = try tool_args.requiredStringArg(value.object, "path"),
+        .clean_start = tool_args.optionalBoolArg(value.object, "clean_start") orelse false,
+    } };
 }
 
 pub fn permissionStateKeyForCall(
@@ -2082,11 +2119,22 @@ pub fn permissionStateKeyForCall(
     }
     if (try isRunCommandCall(input, arena, call)) {
         const command = try runCommandContext(input, arena, call);
+        const command_identity = switch (command.execution_mode) {
+            .captured => command.command,
+            .tty => try command_environment.ttyPermissionCommandIdentity(
+                arena,
+                command.environment,
+                command.command,
+            ),
+        };
         return session_permission_state.commandKeyV2(
             arena,
-            command.command,
+            command_identity,
             command.resolved_cwd,
-            "foreground",
+            switch (command.execution_mode) {
+                .captured => "foreground",
+                .tty => "tty",
+            },
             @tagName(command.target_os),
         );
     }
@@ -2104,6 +2152,24 @@ pub fn permissionStateKeyForCall(
     }
     const bytes = try canonical.toOwnedSlice();
     return session_permission_state.RuleKey.init(.structured_tool, bytes);
+}
+
+fn commandPermissionIdentityForContext(
+    arena: Allocator,
+    command: command_admission.CommandContext,
+) ![]const u8 {
+    return switch (command.execution_mode) {
+        .captured => command_environment.permissionCommandIdentity(
+            arena,
+            command.environment,
+            command.command,
+        ),
+        .tty => command_environment.ttyPermissionCommandIdentity(
+            arena,
+            command.environment,
+            command.command,
+        ),
+    };
 }
 
 pub const PreparedPermissionStateAction = struct {
@@ -2379,10 +2445,9 @@ fn commandPermissionTarget(
     call: ToolCall,
 ) ![]u8 {
     const context = try runCommandContext(input, arena, call);
-    const identity = try command_environment.permissionCommandIdentity(
+    const identity = try commandPermissionIdentityForContext(
         arena,
-        context.environment,
-        context.command,
+        context,
     );
     return std.fmt.allocPrint(
         arena,
@@ -5009,6 +5074,150 @@ test "automatic clean direct command bypasses the reviewer" {
     }
 }
 
+test "automatic clean TTY command requires reviewed shell authority" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(std.testing.allocator);
+    var fake = FakeAutoClassifier{};
+    const input = testInputWithClassifier(
+        &worker,
+        permission_auto_classifier.Classifier.withOverride(
+            @ptrCast(&fake),
+            FakeAutoClassifier.classify,
+        ),
+    );
+
+    const outcome = requestPermissionOutcome(
+        input,
+        arena_state.allocator(),
+        .{
+            .id = "clean-tty",
+            .name = "shell",
+            .arguments_json = "{\"action\":\"run\",\"command\":\"pwd\",\"profile\":\"clean\",\"tty\":true}",
+        },
+        .auto,
+        &.{},
+    ) catch |err| switch (err) {
+        error.MissingLoginShell, error.UnsupportedShell => return error.SkipZigTest,
+        else => return err,
+    };
+
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    try std.testing.expectEqual(ToolPermissionDecision.once, outcome.decision);
+    const authority = outcome.execution_authority orelse return error.TestExpectedEqual;
+    switch (authority.run_command) {
+        .shell_allowed => |allowed| try std.testing.expectEqual(
+            command_admission.ShellAuthorizationSource.auto_classifier,
+            allowed.source,
+        ),
+        .direct_only => return error.TestExpectedShellAllowed,
+    }
+}
+
+test "TTY admission fingerprints route and explicit shell startup" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(std.testing.allocator);
+    const input = testInputWithClassifier(
+        &worker,
+        permission_auto_classifier.Classifier.disabled(),
+    );
+    const arena = arena_state.allocator();
+
+    const captured = runCommandContext(input, arena, .{
+        .id = "captured-clean",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"pwd\",\"profile\":\"clean\"}",
+    }) catch |err| switch (err) {
+        error.MissingLoginShell, error.UnsupportedShell => return error.SkipZigTest,
+        else => return err,
+    };
+    const tty = try runCommandContext(input, arena, .{
+        .id = "tty-clean",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"pwd\",\"profile\":\"clean\",\"tty\":true}",
+    });
+    try std.testing.expect(!command_admission.AdmissionFingerprint.init(captured).eql(
+        command_admission.AdmissionFingerprint.init(tty),
+    ));
+    const captured_key = try permissionStateKeyForCall(input, arena, .{
+        .id = "captured-key",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"pwd\",\"profile\":\"clean\"}",
+    });
+    const tty_key = try permissionStateKeyForCall(input, arena, .{
+        .id = "tty-key",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"pwd\",\"profile\":\"clean\",\"tty\":true}",
+    });
+    try std.testing.expect(!session_permission_state.RuleKey.eql(captured_key, tty_key));
+    const captured_target = try permissionTargetForCall(input, arena, .{
+        .id = "captured-target",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"pwd\",\"profile\":\"clean\"}",
+    });
+    const tty_target = try permissionTargetForCall(input, arena, .{
+        .id = "tty-target",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"pwd\",\"profile\":\"clean\",\"tty\":true}",
+    });
+    const captured_grants = try permissions.suggestedSessionGrants(
+        arena,
+        input.workspace_root,
+        "run_command",
+        captured_target,
+        .command_cwd,
+    );
+    try std.testing.expect(permissions.sessionGrantAllowed(
+        captured_grants,
+        "run_command",
+        captured_target,
+    ));
+    try std.testing.expect(!permissions.sessionGrantAllowed(
+        captured_grants,
+        "run_command",
+        tty_target,
+    ));
+
+    const clean_shell = try runCommandContext(input, arena, .{
+        .id = "tty-shell-clean",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"pwd\",\"tty\":true,\"shell\":{\"kind\":\"executable\",\"path\":\"/bin/bash\",\"clean_start\":true}}",
+    });
+    const user_shell = try runCommandContext(input, arena, .{
+        .id = "tty-shell-user",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"pwd\",\"tty\":true,\"shell\":{\"kind\":\"executable\",\"path\":\"/bin/bash\",\"clean_start\":false}}",
+    });
+    try std.testing.expect(!command_admission.AdmissionFingerprint.init(clean_shell).eql(
+        command_admission.AdmissionFingerprint.init(user_shell),
+    ));
+    const encoded_clean_shell = try runCommandContext(input, arena, .{
+        .id = "tty-shell-encoded",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"pwd\",\"tty\":true,\"shell\":\"{\\\"kind\\\":\\\"executable\\\",\\\"path\\\":\\\"/bin/bash\\\",\\\"clean_start\\\":true}\"}",
+    });
+    try std.testing.expect(command_admission.AdmissionFingerprint.init(clean_shell).eql(
+        command_admission.AdmissionFingerprint.init(encoded_clean_shell),
+    ));
+    const clean_shell_key = try permissionStateKeyForCall(input, arena, .{
+        .id = "tty-shell-clean-key",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"pwd\",\"tty\":true,\"shell\":{\"kind\":\"executable\",\"path\":\"/bin/bash\",\"clean_start\":true}}",
+    });
+    const user_shell_key = try permissionStateKeyForCall(input, arena, .{
+        .id = "tty-shell-user-key",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"pwd\",\"tty\":true,\"shell\":{\"kind\":\"executable\",\"path\":\"/bin/bash\",\"clean_start\":false}}",
+    });
+    try std.testing.expect(!session_permission_state.RuleKey.eql(
+        clean_shell_key,
+        user_shell_key,
+    ));
+}
+
 test "known reversible auto commands bypass the reviewer" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -5049,6 +5258,23 @@ test "known reversible auto commands bypass the reviewer" {
         );
     }
     try std.testing.expectEqual(@as(usize, 0), fake.calls);
+
+    const tty = try requestPermissionOutcome(
+        input,
+        arena_state.allocator(),
+        .{
+            .id = "known-reversible-tty",
+            .name = "shell",
+            .arguments_json = "{\"action\":\"run\",\"command\":\"git status --short --branch\",\"profile\":\"clean\",\"tty\":true}",
+        },
+        .auto,
+        &.{},
+    );
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    try std.testing.expectEqual(
+        command_admission.ShellAuthorizationSource.auto_classifier,
+        tty.execution_authority.?.run_command.shell_allowed.source,
+    );
 }
 
 test "session deny narrows configured command allow" {
