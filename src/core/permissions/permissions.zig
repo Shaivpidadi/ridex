@@ -88,6 +88,8 @@ pub const PermissionTargetKind = enum {
     path_optional_existing,
     path_create_parent,
     path_existing_parent,
+    /// The tool resolves one or more exact canonical filesystem targets.
+    path_set,
     command_cwd,
     url,
 };
@@ -210,6 +212,7 @@ pub fn permissionTargetForCall(
             const path_arg = try tool_args.requiredStringArg(args, "path");
             break :blk try resolveFileToolPath(arena, workspace_root, call.name, path_arg, .existing);
         },
+        .path_set => error.CustomPermissionTargetsRequired,
         .none => try arena.dupe(u8, call.name),
     };
 }
@@ -1108,7 +1111,7 @@ pub fn isFilesystemMutationTool(tool_name: []const u8) bool {
 pub fn displayTargetForPolicy(alloc: std.mem.Allocator, workspace_root: []const u8, target_path: []const u8, target_kind: PermissionTargetKind) ![]u8 {
     return switch (target_kind) {
         .command_cwd => displayCommandTarget(alloc, workspace_root, target_path),
-        .path_existing, .path_optional_existing, .path_create_parent, .path_existing_parent => displayPathTarget(alloc, workspace_root, target_path),
+        .path_existing, .path_optional_existing, .path_create_parent, .path_existing_parent, .path_set => displayPathTarget(alloc, workspace_root, target_path),
         else => alloc.dupe(u8, target_path),
     };
 }
@@ -1498,7 +1501,7 @@ pub fn patternForSessionGrantMatch(tool_name: []const u8, target_path: []const u
 
 fn isPathBasedTool(target_kind: PermissionTargetKind) bool {
     return switch (target_kind) {
-        .path_existing, .path_optional_existing, .path_create_parent, .path_existing_parent => true,
+        .path_existing, .path_optional_existing, .path_create_parent, .path_existing_parent, .path_set => true,
         else => false,
     };
 }

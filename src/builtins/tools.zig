@@ -753,7 +753,8 @@ pub const apply_patch = ToolSpec{
     .completed_action_label = "Applied patch",
     .label_arg_kind = .none,
     .label_arg_default = "files",
-    .permission_target_kind = .none,
+    .permission_target_kind = .path_set,
+    .permission_targets_fn = apply_patch_impl.permissionTargets,
     .decode = apply_patch_impl.decode,
     .validate = apply_patch_impl.validate,
     .call = apply_patch_impl.call,
@@ -2250,7 +2251,8 @@ test "built-in apply_patch is hidden and workspace scoped" {
     try std.testing.expectEqual(tool_dispatch.ExecutorKind.apply_patch, apply_patch.executor_kind);
     try std.testing.expectEqual(types.ToolActivityKind.edit, apply_patch.activity_kind);
     try std.testing.expect(apply_patch.requires_approval);
-    try std.testing.expectEqual(tool_dispatch.PermissionTargetKind.none, apply_patch.permission_target_kind);
+    try std.testing.expectEqual(tool_dispatch.PermissionTargetKind.path_set, apply_patch.permission_target_kind);
+    try std.testing.expect(apply_patch.permission_targets_fn.? == apply_patch_impl.permissionTargets);
     try std.testing.expect(apply_patch.decode == apply_patch_impl.decode);
     try std.testing.expect(apply_patch.validate.? == apply_patch_impl.validate);
     try std.testing.expect(apply_patch.call == apply_patch_impl.call);

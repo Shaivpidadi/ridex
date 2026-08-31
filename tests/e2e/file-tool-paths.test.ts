@@ -1358,6 +1358,75 @@ describe("filesystem path handling", () => {
   );
 
   test(
+    "apply_patch denies the complete transaction when any target is forbidden",
+    async () => {
+      const root = createIsolatedRoot();
+      try {
+        const updateTarget = join(root.workspace, "update.txt");
+        const addedTarget = join(root.workspace, "added.txt");
+        writeFileSync(updateTarget, "before\n");
+        writeFileSync(
+          join(root.home, ".fx", "settings.json"),
+          JSON.stringify({
+            permission: {
+              edit: {
+                "added.txt": "deny",
+              },
+            },
+          }),
+        );
+        const gateway = startFakeGateway([
+          toolCall("denied_patch_1", "apply_patch", {
+            patch:
+              "*** Begin Patch\n*** Update File: update.txt\n@@\n-before\n+after\n*** Add File: added.txt\n+added\n*** End Patch",
+          }),
+          (body) => {
+            expect(toolResultReason(body, "denied_patch_1")).toContain(
+              '"reason":"policy_denied"',
+            );
+            expect(readFileSync(updateTarget, "utf8")).toBe("before\n");
+            expect(existsSync(addedTarget)).toBe(false);
+            return finalText("patch denied atomically");
+          },
+        ]);
+        try {
+          const result = await runFx(
+            [
+              "ask",
+              "--auto",
+              "--json",
+              "--no-save",
+              "Exercise patch permission denial.",
+            ],
+            {
+              cwd: root.workspace,
+              env: gatewayEnv(root, gateway, root.home, {
+                FX_EXPERIMENT_X9_EDITOR: "patch_v3",
+              }),
+              timeoutMs: TIMEOUT,
+            },
+          );
+          const json = parseFxJson(result);
+          expect(gateway.requests).toHaveLength(2);
+          expect(gateway.classifierRequests).toHaveLength(0);
+          expect(gateway.remainingResponseCount()).toBe(0);
+          expect(json.output).toBe("patch denied atomically");
+          expect(json.tool_calls).toEqual([
+            { name: "apply_patch", status: "error" },
+          ]);
+          expect(readFileSync(updateTarget, "utf8")).toBe("before\n");
+          expect(existsSync(addedTarget)).toBe(false);
+        } finally {
+          gateway.stop();
+        }
+      } finally {
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "failed patch defers queued fallback edits until the model observes current state",
     async () => {
       const root = createIsolatedRoot();

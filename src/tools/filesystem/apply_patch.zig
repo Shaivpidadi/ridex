@@ -334,8 +334,15 @@ pub fn decode(
     ctx: tool_dispatch.DispatchContext,
     args_json: []const u8,
 ) tool_dispatch.DispatchError!tool_dispatch.DecodeResult {
-    var parsed = std.json.parseFromSlice(std.json.Value, ctx.allocator, args_json, .{}) catch {
-        return failure(ctx.allocator, "apply_patch arguments must be valid JSON");
+    return decodeAlloc(ctx.allocator, args_json);
+}
+
+fn decodeAlloc(
+    alloc: Allocator,
+    args_json: []const u8,
+) tool_dispatch.DispatchError!tool_dispatch.DecodeResult {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, args_json, .{}) catch {
+        return failure(alloc, "apply_patch arguments must be valid JSON");
     };
     defer parsed.deinit();
 
@@ -343,37 +350,111 @@ pub fn decode(
         .string => |value| value,
         .object => |object| blk: {
             const value = object.get("patch") orelse object.get("input") orelse
-                return failure(ctx.allocator, "apply_patch requires string field \"patch\"");
+                return failure(alloc, "apply_patch requires string field \"patch\"");
             if (value != .string) {
-                return failure(ctx.allocator, "apply_patch field \"patch\" must be a string");
+                return failure(alloc, "apply_patch field \"patch\" must be a string");
             }
             break :blk value.string;
         },
-        else => return failure(ctx.allocator, "apply_patch arguments must be an object or patch string"),
+        else => return failure(alloc, "apply_patch arguments must be an object or patch string"),
     };
     if (patch.len > max_patch_bytes) {
-        return failure(ctx.allocator, "apply_patch patch exceeds the 4 MiB limit");
+        return failure(alloc, "apply_patch patch exceeds the 4 MiB limit");
     }
 
     const normalized = trimMarkdownFence(patch);
     var lines: std.ArrayList([]const u8) = .empty;
-    defer lines.deinit(ctx.allocator);
+    defer lines.deinit(alloc);
     var iterator = std.mem.splitScalar(u8, normalized, '\n');
-    while (iterator.next()) |line| try lines.append(ctx.allocator, line);
+    while (iterator.next()) |line| try lines.append(alloc, line);
 
-    var parser = Parser{ .alloc = ctx.allocator, .lines = lines.items };
+    var parser = Parser{ .alloc = alloc, .lines = lines.items };
     const operations = parser.parse() catch |err| switch (err) {
-        error.InvalidPatch => return failure(ctx.allocator, parser.reason),
+        error.InvalidPatch => return failure(alloc, parser.reason),
         error.OutOfMemory => return error.OutOfMemory,
-        error.WriteFailed => return failure(ctx.allocator, "apply_patch could not buffer the patch"),
+        error.WriteFailed => return failure(alloc, "apply_patch could not buffer the patch"),
     };
     errdefer {
-        for (operations) |*operation| operation.deinit(ctx.allocator);
-        ctx.allocator.free(operations);
+        for (operations) |*operation| operation.deinit(alloc);
+        alloc.free(operations);
     }
-    const input = try ctx.allocator.create(Input);
+    const input = try alloc.create(Input);
     input.* = .{ .operations = operations };
     return .{ .input = .{ .ptr = input, .deinit_fn = inputDeinit } };
+}
+
+/// Resolves every source and destination before admission so one denied path
+/// rejects the complete transactional patch.
+pub fn permissionTargets(
+    alloc: Allocator,
+    workspace_root: []const u8,
+    args_json: []const u8,
+) anyerror!permissions.PermissionCallTargets {
+    if (workspace_root.len == 0) return error.WorkspaceUnavailable;
+
+    var scratch_state = std.heap.ArenaAllocator.init(alloc);
+    defer scratch_state.deinit();
+    const scratch = scratch_state.allocator();
+    const decoded = try decodeAlloc(scratch, args_json);
+    const erased = switch (decoded) {
+        .input => |input| input,
+        .failure => return error.InvalidToolArguments,
+    };
+    defer erased.deinit(scratch);
+    const input = erased.as(Input);
+
+    var targets: std.ArrayList(permissions.PermissionCallTarget) = .empty;
+    errdefer {
+        for (targets.items) |target| alloc.free(target.path);
+        targets.deinit(alloc);
+    }
+    for (input.operations) |operation| {
+        switch (operation) {
+            .update => |update| {
+                try appendPermissionTarget(
+                    alloc,
+                    &targets,
+                    "update",
+                    try resolvePatchPath(scratch, workspace_root, update.path, .existing),
+                );
+                if (update.move_to) |move_to| {
+                    try appendPermissionTarget(
+                        alloc,
+                        &targets,
+                        "move_destination",
+                        try resolvePatchPath(scratch, workspace_root, move_to, .create),
+                    );
+                }
+            },
+            .add => |add| try appendPermissionTarget(
+                alloc,
+                &targets,
+                "add",
+                try resolvePatchPath(scratch, workspace_root, add.path, .create),
+            ),
+            .delete => |delete| try appendPermissionTarget(
+                alloc,
+                &targets,
+                "delete",
+                try resolvePatchPath(scratch, workspace_root, delete.path, .existing),
+            ),
+        }
+    }
+    return .{ .items = try targets.toOwnedSlice(alloc) };
+}
+
+fn appendPermissionTarget(
+    alloc: Allocator,
+    targets: *std.ArrayList(permissions.PermissionCallTarget),
+    role: []const u8,
+    path: []const u8,
+) Allocator.Error!void {
+    for (targets.items) |target| {
+        if (std.mem.eql(u8, target.path, path)) return;
+    }
+    const owned_path = try alloc.dupe(u8, path);
+    errdefer alloc.free(owned_path);
+    try targets.append(alloc, .{ .role = role, .path = owned_path });
 }
 
 fn failure(alloc: Allocator, reason: []const u8) Allocator.Error!tool_dispatch.DecodeResult {
@@ -1073,6 +1154,39 @@ test "apply_patch v3 decodes multiple files and multiple hunks" {
     const patch_input = input.as(Input);
     try std.testing.expectEqual(@as(usize, 3), patch_input.operations.len);
     try std.testing.expectEqual(@as(usize, 2), patch_input.operations[0].update.hunks.len);
+}
+
+test "apply_patch resolves every permission target before execution" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestFile(tmp.dir, "update.txt", "old\n");
+    try writeTestFile(tmp.dir, "move.txt", "move\n");
+    try writeTestFile(tmp.dir, "delete.txt", "delete\n");
+    const root = try workspaceRoot(std.testing.allocator, tmp);
+    defer std.testing.allocator.free(root);
+
+    var targets = try permissionTargets(std.testing.allocator, root,
+        \\{"patch":"*** Begin Patch\n*** Update File: update.txt\n@@\n-old\n+new\n*** Update File: move.txt\n*** Move to: moved.txt\n@@\n-move\n+moved\n*** Add File: added.txt\n+added\n*** Delete File: delete.txt\n*** End Patch"}
+    );
+    defer targets.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 5), targets.items.len);
+    const expected = [_]struct { role: []const u8, path: []const u8 }{
+        .{ .role = "update", .path = "update.txt" },
+        .{ .role = "update", .path = "move.txt" },
+        .{ .role = "move_destination", .path = "moved.txt" },
+        .{ .role = "add", .path = "added.txt" },
+        .{ .role = "delete", .path = "delete.txt" },
+    };
+    for (targets.items, expected) |actual, wanted| {
+        try std.testing.expectEqualStrings(wanted.role, actual.role);
+        const expected_path = try std.fs.path.join(
+            std.testing.allocator,
+            &.{ root, wanted.path },
+        );
+        defer std.testing.allocator.free(expected_path);
+        try std.testing.expectEqualStrings(expected_path, actual.path);
+    }
 }
 
 test "apply_patch v3 applies a transactional multi-file patch" {
