@@ -1927,6 +1927,7 @@ pub fn runFakePromptWithLifecycle(
     hooks.workspace_root = config.workspace_root;
     var deps = hooks.deps();
     deps.agent_stream_provider = gateway.provider();
+    deps.compaction_stream_provider = gateway.provider();
     if (hooks.execute_delegate) |delegate| {
         if (delegate.set_agent_stream_provider) |set_provider| {
             set_provider(delegate.ctx, deps.agent_stream_provider);

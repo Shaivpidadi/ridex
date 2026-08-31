@@ -2827,21 +2827,26 @@ fn processQueuedPromptInner(
         finish_trace.finish("interrupted");
         return;
     }
+    if (job.context_history_start > job.history.len) {
+        return error.InvalidContextHistoryStart;
+    }
+    const active_history = job.history[job.context_history_start..];
     const history_messages_before = stable_prefix.items.len;
-    const interrupted_turns = runtime_interruption.countInterruptedHistory(job.history);
-    const partial_interrupted_closures = runtime_interruption.countPartialTextInterruptedClosures(job.history);
-    const history_turn_kinds = try runtime_telemetry.formatHistoryTurnKinds(arena, job.history);
+    const interrupted_turns = runtime_interruption.countInterruptedHistory(active_history);
+    const partial_interrupted_closures = runtime_interruption.countPartialTextInterruptedClosures(active_history);
+    const history_turn_kinds = try runtime_telemetry.formatHistoryTurnKinds(arena, active_history);
     debug_trace.eventf(
         "history",
         "projection_start",
         finish_trace.ctx,
         "history_turns={d} gateway_messages_before={d} interrupted_turns={d} history_turn_kinds={s}",
-        .{ job.history.len, history_messages_before, interrupted_turns, history_turn_kinds },
+        .{ active_history.len, history_messages_before, interrupted_turns, history_turn_kinds },
     );
-    try session_runtime.appendHistoryChatMessages(
+    try session_runtime.appendActiveContextHistoryChatMessages(
         arena,
         &history_messages,
         job.history,
+        job.context_history_start,
     );
     const projected_roles = try runtime_telemetry.formatMessageRoles(arena, history_messages.items);
     debug_trace.eventf(
@@ -2849,7 +2854,7 @@ fn processQueuedPromptInner(
         "projection_end",
         finish_trace.ctx,
         "history_turns={d} gateway_messages={d} added_gateway_messages={d} interrupted_turns={d} history_turn_kinds={s} projected_message_roles={s} partial_interrupted_closures={d}",
-        .{ job.history.len, stable_prefix.items.len + history_messages.items.len, history_messages.items.len, interrupted_turns, history_turn_kinds, projected_roles, partial_interrupted_closures },
+        .{ active_history.len, stable_prefix.items.len + history_messages.items.len, history_messages.items.len, interrupted_turns, history_turn_kinds, projected_roles, partial_interrupted_closures },
     );
     for (job.grants) |grant| {
         try local_grants.append(arena, .{ .tool_name = grant.tool_name, .target_path = grant.target_path });
@@ -3077,6 +3082,7 @@ fn buildGatewayMessagesForCompactionWindow(
     current_user_message: ChatMessage,
     within_turn_suffix: []const ChatMessage,
     handoff: ?[]const u8,
+    retained_history_tail: []const ChatMessage,
     compacted_suffix_len: usize,
 ) !std.ArrayList(ChatMessage) {
     if (handoff == null) return runtime_prompt_context.buildGatewayMessages(
@@ -3093,6 +3099,7 @@ fn buildGatewayMessagesForCompactionWindow(
         .content = handoff.?,
         .cache_policy = .no_cache,
     });
+    try compacted_suffix.appendSlice(alloc, retained_history_tail);
     try compacted_suffix.appendSlice(
         alloc,
         within_turn_suffix[@min(compacted_suffix_len, within_turn_suffix.len)..],
@@ -3107,6 +3114,22 @@ fn buildGatewayMessagesForCompactionWindow(
     );
 }
 
+fn buildCanonicalCompactionMessages(
+    alloc: Allocator,
+    history: []const HistoryTurn,
+    within_turn_suffix: []const ChatMessage,
+) !std.ArrayList(ChatMessage) {
+    var messages: std.ArrayList(ChatMessage) = .empty;
+    errdefer messages.deinit(alloc);
+    try session_runtime.appendCompactionHistoryChatMessages(
+        alloc,
+        &messages,
+        history,
+    );
+    try messages.appendSlice(alloc, within_turn_suffix);
+    return messages;
+}
+
 fn latestCompactionCount(history: []const HistoryTurn) usize {
     var count: usize = 0;
     for (history) |turn| {
@@ -3115,17 +3138,6 @@ fn latestCompactionCount(history: []const HistoryTurn) usize {
         }
     }
     return count;
-}
-
-fn compactedHistoryTurnCount(history: []const HistoryTurn) usize {
-    var removed: usize = 0;
-    for (history) |turn| switch (turn) {
-        .compacted_summary => |summary| {
-            removed = @max(removed, summary.removed_turn_count);
-        },
-        else => removed += 1,
-    };
-    return removed;
 }
 
 fn commitContextCompaction(
@@ -3191,9 +3203,9 @@ fn processQueuedPromptLoop(
     defer terminal_validation_retry.deinit(arena);
     var malformed_arguments_retry: runtime_tool_admission.MalformedArgumentsRetryState = .{};
     var active_compaction_handoff: ?[]const u8 = null;
+    var active_compaction_history_tail: []const ChatMessage = &.{};
     var compacted_suffix_len: usize = 0;
     var compaction_count = latestCompactionCount(job.history);
-    const compacted_history_turn_count = compactedHistoryTurnCount(job.history);
     var completed_tool_names = completed_tool_names_ptr.*;
     defer completed_tool_names_ptr.* = completed_tool_names;
     var context_delivery_state: context_contract.DeliveryState = if (deps.context_enabled)
@@ -3347,6 +3359,7 @@ fn processQueuedPromptLoop(
             current_user_effective,
             within_turn_suffix.items,
             active_compaction_handoff,
+            active_compaction_history_tail,
             compacted_suffix_len,
         );
         last_gateway_message_count = gateway_messages.items.len;
@@ -3525,6 +3538,7 @@ fn processQueuedPromptLoop(
                 current_user_effective,
                 within_turn_suffix.items,
                 active_compaction_handoff,
+                active_compaction_history_tail,
                 compacted_suffix_len,
             );
             debug_trace.eventf("agent", "before_provider_preflight", step_ctx, "model={s} messages={d}", .{ gateway_model, gateway_messages.items.len });
@@ -3668,10 +3682,6 @@ fn processQueuedPromptLoop(
                     .capacity_failure => return error.ContextCapacityExceeded,
                     .compact => {
                         std.debug.assert(projection_plan.next_action == .continue_turn);
-                        const accepted_tokens = projection_plan.accepted_handoff_tokens orelse
-                            return error.ContextCapacityExceeded;
-                        const generation_tokens = projection_plan.generation_tokens orelse
-                            return error.ContextCapacityExceeded;
                         try runtime_context_compaction.validateUnversionedHistoryResults(
                             job.history,
                             job.unversioned_history_count,
@@ -3682,6 +3692,12 @@ fn processQueuedPromptLoop(
                             within_turn_suffix.items,
                             @constCast(request_messages),
                         );
+                        var compaction_messages = try buildCanonicalCompactionMessages(
+                            arena,
+                            job.history,
+                            within_turn_suffix.items,
+                        );
+                        defer compaction_messages.deinit(arena);
                         const result_storage: runtime_context_compaction.ResultStorage =
                             if (config.session_child_capability) |capability|
                                 .{ .managed = capability }
@@ -3694,6 +3710,43 @@ fn processQueuedPromptLoop(
                             @constCast(request_messages),
                             result_storage,
                         );
+                        try runtime_context_compaction.promoteMessageResults(
+                            arena,
+                            compaction_messages.items,
+                            result_storage,
+                        );
+                        const retained_message_count: usize = if (within_turn_suffix.items.len > 0)
+                            0
+                        else
+                            @min(@as(usize, 2), compaction_messages.items.len);
+                        const retained_tokens = runtime_prompt_context.estimateCompactionSourceTokens(
+                            compaction_messages.items[compaction_messages.items.len - retained_message_count ..],
+                        );
+                        const prompt_tokens = runtime_prompt_context.estimateCompactionSourceTokens(
+                            &.{current_user_effective},
+                        );
+                        const refined_plan = runtime_prompt_context.planCompaction(.{
+                            .trigger = .automatic,
+                            .capabilities = request_capabilities,
+                            .request_tokens = request_cost.estimated_input_tokens,
+                            .source_tokens = request_cost.estimated_input_tokens,
+                            .protected_tokens = prompt_tokens +| retained_tokens,
+                        });
+                        if (refined_plan.decision != .compact) {
+                            return error.ContextCapacityExceeded;
+                        }
+                        const accepted_tokens = refined_plan.accepted_handoff_tokens orelse
+                            return error.ContextCapacityExceeded;
+                        const generation_tokens = refined_plan.generation_tokens orelse
+                            return error.ContextCapacityExceeded;
+                        const compactor_capabilities = deps.available_model_capabilities(
+                            deps.ctx,
+                            runtime_context_compaction.compactor_model,
+                        );
+                        const compactor_generation_tokens = if (compactor_capabilities.max_output_tokens) |limit|
+                            @min(generation_tokens, @as(usize, @intCast(limit)))
+                        else
+                            generation_tokens;
                         if (deps.push_interactive_notice) |push_notice| {
                             try push_notice(deps.ctx, .{
                                 .topic = "context",
@@ -3703,30 +3756,61 @@ fn processQueuedPromptLoop(
                         }
                         const compacted = try runtime_context_compaction.compact(
                             arena,
-                            request_messages,
+                            compaction_messages.items,
                             .{
-                                .stream_provider = deps.agent_stream_provider,
+                                .stream_provider = deps.compaction_stream_provider,
                                 .api_key = active_api_key,
                                 .credential_source = job.credential_source,
                                 .gateway_team = job.gateway_team,
                                 .session_id = lifecycle.scope.session_id,
-                                .model = gateway_model,
                                 .retry_count = config.gateway_retry_count,
                                 .cancel_flag = config.cancel_flag,
                                 .accepted_tokens = accepted_tokens,
-                                .generation_tokens = generation_tokens,
-                                .provider_options = provider_opts,
+                                .generation_tokens = compactor_generation_tokens,
+                                .provider_options = model_capabilities.resolveProviderOptionsForCapabilities(
+                                    compactor_capabilities,
+                                    .auto,
+                                    false,
+                                ),
                                 .usage = deps.usage,
                                 .usage_allocator = deps.usage_allocator,
                                 .trace_ctx = step_ctx,
+                                .protected_tail_messages = retained_message_count,
                             },
                         );
                         active_compaction_handoff = compacted.handoff;
-                        compacted_suffix_len = within_turn_suffix.items.len;
+                        const retained_active_messages = @min(
+                            compacted.retained_message_count,
+                            within_turn_suffix.items.len,
+                        );
+                        const retained_history_messages =
+                            compacted.retained_message_count - retained_active_messages;
+                        const history_message_count = compaction_messages.items.len -
+                            within_turn_suffix.items.len;
+                        if (retained_history_messages > history_message_count) {
+                            return error.InvalidContextHistoryStart;
+                        }
+                        active_compaction_history_tail = try arena.dupe(
+                            ChatMessage,
+                            compaction_messages.items[history_message_count - retained_history_messages .. history_message_count],
+                        );
+                        compacted_suffix_len = within_turn_suffix.items.len -
+                            retained_active_messages;
+                        const retained_history_turns = try session_runtime.retainedHistoryTurnCountForMessageTail(
+                            arena,
+                            job.history,
+                            retained_history_messages,
+                        );
+                        const raw_history_turns = session_runtime.rawHistoryTurnCount(
+                            job.history,
+                        );
+                        if (retained_history_turns > raw_history_turns) {
+                            return error.InvalidContextHistoryStart;
+                        }
                         compaction_count += 1;
                         try commitContextCompaction(deps, .{
                             .summary = @constCast(active_compaction_handoff.?),
-                            .removed_turn_count = compacted_history_turn_count,
+                            .removed_turn_count = raw_history_turns - retained_history_turns,
                             .compaction_count = compaction_count,
                         });
                         debug_trace.eventf(

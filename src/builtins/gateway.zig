@@ -186,7 +186,23 @@ pub fn buildAgentRequest(
         );
         return finalizeAgentRequestBody(alloc, request.model, body);
     }
-    if (request.response_format != null) return error.StructuredResponseRequiresVerifiedImages;
+    if (request.response_format) |response_format| {
+        const body = try vercel_protocol.buildGatewayRequestBodyWithStructuredResponseAndBudget(
+            alloc,
+            tools_json,
+            request.messages,
+            request.provider_options,
+            request.tool_choice,
+            request.max_output_tokens,
+            .{
+                .name = response_format.name,
+                .description = response_format.description,
+                .schema = response_format.schema,
+            },
+            budget orelse .{},
+        );
+        return finalizeAgentRequestBody(alloc, request.model, body);
+    }
 
     if (request.vision_mode != .required) {
         const body = if (budget) |active|
@@ -361,6 +377,33 @@ test "agent request builder keeps default reasoning silent and emits output limi
     try std.testing.expect(std.mem.find(u8, body, "\"maxOutputTokens\":32000") != null);
     try std.testing.expect(std.mem.find(u8, body, "\"reasoning\"") == null);
     try std.testing.expect(std.mem.find(u8, body, "\"providerOptions\"") == null);
+}
+
+test "agent request builder supports structured output without images" {
+    const alloc = std.testing.allocator;
+    var schema = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        "{\"type\":\"object\",\"properties\":{}}",
+        .{},
+    );
+    defer schema.deinit();
+    const messages = [_]shared_types.ChatMessage{.{ .role = .user, .content = "question" }};
+    const body = try buildAgentRequest(alloc, .{
+        .model = "openai/gpt-5.6-luna",
+        .messages = &messages,
+        .tool_choice = .none,
+        .provider_options = resolveGatewayProviderOptions("openai/gpt-5.6-luna", .auto, false),
+        .response_format = .{
+            .name = "state",
+            .description = "typed state",
+            .schema = schema.value,
+        },
+    });
+    defer alloc.free(body);
+
+    try std.testing.expect(std.mem.find(u8, body, "\"responseFormat\"") != null);
+    try std.testing.expect(std.mem.find(u8, body, "\"type\":\"json\"") != null);
 }
 
 test "agent request builder scopes the product user agent to GLM 5.2" {

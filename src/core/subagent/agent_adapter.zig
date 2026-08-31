@@ -212,7 +212,8 @@ pub fn run(
             null,
         .permission_mode = admission.permission_mode,
         .history = history,
-        .unversioned_history_count = turn.sessionRuntime().contextUnversionedHistoryCount(),
+        .context_history_start = turn.sessionRuntime().contextHistoryStart(),
+        .unversioned_history_count = turn.sessionRuntime().unversionedHistoryEnd(),
         .root_user_intent_context = if (message.root_user_intent_context.len > 0)
             arena.dupe(u8, message.root_user_intent_context) catch return error.OutOfMemory
         else
@@ -299,6 +300,7 @@ fn runtimeDeps(context: *Context) agent_runtime.AgentRuntimeDeps {
     return .{
         .ctx = context,
         .agent_stream_provider = context.config.tool_context.agent_stream_provider,
+        .compaction_stream_provider = context.config.tool_context.compaction_stream_provider,
         .tool_registry = context.config.tool_context.tool_registry,
         .context_registry = context.config.context_registry,
         .context_enabled = context.config.context_enabled,

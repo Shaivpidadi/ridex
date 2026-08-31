@@ -456,6 +456,12 @@ const App = struct {
             .agent_stream_or_unavailable();
     }
 
+    pub fn compactionStreamProvider(self: *const Self) agent_stream_provider.Provider {
+        return self.providerSet()
+            .select(.gateway)
+            .agent_stream_or_unavailable();
+    }
+
     pub fn fetchProviderCatalog(
         self: *Self,
         provider: model_provider.ProviderId,
@@ -1418,7 +1424,7 @@ const App = struct {
         );
         errdefer types.freeImageAttachmentSlice(std.heap.c_allocator, authorized_image_catalog);
 
-        const history_copy = try self.session.snapshotCanonicalContextHistory(std.heap.c_allocator);
+        const history_copy = try self.session.snapshotHistory(std.heap.c_allocator);
         errdefer types.freeHistoryTurnSlice(std.heap.c_allocator, history_copy);
         const root_user_intent_context = try auto_classifier_context.buildCanonicalRootUserContext(
             std.heap.c_allocator,
@@ -1482,7 +1488,8 @@ const App = struct {
             .account_id = account_id_copy,
             .permission_mode = self.permission_engine.mode,
             .history = history_copy,
-            .unversioned_history_count = self.session.contextUnversionedHistoryCount(),
+            .context_history_start = self.session.contextHistoryStart(),
+            .unversioned_history_count = self.session.unversionedHistoryEnd(),
             .root_user_intent_context = root_user_intent_context,
             .grants = grants_copy,
             .skill_bindings = skill_bindings,

@@ -76,9 +76,13 @@ pub const QueuedPrompt = struct {
     account_id: ?[]u8 = null,
     permission_mode: types.PermissionMode,
     history: []types.HistoryTurn,
-    /// Count of leading projected turns loaded without corrected result
-    /// provenance. The conservative default protects callers that do not own a
-    /// SessionRuntime snapshot.
+    /// Active model-context boundary within the complete owned canonical
+    /// history snapshot. Compaction reads raw turns before this boundary;
+    /// ordinary provider projection does not.
+    context_history_start: usize = 0,
+    /// Absolute end of the leading canonical-history range loaded without
+    /// corrected result provenance. The conservative default protects callers
+    /// that do not own a SessionRuntime snapshot.
     unversioned_history_count: usize = std.math.maxInt(usize),
     root_user_intent_context: []u8 = &.{},
     grants: []types.PermissionGrant,
@@ -306,6 +310,7 @@ const PreparedQueuedPromptDraft = struct {
 
 const PreparedHistoryPropagation = struct {
     history: []types.HistoryTurn,
+    context_history_start: usize,
     root_user_intent_context: []u8,
     authorized_image_catalog: []types.ImageAttachment,
     snapshot_file_ownerships: ?[]types.SnapshotFileOwnership,
@@ -1494,6 +1499,10 @@ pub const WorkerRuntime = struct {
 
             prepared[prepared_count] = .{
                 .history = next_history,
+                .context_history_start = if (turn == .compacted_summary)
+                    next_history.len - 1
+                else
+                    prompt.context_history_start,
                 .root_user_intent_context = next_root_user_intent_context,
                 .authorized_image_catalog = next_image_catalog,
                 .snapshot_file_ownerships = next_snapshot_file_ownerships,
@@ -1507,6 +1516,7 @@ pub const WorkerRuntime = struct {
         for (self.queued_prompts.items, prepared) |*prompt, next| {
             types.freeHistoryTurnSlice(alloc, prompt.history);
             prompt.history = next.history;
+            prompt.context_history_start = next.context_history_start;
             if (turn == .compacted_summary) prompt.unversioned_history_count = 0;
             if (prompt.root_user_intent_context.len > 0) alloc.free(prompt.root_user_intent_context);
             prompt.root_user_intent_context = next.root_user_intent_context;
@@ -2162,14 +2172,17 @@ fn appendHistoryTurnProjection(
     turn: types.HistoryTurn,
     max_history_turns: usize,
 ) ![]types.HistoryTurn {
-    const combined_len = std.math.add(usize, current.len, 1) catch
-        return error.OutOfMemory;
-    const combined = try alloc.alloc(types.HistoryTurn, combined_len);
-    defer alloc.free(combined);
-    std.mem.copyForwards(types.HistoryTurn, combined[0..current.len], current);
-    combined[current.len] = turn;
     _ = max_history_turns;
-    return session_runtime.snapshotOwnedCanonicalContextHistory(alloc, combined);
+    const next = try alloc.alloc(types.HistoryTurn, current.len + 1);
+    errdefer alloc.free(next);
+    var copied: usize = 0;
+    errdefer for (next[0..copied]) |owned| types.freeHistoryTurn(alloc, owned);
+    for (current, 0..) |entry, index| {
+        next[index] = try types.dupeHistoryTurn(alloc, entry);
+        copied += 1;
+    }
+    next[current.len] = try types.dupeHistoryTurn(alloc, turn);
+    return next;
 }
 
 pub fn freeQueuedPrompt(alloc: std.mem.Allocator, prompt: QueuedPrompt) void {
@@ -3482,9 +3495,10 @@ test "queue, event, snapshot, sync, history, and grant behavior" {
     } };
     defer types.freeHistoryTurn(alloc, turn);
     try runtime.propagateHistoryTurn(alloc, turn, 1);
-    try std.testing.expectEqual(@as(usize, 1), runtime.queued_prompts.items[0].history.len);
-    try std.testing.expect(runtime.queued_prompts.items[0].history[0] == .compacted_summary);
-    try std.testing.expectEqualStrings("summary", runtime.queued_prompts.items[0].history[0].compacted_summary.summary);
+    try std.testing.expectEqual(@as(usize, 2), runtime.queued_prompts.items[0].history.len);
+    try std.testing.expect(runtime.queued_prompts.items[0].history[1] == .compacted_summary);
+    try std.testing.expectEqualStrings("summary", runtime.queued_prompts.items[0].history[1].compacted_summary.summary);
+    try std.testing.expectEqual(@as(usize, 1), runtime.queued_prompts.items[0].context_history_start);
     try std.testing.expectEqual(@as(usize, 0), runtime.queued_prompts.items[0].unversioned_history_count);
 
     try runtime.propagateGrant(alloc, "read_file", "/tmp/a");

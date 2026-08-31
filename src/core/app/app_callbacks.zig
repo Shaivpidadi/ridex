@@ -272,6 +272,10 @@ pub fn Bindings(comptime App: type) type {
                     app.agentStreamProvider()
                 else
                     agent_stream_provider.unavailable_provider,
+                .compaction_stream_provider = if (comptime @hasDecl(App, "compactionStreamProvider"))
+                    app.compactionStreamProvider()
+                else
+                    agent_stream_provider.unavailable_provider,
                 .cooperative_transport_pulse = if (comptime @hasDecl(App, "cooperativeTransportPulse")) .{
                     .ctx = @ptrCast(app),
                     .run = cooperativeTransportPulse,

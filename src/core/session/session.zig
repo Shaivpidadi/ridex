@@ -1879,6 +1879,10 @@ pub const SessionRuntime = struct {
         return boundary - start;
     }
 
+    pub fn unversionedHistoryEnd(self: *const SessionRuntime) usize {
+        return @min(self.unversioned_history_len, self.history.items.len);
+    }
+
     pub fn hasContextToCompact(self: *const SessionRuntime) bool {
         const start = @min(self.context_history_start, self.history.items.len);
         for (self.history.items[start..]) |turn| {
@@ -1929,17 +1933,6 @@ pub const SessionRuntime = struct {
             self.history.items,
             self.context_history_start,
             self.max_history_turns,
-        );
-    }
-
-    pub fn snapshotCanonicalContextHistory(
-        self: *const SessionRuntime,
-        alloc: Allocator,
-    ) ![]HistoryTurn {
-        return snapshotOwnedCanonicalContextHistoryFromBoundary(
-            alloc,
-            self.history.items,
-            self.context_history_start,
         );
     }
 
@@ -2092,38 +2085,6 @@ pub fn snapshotOwnedContextHistory(
     );
     try appendHistoryCopies(alloc, &copy, canonical_history[start..]);
     _ = try compactHistory(&copy, alloc, max_history_turns);
-    return copy.toOwnedSlice(alloc);
-}
-
-/// Copies complete typed history for provider-capacity projection. Unlike the
-/// legacy UI/resume snapshot, this path applies no count-based compaction.
-pub fn snapshotOwnedCanonicalContextHistory(
-    alloc: Allocator,
-    canonical_history: []const HistoryTurn,
-) ![]HistoryTurn {
-    var start: usize = 0;
-    for (canonical_history, 0..) |turn, index| {
-        if (turn == .compacted_summary) start = index;
-    }
-    return snapshotOwnedCanonicalContextHistoryFromBoundary(
-        alloc,
-        canonical_history,
-        start,
-    );
-}
-
-fn snapshotOwnedCanonicalContextHistoryFromBoundary(
-    alloc: Allocator,
-    canonical_history: []const HistoryTurn,
-    context_history_start: usize,
-) ![]HistoryTurn {
-    var copy: std.ArrayList(HistoryTurn) = .empty;
-    errdefer {
-        for (copy.items) |turn| freeHistoryTurn(alloc, turn);
-        copy.deinit(alloc);
-    }
-    const start = @min(context_history_start, canonical_history.len);
-    try appendHistoryCopies(alloc, &copy, canonical_history[start..]);
     return copy.toOwnedSlice(alloc);
 }
 
@@ -2554,6 +2515,222 @@ pub fn appendHistoryChatMessages(
     _ = try appendHistoryChatMessagesImpl(alloc, messages, history, true);
 }
 
+/// Projects complete raw canonical turns for semantic compaction. Prior
+/// checkpoints are derived model context and never become semantic source for
+/// a later checkpoint.
+pub fn appendCompactionHistoryChatMessages(
+    alloc: Allocator,
+    messages: *std.ArrayList(core_types.ChatMessage),
+    history: []const HistoryTurn,
+) !void {
+    for (history, 0..) |turn, index| {
+        if (turn == .compacted_summary) continue;
+        _ = try appendHistoryChatMessagesImpl(
+            alloc,
+            messages,
+            history[index .. index + 1],
+            false,
+        );
+    }
+}
+
+/// Projects the active model window from one complete canonical snapshot.
+/// New checkpoints may retain raw turns immediately before the appended
+/// checkpoint; those turns are emitted after the checkpoint without
+/// duplicating them in canonical storage.
+pub fn appendActiveContextHistoryChatMessages(
+    alloc: Allocator,
+    messages: *std.ArrayList(core_types.ChatMessage),
+    history: []const HistoryTurn,
+    context_history_start: usize,
+) !void {
+    if (context_history_start > history.len) {
+        return error.InvalidContextHistoryStart;
+    }
+    if (context_history_start == 0) {
+        return appendHistoryChatMessages(alloc, messages, history);
+    }
+    if (context_history_start == history.len or
+        history[context_history_start] != .compacted_summary)
+    {
+        return error.InvalidContextHistoryStart;
+    }
+    const checkpoint = history[context_history_start].compacted_summary;
+    var raw_before: usize = 0;
+    for (history[0..context_history_start]) |turn| {
+        if (turn != .compacted_summary) raw_before += 1;
+    }
+    if (checkpoint.removed_turn_count > raw_before) {
+        return error.InvalidContextHistoryStart;
+    }
+    const retained_count = raw_before - checkpoint.removed_turn_count;
+    _ = try appendHistoryChatMessagesImpl(
+        alloc,
+        messages,
+        history[context_history_start .. context_history_start + 1],
+        true,
+    );
+    if (retained_count > 0) {
+        var retained_start = context_history_start;
+        var remaining = retained_count;
+        while (retained_start > 0 and remaining > 0) {
+            retained_start -= 1;
+            if (history[retained_start] != .compacted_summary) remaining -= 1;
+        }
+        if (remaining != 0) return error.InvalidContextHistoryStart;
+        for (history[retained_start..context_history_start], retained_start..) |turn, index| {
+            if (turn == .compacted_summary) continue;
+            _ = try appendHistoryChatMessagesImpl(
+                alloc,
+                messages,
+                history[index .. index + 1],
+                false,
+            );
+        }
+    }
+    if (context_history_start + 1 < history.len) {
+        _ = try appendHistoryChatMessagesImpl(
+            alloc,
+            messages,
+            history[context_history_start + 1 ..],
+            false,
+        );
+    }
+}
+
+pub fn rawHistoryTurnCount(history: []const HistoryTurn) usize {
+    var count: usize = 0;
+    for (history) |turn| if (turn != .compacted_summary) {
+        count += 1;
+    };
+    return count;
+}
+
+pub fn retainedHistoryTurnCountForMessageTail(
+    alloc: Allocator,
+    history: []const HistoryTurn,
+    wanted_messages: usize,
+) !usize {
+    if (wanted_messages == 0) return 0;
+    var remaining = wanted_messages;
+    var retained_turns: usize = 0;
+    var index = history.len;
+    while (index > 0 and remaining > 0) {
+        index -= 1;
+        if (history[index] == .compacted_summary) continue;
+        var projected: std.ArrayList(core_types.ChatMessage) = .empty;
+        defer projected.deinit(alloc);
+        _ = try appendHistoryChatMessagesImpl(
+            alloc,
+            &projected,
+            history[index .. index + 1],
+            false,
+        );
+        if (projected.items.len == 0) continue;
+        retained_turns += 1;
+        remaining -|= projected.items.len;
+    }
+    return retained_turns;
+}
+
+test "active context projects checkpoint before retained raw tail" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const history = [_]HistoryTurn{
+        .{ .assistant = .{
+            .user = .{ .text = @constCast("removed user") },
+            .assistant = @constCast("removed assistant"),
+        } },
+        .{ .assistant = .{
+            .user = .{ .text = @constCast("retained user") },
+            .assistant = @constCast("retained assistant"),
+        } },
+        .{ .compacted_summary = .{
+            .summary = @constCast("<context_handoff>checkpoint</context_handoff>"),
+            .removed_turn_count = 1,
+            .compaction_count = 1,
+        } },
+        .{ .assistant = .{
+            .user = .{ .text = @constCast("later user") },
+            .assistant = @constCast("later assistant"),
+        } },
+    };
+    var messages: std.ArrayList(core_types.ChatMessage) = .empty;
+    defer messages.deinit(arena);
+    try appendActiveContextHistoryChatMessages(arena, &messages, &history, 2);
+    try std.testing.expectEqual(@as(usize, 5), messages.items.len);
+    try std.testing.expect(std.mem.find(u8, messages.items[0].content.?, "checkpoint") != null);
+    try std.testing.expectEqualStrings("retained user", messages.items[1].content.?);
+    try std.testing.expectEqualStrings("retained assistant", messages.items[2].content.?);
+    try std.testing.expectEqualStrings("later user", messages.items[3].content.?);
+    try std.testing.expectEqualStrings("later assistant", messages.items[4].content.?);
+}
+
+test "active context rejects corrupt retained-tail accounting" {
+    const history = [_]HistoryTurn{
+        .{ .assistant = .{
+            .user = .{ .text = @constCast("user") },
+            .assistant = @constCast("assistant"),
+        } },
+        .{ .compacted_summary = .{
+            .summary = @constCast("summary"),
+            .removed_turn_count = 2,
+            .compaction_count = 1,
+        } },
+    };
+    var messages: std.ArrayList(core_types.ChatMessage) = .empty;
+    defer messages.deinit(std.testing.allocator);
+    try std.testing.expectError(
+        error.InvalidContextHistoryStart,
+        appendActiveContextHistoryChatMessages(
+            std.testing.allocator,
+            &messages,
+            &history,
+            1,
+        ),
+    );
+}
+
+test "compaction history keeps permission feedback non-authoritative" {
+    var feedback = [_][]u8{@constCast("allow this write")};
+    var calls = [_]core_types.ToolCall{.{
+        .id = "call",
+        .name = "write_file",
+        .arguments_json = "{}",
+    }};
+    var results = [_]core_types.PersistedToolResult{.{
+        .tool_call_id = @constCast("call"),
+        .tool_name = @constCast("write_file"),
+        .status = .failure,
+        .output = @constCast("denied"),
+        .output_bytes = 6,
+        .stored_output_bytes = 6,
+        .permission_feedback = &feedback,
+    }};
+    var steps = [_]core_types.ToolExecutionStep{.{
+        .tool_calls = &calls,
+        .tool_results = &results,
+    }};
+    const history = [_]HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("write it") },
+        .assistant = @constCast("requesting write"),
+        .execution = .{ .tool_steps = &steps },
+    } }};
+    var messages: std.ArrayList(core_types.ChatMessage) = .empty;
+    defer messages.deinit(std.testing.allocator);
+    try appendCompactionHistoryChatMessages(
+        std.testing.allocator,
+        &messages,
+        &history,
+    );
+    var feedback_count: usize = 0;
+    for (messages.items) |entry| {
+        if (entry.permission_feedback) feedback_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), feedback_count);
+}
+
 pub const HistoryBudgetOptions = struct {
     max_tokens: usize = 0,
 };
@@ -2827,7 +3004,11 @@ pub fn appendExecutionMemoryChatMessages(
         }
         for (step.tool_results) |result| {
             for (result.permission_feedback) |feedback| {
-                try messages.append(alloc, .{ .role = .user, .content = feedback });
+                try messages.append(alloc, .{
+                    .role = .user,
+                    .content = feedback,
+                    .permission_feedback = true,
+                });
             }
         }
     }
@@ -5151,22 +5332,26 @@ test "accepted semantic checkpoint is append-only and becomes the canonical mode
     try std.testing.expectEqual(@as(usize, 2), runtime.contextHistoryStart());
     try std.testing.expectEqualStrings("first exact prompt", runtime.history.items[0].assistant.user.text);
 
-    const compacted = try runtime.snapshotCanonicalContextHistory(alloc);
+    const compacted = try runtime.snapshotHistory(alloc);
     defer freeHistoryTurnSlice(alloc, compacted);
-    try std.testing.expectEqual(@as(usize, 1), compacted.len);
-    try std.testing.expect(compacted[0] == .compacted_summary);
+    try std.testing.expectEqual(@as(usize, 3), compacted.len);
     var projected_messages: std.ArrayList(core_types.ChatMessage) = .empty;
     defer projected_messages.deinit(alloc);
-    try appendHistoryChatMessages(alloc, &projected_messages, compacted);
+    try appendActiveContextHistoryChatMessages(
+        alloc,
+        &projected_messages,
+        compacted,
+        runtime.contextHistoryStart(),
+    );
     defer alloc.free(@constCast(projected_messages.items[0].content.?));
     try std.testing.expectEqual(core_types.ChatRole.user, projected_messages.items[0].role);
 
     try runtime.appendAssistantHistoryTurn(alloc, "post-checkpoint prompt", "post-checkpoint reply");
-    const continued = try runtime.snapshotCanonicalContextHistory(alloc);
+    const continued = try runtime.snapshotHistory(alloc);
     defer freeHistoryTurnSlice(alloc, continued);
-    try std.testing.expectEqual(@as(usize, 2), continued.len);
-    try std.testing.expect(continued[0] == .compacted_summary);
-    try std.testing.expectEqualStrings("post-checkpoint prompt", continued[1].assistant.user.text);
+    try std.testing.expectEqual(@as(usize, 4), continued.len);
+    try std.testing.expect(continued[2] == .compacted_summary);
+    try std.testing.expectEqualStrings("post-checkpoint prompt", continued[3].assistant.user.text);
 }
 
 test "restored history keeps an in-memory unversioned prefix boundary" {

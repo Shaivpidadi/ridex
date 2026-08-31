@@ -2718,7 +2718,7 @@ test "processQueuedPrompt uses one available capability snapshot for compaction 
         ),
     }};
     const completions = [_]FakeCompletion{
-        .{ .content = "# Objective\nContinue from the compacted history." },
+        .{ .content = "{\"objective\":{\"text\":\"Continue from the compacted history.\",\"sources\":[\"S0\"]},\"constraints\":[],\"obligations\":[],\"next_action\":{\"kind\":\"none\",\"text\":\"Continue.\",\"sources\":[\"S0\"]}}" },
         .{ .content = "Done" },
     };
     var gateway = FakeGateway.init(alloc, &completions);
@@ -2735,11 +2735,13 @@ test "processQueuedPrompt uses one available capability snapshot for compaction 
     try std.testing.expectEqual(@as(usize, 0), hooks.capability_queries.items.len);
     try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
     try expectBodyContains(&gateway, 0, old_marker);
-    try expectBodyContains(&gateway, 0, "NEW_HISTORY_USER");
-    try expectBodyContains(&gateway, 0, "NEW_HISTORY_ASSISTANT");
-    try expectBodyContains(&gateway, 0, "\"maxOutputTokens\":6384");
+    try expectBodyNotContains(&gateway, 0, "NEW_HISTORY_USER");
+    try expectBodyNotContains(&gateway, 0, "NEW_HISTORY_ASSISTANT");
+    try expectBodyContains(&gateway, 0, "\"maxOutputTokens\":");
     try expectBodyContains(&gateway, 1, "context_handoff");
     try expectBodyNotContains(&gateway, 1, old_marker);
+    try expectBodyContains(&gateway, 1, "NEW_HISTORY_USER");
+    try expectBodyContains(&gateway, 1, "NEW_HISTORY_ASSISTANT");
     try expectBodyContains(&gateway, 1, "\"maxOutputTokens\":16000");
 }
 
@@ -2798,7 +2800,7 @@ test "processQueuedPrompt semantically compacts history at eighty percent and co
         "{\"path\":\"first.txt\"}",
     )};
     const completions = [_]FakeCompletion{
-        .{ .content = "# Objective\nFinish after the verified read.\n\n# Completed effects\nRead first.txt once.\n\n# Next action\nReturn the result." },
+        .{ .content = "{\"objective\":{\"text\":\"Finish after the verified read.\",\"sources\":[\"S0\"]},\"constraints\":[],\"obligations\":[],\"next_action\":{\"kind\":\"none\",\"text\":\"Return the result.\",\"sources\":[\"S0\"]}}" },
         .{ .tool_calls = &first_calls },
         .{ .content = "Automatic compaction complete." },
     };
@@ -2819,10 +2821,16 @@ test "processQueuedPrompt semantically compacts history at eighty percent and co
     config.tool_result_dir = result_dir;
     var job = fixture.job();
     job.model = @constCast(model);
-    var history = [_]HistoryTurn{.{ .assistant = .{
-        .user = .{ .text = @constCast("AUTO_HISTORY_USER_SENTINEL") },
-        .assistant = @constCast("AUTO_HISTORY_ASSISTANT_SENTINEL\n" ++ ("h" ** 200_000)),
-    } }};
+    var history = [_]HistoryTurn{
+        .{ .assistant = .{
+            .user = .{ .text = @constCast("AUTO_HISTORY_USER_SENTINEL") },
+            .assistant = @constCast("AUTO_HISTORY_ASSISTANT_SENTINEL\n" ++ ("h" ** 200_000)),
+        } },
+        .{ .assistant = .{
+            .user = .{ .text = @constCast("AUTO_RECENT_USER") },
+            .assistant = @constCast("AUTO_RECENT_ASSISTANT"),
+        } },
+    };
     job.history = &history;
 
     try runFakePrompt(&gateway, &hooks, config, job);
@@ -2857,7 +2865,7 @@ test "processQueuedPrompt compacts mid-turn after tool output crosses eighty per
     )};
     const completions = [_]FakeCompletion{
         .{ .tool_calls = &calls },
-        .{ .content = "# Objective\nFinish after reading large.txt.\n\n# Completed effects\nThe read ran once.\n\n# Next action\nReturn the conclusion." },
+        .{ .content = "{\"objective\":{\"text\":\"Finish after reading large.txt.\",\"sources\":[\"S0\"]},\"constraints\":[],\"obligations\":[],\"next_action\":{\"kind\":\"none\",\"text\":\"Return the conclusion.\",\"sources\":[\"S0\"]}}" },
         .{ .content = "Mid-turn compaction complete." },
     };
     var gateway = FakeGateway.init(alloc, &completions);

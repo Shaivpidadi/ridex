@@ -142,6 +142,30 @@ pub fn buildGatewayRequestBodyWithVerifiedImagesAndBudget(
     );
 }
 
+pub fn buildGatewayRequestBodyWithStructuredResponseAndBudget(
+    alloc: std.mem.Allocator,
+    tools_json: []const u8,
+    messages: []const ChatMessage,
+    options: model_capabilities.ResolvedProviderOptions,
+    tool_choice: types.ToolChoice,
+    max_output_tokens: ?u32,
+    response_format: StructuredResponseFormat,
+    budget: BuildBudget,
+) ![]u8 {
+    try validateToolMessageHistory(alloc, messages);
+    return buildGatewayRequestBodyValidated(
+        alloc,
+        tools_json,
+        messages,
+        options,
+        tool_choice.label(),
+        max_output_tokens,
+        budget,
+        response_format,
+        null,
+    );
+}
+
 pub fn buildGatewayRequiredToolRequestBodyWithOptions(
     alloc: std.mem.Allocator,
     tools_json: []const u8,

@@ -975,6 +975,7 @@ const AskContext = struct {
             .max_tool_result_bytes = self.max_tool_result_bytes,
             .api_key = self.api_key,
             .agent_stream_provider = self.agentStreamProvider(),
+            .compaction_stream_provider = self.compactionStreamProvider(),
             .gateway_team = self.gateway_team,
             .credential_source = self.credential_source,
             .account_id = self.account_id,
@@ -1085,6 +1086,10 @@ const AskContext = struct {
 
     fn agentStreamProvider(self: *const AskContext) agent_stream_provider.Provider {
         return self.cfg.provider_set.select(self.provider).agent_stream_or_unavailable();
+    }
+
+    fn compactionStreamProvider(self: *const AskContext) agent_stream_provider.Provider {
+        return self.cfg.provider_set.select(.gateway).agent_stream_or_unavailable();
     }
 
     fn writeStdout(self: *AskContext, text: []const u8) !void {
@@ -1719,7 +1724,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     if (explicit_skills.diagnostic_notice) |notice| try pushContextNotice(@ptrCast(&ctx), notice);
     ctx.subagent_skills_prompt = try alloc.dupe(u8, skills_section);
     ctx.subagent_explicit_skills_prompt = try alloc.dupe(u8, explicit_skills.text);
-    const context_history = try ctx.session.snapshotCanonicalContextHistory(alloc);
+    const context_history = try ctx.session.snapshotHistory(alloc);
     defer types.freeHistoryTurnSlice(alloc, context_history);
     const root_user_intent_context = try auto_classifier_context.buildCanonicalRootUserContext(
         alloc,
@@ -1745,7 +1750,8 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         .provider = ctx.provider,
         .permission_mode = ctx.permission_mode,
         .history = context_history,
-        .unversioned_history_count = ctx.session.contextUnversionedHistoryCount(),
+        .context_history_start = ctx.session.contextHistoryStart(),
+        .unversioned_history_count = ctx.session.unversionedHistoryEnd(),
         .root_user_intent_context = root_user_intent_context,
         .grants = &.{},
         // process_queued_prompt is synchronous here; AskContext keeps the
@@ -1934,6 +1940,7 @@ fn agentRuntimeDeps(ctx: *AskContext) agent_runtime.AgentRuntimeDeps {
     return .{
         .ctx = @ptrCast(ctx),
         .agent_stream_provider = ctx.agentStreamProvider(),
+        .compaction_stream_provider = ctx.compactionStreamProvider(),
         .tool_registry = ctx.toolRegistry(),
         .context_registry = ctx.deps.context_registry,
         .context_enabled = ctx.context_enabled,

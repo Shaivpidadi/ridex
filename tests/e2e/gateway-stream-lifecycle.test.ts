@@ -4122,7 +4122,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         fakeGatewayFinalText("FIRST_REPLY_COMPACTION_SENTINEL"),
         fakeGatewayFinalText("SECOND_REPLY_COMPACTION_SENTINEL"),
         fakeGatewayFinalText(
-          "# Objective\nContinue the compacted session.\n\n# User constraints\nPreserve FIRST_PROMPT_COMPACTION_SENTINEL and SECOND_PROMPT_COMPACTION_SENTINEL.\n\n# Completed effects\nRead manual-compaction-large.txt once.\n\n# Next action\nAnswer the next user prompt.",
+          '{"objective":{"text":"Continue the compacted session.","sources":["S0"]},"constraints":[{"text":"Preserve FIRST_PROMPT_COMPACTION_SENTINEL and SECOND_PROMPT_COMPACTION_SENTINEL.","sources":["S0"]}],"obligations":[],"next_action":{"kind":"await_external_input","text":"Answer the next user prompt.","sources":["S0"]}}',
         ),
         fakeGatewayFinalText("compaction restart complete"),
       ];
@@ -4290,7 +4290,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         fakeGatewayFinalText("SKILL_BEFORE_COMPACTION_COMPLETE"),
         fakeGatewayFinalText("SECOND_COMPACTION_TURN_COMPLETE"),
         fakeGatewayFinalText(
-          "# Objective\nContinue after compacting the skill workflow.\n\n# Completed effects\nThe explicit skill was read once.\n\n# Next action\nRead the skill again when asked.",
+          '{"objective":{"text":"Continue after compacting the explicit skill workflow.","sources":["S0"]},"constraints":[],"obligations":[],"next_action":{"kind":"await_external_input","text":"Read the skill again when asked.","sources":["S0"]}}',
         ),
         fakeGatewayToolCall(afterCallId, "skill", { name: skillName }),
         fakeGatewayFinalText("SKILL_AFTER_COMPACTION_COMPLETE"),
