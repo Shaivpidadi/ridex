@@ -876,19 +876,21 @@ function startFakeCodexToolLoop(options: {
   toolName?: string;
   toolArguments?: object;
   finalText?: string;
+  inputModalities?: string[];
 } = {}) {
   const bodies: string[] = [];
   const accessToken = chatgptAccessToken("acct_tool_loop");
   const toolName = options.toolName ?? "read_file";
   const toolArguments = options.toolArguments ?? { path: "README.md" };
   const finalText = options.finalText ?? "CODEX_TOOL_LOOP_OK";
+  const inputModalities = options.inputModalities ?? ["text"];
   const server = Bun.serve({
     hostname: "127.0.0.1",
     port: 0,
     async fetch(request) {
       if (new URL(request.url).pathname === "/models") {
         return Response.json({ models: [
-          { slug: "gpt-5.6-sol", visibility: "list", supported_in_api: true, supported_reasoning_levels: [{ effort: "high" }], additional_speed_tiers: [], input_modalities: ["text"], context_window: 272000 },
+          { slug: "gpt-5.6-sol", visibility: "list", supported_in_api: true, supported_reasoning_levels: [{ effort: "high" }], additional_speed_tiers: [], input_modalities: inputModalities, context_window: 272000 },
           { slug: "gpt-5.4-mini", visibility: "list", supported_in_api: true, supported_reasoning_levels: [{ effort: "low" }], additional_speed_tiers: [], input_modalities: ["text"], context_window: 128000 },
         ] });
       }
@@ -3047,6 +3049,7 @@ test(
       toolName: "vision",
       toolArguments: { image_ids: [1], focus: "Inspect the image." },
       finalText: "CODEX_VISION_DISABLED_OK",
+      inputModalities: ["text", "image"],
     });
     try {
       writeSeededChatGptLogin(home, codex.accessToken);
