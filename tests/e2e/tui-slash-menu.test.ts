@@ -2995,7 +2995,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
   );
 
   test(
-    "skills catalog retains input ownership for global view shortcuts",
+    "skills catalog keeps direct Ctrl-X and escaped Ctrl-X returns to the composer",
     async () => {
       const fixture = createSkillsMenuFixture();
       session = await TmuxSession.create({
@@ -3025,9 +3025,8 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.sendText("/skills");
       await waitForSkillsMenu(session, 4);
       await session.sendHexBytes(["1b", "18"]);
-      await session.waitForText("Agents & processes", 5_000);
-      await session.sendKeys("C-x");
       await session.waitForComposer(5_000);
+      expect((await session.capturePane())).not.toContain("Agents & processes");
       await session.sendText("/quit");
       expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
       session = null;
