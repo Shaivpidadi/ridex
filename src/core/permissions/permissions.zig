@@ -1114,6 +1114,85 @@ pub fn ruleDecisionFor(alloc: std.mem.Allocator, rules: types.PermissionRuleSet,
     return evaluateRulesetForTool(rules.rules, permission, tool_name, pattern) orelse .none;
 }
 
+/// Read-only FreeRide diagnostics the agent may always run. ridex's
+/// entire model chain is the local FreeRide gateway, and self-diagnosis
+/// (the bundled `freeride` skill) must not stall on permission prompts
+/// for commands that only report state. These are PREPENDED to the
+/// user's rules and rule evaluation keeps the LAST match, so an
+/// explicit user deny (or ask) still wins.
+pub const freeride_diagnostic_rules = [_]types.PermissionRule{
+    .{ .permission = @constCast("bash"), .pattern = @constCast("freeride doctor"), .action = .allow },
+    .{ .permission = @constCast("bash"), .pattern = @constCast("freeride keys"), .action = .allow },
+    .{ .permission = @constCast("bash"), .pattern = @constCast("freeride providers"), .action = .allow },
+    .{ .permission = @constCast("bash"), .pattern = @constCast("freeride telemetry"), .action = .allow },
+    .{ .permission = @constCast("bash"), .pattern = @constCast("freeride --version"), .action = .allow },
+    .{ .permission = @constCast("bash"), .pattern = @constCast("ridex doctor"), .action = .allow },
+    // Health probe in any curl spelling; the static-command guard on
+    // bash allow rules already rejects chained/metachar commands.
+    .{ .permission = @constCast("bash"), .pattern = @constCast("curl *127.0.0.1:11343/health"), .action = .allow },
+    .{ .permission = @constCast("bash"), .pattern = @constCast("curl *localhost:11343/health"), .action = .allow },
+};
+
+/// Returns an owned rule set of the built-in FreeRide diagnostic
+/// grants followed by (and therefore overridable by) the user's rules.
+pub fn withFreerideDiagnosticDefaults(
+    alloc: std.mem.Allocator,
+    user: types.PermissionRuleSet,
+) !types.PermissionRuleSet {
+    var merged: std.ArrayList(types.PermissionRule) = .empty;
+    errdefer {
+        for (merged.items) |rule| {
+            alloc.free(rule.permission);
+            alloc.free(rule.pattern);
+        }
+        merged.deinit(alloc);
+    }
+    for (freeride_diagnostic_rules) |rule| {
+        try appendDupedRule(alloc, &merged, rule);
+    }
+    for (user.rules) |rule| {
+        try appendDupedRule(alloc, &merged, rule);
+    }
+    return .{ .rules = try merged.toOwnedSlice(alloc) };
+}
+
+test "freeride diagnostic defaults allow read-only commands and user rules still win" {
+    const alloc = std.testing.allocator;
+
+    var defaults_only = try withFreerideDiagnosticDefaults(alloc, .{});
+    defer defaults_only.deinit(alloc);
+    try std.testing.expectEqual(RuleDecision.allow, ruleDecisionForPermissionPattern(defaults_only, "bash", "freeride doctor", .none));
+    try std.testing.expectEqual(RuleDecision.allow, ruleDecisionForPermissionPattern(defaults_only, "bash", "freeride keys", .none));
+    try std.testing.expectEqual(RuleDecision.allow, ruleDecisionForPermissionPattern(defaults_only, "bash", "curl -sf -m 3 http://127.0.0.1:11343/health", .none));
+    // Mutating commands stay unlisted: reload/init/serve fall back.
+    try std.testing.expectEqual(RuleDecision.none, ruleDecisionForPermissionPattern(defaults_only, "bash", "freeride reload", .none));
+    try std.testing.expectEqual(RuleDecision.none, ruleDecisionForPermissionPattern(defaults_only, "bash", "freeride init", .none));
+
+    var deny_rules = [_]types.PermissionRule{
+        .{ .permission = @constCast("bash"), .pattern = @constCast("freeride doctor"), .action = .deny },
+    };
+    var with_user_deny = try withFreerideDiagnosticDefaults(alloc, .{ .rules = &deny_rules });
+    defer with_user_deny.deinit(alloc);
+    try std.testing.expectEqual(RuleDecision.deny, ruleDecisionForPermissionPattern(with_user_deny, "bash", "freeride doctor", .none));
+    try std.testing.expectEqual(RuleDecision.allow, ruleDecisionForPermissionPattern(with_user_deny, "bash", "freeride keys", .none));
+}
+
+fn appendDupedRule(
+    alloc: std.mem.Allocator,
+    list: *std.ArrayList(types.PermissionRule),
+    rule: types.PermissionRule,
+) !void {
+    const permission = try alloc.dupe(u8, rule.permission);
+    errdefer alloc.free(permission);
+    const pattern = try alloc.dupe(u8, rule.pattern);
+    errdefer alloc.free(pattern);
+    try list.append(alloc, .{
+        .permission = permission,
+        .pattern = pattern,
+        .action = rule.action,
+    });
+}
+
 pub fn ruleDecisionForPermissionPattern(rules: types.PermissionRuleSet, permission: []const u8, pattern: []const u8, fallback: RuleDecision) RuleDecision {
     return evaluateRuleset(rules.rules, permission, pattern) orelse fallback;
 }
