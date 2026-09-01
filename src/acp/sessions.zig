@@ -1014,7 +1014,8 @@ pub fn handleListSessions(state: *server.ServerState, alloc: Allocator, msg: *js
     };
     defer store.deinit(alloc);
 
-    var page = store.listSessionPage(
+    var page = subagent_resume_admission.listVisiblePage(
+        store,
         alloc,
         if (params.cwd != null) .current_workspace else .all_workspaces,
         params.continuation,

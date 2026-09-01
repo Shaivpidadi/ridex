@@ -641,11 +641,14 @@ pub const Store = struct {
         options: session_log.Options,
     ) !LoadedWritableSession {
         var root = self.canonical_root;
-        const lifecycle = try self.makeLatestCacheLifecycle(
-            alloc,
-            initialIndexEffect(state),
-            options.test_controls,
-        );
+        const lifecycle: ?session_log.CommitLifecycle = if (state.subagent_child)
+            null
+        else
+            try self.makeLatestCacheLifecycle(
+                alloc,
+                initialIndexEffect(state),
+                options.test_controls,
+            );
         var loaded = try root.startWritableSessionWithLifecycle(
             alloc,
             state,
@@ -3399,7 +3402,7 @@ pub const Store = struct {
             loaded.active_id,
         );
 
-        if (loaded.commit_lifecycle == null) {
+        if (loaded.commit_lifecycle == null and !loaded.state.subagent_child) {
             try self.installLatestCacheLifecycle(
                 alloc,
                 &loaded,

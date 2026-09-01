@@ -36,6 +36,78 @@ pub const ActionableSessionPage = struct {
     }
 };
 
+pub fn listVisiblePage(
+    store: session_store.Store,
+    alloc: Allocator,
+    scope: session_store.SessionListScope,
+    continuation: ?session_store.ResumableSessionContinuation,
+    limit: usize,
+) !session_store.SessionListPage {
+    if (limit == 0) return error.InvalidSessionListLimit;
+    var result = session_store.SessionListPage{};
+    errdefer result.deinit(alloc);
+    var position: ?ActionableContinuation = if (continuation) |value| .{
+        .updated_at_ms = value.updated_at_ms,
+        .id = try alloc.dupe(u8, value.id),
+    } else null;
+    defer if (position) |*value| value.deinit(alloc);
+
+    while (result.summaries.items.len < limit) {
+        const next = if (position) |value| value.view() else null;
+        var page = try store.listSessionPage(
+            alloc,
+            scope,
+            next,
+            limit - result.summaries.items.len,
+        );
+        defer page.deinit(alloc);
+        result.skipped_invalid +|= page.skipped_invalid;
+        if (page.summaries.items.len == 0) {
+            result.has_more = false;
+            break;
+        }
+        for (page.summaries.items) |summary| {
+            if (position) |*value| value.deinit(alloc);
+            position = .{
+                .updated_at_ms = summary.updated_at_ms,
+                .id = try alloc.dupe(u8, summary.id),
+            };
+            if (try isVisibleSession(store, alloc, summary.id)) {
+                var cloned = try session_summary_codec.cloneSessionSummary(
+                    alloc,
+                    summary,
+                );
+                result.summaries.append(alloc, cloned) catch |err| {
+                    cloned.deinit(alloc);
+                    return err;
+                };
+            }
+        }
+        result.has_more = page.has_more;
+        if (!page.has_more) break;
+    }
+    return result;
+}
+
+pub fn latestVisibleWorkspaceSummary(
+    store: session_store.Store,
+    alloc: Allocator,
+) !session_store.SessionSummary {
+    var page = try listVisiblePage(
+        store,
+        alloc,
+        .current_workspace,
+        null,
+        1,
+    );
+    defer page.deinit(alloc);
+    if (page.summaries.items.len == 0) return error.NoSavedSessions;
+    return session_summary_codec.cloneSessionSummary(
+        alloc,
+        page.summaries.items[0],
+    );
+}
+
 pub fn listActionablePage(
     store: session_store.Store,
     alloc: Allocator,
@@ -171,8 +243,22 @@ pub fn resumeForExternalPrompt(
     workspace_root: []const u8,
     options: session_store.ResumeOptions,
 ) !session_store.LoadedWritableSession {
-    if (target == .id) try ensureExternalMarkerAllowed(store, alloc, target.id);
-    var loaded = try store.resumeTargetForWrite(alloc, target, workspace_root, options);
+    var selected: ?session_store.SessionSummary = switch (target) {
+        .id => null,
+        .last => try latestVisibleWorkspaceSummary(store, alloc),
+    };
+    defer if (selected) |*summary| summary.deinit(alloc);
+    const external_target: session_store.ResumeTarget = if (selected) |summary|
+        .{ .id = summary.id }
+    else
+        target;
+    try ensureExternalMarkerAllowed(store, alloc, external_target.id);
+    var loaded = try store.resumeTargetForWrite(
+        alloc,
+        external_target,
+        workspace_root,
+        options,
+    );
     errdefer loaded.deinit(alloc);
     try ensureLoadedExternalPromptAllowed(&loaded);
     return loaded;
@@ -183,7 +269,19 @@ pub fn admitResumeViewForExternalPrompt(
     alloc: Allocator,
     target: session_store.ResumeTarget,
 ) !?session_store.ResumeViewAdmission {
-    var admission = (try store.admitResumeView(alloc, target)) orelse return null;
+    var selected: ?session_store.SessionSummary = switch (target) {
+        .id => null,
+        .last => latestVisibleWorkspaceSummary(store, alloc) catch |err| switch (err) {
+            error.NoSavedSessions => return null,
+            else => return err,
+        },
+    };
+    defer if (selected) |*summary| summary.deinit(alloc);
+    const external_target: session_store.ResumeTarget = if (selected) |summary|
+        .{ .id = summary.id }
+    else
+        target;
+    var admission = (try store.admitResumeView(alloc, external_target)) orelse return null;
     errdefer admission.deinit(alloc);
     try ensureExternalPromptAllowed(store, alloc, admission.sessionId());
     return admission;
@@ -236,6 +334,21 @@ fn ensureExternalPromptAllowed(
         else => return err,
     };
     if (managed) return error.OneOffSessionNotResumable;
+}
+
+fn isVisibleSession(
+    store: session_store.Store,
+    alloc: Allocator,
+    session_id: []const u8,
+) !bool {
+    return !(child_state.isManagedChildSession(
+        store,
+        alloc,
+        session_id,
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return false,
+    });
 }
 
 fn ensureExternalMarkerAllowed(

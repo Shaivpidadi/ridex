@@ -5431,6 +5431,116 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       rmSync(root.root, { recursive: true, force: true });
     }
   }, 30_000);
+
+  test("SIGKILL during persistent child work keeps parent recovery selectable", async () => {
+    const root = createFixtureRoot("subagent-persistent-sigkill-recovery");
+    const tracePath = join(root.root, "trace.log");
+    const childPrompt = "Remain active until the saved parent is killed.";
+    const resumePrompt = "Continue after the interrupted persistent child.";
+    const gateway = startDynamicFakeGateway((body) => {
+      if (promptText(body).includes(resumePrompt)) {
+        return fakeGatewayFinalText("PARENT_RECOVERY_COMPLETE");
+      }
+      if (promptText(body).includes(childPrompt)) {
+        return delayedSuccessfulResponse();
+      }
+      return fakeGatewayToolCall("persistent_sigkill_message", "subagent", {
+        request: {
+          action: "message",
+          agent: "reviewer",
+          message: childPrompt,
+        },
+      });
+    }, {
+      classifierDecision: "clear",
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+    });
+    const first = Bun.spawn(
+      [FX_BIN, "ask", "--json", "--auto", "Start the persistent child."],
+      {
+        cwd: root.workspace,
+        env: fixtureEnv(root, gateway, tracePath),
+        stdin: "ignore",
+        stdout: "ignore",
+        stderr: "pipe",
+      },
+    );
+    try {
+      const childDeadline = Date.now() + 10_000;
+      while (
+        !gateway.requests.some((request) =>
+          promptText(request.body).includes(childPrompt)
+        ) && Date.now() < childDeadline
+      ) {
+        await Bun.sleep(25);
+      }
+      expect(gateway.requests.some((request) =>
+        promptText(request.body).includes(childPrompt)
+      )).toBe(true);
+
+      first.kill("SIGKILL");
+      await first.exited;
+      const firstStderr = await new Response(first.stderr).text();
+      expect(firstStderr).not.toContain("panic: reached unreachable code");
+
+      const latest = await runFx(["session", "last", "--json"], {
+        cwd: root.workspace,
+        env: { HOME: root.home },
+        timeoutMs: 10_000,
+      });
+      expect(latest.code).toBe(0);
+      const latestId = (JSON.parse(latest.stdout) as { id: string }).id;
+
+      const sessionIds = readdirSync(join(root.home, ".fx", "sessions"))
+        .filter((name) => /^\d+-\d+-[0-9a-f]+$/.test(name));
+      expect(sessionIds).toHaveLength(2);
+      const parentId = sessionIds.find((id) =>
+        existsSync(join(root.home, ".fx", "sessions", id, "subagent", "children.json"))
+      );
+      const childId = sessionIds.find((id) => id !== parentId);
+      expect(parentId).toBeDefined();
+      expect(childId).toBeDefined();
+      expect(latestId).toBe(parentId!);
+      const listed = await runFx(["sessions", "--json"], {
+        cwd: root.workspace,
+        env: { HOME: root.home },
+        timeoutMs: 10_000,
+      });
+      expect(listed.code).toBe(0);
+      expect((JSON.parse(listed.stdout) as {
+        sessions: Array<{ id: string }>;
+      }).sessions.map((session) => session.id)).toEqual([parentId!]);
+
+      const resumed = await runFx(
+        [
+          "ask",
+          "--json",
+          "--auto",
+          "--resume-id",
+          parentId!,
+          resumePrompt,
+        ],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 15_000,
+        },
+      );
+      if (resumed.code !== 0) {
+        throw new Error(
+          `persistent child recovery failed: code=${resumed.code} signal=${resumed.signal}\nstdout=${resumed.stdout}\nstderr=${resumed.stderr}\ntrace=${existsSync(tracePath) ? readFileSync(tracePath, "utf8") : "<missing>"}`,
+        );
+      }
+      expect(parseAskJson(resumed.stdout).output).toContain(
+        "PARENT_RECOVERY_COMPLETE",
+      );
+    } finally {
+      if (first.exitCode === null) first.kill("SIGKILL");
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 35_000);
+
   test("selected dynamic MCP review cautions with zero sends and clears exactly once", async () => {
     for (const decision of ["caution", "clear"] as const) {
       const root = createFixtureRoot(`mcp-review-${decision}`);

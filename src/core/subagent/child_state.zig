@@ -388,7 +388,10 @@ pub const Registry = struct {
             if (child.active) |active| {
                 if (child.last_work_id) |old| alloc.free(old);
                 child.last_work_id = alloc.dupe(u8, active.id) catch null;
+                child.last_request_fingerprint = active.request_fingerprint;
                 child.last_outcome = .interrupted;
+                child.active.?.deinit(alloc);
+                child.active = null;
             }
             child.phase = .interrupted;
             changed = true;
@@ -637,15 +640,17 @@ fn parseRegistry(alloc: Allocator, bytes: []const u8, parent_id: []const u8) !Re
     registry.generation = try unsigned(root, "generation");
     const children = try alloc.alloc(Child, values.array.items.len);
     var built: usize = 0;
-    errdefer {
+    var children_owned = true;
+    errdefer if (children_owned) {
         for (children[0..built]) |*child| child.deinit(alloc);
         alloc.free(children);
-    }
+    };
     for (values.array.items) |value| {
         children[built] = try parseChild(alloc, value);
         built += 1;
     }
     registry.children = children;
+    children_owned = false;
     try validateRegistry(registry);
     return registry;
 }
@@ -866,6 +871,52 @@ test "parent child state round trips only required delegation state" {
     try std.testing.expectEqualStrings("reviewer", decoded.children[0].agentName().?);
     try std.testing.expectEqualStrings("Review carefully.", decoded.children[0].instructions());
     try std.testing.expectEqual(Phase.running, decoded.children[0].phase);
+}
+
+test "interrupted active work clears ownership and remains round trippable" {
+    const alloc = std.testing.allocator;
+    var registry = try Registry.init(alloc, "01J00000000000000000000000");
+    defer registry.deinit(alloc);
+    var active = ActiveWork{
+        .id = try alloc.dupe(u8, "work-1"),
+        .request_fingerprint = [_]u8{7} ** 32,
+        .message = try alloc.dupe(u8, "review this"),
+        .created_at_ms = 1,
+    };
+    defer active.deinit(alloc);
+    try registry.appendPersistent(
+        alloc,
+        "01J00000000000000000000001",
+        "reviewer",
+        "Review carefully.",
+        active,
+    );
+
+    registry.interruptActive(alloc);
+
+    const child = registry.children[0];
+    try std.testing.expectEqual(Phase.interrupted, child.phase);
+    try std.testing.expect(child.active == null);
+    try std.testing.expectEqualStrings("work-1", child.last_work_id.?);
+    try std.testing.expectEqual([_]u8{7} ** 32, child.last_request_fingerprint.?);
+    try std.testing.expectEqual(Outcome.interrupted, child.last_outcome.?);
+    const encoded = try renderRegistry(alloc, registry);
+    defer alloc.free(encoded);
+    var decoded = try parseRegistry(alloc, encoded, registry.parent_id);
+    defer decoded.deinit(alloc);
+    try std.testing.expectEqual(Phase.interrupted, decoded.children[0].phase);
+    try std.testing.expect(decoded.children[0].active == null);
+}
+
+test "invalid registry state returns an error without duplicate cleanup" {
+    const alloc = std.testing.allocator;
+    const invalid =
+        \\{"schema_version":1,"parent_id":"01J00000000000000000000000","generation":1,"children":[{"id":"01J00000000000000000000001","kind":"persistent","persistent":{"agent":"reviewer","instructions":""},"phase":"interrupted","work_generation":1,"active":{"id":"work-1","request_fingerprint":"0000000000000000000000000000000000000000000000000000000000000000","message":"review","root_user_intent_context":"","root_user_messages":[],"root_user_evidence_complete":true,"permission_mode":"auto","created_at_ms":1},"last_work_id":null,"last_request_fingerprint":null,"last_outcome":null}]}
+    ;
+    try std.testing.expectError(
+        error.InvalidState,
+        parseRegistry(alloc, invalid, "01J00000000000000000000000"),
+    );
 }
 
 test "persistent state derives create continue busy and terminal transitions" {
