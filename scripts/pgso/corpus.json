@@ -56,14 +56,6 @@
       "requires_tmux": false
     },
     {
-      "name": "direct-background",
-      "argv": ["{binary}", "background", "--json"],
-      "cwd": ".",
-      "env_set": {"FX_SKIP_ONBOARDING": "1"},
-      "timeout_seconds": 60,
-      "requires_tmux": false
-    },
-    {
       "name": "direct-doctor",
       "argv": ["{binary}", "doctor", "--json"],
       "cwd": ".",

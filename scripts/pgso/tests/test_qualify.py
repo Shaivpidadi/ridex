@@ -93,8 +93,8 @@ class PgsoQualificationTests(unittest.TestCase):
         self.assertEqual(50.0, percentile(samples, 0.50))
         self.assertEqual(95.0, percentile(samples, 0.95))
 
-    def test_production_plans_cover_six_startup_and_six_heavy_workloads(self) -> None:
-        self.assertEqual(6, len(STARTUP_COMMANDS))
+    def test_production_plans_cover_five_startup_and_six_heavy_workloads(self) -> None:
+        self.assertEqual(5, len(STARTUP_COMMANDS))
         workload_names = tuple(
             workload.name
             for plan in BENCHMARK_PLANS
@@ -308,7 +308,7 @@ class PgsoQualificationTests(unittest.TestCase):
         hyperfine_calls = [
             command for command in calls if command[0] == str(hyperfine)
         ]
-        self.assertEqual(600, len(hyperfine_calls))
+        self.assertEqual(500, len(hyperfine_calls))
         for command_start in range(0, len(hyperfine_calls), 100):
             command_rounds = hyperfine_calls[command_start : command_start + 100]
             for round_index, command in enumerate(command_rounds):

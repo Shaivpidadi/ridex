@@ -110,7 +110,6 @@ class PgsoCorpusTests(unittest.TestCase):
             ("direct-help", ("help",)),
             ("direct-version", ("--version",)),
             ("direct-status", ("status", "--json")),
-            ("direct-background", ("background", "--json")),
             ("direct-doctor", ("doctor", "--json")),
             ("direct-sessions", ("sessions", "--json")),
         )
@@ -174,12 +173,12 @@ class PgsoCorpusTests(unittest.TestCase):
 
         corpus = load_corpus(self.write_manifest(payload), repo_root=self.root)
 
-        self.assertEqual(6, len(corpus.scenarios))
+        self.assertEqual(5, len(corpus.scenarios))
         self.assertEqual(
             ("e2e-new-feature",),
             tuple(scenario.name for scenario in corpus.verification_scenarios),
         )
-        self.assertEqual(7, len(corpus.candidate_scenarios))
+        self.assertEqual(6, len(corpus.candidate_scenarios))
 
     def test_load_rejects_duplicate_test_files_across_phases(self) -> None:
         test_file = "shared.test.ts"
@@ -363,8 +362,8 @@ class PgsoCorpusTests(unittest.TestCase):
             EXCLUDED_E2E_TESTS,
             tuple(test_file for test_file, _ in corpus.intentional_exclusions),
         )
-        self.assertEqual(35, len(corpus.scenarios))
-        self.assertEqual(52, len(corpus.candidate_scenarios))
+        self.assertEqual(34, len(corpus.scenarios))
+        self.assertEqual(51, len(corpus.candidate_scenarios))
         self.assertEqual(
             {
                 "direct-help": 100,
