@@ -2643,6 +2643,9 @@ pub fn retainedHistoryTailForMessageCount(
         wanted_messages,
     );
     if (turn_count == 0) return .{ .turn_count = 0, .message_count = 0 };
+    if (turn_count == rawHistoryTurnCount(history)) {
+        return .{ .turn_count = 0, .message_count = 0 };
+    }
 
     var retained_start = history.len;
     var remaining = turn_count;
@@ -2686,6 +2689,10 @@ test "retained compaction tail expands requested messages to complete raw turns"
         .tool_results = &results,
     }};
     var history = [_]HistoryTurn{
+        .{ .assistant = .{
+            .user = .{ .text = @constCast("older raw user") },
+            .assistant = @constCast("older raw assistant"),
+        } },
         .{ .compacted_summary = .{
             .summary = @constCast("older summary"),
             .removed_turn_count = 1,
@@ -2701,6 +2708,10 @@ test "retained compaction tail expands requested messages to complete raw turns"
     const tail = try retainedHistoryTailForMessageCount(alloc, &history, 2);
     try std.testing.expectEqual(@as(usize, 1), tail.turn_count);
     try std.testing.expectEqual(@as(usize, 4), tail.message_count);
+
+    const only_tail = try retainedHistoryTailForMessageCount(alloc, history[1..], 2);
+    try std.testing.expectEqual(@as(usize, 0), only_tail.turn_count);
+    try std.testing.expectEqual(@as(usize, 0), only_tail.message_count);
 }
 
 test "active context projects checkpoint before retained raw tail" {

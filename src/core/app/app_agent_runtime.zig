@@ -1123,6 +1123,7 @@ pub fn Runtime(comptime App: type) type {
                     .usage = deps.usage,
                     .usage_allocator = deps.usage_allocator,
                     .trace_ctx = .{ .turn_id = job.turn_id },
+                    .protected_tail_messages = retained_message_count,
                 },
             );
             defer compacted.deinit(std.heap.c_allocator);

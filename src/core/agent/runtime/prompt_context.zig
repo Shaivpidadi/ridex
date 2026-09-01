@@ -139,6 +139,11 @@ pub const RequestCost = struct {
     estimated_input_tokens: usize,
 };
 
+pub const RequestTokenCalibration = struct {
+    serialized_bytes: usize,
+    exact_input_tokens: usize,
+};
+
 pub fn measureProviderRequest(body: []const u8) RequestCost {
     var estimator = token_estimate.StreamingEstimator{};
     estimator.consume(body);
@@ -149,6 +154,48 @@ pub fn measureProviderRequest(body: []const u8) RequestCost {
             std.math.maxInt(usize),
         )),
     };
+}
+
+pub fn calibrateProviderRequest(
+    cost: RequestCost,
+    calibration: RequestTokenCalibration,
+) RequestCost {
+    if (calibration.serialized_bytes == 0 or calibration.exact_input_tokens == 0) {
+        return cost;
+    }
+    const calibrated_tokens = multiplyDivideCeilSaturating(
+        cost.serialized_bytes,
+        calibration.exact_input_tokens,
+        calibration.serialized_bytes,
+    );
+    return .{
+        .serialized_bytes = cost.serialized_bytes,
+        .estimated_input_tokens = @max(
+            cost.estimated_input_tokens,
+            calibrated_tokens,
+        ),
+    };
+}
+
+fn multiplyDivideCeilSaturating(
+    value: usize,
+    numerator: usize,
+    denominator: usize,
+) usize {
+    std.debug.assert(denominator != 0);
+    const whole = std.math.mul(
+        usize,
+        value / denominator,
+        numerator,
+    ) catch return std.math.maxInt(usize);
+    const remainder_product = std.math.mul(
+        usize,
+        value % denominator,
+        numerator,
+    ) catch return std.math.maxInt(usize);
+    const partial = remainder_product / denominator +
+        @intFromBool(remainder_product % denominator != 0);
+    return std.math.add(usize, whole, partial) catch std.math.maxInt(usize);
 }
 
 pub fn estimateCompactionSourceTokens(messages: []const ChatMessage) usize {
@@ -371,6 +418,20 @@ test "provider request measurement includes serialized structure" {
     );
     try std.testing.expect(fragmented.serialized_bytes > compact.serialized_bytes);
     try std.testing.expect(fragmented.estimated_input_tokens > compact.estimated_input_tokens);
+}
+
+test "provider request measurement learns the prior exact token density" {
+    const current = RequestCost{
+        .serialized_bytes = 1_456_988,
+        .estimated_input_tokens = 365_113,
+    };
+    const calibrated = calibrateProviderRequest(current, .{
+        .serialized_bytes = 767_736,
+        .exact_input_tokens = 398_710,
+    });
+
+    try std.testing.expect(calibrated.estimated_input_tokens > 695_142);
+    try std.testing.expect(calibrated.estimated_input_tokens >= current.estimated_input_tokens);
 }
 
 test "compaction v2 triggers automatic work at eighty percent and targets ten percent" {

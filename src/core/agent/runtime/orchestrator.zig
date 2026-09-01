@@ -3192,20 +3192,59 @@ fn buildGatewayMessagesForCompactionWindow(
     );
 }
 
-fn buildCanonicalCompactionMessages(
+fn buildCanonicalCompactionWindow(
     alloc: Allocator,
     history: []const HistoryTurn,
     within_turn_suffix: []const ChatMessage,
+    handoff: ?[]const u8,
+    retained_history_tail: []const ChatMessage,
+    compacted_suffix_len: usize,
 ) !std.ArrayList(ChatMessage) {
     var messages: std.ArrayList(ChatMessage) = .empty;
     errdefer messages.deinit(alloc);
-    try session_runtime.appendCompactionHistoryChatMessages(
-        alloc,
-        &messages,
-        history,
-    );
-    try messages.appendSlice(alloc, within_turn_suffix);
+    if (handoff) |active_handoff| {
+        try messages.append(alloc, .{
+            .role = .user,
+            .content = active_handoff,
+            .cache_policy = .no_cache,
+        });
+        try messages.appendSlice(alloc, retained_history_tail);
+        try messages.appendSlice(
+            alloc,
+            within_turn_suffix[@min(compacted_suffix_len, within_turn_suffix.len)..],
+        );
+    } else {
+        try session_runtime.appendCompactionHistoryChatMessages(
+            alloc,
+            &messages,
+            history,
+        );
+        try messages.appendSlice(alloc, within_turn_suffix);
+    }
     return messages;
+}
+
+test "repeated compaction source replaces the prior suffix with its handoff" {
+    const suffix = [_]ChatMessage{
+        .{ .role = .assistant, .content = "old assistant" },
+        .{ .role = .tool, .content = "old result" },
+        .{ .role = .assistant, .content = "new assistant" },
+        .{ .role = .tool, .content = "new result" },
+    };
+    var messages = try buildCanonicalCompactionWindow(
+        std.testing.allocator,
+        &.{},
+        &suffix,
+        "prior handoff",
+        &.{},
+        2,
+    );
+    defer messages.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 3), messages.items.len);
+    try std.testing.expectEqualStrings("prior handoff", messages.items[0].content.?);
+    try std.testing.expectEqualStrings("new assistant", messages.items[1].content.?);
+    try std.testing.expectEqualStrings("new result", messages.items[2].content.?);
 }
 
 fn latestCompactionCount(history: []const HistoryTurn) usize {
@@ -3333,6 +3372,10 @@ fn processQueuedPromptLoop(
     var active_compaction_history_tail: []const ChatMessage = &.{};
     var compacted_suffix_len: usize = 0;
     var compaction_count = latestCompactionCount(job.history);
+    var request_token_calibration: ?struct {
+        model: []const u8,
+        cost: runtime_prompt_context.RequestTokenCalibration,
+    } = null;
     var completed_tool_names = completed_tool_names_ptr.*;
     defer completed_tool_names_ptr.* = completed_tool_names;
     var context_delivery_state: context_contract.DeliveryState = if (deps.context_enabled)
@@ -3535,6 +3578,7 @@ fn processQueuedPromptLoop(
         var successful_request_messages: []const ChatMessage = &.{};
         var successful_source_messages: []const ChatMessage = &.{};
         var successful_gateway_model: []const u8 = "";
+        var successful_request_cost: ?runtime_prompt_context.RequestCost = null;
         var successful_vision_route: runtime_vision_contracts.VisionRoute = .native_images;
         var successful_vision_mode: runtime_gateway_step.VisionToolMode = .unavailable;
         var reset_stream_for_next_attempt = false;
@@ -3800,12 +3844,24 @@ fn processQueuedPromptLoop(
                     null,
             };
             var prepared_request_body: ?[]const u8 = null;
+            var request_cost_for_attempt: ?runtime_prompt_context.RequestCost = null;
             if (try deps.agent_stream_provider.buildRequest(
                 overlay_arena,
                 request_data,
             )) |request_body| {
                 prepared_request_body = request_body;
-                const request_cost = runtime_prompt_context.measureProviderRequest(request_body);
+                const measured_request_cost = runtime_prompt_context.measureProviderRequest(request_body);
+                const request_cost = if (request_token_calibration) |calibration|
+                    if (std.mem.eql(u8, calibration.model, gateway_model))
+                        runtime_prompt_context.calibrateProviderRequest(
+                            measured_request_cost,
+                            calibration.cost,
+                        )
+                    else
+                        measured_request_cost
+                else
+                    measured_request_cost;
+                request_cost_for_attempt = request_cost;
                 const has_new_compactable_context = active_compaction_handoff == null or
                     compacted_suffix_len < within_turn_suffix.items.len;
                 const projection_plan = runtime_prompt_context.planCompaction(.{
@@ -3856,10 +3912,13 @@ fn processQueuedPromptLoop(
                             within_turn_suffix.items,
                             @constCast(request_messages),
                         );
-                        var compaction_messages = try buildCanonicalCompactionMessages(
+                        var compaction_messages = try buildCanonicalCompactionWindow(
                             arena,
                             job.history,
                             within_turn_suffix.items,
+                            active_compaction_handoff,
+                            active_compaction_history_tail,
+                            compacted_suffix_len,
                         );
                         defer compaction_messages.deinit(arena);
                         const result_storage: runtime_context_compaction.ResultStorage =
@@ -3960,14 +4019,20 @@ fn processQueuedPromptLoop(
                             },
                         );
                         active_compaction_handoff = compacted.handoff;
+                        const compactable_suffix_start = @min(
+                            compacted_suffix_len,
+                            within_turn_suffix.items.len,
+                        );
+                        const compactable_suffix_message_count =
+                            within_turn_suffix.items.len - compactable_suffix_start;
                         const retained_active_messages = @min(
                             compacted.retained_message_count,
-                            within_turn_suffix.items.len,
+                            compactable_suffix_message_count,
                         );
                         const retained_history_messages =
                             compacted.retained_message_count - retained_active_messages;
                         const history_message_count = compaction_messages.items.len -
-                            within_turn_suffix.items.len;
+                            compactable_suffix_message_count;
                         if (retained_history_messages > history_message_count) {
                             return error.InvalidContextHistoryStart;
                         }
@@ -4008,6 +4073,7 @@ fn processQueuedPromptLoop(
                                 .body = "Context compacted.",
                             });
                         }
+                        request_token_calibration = null;
                         skip_next_preflight_refresh = true;
                         continue;
                     },
@@ -5028,6 +5094,7 @@ fn processQueuedPromptLoop(
             successful_request_messages = request_messages;
             successful_source_messages = recovery_source_messages;
             successful_gateway_model = gateway_model;
+            successful_request_cost = request_cost_for_attempt;
             successful_vision_route = vision_route;
             successful_vision_mode = vision_mode;
             successful_recovery_strategy = recovery_strategy;
@@ -5039,6 +5106,20 @@ fn processQueuedPromptLoop(
         defer if (stream_result_set) stream_result.deinit(arena);
 
         var completion = streamCompletion(stream_result);
+        if (successful_request_cost) |request_cost| {
+            if (completion.usage.input_tokens) |exact_input_tokens| {
+                request_token_calibration = .{
+                    .model = successful_gateway_model,
+                    .cost = .{
+                        .serialized_bytes = request_cost.serialized_bytes,
+                        .exact_input_tokens = @intCast(@min(
+                            exact_input_tokens,
+                            std.math.maxInt(usize),
+                        )),
+                    },
+                };
+            }
+        }
         const filtered_provider_calls = try filterMaterializedProviderCalls(
             arena,
             within_turn_suffix.items,
