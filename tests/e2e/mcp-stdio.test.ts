@@ -883,8 +883,10 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
         .toContain("enabledMcpjsonServers");
 
       await tui.sendText("/mcp trust reset");
-      await tui.waitForText("MCP configuration reloaded successfully", 15_000);
-      await tui.waitForText("Project MCP server 'fixture' is defined in .mcp.json", 10_000);
+      await tui.waitForPane((pane) =>
+        pane.split("MCP configuration reloaded successfully").length - 1 >= 2 &&
+        pane.split("Project MCP server 'fixture' is defined in .mcp.json").length - 1 >= 2,
+      15_000);
       await tui.sendLiteral("3");
       await tui.waitForText("MCP configuration reloaded successfully", 15_000);
       await tui.sendText("/mcp list");
