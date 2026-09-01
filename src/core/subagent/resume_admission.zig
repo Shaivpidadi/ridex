@@ -171,10 +171,10 @@ pub fn resumeForExternalPrompt(
     workspace_root: []const u8,
     options: session_store.ResumeOptions,
 ) !session_store.LoadedWritableSession {
-    if (target == .id) try ensureExternalPromptAllowed(store, alloc, target.id, true);
+    if (target == .id) try ensureExternalMarkerAllowed(store, alloc, target.id);
     var loaded = try store.resumeTargetForWrite(alloc, target, workspace_root, options);
     errdefer loaded.deinit(alloc);
-    try ensureExternalPromptAllowed(store, alloc, loaded.active_id, false);
+    try ensureLoadedExternalPromptAllowed(&loaded);
     return loaded;
 }
 
@@ -185,7 +185,7 @@ pub fn admitResumeViewForExternalPrompt(
 ) !?session_store.ResumeViewAdmission {
     var admission = (try store.admitResumeView(alloc, target)) orelse return null;
     errdefer admission.deinit(alloc);
-    try ensureExternalPromptAllowed(store, alloc, admission.sessionId(), true);
+    try ensureExternalPromptAllowed(store, alloc, admission.sessionId());
     return admission;
 }
 
@@ -197,7 +197,7 @@ pub fn resumeAdmittedForExternalPrompt(
     workspace_root: []const u8,
     options: session_store.ResumeOptions,
 ) !session_store.LoadedWritableSession {
-    try ensureExternalPromptAllowed(store, alloc, session_id, true);
+    try ensureExternalMarkerAllowed(store, alloc, session_id);
     var loaded = try store.resumeAdmittedForWrite(
         alloc,
         admission,
@@ -206,7 +206,7 @@ pub fn resumeAdmittedForExternalPrompt(
         options,
     );
     errdefer loaded.deinit(alloc);
-    try ensureExternalPromptAllowed(store, alloc, loaded.active_id, false);
+    try ensureLoadedExternalPromptAllowed(&loaded);
     return loaded;
 }
 
@@ -223,7 +223,6 @@ fn ensureExternalPromptAllowed(
     store: session_store.Store,
     alloc: Allocator,
     session_id: []const u8,
-    before_writable_resume: bool,
 ) !void {
     const managed = child_state.isManagedChildSession(
         store,
@@ -233,11 +232,33 @@ fn ensureExternalPromptAllowed(
         error.OutOfMemory => return error.OutOfMemory,
         error.SessionNotFound,
         error.SessionStoreUnavailable,
-        => if (before_writable_resume) return else return err,
+        => return,
         else => return err,
     };
     if (managed) return error.OneOffSessionNotResumable;
-    if (!before_writable_resume) return;
+}
+
+fn ensureExternalMarkerAllowed(
+    store: session_store.Store,
+    alloc: Allocator,
+    session_id: []const u8,
+) !void {
+    const managed = child_state.hasManagedChildMarker(
+        store,
+        alloc,
+        session_id,
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.SessionNotFound, error.SessionStoreUnavailable => return,
+        else => return err,
+    };
+    if (managed) return error.OneOffSessionNotResumable;
+}
+
+fn ensureLoadedExternalPromptAllowed(
+    loaded: *const session_store.LoadedWritableSession,
+) !void {
+    if (loaded.state.subagent_child) return error.OneOffSessionNotResumable;
 }
 
 test "managed child marker is hidden from external resume" {
@@ -310,6 +331,7 @@ test "subagent work identity hides a partial child without owner sidecar" {
             .fast_mode = false,
         },
         .last_subagent_work_id = try alloc.dupe(u8, "work-1"),
+        .subagent_child = true,
     };
     defer durable.deinit(alloc);
     var writable = try store.startWritableSession(alloc, durable);
@@ -317,6 +339,12 @@ test "subagent work identity hides a partial child without owner sidecar" {
 
     try std.testing.expectError(
         error.OneOffSessionNotResumable,
-        ensureExternalPromptAllowed(store, alloc, "partial-child", false),
+        resumeForExternalPrompt(
+            store,
+            alloc,
+            .{ .id = "partial-child" },
+            workspace,
+            .{},
+        ),
     );
 }

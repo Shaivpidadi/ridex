@@ -126,6 +126,10 @@ pub const DurableSessionState = struct {
     /// Last ordinary history commit correlated to durable subagent work. This
     /// control-only marker is not included in model history.
     last_subagent_work_id: ?[]u8 = null,
+    /// True only for a parent-owned subagent session. This durable identity
+    /// keeps the session private even if owner sidecar publication is
+    /// interrupted immediately after creation.
+    subagent_child: bool = false,
     /// Null only for sessions written before durable usage accounting.
     usage: ?session_usage.Snapshot = null,
     /// Active control state. It is never projected into model history and a
@@ -192,6 +196,7 @@ pub const DurableSessionState = struct {
             .total_output_tokens = self.total_output_tokens,
             .permission_state = permission_state,
             .last_subagent_work_id = last_subagent_work_id,
+            .subagent_child = self.subagent_child,
             .usage = usage,
             .recovery_checkpoint = recovery_checkpoint,
         };
@@ -648,6 +653,9 @@ fn writeState(writer: *std.Io.Writer, state: DurableSessionState) !void {
         try writer.writeAll(",\"last_subagent_work_id\":");
         try writeJsonString(writer, id);
     }
+    if (state.subagent_child) {
+        try writer.writeAll(",\"subagent_child\":true");
+    }
     if (state.recovery_checkpoint) |checkpoint| {
         try writer.writeAll(",\"recovery_checkpoint\":");
         try writeRecoveryCheckpoint(writer, checkpoint);
@@ -875,13 +883,15 @@ fn decodeStateImpl(alloc: Allocator, source: *std.Io.Reader, limits: DecodeLimit
     var usage_seen = false;
     var last_subagent_work_id: ?[]u8 = null;
     errdefer if (last_subagent_work_id) |work_id| alloc.free(work_id);
+    var subagent_child = false;
+    var subagent_child_seen = false;
     var recovery_checkpoint: ?RecoveryCheckpoint = null;
     errdefer if (recovery_checkpoint) |*checkpoint| checkpoint.deinit(alloc);
     while (try json_reader.peekNextTokenType() != .object_end) {
         const key = try readStringOwned(&json_reader, alloc, 64);
         defer alloc.free(key);
         if (std.mem.eql(u8, key, "context_history_start")) {
-            if (context_seen or permission_state_seen or usage_seen or last_subagent_work_id != null or recovery_checkpoint != null) {
+            if (context_seen or permission_state_seen or usage_seen or last_subagent_work_id != null or subagent_child_seen or recovery_checkpoint != null) {
                 return error.InvalidSessionFormat;
             }
             const raw = try readU64(&json_reader, alloc);
@@ -889,7 +899,7 @@ fn decodeStateImpl(alloc: Allocator, source: *std.Io.Reader, limits: DecodeLimit
                 return error.InvalidSessionFormat;
             context_seen = true;
         } else if (std.mem.eql(u8, key, "permission_state")) {
-            if (permission_state_seen or usage_seen or last_subagent_work_id != null or recovery_checkpoint != null) {
+            if (permission_state_seen or usage_seen or last_subagent_work_id != null or subagent_child_seen or recovery_checkpoint != null) {
                 return error.InvalidSessionFormat;
             }
             var arena = std.heap.ArenaAllocator.init(alloc);
@@ -902,7 +912,7 @@ fn decodeStateImpl(alloc: Allocator, source: *std.Io.Reader, limits: DecodeLimit
             permission_state = try parsePermissionState(alloc, value);
             permission_state_seen = true;
         } else if (std.mem.eql(u8, key, "usage")) {
-            if (usage_seen or last_subagent_work_id != null or recovery_checkpoint != null) return error.InvalidSessionFormat;
+            if (usage_seen or last_subagent_work_id != null or subagent_child_seen or recovery_checkpoint != null) return error.InvalidSessionFormat;
             const parse_limit = @min(
                 limits.max_value_bytes,
                 session_usage.max_snapshot_bytes,
@@ -918,8 +928,13 @@ fn decodeStateImpl(alloc: Allocator, source: *std.Io.Reader, limits: DecodeLimit
             usage = try session_usage.parseSnapshotValue(alloc, value);
             usage_seen = true;
         } else if (std.mem.eql(u8, key, "last_subagent_work_id")) {
-            if (last_subagent_work_id != null or recovery_checkpoint != null) return error.InvalidSessionFormat;
+            if (last_subagent_work_id != null or subagent_child_seen or recovery_checkpoint != null) return error.InvalidSessionFormat;
             last_subagent_work_id = try readStringOwned(&json_reader, alloc, 128);
+        } else if (std.mem.eql(u8, key, "subagent_child")) {
+            if (subagent_child_seen or recovery_checkpoint != null) return error.InvalidSessionFormat;
+            subagent_child = try readBool(&json_reader);
+            if (!subagent_child) return error.InvalidDurableField;
+            subagent_child_seen = true;
         } else if (std.mem.eql(u8, key, "recovery_checkpoint")) {
             if (recovery_checkpoint != null) return error.InvalidSessionFormat;
             var arena = std.heap.ArenaAllocator.init(alloc);
@@ -957,6 +972,7 @@ fn decodeStateImpl(alloc: Allocator, source: *std.Io.Reader, limits: DecodeLimit
         .total_output_tokens = total_output_tokens,
         .permission_state = permission_state,
         .last_subagent_work_id = last_subagent_work_id,
+        .subagent_child = subagent_child,
         .usage = usage,
         .recovery_checkpoint = recovery_checkpoint,
     };
@@ -2607,6 +2623,7 @@ test "durable state round trips live history while discarding legacy authority" 
         .total_input_tokens = 1234,
         .total_output_tokens = 567,
         .last_subagent_work_id = @constCast("work-17"),
+        .subagent_child = true,
         .usage = usage,
     };
 
@@ -3391,6 +3408,7 @@ fn expectStateEqual(expected: DurableSessionState, actual: DurableSessionState) 
     try std.testing.expectEqual(expected.context_history_start, actual.context_history_start);
     try std.testing.expectEqual(expected.total_input_tokens, actual.total_input_tokens);
     try std.testing.expectEqual(expected.total_output_tokens, actual.total_output_tokens);
+    try std.testing.expectEqual(expected.subagent_child, actual.subagent_child);
     try expectPermissionStateEqual(expected.permission_state, actual.permission_state);
     try std.testing.expectEqual(expected.last_subagent_work_id != null, actual.last_subagent_work_id != null);
     if (expected.last_subagent_work_id) |work_id| {

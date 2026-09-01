@@ -493,6 +493,21 @@ pub fn isManagedChildSession(
     alloc: Allocator,
     session_id: []const u8,
 ) !bool {
+    if (try hasManagedChildMarker(sessions, alloc, session_id)) return true;
+
+    var state = try sessions.loadReadOnly(alloc, session_id);
+    defer state.deinit(alloc);
+    return state.subagent_child;
+}
+
+/// Checks only immutable current and legacy child markers. Callers that
+/// already hold a loaded session use its durable `subagent_child` bit and
+/// this marker-only check rather than reopening session state.
+pub fn hasManagedChildMarker(
+    sessions: session_store.Store,
+    alloc: Allocator,
+    session_id: []const u8,
+) !bool {
     var capability = sessions.openSubagentControlCapabilityReadOnly(
         alloc,
         session_id,
@@ -534,10 +549,7 @@ pub fn isManagedChildSession(
             if (parent == .string) return true;
         }
     }
-
-    var state = try sessions.loadReadOnly(alloc, session_id);
-    defer state.deinit(alloc);
-    return state.last_subagent_work_id != null;
+    return false;
 }
 
 fn renderRegistry(alloc: Allocator, registry: Registry) ![]u8 {

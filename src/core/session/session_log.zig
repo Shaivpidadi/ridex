@@ -690,10 +690,12 @@ pub const LoadedWritableSession = struct {
         failed_tail: FailedTailDisposition,
         options: Options,
     ) !CommitPosition {
-        const usage_sidecar_bytes = if (state.usage) |usage|
+        var replacement = state;
+        replacement.subagent_child = self.state.subagent_child;
+        const usage_sidecar_bytes = if (replacement.usage) |usage|
             encodeUsageSidecarBestEffort(
                 alloc,
-                state.id,
+                replacement.id,
                 usage,
             )
         else
@@ -703,7 +705,7 @@ pub const LoadedWritableSession = struct {
         const same_workspace = std.mem.eql(
             u8,
             self.state.workspace_root,
-            state.workspace_root,
+            replacement.workspace_root,
         );
         const may_defer_cache = same_workspace and switch (reason) {
             .compaction, .log_compaction => true,
@@ -712,13 +714,13 @@ pub const LoadedWritableSession = struct {
         const cache_deferred = if (may_defer_cache)
             try self.prepareCommitLifecycleOpportunistic(alloc, options)
         else blk: {
-            try self.prepareCommitLifecycle(alloc, state.workspace_root, options);
+            try self.prepareCommitLifecycle(alloc, replacement.workspace_root, options);
             break :blk false;
         };
         _ = commitStateReplacementImpl(
             self,
             alloc,
-            state,
+            replacement,
             reason,
             failed_tail,
             options,
@@ -2174,7 +2176,7 @@ fn createNativeSession(
             .conversation_language = initial_state.conversation_language,
             .preferences = initial_state.preferences,
             .usage = initial_state.usage orelse synthesized_usage.?,
-            .work_id = initial_state.last_subagent_work_id,
+            .subagent_child = initial_state.subagent_child,
         } },
     };
     const line = try session_event.encodeFrame(alloc, envelope);
@@ -4167,7 +4169,7 @@ fn compactCanonicalLog(
             .conversation_language = loaded.state.conversation_language,
             .preferences = loaded.state.preferences,
             .usage = loaded.state.usage,
-            .work_id = loaded.state.last_subagent_work_id,
+            .subagent_child = loaded.state.subagent_child,
         } },
     };
     const first_line = try session_event.encodeFrame(alloc, session_started);
@@ -4336,7 +4338,7 @@ fn makeCleanupCandidatesForTest(
             .conversation_language = loaded.state.conversation_language,
             .preferences = loaded.state.preferences,
             .usage = loaded.state.usage,
-            .work_id = loaded.state.last_subagent_work_id,
+            .subagent_child = loaded.state.subagent_child,
         } },
     };
     const line = try session_event.encodeFrame(alloc, envelope);
@@ -5716,6 +5718,36 @@ test "display projection waits for first prompt and preserves derived title" {
         "first prompt title should freeze after this",
         preserved_display.title,
     );
+}
+
+test "state replacement preserves subagent child identity" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "session-subagent-child", 10);
+    defer initial.deinit(alloc);
+    initial.subagent_child = true;
+
+    {
+        var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+        defer loaded.deinit(alloc);
+        var replacement = try loaded.state.dupe(alloc);
+        defer replacement.deinit(alloc);
+        replacement.updated_at_ms = 20;
+        replacement.subagent_child = false;
+        _ = try loaded.commitStateReplacement(
+            alloc,
+            replacement,
+            .recovery,
+            .retry_expected_tail,
+            .{},
+        );
+        try std.testing.expect(loaded.state.subagent_child);
+    }
+
+    var reloaded = try temp.root.loadReadOnly(alloc, initial.id, .{});
+    defer reloaded.deinit(alloc);
+    try std.testing.expect(reloaded.subagent_child);
 }
 
 fn historyEvent(state: session_codec.DurableSessionState) session_event.Event {
