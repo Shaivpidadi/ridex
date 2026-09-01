@@ -1953,6 +1953,20 @@ pub const Runtime = struct {
         provider: model_provider.ProviderId,
     ) !?bool {
         return switch (provider) {
+            // FreeRide's credential is synthetic (ai_gateway_api_key with a
+            // local token); any non-subscription source it already holds is
+            // fine, otherwise fall through to the gateway-style selection.
+            .freeride => if (self.credentialSource() != null and
+                self.credentialSource() != .chatgpt_subscription and
+                self.credentialSource() != .grok_subscription)
+                false
+            else
+                self.selectSourceWithLoader(
+                    alloc,
+                    .ai_gateway_api_key,
+                    self,
+                    loadRuntimeCredentialSource,
+                ),
             .codex => if (self.credentialSource() == .chatgpt_subscription)
                 false
             else

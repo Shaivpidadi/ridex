@@ -1084,8 +1084,9 @@ fn configuredProviderSelection(
     default_model: []const u8,
     settings: *const config_runtime.Settings,
 ) !model_provider.ProviderSelection {
-    const provider = settings.provider orelse .gateway;
+    const provider = settings.provider orelse model_provider.default_provider;
     const model = settings.models.get(provider) orelse switch (provider) {
+        .freeride => model_provider.freeride_default_model,
         .gateway => default_model,
         .codex => return error.CodexModelNotSelected,
         .grok => return error.GrokModelNotSelected,

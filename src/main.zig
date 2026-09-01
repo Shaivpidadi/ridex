@@ -2013,6 +2013,7 @@ const App = struct {
         }
         var providers = builtin_providers.native;
         if (comptime !host_profile.tools) {
+            providers.freeride.permission_reviewer = null;
             providers.gateway.permission_reviewer = null;
             providers.codex.permission_reviewer = null;
             providers.grok.permission_reviewer = null;

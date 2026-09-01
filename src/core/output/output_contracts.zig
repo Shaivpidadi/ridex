@@ -850,6 +850,7 @@ pub const ModelListSnapshot = struct {
 
     fn emptyCatalogProviderName(self: ModelListSnapshot) []const u8 {
         return switch (self.provider) {
+            .freeride => "freeride",
             .gateway => "gateway",
             .codex => provider_catalog.label(.codex),
             .grok => provider_catalog.label(.grok),
