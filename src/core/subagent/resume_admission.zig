@@ -101,7 +101,10 @@ pub fn latestVisibleWorkspaceSummary(
         1,
     );
     defer page.deinit(alloc);
-    if (page.summaries.items.len == 0) return error.NoSavedSessions;
+    if (page.summaries.items.len == 0) {
+        if (page.skipped_invalid > 0) return error.NoReadableSessions;
+        return error.NoSavedSessions;
+    }
     return session_summary_codec.cloneSessionSummary(
         alloc,
         page.summaries.items[0],
@@ -347,7 +350,7 @@ fn isVisibleSession(
         session_id,
     ) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        else => return false,
+        else => return true,
     });
 }
 
