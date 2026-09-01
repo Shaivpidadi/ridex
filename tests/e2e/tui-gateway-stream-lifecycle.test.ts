@@ -2686,7 +2686,6 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       await session.sendLiteral(submittedPrompt);
       session.sendKeysImmediate(["Enter"]);
       session.sendLiteralImmediate(newerDraft);
-      session.sendKeysImmediate(["Enter"]);
       await waitForCondition(
         () => heldGateway.requests.length === 1 && hold.started,
         "held idle submitted prompt stream",
