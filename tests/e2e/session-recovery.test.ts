@@ -68,6 +68,15 @@ class LineClient {
     );
   }
 
+  async readResponse(id: number, timeoutMs = TIMEOUT): Promise<any> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const message = await this.read(Math.max(1, deadline - Date.now()));
+      if (message.id === id) return message;
+    }
+    throw new Error(`timed out waiting for ACP response id=${id}`);
+  }
+
   kill(): void {
     this.proc.kill("SIGKILL");
   }
@@ -101,9 +110,9 @@ async function createSession(cwd: string, home: string): Promise<string> {
   const client = startAcp(cwd, home);
   try {
     client.send({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: 1 } });
-    expect((await client.read()).result).toBeDefined();
+    expect((await client.readResponse(1)).result).toBeDefined();
     client.send({ jsonrpc: "2.0", id: 2, method: "session/new", params: { mcpServers: [] } });
-    const response = await client.read();
+    const response = await client.readResponse(2);
     expect(response.result?.sessionId).toBeDefined();
     return response.result.sessionId;
   } finally {
@@ -141,7 +150,7 @@ describe("session recovery", () => {
             FX_E2E_SESSION_BOUNDARY_READY: ready,
           });
           first.send({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: 1 } });
-          expect((await first.read()).result).toBeDefined();
+          expect((await first.readResponse(1)).result).toBeDefined();
           first.send({ jsonrpc: "2.0", id: 2, method: "session/new", params: { mcpServers: [] } });
           await waitForPath(ready);
           first.kill();
@@ -196,7 +205,7 @@ describe("session recovery", () => {
             FX_E2E_SESSION_BOUNDARY_READY: ready,
           });
           first.send({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: 1 } });
-          expect((await first.read()).result).toBeDefined();
+          expect((await first.readResponse(1)).result).toBeDefined();
           first.send({ jsonrpc: "2.0", id: 2, method: "session/new", params: { mcpServers: [] } });
           await waitForPath(ready);
           first.kill();
@@ -212,9 +221,9 @@ describe("session recovery", () => {
 
           const resolver = startAcp(workspaceRoot, home);
           resolver.send({ jsonrpc: "2.0", id: 3, method: "initialize", params: { protocolVersion: 1 } });
-          expect((await resolver.read()).result).toBeDefined();
+          expect((await resolver.readResponse(3)).result).toBeDefined();
           resolver.send({ jsonrpc: "2.0", id: 4, method: "session/load", params: { sessionId, mcpServers: [] } });
-          expect((await resolver.read()).result).toBeDefined();
+          expect((await resolver.readResponse(4)).result).toBeDefined();
           resolver.kill();
 
           const detail = await runFx(["session", "--id", sessionId, "--json"], {
@@ -279,21 +288,21 @@ describe("session recovery", () => {
 
       const writer = startAcp(workspaceRoot, home);
       writer.send({ jsonrpc: "2.0", id: 10, method: "initialize", params: { protocolVersion: 1 } });
-      expect((await writer.read()).result).toBeDefined();
+      expect((await writer.readResponse(10)).result).toBeDefined();
       writer.send({
         jsonrpc: "2.0",
         id: 11,
         method: "session/load",
         params: { sessionId, mcpServers: [] },
       });
-      expect((await writer.read()).result).toBeDefined();
+      expect((await writer.readResponse(11)).result).toBeDefined();
       writer.send({
         jsonrpc: "2.0",
         id: 12,
         method: "session/set_config_option",
-        params: { configId: "model", value: "o4-mini" },
+        params: { sessionId, configId: "model", value: "o4-mini" },
       });
-      expect((await writer.read()).result).toBeDefined();
+      expect((await writer.readResponse(12)).result).toBeDefined();
       writer.kill();
       await Bun.sleep(100);
 
@@ -481,7 +490,7 @@ describe("session recovery", () => {
           FX_E2E_SESSION_BOUNDARY_READY: ready,
         });
         first.send({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: 1 } });
-        expect((await first.read()).result).toBeDefined();
+        expect((await first.readResponse(1)).result).toBeDefined();
         first.send({ jsonrpc: "2.0", id: 2, method: "session/new", params: { mcpServers: [] } });
         await waitForPath(ready);
         first.kill();
@@ -521,9 +530,9 @@ describe("session recovery", () => {
           FX_TRACE_LOG: resolverTrace,
         });
         resolver.send({ jsonrpc: "2.0", id: 3, method: "initialize", params: { protocolVersion: 1 } });
-        expect((await resolver.read()).result).toBeDefined();
+        expect((await resolver.readResponse(3)).result).toBeDefined();
         resolver.send({ jsonrpc: "2.0", id: 4, method: "session/load", params: { sessionId, mcpServers: [] } });
-        const loadResponse = await resolver.read();
+        const loadResponse = await resolver.readResponse(4);
         resolver.kill();
         expect(readFileSync(resolverTrace, "utf8")).toContain(
           "session operation=load outcome=failed error=SessionNotFound",
@@ -585,14 +594,14 @@ describe("session recovery", () => {
             FX_E2E_SESSION_BOUNDARY_READY: ready,
           });
           writer.send({ jsonrpc: "2.0", id: 10, method: "initialize", params: { protocolVersion: 1 } });
-          expect((await writer.read()).result).toBeDefined();
+          expect((await writer.readResponse(10)).result).toBeDefined();
           writer.send({ jsonrpc: "2.0", id: 11, method: "session/load", params: { sessionId, mcpServers: [] } });
-          expect((await writer.read()).result).toBeDefined();
+          expect((await writer.readResponse(11)).result).toBeDefined();
           writer.send({
             jsonrpc: "2.0",
             id: 12,
             method: "session/set_config_option",
-            params: { configId: "model", value: "o4-mini" },
+            params: { sessionId, configId: "model", value: "o4-mini" },
           });
           await waitForPath(ready);
           writer.kill();
@@ -615,9 +624,9 @@ describe("session recovery", () => {
 
           const resolver = startAcp(workspaceRoot, home);
           resolver.send({ jsonrpc: "2.0", id: 20, method: "initialize", params: { protocolVersion: 1 } });
-          expect((await resolver.read()).result).toBeDefined();
+          expect((await resolver.readResponse(20)).result).toBeDefined();
           resolver.send({ jsonrpc: "2.0", id: 21, method: "session/load", params: { sessionId, mcpServers: [] } });
-          const loaded = await resolver.read();
+          const loaded = await resolver.readResponse(21);
           expect(loaded.result).toBeDefined();
           const loadedModel = loaded.result.configOptions.find(
             (option: { id: string; currentValue: string }) => option.id === "model",
