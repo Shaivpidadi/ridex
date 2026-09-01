@@ -62,7 +62,7 @@ afterEach(async () => {
 
 describe.skipIf(SKIP)("tui: interrupt recovery", () => {
   test(
-    "submitted status text queues behind an active response",
+    "submitted status text steers an active response without cancellation",
     async () => {
       root = realpathSync(mkdtempSync(join(tmpdir(), "fx-text-queues-")));
       const home = join(root, "home");
@@ -137,16 +137,23 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
       expect(gateway.requests[1]!.body).not.toContain(
         "Continue from the latest meaningful state",
       );
+      expect(gateway.requests[1]!.body).toContain("<user_steering>");
+      expect(gateway.requests[1]!.body).toContain(
+        "Apply this live user update to the current task.",
+      );
       expect(readFileSync(stderrPath, "utf8")).toBe("");
       expect(session.isAlive()).toBe(true);
       expect(session.isPaneAlive()).toBe(true);
 
       const sessionRoot = join(home, ".fx", "sessions");
-      const eventsPath = readdirSync(sessionRoot, { withFileTypes: true })
-        .filter((entry) => entry.isDirectory())
-        .map((entry) => join(sessionRoot, entry.name, "events.jsonl"))
-        .find((path) => existsSync(path) && readFileSync(path, "utf8").includes(queuedText));
-      expect(eventsPath).toBeDefined();
+      let eventsPath: string | undefined;
+      await waitForCondition(() => {
+        eventsPath = readdirSync(sessionRoot, { withFileTypes: true })
+          .filter((entry) => entry.isDirectory())
+          .map((entry) => join(sessionRoot, entry.name, "events.jsonl"))
+          .find((path) => existsSync(path) && readFileSync(path, "utf8").includes(queuedText));
+        return eventsPath !== undefined;
+      }, "steering history persistence");
       const events = readFileSync(eventsPath!, "utf8");
       expect(events).not.toContain('"kind":"interrupted"');
       expect(events).toContain(queuedText);

@@ -1103,7 +1103,7 @@ fn writeSnapshotLocator(writer: *std.Io.Writer, value: ?[]const u8) !void {
 }
 
 fn writeExecutionMemory(writer: *std.Io.Writer, execution: session.ExecutionMemory) !void {
-    try writer.writeAll("{\"schema_version\":5,\"tool_steps\":[");
+    try writer.writeAll("{\"schema_version\":6,\"tool_steps\":[");
     for (execution.tool_steps, 0..) |step, i| {
         if (i > 0) try writer.writeByte(',');
         try writer.writeAll("{\"assistant\":");
@@ -1124,6 +1124,11 @@ fn writeExecutionMemory(writer: *std.Io.Writer, execution: session.ExecutionMemo
     for (execution.files, 0..) |file, i| {
         if (i > 0) try writer.writeByte(',');
         try writeFileEvidence(writer, file);
+    }
+    try writer.writeAll("],\"steering\":[");
+    for (execution.steering, 0..) |text, i| {
+        if (i > 0) try writer.writeByte(',');
+        try writeDurableBytes(writer, text);
     }
     try writer.writeAll("],\"turn_summary\":");
     if (execution.turn_summary) |summary| {
@@ -1476,17 +1481,13 @@ fn imageAttachmentObject(value: std.json.Value) !std.json.ObjectMap {
 
 fn parseExecutionMemory(alloc: Allocator, value: std.json.Value) !session.ExecutionMemory {
     const source = try requireObject(value);
-    const has_turn_summary = source.get("turn_summary") != null;
-    const object = if (has_turn_summary)
-        try exactObject(value, &.{ "schema_version", "tool_steps", "files", "turn_summary" })
-    else
-        try exactObject(value, &.{ "schema_version", "tool_steps", "files" });
-    const schema_version = try requireU64(object, "schema_version");
-    if (schema_version < 1 or schema_version > 5 or
-        (schema_version == 5) != has_turn_summary)
-    {
-        return error.InvalidSessionFormat;
-    }
+    const schema_version = try requireU64(source, "schema_version");
+    const object = switch (schema_version) {
+        1...4 => try exactObject(value, &.{ "schema_version", "tool_steps", "files" }),
+        5 => try exactObject(value, &.{ "schema_version", "tool_steps", "files", "turn_summary" }),
+        6 => try exactObject(value, &.{ "schema_version", "tool_steps", "files", "steering", "turn_summary" }),
+        else => return error.InvalidSessionFormat,
+    };
     const tool_steps = try parseToolSteps(
         alloc,
         object.get("tool_steps") orelse return error.InvalidSessionFormat,
@@ -1494,13 +1495,23 @@ fn parseExecutionMemory(alloc: Allocator, value: std.json.Value) !session.Execut
     );
     errdefer session.freeExecutionMemory(alloc, .{ .tool_steps = tool_steps });
     const files = try parseFiles(alloc, object.get("files") orelse return error.InvalidSessionFormat);
-    const turn_summary = if (has_turn_summary)
+    errdefer types.freeFileEvidenceSlice(alloc, files);
+    const steering: [][]u8 = if (schema_version >= 6)
+        try parseDurableBytesArray(
+            alloc,
+            object.get("steering") orelse return error.InvalidSessionFormat,
+        )
+    else
+        &.{};
+    errdefer types.freePermissionFeedback(alloc, steering);
+    const turn_summary = if (schema_version >= 5)
         try parseOptionalTurnSummary(object.get("turn_summary").?)
     else
         null;
     return .{
         .tool_steps = tool_steps,
         .files = files,
+        .steering = steering,
         .turn_summary = turn_summary,
     };
 }
@@ -1751,7 +1762,7 @@ fn parseToolResult(
         1 => .{ .object = try exactObject(value, v1_keys), .extended = false },
         2 => try exactVariantObject(value, v2_keys, v2_extended_keys),
         3 => .{ .object = try exactObject(value, v3_keys), .extended = true },
-        4, 5 => .{ .object = try exactObject(value, v4_keys), .extended = true },
+        4, 5, 6 => .{ .object = try exactObject(value, v4_keys), .extended = true },
         else => return error.InvalidSessionFormat,
     };
     const object = result_shape.object;
@@ -2927,11 +2938,13 @@ test "execution memory codec preserves feedback and reads v1 results without it"
         .tool_calls = calls[0..],
         .tool_results = results[0..],
     }};
+    var steering = [_][]u8{@constCast("focus on persistence")};
     const turn: session.HistoryTurn = .{ .assistant = .{
         .user = .{ .text = @constCast("write a note") },
         .assistant = @constCast("done"),
         .execution = .{
             .tool_steps = steps[0..],
+            .steering = steering[0..],
             .turn_summary = .{
                 .started_at_ms = 100,
                 .completed_at_ms = 250,
@@ -2945,7 +2958,8 @@ test "execution memory codec preserves feedback and reads v1 results without it"
     var encoded: std.Io.Writer.Allocating = .init(alloc);
     defer encoded.deinit();
     try writeHistoryTurn(&encoded.writer, turn);
-    try std.testing.expect(std.mem.find(u8, encoded.written(), "\"schema_version\":5") != null);
+    try std.testing.expect(std.mem.find(u8, encoded.written(), "\"schema_version\":6") != null);
+    try std.testing.expect(std.mem.find(u8, encoded.written(), "\"steering\":[\"focus on persistence\"]") != null);
     try std.testing.expect(std.mem.find(u8, encoded.written(), "\"permission_feedback\"") != null);
     try std.testing.expect(std.mem.find(u8, encoded.written(), "\"committed_file_presentation\"") != null);
     try std.testing.expect(std.mem.find(u8, encoded.written(), "\"command_output_replay\"") != null);
@@ -2959,6 +2973,11 @@ test "execution memory codec preserves feedback and reads v1 results without it"
     try std.testing.expectEqual(
         turn.assistant.execution.turn_summary,
         decoded.assistant.execution.turn_summary,
+    );
+    try std.testing.expectEqual(@as(usize, 1), decoded.assistant.execution.steering.len);
+    try std.testing.expectEqualStrings(
+        "focus on persistence",
+        decoded.assistant.execution.steering[0],
     );
     try std.testing.expectEqual(@as(usize, 1), decoded_result.permission_feedback.len);
     try std.testing.expectEqualStrings("read it after writing", decoded_result.permission_feedback[0]);
@@ -3006,6 +3025,14 @@ test "execution memory codec preserves feedback and reads v1 results without it"
     try std.testing.expect(v2_decoded.assistant.execution.tool_steps[0].tool_results[0].committed_file_presentation == null);
     try std.testing.expect(v2_decoded.assistant.execution.tool_steps[0].tool_results[0].command_output_replay == null);
     try std.testing.expect(v2_decoded.assistant.execution.tool_steps[0].tool_results[0].command_process_presentation == null);
+
+    const v5 =
+        "{\"kind\":\"assistant\",\"user\":{\"text\":\"prompt\",\"images\":[]},\"assistant\":\"done\",\"execution\":{\"schema_version\":5,\"tool_steps\":[],\"files\":[],\"turn_summary\":null}}";
+    var v5_parsed = try std.json.parseFromSlice(std.json.Value, alloc, v5, .{});
+    defer v5_parsed.deinit();
+    const v5_decoded = try parseHistoryTurn(alloc, v5_parsed.value);
+    defer session.freeHistoryTurn(alloc, v5_decoded);
+    try std.testing.expectEqual(@as(usize, 0), v5_decoded.assistant.execution.steering.len);
 }
 
 test "private codec preserves summary-only specialized turns" {
@@ -3511,6 +3538,10 @@ fn expectHistoryTurnEqual(expected: session.HistoryTurn, actual: session.History
 
 fn expectExecutionMemoryEqual(expected: session.ExecutionMemory, actual: session.ExecutionMemory) !void {
     try std.testing.expectEqual(expected.turn_summary, actual.turn_summary);
+    try std.testing.expectEqual(expected.steering.len, actual.steering.len);
+    for (expected.steering, actual.steering) |text, got_text| {
+        try std.testing.expectEqualSlices(u8, text, got_text);
+    }
     try std.testing.expectEqual(expected.tool_steps.len, actual.tool_steps.len);
     for (expected.tool_steps, actual.tool_steps) |step, got_step| {
         try expectOptionalBytesEqual(step.assistant, got_step.assistant);
