@@ -5,6 +5,7 @@ const secret = @import("../core/auth/secret.zig");
 const agent_stream_provider = @import("../core/agent/stream_provider.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const io_mod = @import("../core/shared/io.zig");
+const model_provider = @import("../core/config/model_provider.zig");
 const types = @import("../core/shared/types.zig");
 
 pub fn isRetryableGatewayError(err: anyerror) bool {
@@ -200,6 +201,7 @@ const e2e_gateway_chat_url_env = "FX_E2E_GATEWAY_CHAT_URL";
 const e2e_gateway_models_url_env = "FX_E2E_GATEWAY_MODELS_URL";
 const e2e_gateway_credits_url_env = "FX_E2E_GATEWAY_CREDITS_URL";
 const default_gateway_base_url = "https://ai-gateway.vercel.sh";
+pub const freeride_gateway_base_url = "http://127.0.0.1:11343";
 pub const vercel_ai_gateway_team_header = "x-vercel-ai-gateway-team";
 /// Identifies fx on every AI Gateway request; the zig std.http default
 /// (`zig/<version> (std.http)`) is never sent to the gateway.
@@ -598,12 +600,16 @@ test "gateway JSON transport preserves non-success HTTP status" {
 }
 
 fn gatewayBaseUrl() []const u8 {
-    const override = io_mod.getenv("FX_GATEWAY_BASE_URL") orelse return default_gateway_base_url;
+    const base = switch (model_provider.active_transport_provider) {
+        .freeride => freeride_gateway_base_url,
+        else => default_gateway_base_url,
+    };
+    const override = io_mod.getenv("FX_GATEWAY_BASE_URL") orelse return base;
     // The base URL carries the bearer token; only a loopback HTTP override is
     // trusted for local testing.
     if (!isLoopbackHttpUrl(override)) {
         debug_trace.logf("stream", "ignoring FX_GATEWAY_BASE_URL: not loopback http", .{});
-        return default_gateway_base_url;
+        return base;
     }
     return override;
 }

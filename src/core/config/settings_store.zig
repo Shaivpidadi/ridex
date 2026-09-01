@@ -1549,6 +1549,7 @@ fn putModelPreference(
     };
     changed = try putString(arena, models, @tagName(preference.provider), preference.model) or changed;
     const legacy_key = switch (preference.provider) {
+        .freeride => "freeride_model", // no legacy installs; never present
         .gateway => "model",
         .codex => "codex_model",
         .grok => "grok_model",
