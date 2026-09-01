@@ -24,7 +24,6 @@ const mcp_model_catalog = @import("../mcp/model_catalog.zig");
 const permission_gate = @import("../permissions/permission_gate.zig");
 const permissions = @import("../permissions/permissions.zig");
 const prompt_policy_contract = @import("../config/prompt_policy.zig");
-const model_capabilities = @import("../config/model_capabilities.zig");
 const model_provider = @import("../config/model_provider.zig");
 const session_runtime = @import("../session/session.zig");
 const session_child_store = @import("../session/session_child_store.zig");
@@ -1014,7 +1013,7 @@ pub fn Runtime(comptime App: type) type {
 
         pub fn processContextCompaction(
             app: *App,
-            job: worker_runtime.QueuedPrompt,
+            job: worker_runtime.ContextCompactionTask,
             gateway_retry_count: usize,
         ) !void {
             var arena_state = std.heap.ArenaAllocator.init(std.heap.c_allocator);
@@ -1032,15 +1031,11 @@ pub fn Runtime(comptime App: type) type {
             );
             var messages: std.ArrayList(ChatMessage) = .empty;
             defer messages.deinit(arena);
-            try session_runtime.appendCompactionHistoryChatMessages(
+            try session_runtime.appendActiveContextHistoryChatMessages(
                 arena,
                 &messages,
                 job.history,
-            );
-            try runtime_context_compaction.promoteMessageResults(
-                arena,
-                messages.items,
-                result_storage,
+                job.context_history_start,
             );
             const source_tokens = runtime_prompt_context.estimateCompactionSourceTokens(
                 messages.items,
@@ -1056,80 +1051,7 @@ pub fn Runtime(comptime App: type) type {
             );
             const deps = app_callbacks.Bindings(App).agentRuntimeDeps(app);
             const capabilities = deps.available_model_capabilities(deps.ctx, job.model);
-            const plan = runtime_prompt_context.planCompaction(.{
-                .trigger = .manual,
-                .capabilities = capabilities,
-                .request_tokens = source_tokens,
-                .source_tokens = source_tokens,
-                .protected_tokens = retained_tokens,
-            });
-            if (plan.decision == .no_op) {
-                try app_worker_runtime.Runtime(App).pushSemanticNotice(app, .{
-                    .topic = "context",
-                    .tone = .neutral,
-                    .body = "No context to compact.",
-                });
-                return;
-            }
-            std.debug.assert(plan.next_action == .stop);
-            const accepted_tokens = plan.accepted_handoff_tokens orelse
-                return error.ContextCapacityExceeded;
-            const generation_tokens = plan.generation_tokens orelse
-                return error.ContextCapacityExceeded;
-            const compaction_route = switch (deps.compaction_route) {
-                .ready => |route| if (route.provider == job.provider)
-                    route
-                else
-                    return error.ContextCompactionRouteMismatch,
-                .unavailable => return error.ContextCompactionUnavailable,
-            };
-            const compactor_capabilities = deps.available_model_capabilities(
-                deps.ctx,
-                compaction_route.model,
-            );
-            const compactor_generation_tokens = if (compactor_capabilities.max_output_tokens) |limit|
-                @min(generation_tokens, @as(usize, @intCast(limit)))
-            else
-                generation_tokens;
-
-            try app_worker_runtime.Runtime(App).pushSemanticNotice(app, .{
-                .topic = "context",
-                .tone = .neutral,
-                .body = "Compacting context…",
-            });
-            var compacted = try runtime_context_compaction.compact(
-                std.heap.c_allocator,
-                messages.items,
-                .{
-                    .stream_provider = deps.agent_stream_provider,
-                    .model = compaction_route.model,
-                    .api_key = job.api_key,
-                    .credential_source = job.credential_source,
-                    .account_id = job.account_id,
-                    .gateway_team = job.gateway_team,
-                    .session_id = app_session_runtime.Runtime(App).activeSessionId(app),
-                    .retry_count = gateway_retry_count,
-                    .cancel_flag = &app.worker.worker_cancel_requested,
-                    .accepted_tokens = accepted_tokens,
-                    .generation_tokens = compactor_generation_tokens,
-                    .compactor_input_tokens = runtime_prompt_context.usableInputTokens(
-                        compactor_capabilities,
-                    ),
-                    .provider_options = model_capabilities.resolveProviderOptionsForCapabilities(
-                        compactor_capabilities,
-                        .auto,
-                        false,
-                    ),
-                    .usage = deps.usage,
-                    .usage_allocator = deps.usage_allocator,
-                    .trace_ctx = .{ .turn_id = job.turn_id },
-                    .protected_tail_messages = retained_message_count,
-                },
-            );
-            defer compacted.deinit(std.heap.c_allocator);
-
             const raw_turn_count = session_runtime.rawHistoryTurnCount(job.history);
-            std.debug.assert(compacted.retained_message_count == retained_tail.message_count);
             const retained_turn_count = retained_tail.turn_count;
             if (retained_turn_count > raw_turn_count) {
                 return error.InvalidContextHistoryStart;
@@ -1144,23 +1066,33 @@ pub fn Runtime(comptime App: type) type {
                 },
                 else => {},
             };
-            const summary = types.CompactedSummaryHistoryTurn{
-                .summary = compacted.handoff,
+            _ = (try agent_runtime.compactContextTransaction(arena, &deps, .{
+                .trigger = .manual,
+                .provider = job.provider,
+                .working_capabilities = capabilities,
+                .request_tokens = source_tokens,
+                .source_tokens = source_tokens,
+                .protected_tokens = retained_tokens,
+                .source_messages = messages.items[0 .. messages.items.len - retained_message_count],
+                .result_storage = result_storage,
+                .api_key = job.api_key,
+                .credential_source = job.credential_source,
+                .account_id = job.account_id,
+                .gateway_team = job.gateway_team,
+                .session_id = app_session_runtime.Runtime(App).activeSessionId(app),
+                .retry_count = gateway_retry_count,
+                .cancel_flag = &app.worker.worker_cancel_requested,
+                .trace_ctx = .{ .turn_id = job.turn_id },
                 .removed_turn_count = raw_turn_count - retained_turn_count,
                 .compaction_count = compaction_count + 1,
-            };
-            if (deps.commit_context_compaction) |effect| {
-                try effect.commit(deps.ctx, summary);
-            } else {
-                try deps.propagate_history_turn(deps.ctx, .{
-                    .compacted_summary = summary,
+            })) orelse {
+                try app_worker_runtime.Runtime(App).pushSemanticNotice(app, .{
+                    .topic = "context",
+                    .tone = .neutral,
+                    .body = "No context to compact.",
                 });
-            }
-            try app_worker_runtime.Runtime(App).pushSemanticNotice(app, .{
-                .topic = "context",
-                .tone = .neutral,
-                .body = "Context compacted.",
-            });
+                return;
+            };
         }
 
         fn lifecycleContext(app: *App) agent_runtime.LifecycleContext {
@@ -2658,9 +2590,7 @@ test "manual compaction worker call commits a checkpoint without a continuation"
                 request.tool_choice == .none;
             try request.admission.admit();
             request.delivery.markPossiblySent();
-            const response =
-                \\{"objective":{"text":"Continue after manual compaction.","sources":["S0"]},"constraints":[],"obligations":[],"next_action":{"kind":"none","text":"Wait for the next request.","sources":["S0"]}}
-            ;
+            const response = "Continue after manual compaction with the user's constraints intact.";
             request.events.emit(.{ .content_delta = response });
             return .{ .completed = .{ .completion = .{
                 .content = response,
@@ -2677,13 +2607,12 @@ test "manual compaction worker call commits a checkpoint without a continuation"
     provider.context = &gateway;
     app.agent_stream_provider = provider;
 
-    var job = try makeQueuedPrompt(alloc);
-    defer worker_runtime.freeQueuedPrompt(alloc, job);
-    job.kind = .compact_context;
-    alloc.free(job.prompt);
-    job.prompt = try alloc.dupe(u8, "");
-    alloc.free(job.history);
-    job.history = try alloc.alloc(types.HistoryTurn, 2);
+    var job = worker_runtime.ContextCompactionTask{
+        .model = try alloc.dupe(u8, "test-model"),
+        .api_key = try alloc.dupe(u8, "api-key"),
+        .history = try alloc.alloc(types.HistoryTurn, 2),
+    };
+    defer worker_runtime.freeContextCompactionTask(alloc, job);
     job.history[0] = try types.dupeHistoryTurn(alloc, .{ .assistant = .{
         .user = .{ .text = @constCast("exact user request") },
         .assistant = @constCast("exact completed response\n" ++ ("evidence " ** 1_000)),

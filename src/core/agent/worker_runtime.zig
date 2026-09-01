@@ -47,11 +47,6 @@ pub const BeginPromptWithSkillBindings = struct {
     skill_display_spans: []SkillDisplaySpan = &.{},
 };
 
-pub const WorkKind = enum {
-    prompt,
-    compact_context,
-};
-
 pub const QueueReviewDraft = struct {
     input: []u8,
     pasted_blocks: []paste_blocks.PastedBlock = &.{},
@@ -60,7 +55,6 @@ pub const QueueReviewDraft = struct {
 };
 
 pub const QueuedPrompt = struct {
-    kind: WorkKind = .prompt,
     turn_id: u64 = 0,
     /// The active turn that may consume this prompt as steering. When that turn
     /// finishes, the target is cleared in place so admission order is retained.
@@ -103,6 +97,24 @@ pub const QueuedPrompt = struct {
     /// Worker begin publishes only its identity so the UI can consume the
     /// pending owner without painting a duplicate card.
     user_prompt_already_presented: bool = false,
+};
+
+pub const ContextCompactionTask = struct {
+    turn_id: u64 = 0,
+    model: []u8,
+    provider: model_provider.ProviderId = .gateway,
+    api_key: []u8,
+    gateway_team: ?[]u8 = null,
+    credential_source: ?types.CredentialSource = null,
+    account_id: ?[]u8 = null,
+    history: []types.HistoryTurn,
+    context_history_start: usize = 0,
+    unversioned_history_count: usize = std.math.maxInt(usize),
+};
+
+pub const WorkItem = union(enum) {
+    prompt: QueuedPrompt,
+    compact_context: ContextCompactionTask,
 };
 
 pub const ActivePromptSnapshotOwnership = struct {
@@ -562,6 +574,7 @@ pub const WorkerRuntime = struct {
     /// One admission-ordered queue for ordinary prompts and steering. Steering
     /// remains in place until its target turn consumes or demotes it.
     queued_prompts: std.ArrayList(QueuedPrompt) = .empty,
+    queued_context_compaction: ?ContextCompactionTask = null,
     worker_events: std.ArrayList(WorkerEvent) = .empty,
     worker_processing: bool = false,
     active_turn_id: u64 = 0,
@@ -577,7 +590,7 @@ pub const WorkerRuntime = struct {
     queued_prompt_count: usize = 0,
     /// `null` means admission is open; otherwise queue take is paused for review.
     queue_admission: ?QueueReviewReason = null,
-    /// When true, `waitAndTakeNextPrompt` will not start a turn.
+    /// When true, queued work will not start.
     turn_start_held: bool = false,
     next_permission_request_id: u64 = 1,
     pending_permission_response: ?permission_request.OwnedPermissionResponse = null,
@@ -607,6 +620,7 @@ pub const WorkerRuntime = struct {
 
         for (self.queued_prompts.items) |prompt| discardQueuedPrompt(alloc, prompt, &.{});
         self.queued_prompts.deinit(alloc);
+        if (self.queued_context_compaction) |task| freeContextCompactionTask(alloc, task);
 
         for (self.worker_events.items) |event| freeWorkerEvent(alloc, event);
         self.worker_events.deinit(alloc);
@@ -806,6 +820,34 @@ pub const WorkerRuntime = struct {
 
     pub fn enqueuePrompt(self: *WorkerRuntime, alloc: std.mem.Allocator, prompt: QueuedPrompt) !void {
         try self.admitPrompt(alloc, prompt, false);
+    }
+
+    pub fn enqueueContextCompaction(
+        self: *WorkerRuntime,
+        task: ContextCompactionTask,
+    ) !void {
+        var queued = task;
+        if (queued.turn_id == 0) queued.turn_id = debug_trace.nextTurnId();
+
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        if (self.finalization_failure != null) return error.TurnFinalizationDeliveryFailed;
+        if (self.worker_stop_requested) return error.WorkerStopped;
+        if (self.worker_processing or self.queued_prompt_count > 0 or
+            self.queued_context_compaction != null)
+        {
+            return error.WorkerBusy;
+        }
+        self.queued_context_compaction = queued;
+        self.queued_prompt_count = 1;
+        debug_trace.eventf(
+            "worker",
+            "context_compaction_enqueue",
+            .{ .turn_id = queued.turn_id },
+            "queue_depth=1",
+            .{},
+        );
+        self.worker_cond.broadcast(io_mod.getIo());
     }
 
     /// Transfers `prompt` to the active turn when steering is requested and the
@@ -1153,6 +1195,22 @@ pub const WorkerRuntime = struct {
         return self.takeNextPromptLocked(alloc);
     }
 
+    pub fn waitAndTakeNextWork(self: *WorkerRuntime, alloc: std.mem.Allocator) !?WorkItem {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+
+        while (((self.queued_prompts.items.len == 0 and
+            self.queued_context_compaction == null) or
+            self.queue_admission != null or self.turn_start_held) and
+            !self.worker_stop_requested)
+        {
+            self.worker_processing = false;
+            self.active_turn_id = 0;
+            self.worker_cond.wait(io_mod.getIo(), &self.worker_mutex) catch break;
+        }
+        return self.takeNextWorkLocked(alloc);
+    }
+
     /// Nonblocking queue take for single-threaded hosts. Returns null while the
     /// queue is empty, paused for review, held, or stopped.
     pub fn tryTakeNextPrompt(self: *WorkerRuntime, alloc: std.mem.Allocator) !?QueuedPrompt {
@@ -1166,6 +1224,43 @@ pub const WorkerRuntime = struct {
             return null;
         }
         return self.takeNextPromptLocked(alloc);
+    }
+
+    pub fn tryTakeNextWork(self: *WorkerRuntime, alloc: std.mem.Allocator) !?WorkItem {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        if ((self.queued_prompts.items.len == 0 and
+            self.queued_context_compaction == null) or
+            self.queue_admission != null or self.turn_start_held or
+            self.worker_stop_requested)
+        {
+            return null;
+        }
+        return self.takeNextWorkLocked(alloc);
+    }
+
+    fn takeNextWorkLocked(self: *WorkerRuntime, alloc: std.mem.Allocator) !?WorkItem {
+        if (self.worker_stop_requested) return null;
+        if (self.queued_context_compaction) |task| {
+            self.queued_context_compaction = null;
+            if (self.queued_prompt_count > 0) self.queued_prompt_count -= 1;
+            self.worker_cancel_requested.store(false, .seq_cst);
+            self.worker_recovery_pause_requested.store(false, .seq_cst);
+            self.worker_connectivity_wait_active.store(false, .seq_cst);
+            self.recovery_continuation_ready = false;
+            self.worker_processing = true;
+            self.active_turn_id = task.turn_id;
+            debug_trace.eventf(
+                "worker",
+                "context_compaction_begin",
+                .{ .turn_id = task.turn_id },
+                "remaining_queue={d} cancel_reset=true",
+                .{self.queued_prompt_count},
+            );
+            return .{ .compact_context = task };
+        }
+        const prompt = (try self.takeNextPromptLocked(alloc)) orelse return null;
+        return .{ .prompt = prompt };
     }
 
     fn takeNextPromptLocked(self: *WorkerRuntime, alloc: std.mem.Allocator) !?QueuedPrompt {
@@ -1354,6 +1449,10 @@ pub const WorkerRuntime = struct {
             discardQueuedPrompt(alloc, prompt, retained_images);
         }
         self.queued_prompts.clearRetainingCapacity();
+        if (self.queued_context_compaction) |task| {
+            freeContextCompactionTask(alloc, task);
+            self.queued_context_compaction = null;
+        }
         self.queued_prompt_count = 0;
         self.queue_admission = null;
         self.worker_cond.broadcast(io_mod.getIo());
@@ -2211,6 +2310,24 @@ pub fn freeQueuedPrompt(alloc: std.mem.Allocator, prompt: QueuedPrompt) void {
     }
 }
 
+pub fn freeContextCompactionTask(
+    alloc: std.mem.Allocator,
+    task: ContextCompactionTask,
+) void {
+    alloc.free(task.model);
+    secret.zeroAndFree(alloc, task.api_key);
+    if (task.gateway_team) |team| alloc.free(team);
+    if (task.account_id) |account_id| alloc.free(account_id);
+    types.freeHistoryTurnSlice(alloc, task.history);
+}
+
+pub fn freeWorkItem(alloc: std.mem.Allocator, work: WorkItem) void {
+    switch (work) {
+        .prompt => |prompt| freeQueuedPrompt(alloc, prompt),
+        .compact_context => |task| freeContextCompactionTask(alloc, task),
+    }
+}
+
 fn discardQueuedPrompt(
     alloc: std.mem.Allocator,
     prompt: QueuedPrompt,
@@ -2322,15 +2439,17 @@ test "manual compaction is a typed worker item and not a prompt" {
     var runtime = WorkerRuntime{};
     defer runtime.deinit(alloc);
 
-    var work = try makePrompt(alloc, "", "provider/model");
-    work.kind = .compact_context;
-    try runtime.enqueuePrompt(alloc, work);
+    const task = ContextCompactionTask{
+        .model = try alloc.dupe(u8, "provider/model"),
+        .api_key = try alloc.dupe(u8, "key"),
+        .history = try alloc.alloc(types.HistoryTurn, 0),
+    };
+    try runtime.enqueueContextCompaction(task);
 
-    const taken = (try runtime.tryTakeNextPrompt(alloc)) orelse
-        return error.TestExpectedQueuedPrompt;
-    defer freeQueuedPrompt(alloc, taken);
-    try std.testing.expectEqual(WorkKind.compact_context, taken.kind);
-    try std.testing.expectEqual(@as(usize, 0), taken.prompt.len);
+    const taken = (try runtime.tryTakeNextWork(alloc)) orelse
+        return error.TestExpectedQueuedWork;
+    defer freeWorkItem(alloc, taken);
+    try std.testing.expect(taken == .compact_context);
 }
 
 test "session transfer discards mismatched active prompt snapshots" {

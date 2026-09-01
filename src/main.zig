@@ -167,6 +167,7 @@ const ToolPermissionDecision = types.ToolPermissionDecision;
 const PermissionGrant = types.PermissionGrant;
 const PermissionEngine = permissions.PermissionEngine;
 const QueuedPrompt = worker_runtime.QueuedPrompt;
+const WorkItem = worker_runtime.WorkItem;
 const WorkerRuntime = worker_runtime.WorkerRuntime;
 const SessionRuntime = session_runtime.SessionRuntime;
 const PromptHistoryRuntime = prompt_history_runtime.PromptHistoryRuntime;
@@ -1175,7 +1176,6 @@ const App = struct {
             draft.images,
             draft.turn_id,
             true,
-            .prompt,
             .queue,
         )) return error.PendingPromptQueueRejected;
         WorkerAppRuntime.syncState(
@@ -1340,7 +1340,6 @@ const App = struct {
             null,
             0,
             false,
-            .prompt,
             intent,
         );
     }
@@ -1361,7 +1360,6 @@ const App = struct {
             null,
             checkpoint.turn_id,
             false,
-            .prompt,
             .queue,
         )) return false;
         WorkerAppRuntime.syncState(
@@ -1380,7 +1378,6 @@ const App = struct {
         prompt_images: ?[]const types.ImageAttachment,
         turn_id: u64,
         user_prompt_already_presented: bool,
-        work_kind: worker_runtime.WorkKind,
         intent: PromptSubmitIntent,
     ) !bool {
         try self.reloadSkills();
@@ -1470,7 +1467,6 @@ const App = struct {
             );
 
         try self.worker.admitPrompt(std.heap.c_allocator, .{
-            .kind = work_kind,
             .turn_id = if (recovery_checkpoint) |checkpoint| checkpoint.turn_id else turn_id,
             .prompt = prompt_copy,
             .images = images_copy,
@@ -1501,17 +1497,38 @@ const App = struct {
 
     pub fn enqueueContextCompaction(self: *App) !bool {
         if (self.worker.isProcessing() or self.worker.queuedPromptCount() > 0) return false;
-        return self.snapshotAndQueuePrompt(
-            "",
-            &.{},
-            null,
-            null,
-            &.{},
-            0,
-            false,
-            .compact_context,
-            .queue,
-        );
+        const selection = self.provider_selection.selection();
+        const model = try std.heap.c_allocator.dupe(u8, selection.model);
+        errdefer std.heap.c_allocator.free(model);
+        const credential = self.auth.gatewayCredential() orelse return error.MissingApiKey;
+        const api_key = try std.heap.c_allocator.dupe(u8, credential.api_key);
+        errdefer secret.zeroAndFree(std.heap.c_allocator, api_key);
+        const gateway_team = if (credential.gateway_team) |team|
+            try std.heap.c_allocator.dupe(u8, team)
+        else
+            null;
+        errdefer if (gateway_team) |team| std.heap.c_allocator.free(team);
+        const account_id = if (self.auth.accountId()) |id|
+            try std.heap.c_allocator.dupe(u8, id)
+        else
+            null;
+        errdefer if (account_id) |id| std.heap.c_allocator.free(id);
+        const history = try self.session.snapshotHistory(std.heap.c_allocator);
+        errdefer types.freeHistoryTurnSlice(std.heap.c_allocator, history);
+
+        try self.worker.enqueueContextCompaction(.{
+            .model = model,
+            .provider = selection.provider,
+            .api_key = api_key,
+            .gateway_team = gateway_team,
+            .credential_source = credential.source,
+            .account_id = account_id,
+            .history = history,
+            .context_history_start = self.session.contextHistoryStart(),
+            .unversioned_history_count = self.session.unversionedHistoryEnd(),
+        });
+        HerdrAppRuntime.reportWorking(self);
+        return true;
     }
 
     pub fn hasContextToCompact(self: *const App) bool {
@@ -2193,17 +2210,17 @@ const App = struct {
         }
     }
 
-    pub fn processQueuedPrompt(self: *App, job: QueuedPrompt) !void {
-        const result = switch (job.kind) {
-            .prompt => AgentAppRuntime.processQueuedPrompt(
+    pub fn processQueuedWork(self: *App, work: WorkItem) !void {
+        const result = switch (work) {
+            .prompt => |job| AgentAppRuntime.processQueuedPrompt(
                 self,
                 job,
                 builtin_gateway.retry_count,
                 builtin_gateway.defaultChatUrl(),
             ),
-            .compact_context => AgentAppRuntime.processContextCompaction(
+            .compact_context => |task| AgentAppRuntime.processContextCompaction(
                 self,
-                job,
+                task,
                 builtin_gateway.retry_count,
             ),
         };

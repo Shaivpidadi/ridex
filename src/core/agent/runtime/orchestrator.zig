@@ -3267,6 +3267,129 @@ fn commitContextCompaction(
     return deps.propagate_history_turn(deps.ctx, .{ .compacted_summary = summary });
 }
 
+pub const ContextCompactionTransactionRequest = struct {
+    trigger: runtime_prompt_context.CompactionTrigger,
+    provider: model_provider.ProviderId,
+    working_capabilities: model_capabilities.Capabilities,
+    request_tokens: usize,
+    source_tokens: usize,
+    protected_tokens: usize,
+    source_messages: []ChatMessage,
+    result_storage: runtime_context_compaction.ResultStorage,
+    api_key: []const u8,
+    credential_source: ?types.CredentialSource = null,
+    account_id: ?[]const u8 = null,
+    gateway_team: ?[]const u8 = null,
+    session_id: ?[]const u8 = null,
+    retry_count: usize,
+    cancel_flag: *std.atomic.Value(bool),
+    trace_ctx: TraceContext,
+    removed_turn_count: usize,
+    compaction_count: usize,
+};
+
+pub const ContextCompactionTransactionResult = struct {
+    compacted: runtime_context_compaction.Result,
+    accepted_tokens: usize,
+
+    pub fn deinit(self: *ContextCompactionTransactionResult, alloc: Allocator) void {
+        self.compacted.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+pub fn compactContextTransaction(
+    alloc: Allocator,
+    deps: *const AgentRuntimeDeps,
+    request: ContextCompactionTransactionRequest,
+) !?ContextCompactionTransactionResult {
+    const plan = runtime_prompt_context.planCompaction(.{
+        .trigger = request.trigger,
+        .capabilities = request.working_capabilities,
+        .request_tokens = request.request_tokens,
+        .source_tokens = request.source_tokens,
+        .protected_tokens = request.protected_tokens,
+    });
+    if (plan.decision == .no_op) return null;
+    const accepted_tokens = plan.accepted_handoff_tokens orelse
+        return error.ContextCapacityExceeded;
+    const generation_tokens = plan.generation_tokens orelse
+        return error.ContextCapacityExceeded;
+    const compaction_route = switch (deps.compaction_route) {
+        .ready => |route| if (route.provider == request.provider)
+            route
+        else
+            return error.ContextCompactionRouteMismatch,
+        .unavailable => return error.ContextCompactionUnavailable,
+    };
+    const compactor_capabilities = deps.available_model_capabilities(
+        deps.ctx,
+        compaction_route.model,
+    );
+    const compactor_generation_tokens = if (compactor_capabilities.max_output_tokens) |limit|
+        @min(generation_tokens, @as(usize, @intCast(limit)))
+    else
+        generation_tokens;
+
+    try runtime_context_compaction.promoteMessageResults(
+        alloc,
+        request.source_messages,
+        request.result_storage,
+    );
+    if (deps.push_interactive_notice) |push_notice| {
+        try push_notice(deps.ctx, .{
+            .topic = "context",
+            .tone = .neutral,
+            .body = "Compacting context…",
+        });
+    }
+    var compacted = try runtime_context_compaction.compact(
+        alloc,
+        request.source_messages,
+        .{
+            .stream_provider = deps.agent_stream_provider,
+            .model = compaction_route.model,
+            .api_key = request.api_key,
+            .credential_source = request.credential_source,
+            .account_id = request.account_id,
+            .gateway_team = request.gateway_team,
+            .session_id = request.session_id,
+            .retry_count = request.retry_count,
+            .cancel_flag = request.cancel_flag,
+            .accepted_tokens = accepted_tokens,
+            .generation_tokens = compactor_generation_tokens,
+            .compactor_input_tokens = runtime_prompt_context.usableInputTokens(
+                compactor_capabilities,
+            ),
+            .provider_options = model_capabilities.resolveProviderOptionsForCapabilities(
+                compactor_capabilities,
+                .auto,
+                false,
+            ),
+            .usage = deps.usage,
+            .usage_allocator = deps.usage_allocator,
+            .trace_ctx = request.trace_ctx,
+        },
+    );
+    errdefer compacted.deinit(alloc);
+    try commitContextCompaction(deps, .{
+        .summary = compacted.handoff,
+        .removed_turn_count = request.removed_turn_count,
+        .compaction_count = request.compaction_count,
+    });
+    if (deps.push_interactive_notice) |push_notice| {
+        try push_notice(deps.ctx, .{
+            .topic = "context",
+            .tone = .neutral,
+            .body = "Context compacted.",
+        });
+    }
+    return .{
+        .compacted = compacted,
+        .accepted_tokens = accepted_tokens,
+    };
+}
+
 test "vision policy keeps image route and tool visibility coherent" {
     const cases = [_]struct {
         image_input_support: model_capabilities.ImageInputSupport,
@@ -3901,7 +4024,6 @@ fn processQueuedPromptLoop(
                         }
                     },
                     .compact => {
-                        std.debug.assert(projection_plan.next_action == .continue_turn);
                         try runtime_context_compaction.validateUnversionedHistoryResults(
                             job.history,
                             job.unversioned_history_count,
@@ -3933,11 +4055,6 @@ fn processQueuedPromptLoop(
                             @constCast(request_messages),
                             result_storage,
                         );
-                        try runtime_context_compaction.promoteMessageResults(
-                            arena,
-                            compaction_messages.items,
-                            result_storage,
-                        );
                         const retained_history_tail = if (within_turn_suffix.items.len > 0)
                             session_runtime.RetainedHistoryTail{ .turn_count = 0, .message_count = 0 }
                         else
@@ -3953,72 +4070,6 @@ fn processQueuedPromptLoop(
                         const prompt_tokens = runtime_prompt_context.estimateCompactionSourceTokens(
                             &.{current_user_effective},
                         );
-                        const refined_plan = runtime_prompt_context.planCompaction(.{
-                            .trigger = .automatic,
-                            .capabilities = request_capabilities,
-                            .request_tokens = request_cost.estimated_input_tokens,
-                            .source_tokens = request_cost.estimated_input_tokens,
-                            .protected_tokens = prompt_tokens +| retained_tokens,
-                        });
-                        if (refined_plan.decision != .compact) {
-                            return error.ContextCapacityExceeded;
-                        }
-                        const accepted_tokens = refined_plan.accepted_handoff_tokens orelse
-                            return error.ContextCapacityExceeded;
-                        const generation_tokens = refined_plan.generation_tokens orelse
-                            return error.ContextCapacityExceeded;
-                        const compaction_route = switch (deps.compaction_route) {
-                            .ready => |route| if (route.provider == job.provider)
-                                route
-                            else
-                                return error.ContextCompactionRouteMismatch,
-                            .unavailable => return error.ContextCompactionUnavailable,
-                        };
-                        const compactor_capabilities = deps.available_model_capabilities(
-                            deps.ctx,
-                            compaction_route.model,
-                        );
-                        const compactor_generation_tokens = if (compactor_capabilities.max_output_tokens) |limit|
-                            @min(generation_tokens, @as(usize, @intCast(limit)))
-                        else
-                            generation_tokens;
-                        if (deps.push_interactive_notice) |push_notice| {
-                            try push_notice(deps.ctx, .{
-                                .topic = "context",
-                                .tone = .neutral,
-                                .body = "Compacting context…",
-                            });
-                        }
-                        const compacted = try runtime_context_compaction.compact(
-                            arena,
-                            compaction_messages.items,
-                            .{
-                                .stream_provider = deps.agent_stream_provider,
-                                .model = compaction_route.model,
-                                .api_key = active_api_key,
-                                .credential_source = job.credential_source,
-                                .account_id = job.account_id,
-                                .gateway_team = job.gateway_team,
-                                .session_id = lifecycle.scope.session_id,
-                                .retry_count = config.gateway_retry_count,
-                                .cancel_flag = config.cancel_flag,
-                                .accepted_tokens = accepted_tokens,
-                                .generation_tokens = compactor_generation_tokens,
-                                .compactor_input_tokens = runtime_prompt_context.usableInputTokens(
-                                    compactor_capabilities,
-                                ),
-                                .provider_options = model_capabilities.resolveProviderOptionsForCapabilities(
-                                    compactor_capabilities,
-                                    .auto,
-                                    false,
-                                ),
-                                .usage = deps.usage,
-                                .usage_allocator = deps.usage_allocator,
-                                .trace_ctx = step_ctx,
-                                .protected_tail_messages = retained_message_count,
-                            },
-                        );
-                        active_compaction_handoff = compacted.handoff;
                         const compactable_suffix_start = @min(
                             compacted_suffix_len,
                             within_turn_suffix.items.len,
@@ -4026,21 +4077,21 @@ fn processQueuedPromptLoop(
                         const compactable_suffix_message_count =
                             within_turn_suffix.items.len - compactable_suffix_start;
                         const retained_active_messages = @min(
-                            compacted.retained_message_count,
+                            retained_message_count,
                             compactable_suffix_message_count,
                         );
                         const retained_history_messages =
-                            compacted.retained_message_count - retained_active_messages;
+                            retained_message_count - retained_active_messages;
                         const history_message_count = compaction_messages.items.len -
                             compactable_suffix_message_count;
                         if (retained_history_messages > history_message_count) {
                             return error.InvalidContextHistoryStart;
                         }
-                        active_compaction_history_tail = try arena.dupe(
+                        const next_compaction_history_tail = try arena.dupe(
                             ChatMessage,
                             compaction_messages.items[history_message_count - retained_history_messages .. history_message_count],
                         );
-                        compacted_suffix_len = within_turn_suffix.items.len -
+                        const next_compacted_suffix_len = within_turn_suffix.items.len -
                             retained_active_messages;
                         const retained_history_turns = try session_runtime.retainedHistoryTurnCountForMessageTail(
                             arena,
@@ -4053,26 +4104,38 @@ fn processQueuedPromptLoop(
                         if (retained_history_turns > raw_history_turns) {
                             return error.InvalidContextHistoryStart;
                         }
-                        compaction_count += 1;
-                        try commitContextCompaction(deps, .{
-                            .summary = @constCast(active_compaction_handoff.?),
+                        const next_compaction_count = compaction_count + 1;
+                        const transaction = (try compactContextTransaction(arena, deps, .{
+                            .trigger = .automatic,
+                            .provider = job.provider,
+                            .working_capabilities = request_capabilities,
+                            .request_tokens = request_cost.estimated_input_tokens,
+                            .source_tokens = request_cost.estimated_input_tokens,
+                            .protected_tokens = prompt_tokens +| retained_tokens,
+                            .source_messages = compaction_messages.items[0 .. compaction_messages.items.len - retained_message_count],
+                            .result_storage = result_storage,
+                            .api_key = active_api_key,
+                            .credential_source = job.credential_source,
+                            .account_id = job.account_id,
+                            .gateway_team = job.gateway_team,
+                            .session_id = lifecycle.scope.session_id,
+                            .retry_count = config.gateway_retry_count,
+                            .cancel_flag = config.cancel_flag,
+                            .trace_ctx = step_ctx,
                             .removed_turn_count = raw_history_turns - retained_history_turns,
-                            .compaction_count = compaction_count,
-                        });
+                            .compaction_count = next_compaction_count,
+                        })) orelse return error.ContextCapacityExceeded;
+                        active_compaction_handoff = transaction.compacted.handoff;
+                        active_compaction_history_tail = next_compaction_history_tail;
+                        compacted_suffix_len = next_compacted_suffix_len;
+                        compaction_count = next_compaction_count;
                         debug_trace.eventf(
                             "context_compaction",
                             "installed",
                             step_ctx,
                             "request_bytes_before={d} estimated_tokens_before={d} handoff_bytes={d} accepted_tokens={d}",
-                            .{ request_cost.serialized_bytes, request_cost.estimated_input_tokens, active_compaction_handoff.?.len, accepted_tokens },
+                            .{ request_cost.serialized_bytes, request_cost.estimated_input_tokens, active_compaction_handoff.?.len, transaction.accepted_tokens },
                         );
-                        if (deps.push_interactive_notice) |push_notice| {
-                            try push_notice(deps.ctx, .{
-                                .topic = "context",
-                                .tone = .neutral,
-                                .body = "Context compacted.",
-                            });
-                        }
                         request_token_calibration = null;
                         skip_next_preflight_refresh = true;
                         continue;

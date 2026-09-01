@@ -2712,7 +2712,7 @@ test "processQueuedPrompt uses one available capability snapshot for compaction 
         ),
     }};
     const completions = [_]FakeCompletion{
-        .{ .content = "{\"objective\":{\"text\":\"Continue from the compacted history.\",\"sources\":[\"S0\"]},\"constraints\":[],\"obligations\":[],\"next_action\":{\"kind\":\"none\",\"text\":\"Continue.\",\"sources\":[\"S0\"]}}" },
+        .{ .content = "Continue from the compacted history with the recent request intact." },
         .{ .content = "Done" },
     };
     var gateway = FakeGateway.init(alloc, &completions);
@@ -2782,7 +2782,7 @@ test "processQueuedPrompt uses the provider-local compaction model" {
             .capabilities = .{ .context_window = 32_000, .max_output_tokens = 16_000 },
         }};
         const completions = [_]FakeCompletion{
-            .{ .content = "{\"objective\":{\"text\":\"Continue.\",\"sources\":[\"S0\"]},\"constraints\":[],\"obligations\":[],\"next_action\":{\"kind\":\"none\",\"text\":\"Continue.\",\"sources\":[\"S0\"]}}" },
+            .{ .content = "Continue from the compacted conversation." },
             .{ .content = "Done" },
         };
         var gateway = FakeGateway.init(alloc, &completions);
@@ -2890,7 +2890,7 @@ test "processQueuedPrompt semantically compacts history at eighty percent and co
         "{\"path\":\"first.txt\"}",
     )};
     const completions = [_]FakeCompletion{
-        .{ .content = "{\"objective\":{\"text\":\"Finish after the verified read.\",\"sources\":[\"S0\"]},\"constraints\":[],\"obligations\":[],\"next_action\":{\"kind\":\"none\",\"text\":\"Return the result.\",\"sources\":[\"S0\"]}}" },
+        .{ .content = "Finish after the verified read and return the result." },
         .{ .tool_calls = &first_calls },
         .{ .content = "Automatic compaction complete." },
     };

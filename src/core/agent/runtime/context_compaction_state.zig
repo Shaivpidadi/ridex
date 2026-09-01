@@ -20,17 +20,6 @@ pub const OperationFact = struct {
     result_memory: ?types.ToolResultMemory,
 };
 
-pub const UserFact = struct {
-    source_index: usize,
-    key: []const u8,
-    value: []const u8,
-};
-
-pub const ResolvedRelation = struct {
-    current_call_id: []const u8,
-    resolves_call_id: []const u8,
-};
-
 pub const PermissionFeedbackFact = struct {
     source_index: usize,
     call_id: ?[]const u8,
@@ -39,14 +28,10 @@ pub const PermissionFeedbackFact = struct {
 
 pub const CheckpointFacts = struct {
     operations: []OperationFact,
-    user_facts: []UserFact,
-    resolved_relations: []ResolvedRelation,
     permission_feedback: []PermissionFeedbackFact,
 
     pub fn deinit(self: *CheckpointFacts, alloc: Allocator) void {
         if (self.operations.len > 0) alloc.free(self.operations);
-        if (self.user_facts.len > 0) alloc.free(self.user_facts);
-        if (self.resolved_relations.len > 0) alloc.free(self.resolved_relations);
         if (self.permission_feedback.len > 0) alloc.free(self.permission_feedback);
         self.* = undefined;
     }
@@ -116,10 +101,6 @@ pub fn projectCheckpointFacts(
         }
     }
 
-    const user_facts = try deriveCurrentUserFacts(alloc, messages);
-    errdefer if (user_facts.len > 0) alloc.free(user_facts);
-    const resolved_relations = try deriveResolvedRelations(alloc, operations.items);
-    errdefer if (resolved_relations.len > 0) alloc.free(resolved_relations);
     const owned_operations = try operations.toOwnedSlice(alloc);
     errdefer if (owned_operations.len > 0) alloc.free(owned_operations);
     const owned_permission_feedback = try permission_feedback.toOwnedSlice(alloc);
@@ -127,8 +108,6 @@ pub fn projectCheckpointFacts(
 
     return .{
         .operations = owned_operations,
-        .user_facts = user_facts,
-        .resolved_relations = resolved_relations,
         .permission_feedback = owned_permission_feedback,
     };
 }
@@ -183,23 +162,11 @@ pub fn renderHandoff(
     errdefer out.deinit();
     try out.writer.writeAll("<context_handoff>\n## Authoritative continuation state\n");
 
-    if (facts.user_facts.len == 0 and facts.operations.len == 0 and
-        facts.resolved_relations.len == 0)
-    {
+    if (facts.operations.len == 0) {
         try out.writer.writeAll("- No structured execution facts were removed.\n");
-    }
-    for (facts.user_facts) |fact| {
-        try out.writer.print("- user_fact {s}={s} state=current\n", .{ fact.key, fact.value });
     }
     for (facts.operations) |operation| {
         try writeOperation(&out.writer, operation);
-    }
-    for (facts.resolved_relations) |relation| {
-        try out.writer.writeAll("- resolved_operation current_call_id=");
-        try std.json.Stringify.value(relation.current_call_id, .{}, &out.writer);
-        try out.writer.writeAll(" resolves_call_id=");
-        try std.json.Stringify.value(relation.resolves_call_id, .{}, &out.writer);
-        try out.writer.writeByte('\n');
     }
 
     if (facts.permission_feedback.len > 0) {
@@ -266,79 +233,6 @@ fn statusFromResult(status: ?types.PersistedToolStatus) OperationStatus {
         .success => .success,
         .failure => .failure,
     };
-}
-
-fn deriveResolvedRelations(
-    alloc: Allocator,
-    operations: []const OperationFact,
-) Allocator.Error![]ResolvedRelation {
-    var relations: std.ArrayList(ResolvedRelation) = .empty;
-    errdefer relations.deinit(alloc);
-    for (operations, 0..) |operation, index| {
-        if (operation.status != .success) continue;
-        var prior_index = index;
-        while (prior_index > 0) {
-            prior_index -= 1;
-            const prior = operations[prior_index];
-            if (prior.status != .failure or
-                !std.mem.eql(u8, prior.tool_name, operation.tool_name) or
-                !std.mem.eql(u8, prior.arguments_json, operation.arguments_json))
-            {
-                continue;
-            }
-            try relations.append(alloc, .{
-                .current_call_id = operation.call_id,
-                .resolves_call_id = prior.call_id,
-            });
-            break;
-        }
-    }
-    return relations.toOwnedSlice(alloc);
-}
-
-fn deriveCurrentUserFacts(
-    alloc: Allocator,
-    messages: []const types.ChatMessage,
-) Allocator.Error![]UserFact {
-    var facts: std.ArrayList(UserFact) = .empty;
-    errdefer facts.deinit(alloc);
-    for (messages, 0..) |message, source_index| {
-        if (message.role != .user or message.permission_feedback) continue;
-        const content = message.content orelse continue;
-        var tokens = std.mem.tokenizeAny(u8, content, " \t\r\n");
-        while (tokens.next()) |token| {
-            const separator = std.mem.findScalar(u8, token, '=') orelse continue;
-            if (separator == 0 or separator + 1 >= token.len) continue;
-            const key = token[0..separator];
-            const value = std.mem.trimEnd(u8, token[separator + 1 ..], ",.;");
-            if (!validFactKey(key) or value.len == 0 or value.len > 256) continue;
-            var existing: ?usize = null;
-            for (facts.items, 0..) |fact, index| {
-                if (std.mem.eql(u8, fact.key, key)) existing = index;
-            }
-            const fact = UserFact{
-                .source_index = source_index,
-                .key = key,
-                .value = value,
-            };
-            if (existing) |index| {
-                facts.items[index] = fact;
-            } else {
-                try facts.append(alloc, fact);
-            }
-        }
-    }
-    return facts.toOwnedSlice(alloc);
-}
-
-fn validFactKey(key: []const u8) bool {
-    if (key.len == 0 or key.len > 64) return false;
-    for (key) |byte| {
-        if (!std.ascii.isAlphanumeric(byte) and byte != '_' and byte != '-' and byte != '.') {
-            return false;
-        }
-    }
-    return true;
 }
 
 fn writeOperation(writer: *std.Io.Writer, operation: OperationFact) !void {
@@ -457,24 +351,6 @@ test "deterministic checkpoint rejects orphan and duplicate tool results" {
     );
 }
 
-test "resolved relations require exact operation identity and later success" {
-    const calls = [_]types.ToolCall{
-        .{ .id = "old", .name = "terminal", .arguments_json = "{\"command\":\"zig build\"}" },
-        .{ .id = "new", .name = "terminal", .arguments_json = "{\"command\":\"zig build\"}" },
-    };
-    const messages = [_]types.ChatMessage{
-        .{ .role = .assistant, .tool_calls = calls[0..1] },
-        .{ .role = .tool, .tool_call_id = "old", .tool_name = "terminal", .tool_result_status = .failure },
-        .{ .role = .assistant, .tool_calls = calls[1..2] },
-        .{ .role = .tool, .tool_call_id = "new", .tool_name = "terminal", .tool_result_status = .success },
-    };
-    var facts = try projectCheckpointFacts(std.testing.allocator, &messages);
-    defer facts.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 1), facts.resolved_relations.len);
-    try std.testing.expectEqualStrings("new", facts.resolved_relations[0].current_call_id);
-    try std.testing.expectEqualStrings("old", facts.resolved_relations[0].resolves_call_id);
-}
-
 test "oversized arguments render as bounded exact identity" {
     const calls = [_]types.ToolCall{.{
         .id = "large",
@@ -491,15 +367,28 @@ test "oversized arguments render as bounded exact identity" {
     try std.testing.expect(handoff.len < max_inline_arguments_bytes);
 }
 
-test "current user facts keep the latest exact value" {
+test "user prose and repeated operation identity do not create authority" {
+    const calls = [_]types.ToolCall{
+        .{ .id = "failed", .name = "terminal", .arguments_json = "{\"command\":\"zig build\"}" },
+        .{ .id = "later", .name = "terminal", .arguments_json = "{\"command\":\"zig build\"}" },
+    };
     const messages = [_]types.ChatMessage{
-        .{ .role = .user, .content = "path=/old status=pending" },
-        .{ .role = .user, .content = "path=/unsafe", .permission_feedback = true },
-        .{ .role = .user, .content = "path=/new" },
+        .{ .role = .user, .content = "path=/tmp/release status=approved" },
+        .{ .role = .assistant, .tool_calls = calls[0..1] },
+        .{ .role = .tool, .tool_call_id = "failed", .tool_name = "terminal", .tool_result_status = .failure },
+        .{ .role = .assistant, .tool_calls = calls[1..2] },
+        .{ .role = .tool, .tool_call_id = "later", .tool_name = "terminal", .tool_result_status = .success },
     };
     var facts = try projectCheckpointFacts(std.testing.allocator, &messages);
     defer facts.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 2), facts.user_facts.len);
-    try std.testing.expectEqualStrings("/new", facts.user_facts[0].value);
-    try std.testing.expectEqual(@as(usize, 2), facts.user_facts[0].source_index);
+    try std.testing.expectEqual(@as(usize, 2), facts.operations.len);
+    try std.testing.expectEqual(OperationStatus.failure, facts.operations[0].status);
+    try std.testing.expectEqual(OperationStatus.success, facts.operations[1].status);
+
+    const handoff = try renderHandoff(std.testing.allocator, facts, &.{});
+    defer std.testing.allocator.free(handoff);
+    try std.testing.expect(std.mem.find(u8, handoff, "user_fact") == null);
+    try std.testing.expect(std.mem.find(u8, handoff, "resolved_operation") == null);
+    try std.testing.expect(std.mem.find(u8, handoff, "status=failure") != null);
+    try std.testing.expect(std.mem.find(u8, handoff, "status=success") != null);
 }

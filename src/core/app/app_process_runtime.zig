@@ -20,8 +20,8 @@ pub fn Runtime(comptime App: type) type {
             event_handlers: app_worker_runtime.WorkerEventHandlers,
             flush_frame: *const fn (*App) anyerror!void,
         ) !void {
-            const job = (try app.worker.tryTakeNextPrompt(std.heap.c_allocator)) orelse return;
-            defer worker_runtime.freeQueuedPrompt(std.heap.c_allocator, job);
+            const work = (try app.worker.tryTakeNextWork(std.heap.c_allocator)) orelse return;
+            defer worker_runtime.freeWorkItem(std.heap.c_allocator, work);
 
             try app_worker_runtime.Runtime(App).tick(
                 app,
@@ -30,7 +30,7 @@ pub fn Runtime(comptime App: type) type {
             );
             try flush_frame(app);
 
-            app.processQueuedPrompt(job) catch |err| {
+            app.processQueuedWork(work) catch |err| {
                 if (err != error.RouteRecoveryStopped) {
                     const body = try formatErrorBody(std.heap.c_allocator, "request failed", err);
                     defer std.heap.c_allocator.free(body);
@@ -117,10 +117,10 @@ pub fn Runtime(comptime App: type) type {
 
         fn workerLoop(app: *App) !void {
             while (true) {
-                const job = (try app.worker.waitAndTakeNextPrompt(std.heap.c_allocator)) orelse return;
+                const work = (try app.worker.waitAndTakeNextWork(std.heap.c_allocator)) orelse return;
 
-                defer worker_runtime.freeQueuedPrompt(std.heap.c_allocator, job);
-                app.processQueuedPrompt(job) catch |err| {
+                defer worker_runtime.freeWorkItem(std.heap.c_allocator, work);
+                app.processQueuedWork(work) catch |err| {
                     if (err != error.RouteRecoveryStopped) {
                         const body = try formatErrorBody(std.heap.c_allocator, "request failed", err);
                         defer std.heap.c_allocator.free(body);
@@ -259,14 +259,17 @@ const TestWorkerApp = struct {
         self.worker.deinit(std.heap.c_allocator);
     }
 
-    fn processQueuedPrompt(self: *TestWorkerApp, job: worker_runtime.QueuedPrompt) !void {
+    fn processQueuedWork(self: *TestWorkerApp, work: worker_runtime.WorkItem) !void {
         self.processed_count += 1;
         if (self.processed_count >= self.shutdown_after_count) self.worker.requestShutdown();
         if (self.processed_count == 1) {
             if (self.first_process_error) |err| return err;
         }
         self.successful_count += 1;
-        self.saw_recovery_prompt = std.mem.eql(u8, job.prompt, "recovery");
+        self.saw_recovery_prompt = switch (work) {
+            .prompt => |job| std.mem.eql(u8, job.prompt, "recovery"),
+            .compact_context => false,
+        };
     }
 };
 

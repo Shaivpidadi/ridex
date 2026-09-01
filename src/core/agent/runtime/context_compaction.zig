@@ -14,7 +14,6 @@ const compaction_state = @import("context_compaction_state.zig");
 const Allocator = std.mem.Allocator;
 
 const provider_timeout_ms: u64 = 120_000;
-const default_protected_tail_messages: usize = 2;
 const summary_prompt_reserve_tokens: usize = 512;
 const max_summary_chunks: usize = 64;
 
@@ -35,12 +34,10 @@ pub const Request = struct {
     usage: ?*session_usage.Usage = null,
     usage_allocator: Allocator = std.heap.c_allocator,
     trace_ctx: debug_trace.TraceContext,
-    protected_tail_messages: usize = default_protected_tail_messages,
 };
 
 pub const Result = struct {
     handoff: []u8,
-    retained_message_count: usize,
 
     pub fn deinit(self: *Result, alloc: Allocator) void {
         alloc.free(self.handoff);
@@ -125,14 +122,11 @@ pub fn compact(
     source_messages: []const types.ChatMessage,
     request: Request,
 ) !Result {
-    if (source_messages.len <= request.protected_tail_messages) {
-        return error.NoContextToCompact;
-    }
+    if (source_messages.len == 0) return error.NoContextToCompact;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
     const scratch = arena_state.allocator();
-    const prefix_len = source_messages.len - request.protected_tail_messages;
-    const compactable = source_messages[0..prefix_len];
+    const compactable = source_messages;
 
     var facts = try compaction_state.projectCheckpointFacts(scratch, compactable);
     defer facts.deinit(scratch);
@@ -176,12 +170,10 @@ pub fn compact(
             "context_compaction",
             "provider_start",
             request.trace_ctx,
-            "model={s} source_messages={d} compactable_messages={d} retained_messages={d} chunks={d} fixed_handoff_tokens={d} summary_budget_tokens={d}",
+            "model={s} source_messages={d} chunks={d} fixed_handoff_tokens={d} summary_budget_tokens={d}",
             .{
                 request.model,
                 source_messages.len,
-                compactable.len,
-                request.protected_tail_messages,
                 ranges.len,
                 fixed_handoff_tokens,
                 summary_budget,
@@ -244,10 +236,7 @@ pub fn compact(
             },
         );
     }
-    return .{
-        .handoff = handoff,
-        .retained_message_count = request.protected_tail_messages,
-    };
+    return .{ .handoff = handoff };
 }
 
 fn planSummaryRanges(
@@ -511,7 +500,6 @@ test "semantic compaction summarizes once while runtime truth remains authoritat
         .accepted_tokens = 1024,
         .generation_tokens = 512,
         .compactor_input_tokens = 100_000,
-        .protected_tail_messages = 0,
         .trace_ctx = .{},
     });
     defer result.deinit(alloc);
@@ -548,7 +536,6 @@ test "capacity-required summaries use identical prompts without a merge call" {
         .accepted_tokens = 2048,
         .generation_tokens = 1024,
         .compactor_input_tokens = 700,
-        .protected_tail_messages = 0,
         .trace_ctx = .{},
     });
     defer result.deinit(alloc);
@@ -580,7 +567,6 @@ test "semantic compaction rejects tool calls incomplete output oversize and canc
             .cancel_flag = &tool_cancel,
             .accepted_tokens = 256,
             .generation_tokens = 128,
-            .protected_tail_messages = 0,
             .trace_ctx = .{},
         }),
     );
@@ -597,7 +583,6 @@ test "semantic compaction rejects tool calls incomplete output oversize and canc
             .cancel_flag = &incomplete_cancel,
             .accepted_tokens = 256,
             .generation_tokens = 128,
-            .protected_tail_messages = 0,
             .trace_ctx = .{},
         }),
     );
@@ -614,7 +599,6 @@ test "semantic compaction rejects tool calls incomplete output oversize and canc
             .cancel_flag = &oversized_cancel,
             .accepted_tokens = 1,
             .generation_tokens = 1,
-            .protected_tail_messages = 0,
             .trace_ctx = .{},
         }),
     );
@@ -631,7 +615,6 @@ test "semantic compaction rejects tool calls incomplete output oversize and canc
             .cancel_flag = &cancelled_flag,
             .accepted_tokens = 256,
             .generation_tokens = 128,
-            .protected_tail_messages = 0,
             .trace_ctx = .{},
         }),
     );

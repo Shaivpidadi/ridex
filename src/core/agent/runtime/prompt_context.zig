@@ -24,11 +24,6 @@ pub const CompactionDecision = enum {
     compact,
 };
 
-pub const CompactionNextAction = enum {
-    continue_turn,
-    stop,
-};
-
 pub const CompactionPlanInput = struct {
     trigger: CompactionTrigger,
     capabilities: model_capabilities.Capabilities,
@@ -39,7 +34,6 @@ pub const CompactionPlanInput = struct {
 
 pub const CompactionPlan = struct {
     decision: CompactionDecision,
-    next_action: CompactionNextAction,
     usable_input_tokens: ?usize,
     high_water_tokens: ?usize,
     session_target_tokens: ?usize,
@@ -48,10 +42,6 @@ pub const CompactionPlan = struct {
 };
 
 pub fn planCompaction(input: CompactionPlanInput) CompactionPlan {
-    const next_action: CompactionNextAction = switch (input.trigger) {
-        .automatic => .continue_turn,
-        .manual => .stop,
-    };
     const usable = usableInputTokens(input.capabilities);
     const high_water = if (usable) |tokens|
         tokens * compaction_high_water_numerator / compaction_ratio_denominator
@@ -67,7 +57,6 @@ pub fn planCompaction(input: CompactionPlanInput) CompactionPlan {
     };
     if (!should_compact) return .{
         .decision = .no_op,
-        .next_action = next_action,
         .usable_input_tokens = usable,
         .high_water_tokens = high_water,
         .session_target_tokens = session_target,
@@ -86,7 +75,6 @@ pub fn planCompaction(input: CompactionPlanInput) CompactionPlan {
         source_target;
     if (input.protected_tokens >= total_target) return .{
         .decision = .no_op,
-        .next_action = next_action,
         .usable_input_tokens = usable,
         .high_water_tokens = high_water,
         .session_target_tokens = session_target,
@@ -101,7 +89,6 @@ pub fn planCompaction(input: CompactionPlanInput) CompactionPlan {
         requested_generation;
     return .{
         .decision = .compact,
-        .next_action = next_action,
         .usable_input_tokens = usable,
         .high_water_tokens = high_water,
         .session_target_tokens = session_target,
@@ -464,7 +451,6 @@ test "compaction v2 triggers automatic work at eighty percent and targets ten pe
     try std.testing.expectEqual(@as(?usize, 80), at_boundary.session_target_tokens);
     try std.testing.expectEqual(@as(?usize, 80), at_boundary.accepted_handoff_tokens);
     try std.testing.expectEqual(@as(?usize, 200), at_boundary.generation_tokens);
-    try std.testing.expectEqual(CompactionNextAction.continue_turn, at_boundary.next_action);
 
     const protected_prompt = planCompaction(.{
         .trigger = .automatic,
@@ -498,7 +484,6 @@ test "manual compaction shares the budget and stops after a smaller source" {
     try std.testing.expectEqual(CompactionDecision.compact, plan.decision);
     try std.testing.expectEqual(@as(?usize, 80), plan.accepted_handoff_tokens);
     try std.testing.expectEqual(@as(?usize, 200), plan.generation_tokens);
-    try std.testing.expectEqual(CompactionNextAction.stop, plan.next_action);
 
     const empty = planCompaction(.{
         .trigger = .manual,
