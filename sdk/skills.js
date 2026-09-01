@@ -1,5 +1,5 @@
 const maxSkills = 64;
-const maxInstructionsBytes = 256 * 1024;
+const maxInstructionsBytes = 64 * 1024;
 
 function escapeAttribute(value) {
   return value.replaceAll("&", "&amp;").replaceAll('"', "&quot;").replaceAll("<", "&lt;");
@@ -38,7 +38,7 @@ export function createSkillsAdapter(records) {
   }
   const instructions = sections.join("\n\n");
   if (new TextEncoder().encode(instructions).length > maxInstructionsBytes) {
-    throw new RangeError("skill instructions exceed the libfx limit");
+    throw new RangeError(`skill instructions exceed the ${maxInstructionsBytes} byte libfx limit`);
   }
   return { instructions, tools };
 }

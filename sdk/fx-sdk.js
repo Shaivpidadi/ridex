@@ -4,6 +4,7 @@ const strictDecoder = new TextDecoder("utf-8", { fatal: true });
 const workspaceInfoLimit = 4 * 1024;
 const workspaceCommandLimit = 64 * 1024;
 const workspaceOutputLimit = 64 * 1024;
+const maxInstructionsBytes = 64 * 1024;
 const streamReadsPerTaskYield = 32;
 
 function validWorkspacePath(path) {
@@ -947,12 +948,19 @@ function normalizeHostTools(value) {
 }
 
 function normalizeInstructions(value) {
-  if (value === undefined) return "";
-  if (typeof value === "string") return value;
+  let instructions;
+  if (value === undefined) instructions = "";
+  else if (typeof value === "string") instructions = value;
   if (Array.isArray(value) && value.every((entry) => typeof entry === "string")) {
-    return value.filter(Boolean).join("\n\n");
+    instructions = value.filter(Boolean).join("\n\n");
   }
-  throw new TypeError("instructions must be a string or an array of strings");
+  if (instructions === undefined) {
+    throw new TypeError("instructions must be a string or an array of strings");
+  }
+  if (encoder.encode(instructions).length > maxInstructionsBytes) {
+    throw new RangeError(`instructions exceed the ${maxInstructionsBytes} byte libfx limit`);
+  }
+  return instructions;
 }
 
 function hostToolContent(value) {
@@ -1068,22 +1076,30 @@ export async function createFxAgent(options = {}) {
     const waiter = pending.get(message.id); if (!waiter) return; pending.delete(message.id);
     if (message.error) waiter.reject(new Error(message.error.message)); else waiter.resolve(message.result);
   });
-  await request("initialize", {
-    protocolVersion: 1,
-    clientCapabilities: {
-      ...(hostTools.descriptors.length || instructions
-        ? { libfx: { tools: hostTools.descriptors, instructions } }
-        : {}),
-    },
-  });
-
-  const sessionResult = await request("libfx/new");
-  sessionId = sessionResult.sessionId;
-  if (initialCheckpoint) {
-    await request("libfx/restore", {
-      sessionId,
-      checkpoint: bytesToBase64(initialCheckpoint),
+  try {
+    await request("initialize", {
+      protocolVersion: 1,
+      clientCapabilities: {
+        ...(hostTools.descriptors.length || instructions
+          ? { libfx: { tools: hostTools.descriptors, instructions } }
+          : {}),
+      },
     });
+
+    const sessionResult = await request("libfx/new");
+    sessionId = sessionResult.sessionId;
+    if (initialCheckpoint) {
+      await request("libfx/restore", {
+        sessionId,
+        checkpoint: bytesToBase64(initialCheckpoint),
+      });
+    }
+  } catch (error) {
+    closing = true;
+    try { runtime.abortHostEffects(); } catch {}
+    try { runtime.closeStdin(); } catch {}
+    try { await runtime.exited; } catch {}
+    throw error;
   }
 
   const agent = {

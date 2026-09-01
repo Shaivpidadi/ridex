@@ -17,6 +17,8 @@ const scripts = [
   "test-native-core-cancel.mjs",
   "test-default-import.mjs",
   "test-libfx-loader.mjs",
+  "test-agent-bootstrap.mjs",
+  "test-instruction-limits.mjs",
 ];
 for (const script of scripts) {
   const args = [fileURLToPath(new URL(script, import.meta.url))];

@@ -76,6 +76,8 @@ const agent = await createFxAgent({
 
 The JavaScript host is the authority for tool effects. The same descriptors,
 schemas, cancellation, results, and events are used by N-API and WebAssembly.
+Instructions are limited to 64 KiB of UTF-8 text, including text assembled by
+the MCP and skills adapters.
 
 ## MCP
 

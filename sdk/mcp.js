@@ -1,5 +1,5 @@
 const maxTools = 64;
-const maxInstructionsBytes = 256 * 1024;
+const maxInstructionsBytes = 64 * 1024;
 
 function contentText(content) {
   if (typeof content === "string") return content;
@@ -73,7 +73,7 @@ export async function createMcpAdapter(client, options = {}) {
   }
   const instructionText = instructions.join("\n\n");
   if (new TextEncoder().encode(instructionText).length > maxInstructionsBytes) {
-    throw new RangeError("MCP instructions exceed the libfx limit");
+    throw new RangeError(`MCP instructions exceed the ${maxInstructionsBytes} byte libfx limit`);
   }
 
   let closed = false;

@@ -165,6 +165,7 @@ jobs:
 
       - name: Test Bun cross-backend integrations
         run: |
+          bun sdk/tests/test-agent-bootstrap.mjs auto
           bun sdk/tests/test-checkpoint.mjs native wasm
           bun sdk/tests/test-checkpoint.mjs wasm native
           bun sdk/tests/test-host-tools.mjs native
