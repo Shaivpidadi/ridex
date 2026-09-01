@@ -9,6 +9,7 @@ const xai_grok_permission_reviewer = @import("../gateway/xai_grok_permission_rev
 const provider_catalog = @import("../core/auth/provider_catalog.zig");
 
 pub const native = provider_set.Set{
+    .freeride = gateway.freeride_provider_bundle,
     .gateway = gateway.provider_bundle,
     .codex = .{
         .compaction_model = "gpt-5.6-luna",

@@ -3356,6 +3356,7 @@ fn canonicalExactGenerationId(
 
 fn exactUsageOrigin(provider: model_provider.ProviderId) []const u8 {
     return switch (provider) {
+        .freeride => "exact/freeride",
         .gateway => "exact/gateway",
         .codex => "exact/codex",
         .grok => "exact/grok",

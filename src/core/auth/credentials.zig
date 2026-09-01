@@ -249,6 +249,8 @@ pub const LoadMode = enum { stored, refresh_if_needed };
 
 const FxLoginRefreshMode = enum { if_needed, force };
 
+pub const freeride_local_token = "freeride-local";
+
 pub const missing_credential_message = "fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.";
 pub const missing_interactive_credential_message = "fx needs access to Vercel AI Gateway. Run /login to sign in, /provider to use an API key, or set AI_GATEWAY_API_KEY.";
 pub const missing_chatgpt_credential_message = "fx needs a Codex subscription login for this model. Run fx login codex.";
@@ -379,6 +381,14 @@ pub fn resolveForProvider(
     provider: model_provider.ProviderId,
     preferred: ?Source,
 ) !Resolution {
+    // FreeRide is a local gateway that ignores the bearer token; a
+    // synthetic credential means no login flow ever gates the agent.
+    if (provider == .freeride) {
+        return .{ .credential = .{
+            .token = try alloc.dupe(u8, freeride_local_token),
+            .source = .ai_gateway_api_key,
+        } };
+    }
     if (provider != .gateway) {
         const source = provider_catalog.find(provider).login_source;
         const credential = loadPreferredSource(alloc, transport, secret_store, mode, source) catch |err| {

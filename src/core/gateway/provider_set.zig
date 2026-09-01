@@ -60,12 +60,14 @@ fn emptyModelCapabilities(_: []const u8) model_capabilities.Capabilities {
 }
 
 pub const Set = struct {
+    freeride: Bundle,
     gateway: Bundle,
     codex: Bundle,
     grok: Bundle,
 
     pub fn select(self: Set, provider: model_provider.ProviderId) Bundle {
         return switch (provider) {
+            .freeride => self.freeride,
             .gateway => self.gateway,
             .codex => self.codex,
             .grok => self.grok,
@@ -87,6 +89,7 @@ pub const Set = struct {
 
     pub fn deferredUsageProviders(self: Set) generation_usage_provider.Set {
         return .{
+            .freeride = self.freeride.deferred_usage,
             .gateway = self.gateway.deferred_usage,
             .codex = self.codex.deferred_usage,
             .grok = self.grok.deferred_usage,
@@ -96,6 +99,7 @@ pub const Set = struct {
 
 pub fn gateway_only(gateway: Bundle) Set {
     return .{
+        .freeride = .{},
         .gateway = gateway,
         .codex = .{},
         .grok = .{},

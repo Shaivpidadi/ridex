@@ -8,7 +8,7 @@ pub const Runtime = struct {
     const Self = @This();
 
     alloc: Allocator,
-    active_provider: model_provider.ProviderId = .gateway,
+    active_provider: model_provider.ProviderId = model_provider.default_provider,
     model: std.ArrayList(u8) = .empty,
 
     pub fn init(alloc: Allocator) Self {
@@ -53,6 +53,7 @@ pub const Runtime = struct {
         self.model = .fromOwnedSlice(owned_model.*);
         owned_model.* = &.{};
         self.active_provider = target_provider;
+        model_provider.active_transport_provider = target_provider;
     }
 };
 

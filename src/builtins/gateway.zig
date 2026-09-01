@@ -15,6 +15,7 @@ const gateway_client = @import("../gateway/client.zig");
 const vercel_failure_diagnostics = @import("../gateway/vercel_failure_diagnostics.zig");
 const vercel_protocol = @import("../gateway/vercel_protocol.zig");
 const io_mod = @import("../core/shared/io.zig");
+const model_provider = @import("../core/config/model_provider.zig");
 const gateway_generation_usage = @import("../gateway/generation_usage.zig");
 const gateway_provider = @import("../core/gateway/gateway_provider.zig");
 const provider_set = @import("../core/gateway/provider_set.zig");
@@ -48,6 +49,11 @@ const credits_path = "/coding-agent/v1/credits";
 pub const retry_count: usize = 3;
 pub const chat_url_env = "FX_GATEWAY_CHAT_URL";
 pub const default_model_catalog_base_url = "https://ai-gateway.vercel.sh";
+// FreeRide's local gateway (ridex's default provider). Loopback by
+// definition, so the same trust rules as the FX_GATEWAY_* overrides
+// apply automatically.
+pub const freeride_default_chat_url = "http://127.0.0.1:11343/v3/ai/language-model";
+pub const freeride_model_catalog_base_url = "http://127.0.0.1:11343";
 const base_url_env = "FX_GATEWAY_BASE_URL";
 const e2e_gateway_models_url_env = "FX_E2E_GATEWAY_MODELS_URL";
 const oauth_request_timeout_ms: i64 = 15_000;
@@ -125,8 +131,15 @@ pub const chat_url_provider = gateway_provider.ChatUrlProvider{
     .resolve_fn = resolveChatUrlForProvider,
 };
 
+fn activeDefaultChatUrl() []const u8 {
+    return switch (model_provider.active_transport_provider) {
+        .freeride => freeride_default_chat_url,
+        else => default_chat_url,
+    };
+}
+
 pub fn agentChatUrl() []const u8 {
-    return resolveChatUrl(default_chat_url, io_mod.getenv(chat_url_env));
+    return resolveChatUrl(activeDefaultChatUrl(), io_mod.getenv(chat_url_env));
 }
 
 pub const cli_model_catalog_provider = gateway_provider.CliModelCatalogProvider{
@@ -150,6 +163,23 @@ pub const generation_usage_provider = gateway_generation_usage.provider;
 pub const agent_stream_provider = agent_stream_provider_contract.Provider{
     .stream_fn = streamAgentCompletion,
     .build_request_fn = buildAgentRequestForProvider,
+};
+
+fn freerideModelCapabilities(_: []const u8) model_capabilities.Capabilities {
+    // FreeRide's catalog serves capability tags; this fallback covers
+    // ids the catalog has not loaded yet. The coding preset guarantees
+    // tool-call support, which is the one capability the agent loop
+    // cannot run without.
+    return .{ .supports_tool_use = true };
+}
+
+pub const freeride_provider_bundle = provider_set.Bundle{
+    .presentation = provider_catalog.find(.freeride),
+    .fallback_model_capabilities_fn = freerideModelCapabilities,
+    .agent_stream = agent_stream_provider,
+    .cli_model_catalog = cli_model_catalog_provider,
+    .model_catalog = model_catalog_provider,
+    .permission_reviewer = permission_reviewer.provider,
 };
 
 pub const provider_bundle = provider_set.Bundle{
@@ -942,7 +972,7 @@ pub fn chatUrl(fallback: []const u8) []const u8 {
 }
 
 pub fn defaultChatUrl() []const u8 {
-    return chatUrl(default_chat_url);
+    return chatUrl(activeDefaultChatUrl());
 }
 
 fn resolveChatUrlForProvider(_: ?*anyopaque, fallback: []const u8) []const u8 {
@@ -2513,11 +2543,15 @@ test "catalog request failures preserve transport and cancellation facts" {
 }
 
 fn modelCatalogUrl(alloc: Allocator, path: []const u8, base_url_override: ?[]const u8) ![]u8 {
+    const active_base_url = switch (model_provider.active_transport_provider) {
+        .freeride => freeride_model_catalog_base_url,
+        else => default_model_catalog_base_url,
+    };
     const base_url = if (base_url_override) |candidate| blk: {
         if (gateway_client.isLoopbackHttpUrl(candidate)) break :blk candidate;
         debug_trace.logf("gateway", "ignoring {s}: not loopback http", .{base_url_env});
-        break :blk default_model_catalog_base_url;
-    } else default_model_catalog_base_url;
+        break :blk active_base_url;
+    } else active_base_url;
 
     return std.fmt.allocPrint(alloc, "{s}{s}", .{ base_url, path });
 }

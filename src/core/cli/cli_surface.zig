@@ -751,11 +751,12 @@ fn activateProviderSelectionFallible(
         );
     defer if (prepared_credential) |*credential| credential.deinit(alloc);
 
-    const already_selected = (settings.provider orelse .gateway) == target;
+    const already_selected = (settings.provider orelse model_provider.defaultProvider()) == target;
     if (caller == .provider_command and already_selected and
         (cfg.auth_mode == .host_managed or prepared_credential != null))
     {
         try writeStdout(deps, switch (target) {
+            .freeride => "FreeRide is already selected.\n",
             .gateway => "Gateway is already selected.\n",
             .codex => "Codex is already selected.\n",
             .grok => "Grok is already selected.\n",
@@ -791,6 +792,7 @@ fn activateProviderSelectionFallible(
             switch (target) {
                 .codex => "Codex credential is unavailable",
                 .grok => "Grok credential is unavailable",
+                .freeride => "FreeRide credential is unavailable",
                 .gateway => "configure a Gateway credential first",
             },
         );
@@ -800,10 +802,13 @@ fn activateProviderSelectionFallible(
         try writeProviderActivationError(alloc, deps, caller, switch (target) {
             .codex => "Codex model catalog is unavailable",
             .grok => "Grok model catalog is unavailable",
+            .freeride => "FreeRide model catalog is unavailable",
             .gateway => "Gateway model catalog is unavailable",
         });
         return false;
     };
+    const previous_transport_provider = model_provider.active_transport_provider;
+    model_provider.active_transport_provider = target;
     const fetch_result = model_catalog.fetchWithPublicFallback(catalog_provider, alloc, .{
         .access = if (cfg.auth_mode == .host_managed)
             .host_managed
@@ -815,6 +820,9 @@ fn activateProviderSelectionFallible(
         .endpoint = cfg.models_path,
         .view = .picker,
     });
+    // The runtime adopts the target (and re-publishes the transport
+    // provider) only after activation succeeds; restore until then.
+    model_provider.active_transport_provider = previous_transport_provider;
     var loaded = switch (fetch_result) {
         .loaded => |loaded| blk: {
             if (loaded.provenance.access.level != .authenticated or
@@ -867,10 +875,11 @@ fn activateProviderSelectionFallible(
     if (performed_login) |provider| switch (provider) {
         .codex => try writeStdout(deps, "Signed in with Codex.\n"),
         .grok => try writeStdout(deps, "Signed in with Grok.\n"),
-        .gateway => unreachable,
+        .freeride, .gateway => unreachable,
     };
     if (caller == .provider_command) {
         try writeStdout(deps, switch (target) {
+            .freeride => "Provider set to FreeRide.\n",
             .gateway => "Provider set to Gateway.\n",
             .codex => "Provider set to Codex.\n",
             .grok => "Provider set to Grok.\n",
@@ -1002,6 +1011,10 @@ fn runNonInteractiveWithDeps(
             }
             // Preserve the original `fx login` behavior for scripts and users.
             const login_provider = maybe_login_provider orelse .gateway;
+            if (login_provider == .freeride) {
+                try writeStderr(deps, "freeride needs no login: the local FreeRide gateway authenticates with provider keys managed by `freeride init`.\n");
+                return .handled_success;
+            }
             runProviderLogin(alloc, cfg, login_provider) catch |err| {
                 try writeProviderLoginFailure(alloc, deps, login_provider, .provider_login, err);
                 return .handled_failure;
@@ -1015,6 +1028,7 @@ fn runNonInteractiveWithDeps(
                 if (login_provider == .gateway) .fx_login else null,
             )) return .handled_failure;
             try writeStdout(deps, switch (login_provider) {
+                .freeride => unreachable, // early-returned above
                 .gateway => "Signed in to Vercel.\nAI Gateway access may still require billing or API setup for the selected account.\n",
                 .codex => "Signed in with Codex.\n",
                 .grok => "Signed in with Grok.\n",
@@ -1276,6 +1290,7 @@ fn runNonInteractiveWithDeps(
             const catalog_access = startup.modelCatalogAccess();
             const catalog_provider = cfg.provider_set.select(startup.provider).cli_model_catalog orelse {
                 try writeStderr(deps, switch (startup.provider) {
+                    .freeride => "fx models: FreeRide model catalog is unavailable\n",
                     .gateway => "fx models: Gateway model catalog is unavailable\n",
                     .codex => "fx models: Codex model catalog is unavailable\n",
                     .grok => "fx models: Grok model catalog is unavailable\n",

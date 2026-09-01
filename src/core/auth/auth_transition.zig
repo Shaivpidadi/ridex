@@ -64,6 +64,9 @@ pub fn signInCompletion(
     provider_routing_supported: bool,
 ) SignInCompletionAction {
     return switch (provider) {
+        // FreeRide never runs a sign-in flow (synthetic credential), so
+        // completion just lands on the provider itself.
+        .freeride => .{ .switch_provider = .freeride },
         .gateway => .vercel,
         .codex => if (provider_routing_supported)
             .{ .switch_provider = .codex }
