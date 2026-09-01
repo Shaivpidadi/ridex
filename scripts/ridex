@@ -20,7 +20,8 @@ STOP_MARKER="$RIDEX_HOME/daemon.stopped"
 PID_FILE="$RIDEX_HOME/daemon.pid"
 DAEMON_LOG="$RIDEX_HOME/daemon.log"
 GATEWAY_URL="${RIDEX_GATEWAY_URL:-http://127.0.0.1:11343}"
-AGENT_BIN="${RIDEX_AGENT_BIN:-$(dirname "$(realpath "$0")")/fx}"
+SCRIPT_DIR="$(dirname "$(realpath "$0")")"
+AGENT_BIN="${RIDEX_AGENT_BIN:-$SCRIPT_DIR/fx}"
 
 # How the daemon is launched. `freeride` from PATH when installed
 # (pipx/uv/pip), overridable for source checkouts:
@@ -89,7 +90,28 @@ ensure_keys() {
     $FREERIDE_CMD reload >/dev/null 2>&1 || true
 }
 
+# The agent's operational knowledge of FreeRide ships as an fx skill:
+# when a request fails, the model consults it to self-diagnose (daemon
+# state, keys, cooldowns, failover taxonomy). Installed/refreshed into
+# the user-scope skills dir on every launch so upgrades propagate.
+SKILLS_HOME="${RIDEX_SKILLS_HOME:-$HOME/.fx/skills}"
+
+ensure_skill() {
+    for _src in "$SCRIPT_DIR/../assets/skills/freeride/SKILL.md" \
+                "$SCRIPT_DIR/skills/freeride/SKILL.md"; do
+        if [ -f "$_src" ]; then
+            _dst="$SKILLS_HOME/freeride/SKILL.md"
+            if ! cmp -s "$_src" "$_dst" 2>/dev/null; then
+                mkdir -p "$SKILLS_HOME/freeride"
+                cp "$_src" "$_dst"
+            fi
+            return 0
+        fi
+    done
+}
+
 ensure_daemon() {
+    ensure_skill
     if healthy; then
         ensure_keys
         return 0
