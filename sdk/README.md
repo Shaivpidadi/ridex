@@ -126,6 +126,11 @@ await createFxAgent({ backend: "native" }); // require N-API
 await createFxAgent({ backend: "wasm" });   // require Wasm + JSPI
 ```
 
+Within one JavaScript realm, libfx compiles each stable Wasm source once and
+creates a separate WebAssembly instance for every Agent. Agent memory, history,
+tools, cancellation, and shutdown remain isolated. Workers and separate
+processes maintain their own module caches.
+
 Node.js 20+ is supported. Browser WebAssembly requires a JSPI-capable browser.
 Some Node versions require `--experimental-wasm-jspi`.
 

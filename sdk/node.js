@@ -27,6 +27,7 @@ const defaultNativeCandidates = [
   `./libfx.${process.platform}-${process.arch}.node`,
 ];
 let nativeBackendPromise;
+const wasmFilePromises = new Map();
 
 function jspiFallbackError(surface, nativeError) {
   const nativeDetail = nativeError ? ` Native loading failed: ${nativeError.message}.` : " No compatible native addon was found.";
@@ -104,10 +105,19 @@ async function resolveNativeBackend(nativeAddon) {
   return nativeBackendPromise;
 }
 
-async function wasmBytes(input) {
-  if (input instanceof URL && input.protocol === "file:") return readFile(input);
-  if (typeof input === "string" && !URL.canParse(input)) return readFile(input);
-  return input;
+function wasmBytes(input) {
+  let path;
+  if (input instanceof URL && input.protocol === "file:") path = fileURLToPath(input);
+  else if (typeof input === "string" && !URL.canParse(input)) path = resolve(input);
+  else return input;
+  const cached = wasmFilePromises.get(path);
+  if (cached) return cached;
+  const pending = readFile(path);
+  wasmFilePromises.set(path, pending);
+  pending.catch(() => {
+    if (wasmFilePromises.get(path) === pending) wasmFilePromises.delete(path);
+  });
+  return pending;
 }
 
 function validateGatewayChatUrl(value) {

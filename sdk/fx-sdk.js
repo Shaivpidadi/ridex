@@ -148,7 +148,10 @@ class ByteQueue {
   }
 }
 
-async function loadModule(input) {
+const modulePromisesBySource = new Map();
+const modulePromisesByObject = new WeakMap();
+
+async function compileModule(input) {
   if (input instanceof WebAssembly.Module) return input;
   if (typeof input === "string") input = fetch(input);
   if (input instanceof Promise) input = await input;
@@ -165,6 +168,21 @@ async function loadModule(input) {
     return WebAssembly.compile(input);
   }
   throw new TypeError("wasm must be a URL, Response, ArrayBuffer, typed array, or WebAssembly.Module");
+}
+
+function loadModule(input) {
+  if (input instanceof WebAssembly.Module) return Promise.resolve(input);
+  const isString = typeof input === "string";
+  if (!isString && (typeof input !== "object" || input === null)) return compileModule(input);
+  const cache = isString ? modulePromisesBySource : modulePromisesByObject;
+  const cached = cache.get(input);
+  if (cached) return cached;
+  const pending = compileModule(input);
+  cache.set(input, pending);
+  pending.catch(() => {
+    if (cache.get(input) === pending) cache.delete(input);
+  });
+  return pending;
 }
 
 function raceWithTimeout(promise, timeoutMs, timeoutValue) {
