@@ -16,10 +16,10 @@ if (!supportsJspi()) {
 const output = [];
 const streamedDecoder = new TextDecoder();
 let streamedText = "";
-const liveDraft = "queued draft";
-const queuedAnswer = "§";
+const liveDraft = "steering draft";
+const steeringAnswer = "§";
 let draftVisibleAt;
-let queuedVisibleAt;
+let pendingVisibleAt;
 const originalSetTimeout = globalThis.setTimeout;
 let observeZeroTimeouts = false;
 let zeroTimeoutCount = 0;
@@ -39,7 +39,7 @@ const terminal = {
     output.push(chunk);
     streamedText += streamedDecoder.decode(chunk, { stream: true });
     if (draftVisibleAt === undefined && streamedText.includes(liveDraft)) draftVisibleAt = performance.now();
-    if (queuedVisibleAt === undefined && streamedText.includes("queued 1")) queuedVisibleAt = performance.now();
+    if (pendingVisibleAt === undefined && streamedText.includes("1 pending message")) pendingVisibleAt = performance.now();
     process.stdout.write(chunk);
   },
   async drain() {
@@ -81,7 +81,7 @@ const mockFetch = async (_url, init) => {
     secondRequestBody = JSON.parse(new TextDecoder().decode(init.body));
     return new Response(new ReadableStream({
       start(controller) {
-        controller.enqueue(encoded.encode(`data: {"type":"text-delta","delta":"${queuedAnswer}"}\n`));
+        controller.enqueue(encoded.encode(`data: {"type":"text-delta","delta":"${steeringAnswer}"}\n`));
         controller.enqueue(encoded.encode('data: {"type":"finish","finishReason":{"unified":"stop"},"usage":{"inputTokens":{"total":1},"outputTokens":{"total":2}}}\n'));
         controller.enqueue(encoded.encode("data: [DONE]\n"));
         controller.close();
@@ -147,21 +147,21 @@ while (draftVisibleAt === undefined) {
   await new Promise((resolve) => setTimeout(resolve, 10));
 }
 runtime.write("\r");
-while (queuedVisibleAt === undefined) {
-  if (streamFinishedAt !== undefined) throw new Error("terminal did not queue follow-up input while the response was active");
-  if (performance.now() >= deadline) throw new Error("timed out waiting for queued follow-up input");
+while (pendingVisibleAt === undefined) {
+  if (streamFinishedAt !== undefined) throw new Error("terminal did not hold steering while the response was active");
+  if (performance.now() >= deadline) throw new Error("timed out waiting for pending steering");
   await new Promise((resolve) => setTimeout(resolve, 10));
 }
 observeZeroTimeouts = false;
-if (secondRequestAt !== undefined) throw new Error("queued follow-up started before the active response finished");
+if (secondRequestAt !== undefined) throw new Error("steering started before the active response finished");
 releaseFirstStream();
 while (streamFinishedAt === undefined) {
   if (performance.now() >= deadline) throw new Error("timed out waiting for streamed fx-term response");
   await new Promise((resolve) => setTimeout(resolve, 10));
 }
-const queuedDeadline = performance.now() + 5000;
-while (secondRequestAt === undefined || !streamedText.includes(queuedAnswer)) {
-  if (performance.now() >= queuedDeadline) throw new Error("timed out waiting for queued fx-term response");
+const steeringDeadline = performance.now() + 5000;
+while (secondRequestAt === undefined || !streamedText.includes(steeringAnswer)) {
+  if (performance.now() >= steeringDeadline) throw new Error("timed out waiting for steered fx-term response");
   await new Promise((resolve) => setTimeout(resolve, 10));
 }
 runtime.write("/exit\r");
@@ -178,14 +178,19 @@ if (!text.includes("Run /help for commands")) throw new Error("shared fx welcome
 if (requestedModel !== "sdk/term-model") throw new Error(`terminal prompt did not use the host-restored model: ${requestedModel}`);
 if (!(streamStartedAt < streamFinishedAt)) throw new Error("terminal fetch did not remain active for continuous streaming");
 if (!(draftVisibleAt < streamFinishedAt)) throw new Error("terminal rendered follow-up input only after continuous streaming finished");
-if (!(queuedVisibleAt < streamFinishedAt)) throw new Error("terminal queued follow-up input only after continuous streaming finished");
-if (!(secondRequestAt >= streamFinishedAt)) throw new Error("terminal started queued follow-up before continuous streaming finished");
-const queuedUser = secondRequestBody.prompt?.filter((message) => message.role === "user").at(-1);
-const queuedText = queuedUser?.content?.filter((part) => part.type === "text").map((part) => part.text);
-if (queuedText?.length !== 1 || queuedText[0] !== liveDraft) {
-  throw new Error(`queued follow-up request changed the submitted draft: ${JSON.stringify(queuedText)}`);
+if (!(pendingVisibleAt < streamFinishedAt)) throw new Error("terminal showed pending steering only after continuous streaming finished");
+if (!(secondRequestAt >= streamFinishedAt)) throw new Error("terminal started steering before continuous streaming finished");
+const steeringUser = secondRequestBody.prompt?.filter((message) => message.role === "user").at(-1);
+const steeringText = steeringUser?.content?.filter((part) => part.type === "text").map((part) => part.text);
+if (
+  steeringText?.length !== 1 ||
+  !steeringText[0].includes("<user_steering>") ||
+  !steeringText[0].includes("Apply this live user update to the current task.") ||
+  !steeringText[0].includes(liveDraft)
+) {
+  throw new Error(`steering request changed the submitted draft or directive: ${JSON.stringify(steeringText)}`);
 }
-if (requestCount !== 2) throw new Error(`terminal sent ${requestCount} requests instead of the active and queued turns`);
+if (requestCount !== 2) throw new Error(`terminal sent ${requestCount} requests instead of the active and steered steps`);
 if (zeroTimeoutCount !== 0) throw new Error(`terminal allocated ${zeroTimeoutCount} zero-timeout poll timer(s)`);
 if (!events.some((event) => event.type === "config.restore" && event.configId === "model")) throw new Error("terminal model restore event was not emitted");
 if (!events.some((event) => event.type === "config.restore" && event.configId === "mode")) throw new Error("terminal mode restore event was not emitted");
