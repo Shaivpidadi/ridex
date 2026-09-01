@@ -116,6 +116,11 @@ const ProviderTerminalPublication = enum {
     published,
 };
 
+const AgentMessageKind = enum {
+    assistant,
+    operational,
+};
+
 const AcpContext = struct {
     alloc: Allocator,
     state: *server.ServerState,
@@ -124,10 +129,8 @@ const AcpContext = struct {
     /// copies of provider call ids so the ID stays stable from permission
     /// review through execution.
     published_tool_calls: std.StringHashMapUnmanaged(ProviderTerminalPublication) = .empty,
-    assistant_message_id: acp_types.MessageIdBuffer = undefined,
-    operational_message_id: acp_types.MessageIdBuffer = undefined,
-    assistant_message_id_ready: bool = false,
-    operational_message_id_ready: bool = false,
+    message_id: acp_types.MessageIdBuffer = undefined,
+    message_kind: ?AgentMessageKind = null,
     stop_reason: acp_types.StopReason = .end_turn,
     auto_classifier: permission_auto_classifier.Classifier =
         permission_auto_classifier.Classifier.disabled(),
@@ -135,6 +138,7 @@ const AcpContext = struct {
     /// session/set_mode changes never mutate a running turn.
     captured_mode: ?[]const u8 = null,
     captured_permission_mode: ?PermissionMode = null,
+    current_prompt_input: ?*ParsedPromptInput = null,
 
     fn deinitPublishedToolCalls(self: *AcpContext) void {
         var keys = self.published_tool_calls.keyIterator();
@@ -150,19 +154,19 @@ const AcpContext = struct {
     }
 
     fn assistantMessageId(self: *AcpContext) []const u8 {
-        if (!self.assistant_message_id_ready) {
-            _ = acp_types.generateMessageId(&self.assistant_message_id);
-            self.assistant_message_id_ready = true;
-        }
-        return &self.assistant_message_id;
+        return self.messageId(.assistant);
     }
 
     fn operationalMessageId(self: *AcpContext) []const u8 {
-        if (!self.operational_message_id_ready) {
-            _ = acp_types.generateMessageId(&self.operational_message_id);
-            self.operational_message_id_ready = true;
+        return self.messageId(.operational);
+    }
+
+    fn messageId(self: *AcpContext, kind: AgentMessageKind) []const u8 {
+        if (self.message_kind != kind) {
+            _ = acp_types.generateMessageId(&self.message_id);
+            self.message_kind = kind;
         }
-        return &self.operational_message_id;
+        return &self.message_id;
     }
 
     fn sendAgentText(self: *AcpContext, message_id: []const u8, text: []const u8) !void {
@@ -604,6 +608,7 @@ pub fn handlePrompt(
         .session_id = session.session_id,
         .captured_mode = captured_mode,
         .captured_permission_mode = captured_permission_mode,
+        .current_prompt_input = &prompt_input,
     };
     defer ctx.deinitPublishedToolCalls();
 
@@ -1859,7 +1864,13 @@ fn toolUpdateContentText(result: ToolExecutionResult) []const u8 {
 fn propagateHistoryTurn(raw_ctx: *anyopaque, turn: HistoryTurn) !void {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     if (ctx.state.active_session) |*session| {
-        try persistAcpHistoryTurn(ctx.alloc, session, turn);
+        try persistAcpHistoryTurn(
+            ctx.alloc,
+            session,
+            turn,
+            ctx.current_prompt_input,
+            .{},
+        );
     }
 }
 
@@ -1867,10 +1878,13 @@ fn persistAcpHistoryTurn(
     alloc: Allocator,
     session: *server.ActiveSessionState,
     turn: HistoryTurn,
+    current_prompt_input: ?*ParsedPromptInput,
+    options: session_log.Options,
 ) !void {
     session.session_write_mutex.lockUncancelable(io_mod.getIo());
     defer session.session_write_mutex.unlock(io_mod.getIo());
     try session.session_rt.appendHistoryEntry(alloc, turn);
+    if (current_prompt_input) |prompt_input| prompt_input.retainImageSnapshots();
     if (comptime host_target.is_wasm) {
         try sessions.commitWasmSessionLocked(alloc, session);
         return;
@@ -1905,7 +1919,7 @@ fn persistAcpHistoryTurn(
         } },
         io_mod.milliTimestamp(),
         .retry_expected_tail,
-        .{},
+        options,
     ) catch |err| switch (err) {
         error.EventFrameTooLarge => {
             try commitAcpStateReplacement(alloc, session, writable, true);
@@ -1990,7 +2004,7 @@ test "ACP degraded history repair commits the finished turn once" {
 
     const turn = try session_runtime.makeAssistantTurn(alloc, "hello", "done");
     defer types.freeHistoryTurn(alloc, turn);
-    try persistAcpHistoryTurn(alloc, &session, turn);
+    try persistAcpHistoryTurn(alloc, &session, turn, null, .{});
 
     try std.testing.expect(session.writable.?.degradedTail() == null);
     try std.testing.expectEqual(@as(usize, 1), session.session_rt.history.items.len);
@@ -1999,6 +2013,45 @@ test "ACP degraded history repair commits the finished turn once" {
         "done",
         session.writable.?.state.history[0].assistant.assistant,
     );
+
+    const image_path = try std.fs.path.join(alloc, &.{ workspace, "image-1.bin" });
+    defer alloc.free(image_path);
+    var image_file = try std.Io.Dir.createFileAbsolute(io_mod.getIo(), image_path, .{});
+    image_file.close(io_mod.getIo());
+    const input_images = try alloc.alloc(types.ImageAttachment, 1);
+    input_images[0] = .{
+        .id = 1,
+        .path = try alloc.dupe(u8, "/tmp/image.png"),
+        .media_type = try alloc.dupe(u8, "image/png"),
+        .snapshot_path = try alloc.dupe(u8, image_path),
+        .snapshot_sha256 = try alloc.dupe(u8, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+    };
+    var prompt_input = ParsedPromptInput{
+        .text = try alloc.dupe(u8, "[Image #1]"),
+        .images = input_images,
+    };
+    const failed_turn: HistoryTurn = .{ .assistant = .{
+        .user = .{
+            .text = try alloc.dupe(u8, prompt_input.text),
+            .images = try types.dupeImageAttachmentSlice(alloc, prompt_input.images),
+        },
+        .assistant = try alloc.dupe(u8, "not persisted"),
+    } };
+    defer types.freeHistoryTurn(alloc, failed_turn);
+    try std.testing.expectError(
+        error.SessionPersistenceDegraded,
+        persistAcpHistoryTurn(
+            alloc,
+            &session,
+            failed_turn,
+            &prompt_input,
+            .{ .test_controls = .{ .boundary_fn = Failure.boundary } },
+        ),
+    );
+    try std.testing.expect(prompt_input.retain_image_snapshots);
+    prompt_input.deinit(alloc);
+    try std.Io.Dir.accessAbsolute(io_mod.getIo(), image_path, .{});
+    try std.testing.expectEqual(@as(usize, 2), session.session_rt.history.items.len);
 }
 
 fn setRecoveryCheckpoint(
@@ -3330,6 +3383,28 @@ test "ACP tool notifications preserve UTF-8 for clipped and unsafe output" {
         );
         defer parsed.deinit();
     }
+}
+
+test "ACP message IDs rotate when the logical message kind resumes" {
+    const alloc = std.testing.allocator;
+    var state = try initTestAcpState(alloc, "/tmp/workspace", .ask);
+    defer state.deinit();
+    var ctx = AcpContext{
+        .alloc = alloc,
+        .state = &state,
+        .session_id = "session_1",
+    };
+
+    var first: acp_types.MessageIdBuffer = undefined;
+    @memcpy(&first, ctx.operationalMessageId());
+    var second: acp_types.MessageIdBuffer = undefined;
+    @memcpy(&second, ctx.assistantMessageId());
+    var third: acp_types.MessageIdBuffer = undefined;
+    @memcpy(&third, ctx.operationalMessageId());
+
+    try std.testing.expect(!std.mem.eql(u8, &first, &second));
+    try std.testing.expect(!std.mem.eql(u8, &second, &third));
+    try std.testing.expect(!std.mem.eql(u8, &first, &third));
 }
 
 test "ACP stream adapter forwards raw Markdown and suppresses rendered duplicates and writer failure" {

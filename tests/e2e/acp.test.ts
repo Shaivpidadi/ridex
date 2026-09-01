@@ -1664,7 +1664,17 @@ describe("acp: model-independent", () => {
       const root = createIsolatedRoot("fx-acp-session-metadata-");
       const title = "Publish ACP session metadata";
       const gateway = startFakeGateway(
-        [finalText("Metadata published.")],
+        [
+          finalText("Metadata published."),
+          fakeGatewaySse([{
+            type: "text-delta",
+            id: "answer_2",
+            delta: "Usage omitted.",
+          }, {
+            type: "finish",
+            finishReason: { unified: "stop", raw: "stop" },
+          }]),
+        ],
         {
           models: [{
             id: FAKE_GATEWAY_MODEL,
@@ -1704,6 +1714,16 @@ describe("acp: model-independent", () => {
         );
         expect(info?.params.sessionId).toBe(sessionId);
         expect(Number.isNaN(Date.parse(info?.params.update.updatedAt))).toBe(false);
+
+        const unmeasured = await runPrompt(
+          client,
+          "Return a response without provider usage metadata.",
+          TIMEOUT,
+        );
+        expect(unmeasured.promptResult.result.stopReason).toBe("end_turn");
+        expect(unmeasured.messages.some((message) =>
+          message.params?.update?.sessionUpdate === "usage_update"
+        )).toBe(false);
 
         await client.close();
         client = await AcpClient.create({
@@ -5285,8 +5305,9 @@ describe("acp: model-independent", () => {
           method: "session/prompt",
           params: {
             prompt: [
-              { type: "text", text: "Describe this image." },
+              { type: "text", text: "Before image." },
               { type: "image", data: imageData, mimeType: "image/png" },
+              { type: "text", text: "After image." },
             ],
           },
         });
@@ -5324,10 +5345,20 @@ describe("acp: model-independent", () => {
           if (message.id === 96) break;
           replay.push(message);
         }
-        const imageChunk = replay.find((message) =>
+        const userChunks = replay.filter((message) =>
+          message.params?.update?.sessionUpdate === "user_message_chunk"
+        );
+        const imageChunk = userChunks.find((message) =>
           message.params?.update?.sessionUpdate === "user_message_chunk" &&
           message.params?.update?.content?.type === "image"
         );
+        expect(userChunks.map((message) => message.params.update.content.type)).toEqual([
+          "text",
+          "image",
+        ]);
+        expect(userChunks[0]?.params.update.content.text).toBe("Before image.\nAfter image.");
+        expect(JSON.stringify(userChunks)).not.toContain("[Image #");
+        expect(new Set(userChunks.map((message) => message.params.update.messageId)).size).toBe(1);
         expect(imageChunk?.params.update.content).toMatchObject({
           type: "image",
           mimeType: "image/png",
@@ -5383,6 +5414,78 @@ describe("acp: model-independent", () => {
         );
         expect(recovered.promptResult.result.stopReason).toBe("end_turn");
         expect(gateway.requests).toHaveLength(1);
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "session load reports an unavailable saved image without failing",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-image-replay-missing-");
+      const imageData = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9WlXYX0AAAAASUVORK5CYII=";
+      const gateway = startFakeGateway(
+        [finalText("image saved")],
+        {
+          models: [{
+            id: FAKE_GATEWAY_MODEL,
+            type: "language",
+            tags: ["vision", "file-input", "tool-use"],
+          }],
+        },
+      );
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        const sessionId = await startCodeSession(client);
+        const saved = await runPromptBlocks(client, [
+          { type: "text", text: "Save this image." },
+          { type: "image", data: imageData, mimeType: "image/png" },
+        ], TIMEOUT);
+        expect(saved.promptResult.result.stopReason).toBe("end_turn");
+        await client.close();
+
+        const imageDir = join(root.home, ".fx", "sessions", sessionId, "images");
+        const snapshots = readdirSync(imageDir);
+        expect(snapshots).toHaveLength(1);
+        rmSync(join(imageDir, snapshots[0]!));
+
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 97);
+        client.send({
+          jsonrpc: "2.0",
+          id: 98,
+          method: "session/load",
+          params: { sessionId, cwd: root.workspace, mcpServers: [] },
+        });
+        const replay: any[] = [];
+        let loadResponse: any = null;
+        while (loadResponse === null) {
+          const message = await client.readLine() as any;
+          if (message.id === 98) loadResponse = message;
+          else replay.push(message);
+        }
+
+        expect(loadResponse.error).toBeUndefined();
+        expect(Array.isArray(loadResponse.result?.configOptions)).toBe(true);
+        const userText = replay
+          .filter((message) =>
+            message.params?.update?.sessionUpdate === "user_message_chunk" &&
+            message.params?.update?.content?.type === "text"
+          )
+          .map((message) => message.params.update.content.text);
+        expect(userText).toEqual(["Save this image.", "Image #1 unavailable"]);
+        expect(JSON.stringify(replay)).not.toContain("[Image #");
         expect(client.stderr).toBe("");
       } finally {
         await client?.close();

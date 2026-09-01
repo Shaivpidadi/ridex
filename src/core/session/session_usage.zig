@@ -1504,9 +1504,13 @@ pub const Usage = struct {
     }
 
     fn observeContextUsage(self: *Usage, sequence: u64, provider_usage: types.Usage) void {
-        const input = provider_usage.input_tokens orelse return;
-        const output = provider_usage.output_tokens orelse return;
-        const used = std.math.add(u64, input, output) catch return;
+        const used: ?u64 = if (provider_usage.input_tokens) |input|
+            if (provider_usage.output_tokens) |output|
+                std.math.add(u64, input, output) catch null
+            else
+                null
+        else
+            null;
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
         if (sequence < self.latest_context_sequence) return;
@@ -3322,6 +3326,18 @@ test "live context usage keeps the newest completed provider observation" {
     const snapshot = usage.liveContextSnapshot().?;
     try std.testing.expectEqual(@as(u64, 37), snapshot.used);
     try std.testing.expectEqual(@as(?f64, 0), snapshot.complete_cost);
+}
+
+test "newer missing context usage clears the prior observation" {
+    var usage = Usage.initFresh();
+    defer usage.deinit(std.testing.allocator);
+
+    usage.observeContextUsage(1, .{ .input_tokens = 30, .output_tokens = 7 });
+    usage.observeContextUsage(2, .{ .input_tokens = 40 });
+    try std.testing.expect(usage.liveContextSnapshot() == null);
+
+    usage.observeContextUsage(1, .{ .input_tokens = 90, .output_tokens = 10 });
+    try std.testing.expect(usage.liveContextSnapshot() == null);
 }
 
 test "direct exact generation IDs are deterministic and provider scoped" {
