@@ -581,16 +581,34 @@ fn pushQueuedPromptBannerRows(
 
     if (ctx.queued_prompt_cards.len == 0) {
         var painted: u16 = 0;
-        var summary = try input_presentation.composeQueuedSummaryRow(
-            alloc,
-            ctx.queued_count,
-            ctx.steering_count,
-            ctx.steering_waiting_on_tool,
-            ctx.queued_paused,
-            width,
-        );
-        try pushFooterBandRow(alloc, frame, plan, plan.footer.banner, &summary);
-        painted +|= 1;
+        if (ctx.steering_messages.len > 0) {
+            for (ctx.steering_messages, 0..) |message, index| {
+                if (painted >= plan.footer.banner_rows) break;
+                var row = try input_presentation.composeSteeringMessageRow(
+                    alloc,
+                    message,
+                    index + 1 == ctx.steering_messages.len,
+                    width,
+                );
+                try pushFooterBandRow(
+                    alloc,
+                    frame,
+                    plan,
+                    plan.footer.banner +| painted,
+                    &row,
+                );
+                painted +|= 1;
+            }
+        } else {
+            var summary = try input_presentation.composeQueuedSummaryRow(
+                alloc,
+                ctx.queued_count,
+                ctx.queued_paused,
+                width,
+            );
+            try pushFooterBandRow(alloc, frame, plan, plan.footer.banner, &summary);
+            painted +|= 1;
+        }
         if (ctx.queued_paused and painted < plan.footer.banner_rows) {
             var hint = try input_presentation.composeQueueReviewHintRow(
                 alloc,

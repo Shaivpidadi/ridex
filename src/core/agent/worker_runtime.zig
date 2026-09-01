@@ -1307,6 +1307,32 @@ pub const WorkerRuntime = struct {
         };
     }
 
+    /// Returns allocator-owned copies of pending steering text in admission
+    /// order. The caller frees every message and the returned slice.
+    pub fn snapshotSteeringMessages(self: *WorkerRuntime, alloc: std.mem.Allocator) ![][]u8 {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+
+        var count: usize = 0;
+        for (self.queued_prompts.items) |prompt| {
+            if (prompt.steer_target_turn_id != null) count += 1;
+        }
+        if (count == 0) return &.{};
+
+        const messages = try alloc.alloc([]u8, count);
+        var copied: usize = 0;
+        errdefer {
+            for (messages[0..copied]) |message| alloc.free(message);
+            alloc.free(messages);
+        }
+        for (self.queued_prompts.items) |prompt| {
+            if (prompt.steer_target_turn_id == null) continue;
+            messages[copied] = try alloc.dupe(u8, prompt.prompt);
+            copied += 1;
+        }
+        return messages;
+    }
+
     pub fn queuedPromptCount(self: *WorkerRuntime) usize {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());
@@ -3180,6 +3206,31 @@ test "active prompt admission drains steering in FIFO order" {
     try std.testing.expectEqual(@as(usize, 2), runtime.worker_events.items.len);
     try std.testing.expectEqualStrings("first", runtime.worker_events.items[0].append_user_feedback);
     try std.testing.expectEqualStrings("second", runtime.worker_events.items[1].append_user_feedback);
+}
+
+test "steering snapshot owns pending messages in admission order" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.worker_processing = true;
+    runtime.active_turn_id = 41;
+
+    try runtime.admitInteractivePrompt(alloc, try makePrompt(alloc, "first", "model"));
+    try runtime.admitInteractivePrompt(alloc, try makePrompt(alloc, "second", "model"));
+    const messages = try runtime.snapshotSteeringMessages(alloc);
+    defer {
+        for (messages) |message| alloc.free(message);
+        alloc.free(messages);
+    }
+
+    const guidance = try runtime.takeSteering(alloc, 41);
+    defer {
+        for (guidance) |text| alloc.free(text);
+        alloc.free(guidance);
+    }
+    try std.testing.expectEqual(@as(usize, 2), messages.len);
+    try std.testing.expectEqualStrings("first", messages[0]);
+    try std.testing.expectEqualStrings("second", messages[1]);
 }
 
 test "manual queue review does not intercept active steering" {

@@ -2903,7 +2903,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
     SPLIT_BOUNDARY_TEST_TIMEOUT,
   );
   test(
-    "ordinary Enter waits for a running tool before steering the same turn",
+    "ordinary Enter keeps pending steering visible in submission order",
     async () => {
       root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-cooperative-steering-")));
       const home = join(root, "home");
@@ -2917,7 +2917,8 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const command =
         `while [ ! -f ${JSON.stringify(releasePath)} ]; do sleep 0.05; done; ` +
         "printf COOPERATIVE_TOOL_DONE";
-      const steering = "Use COOPERATIVE_STEERING_SENTINEL in the answer.";
+      const firstSteering = "Use COOPERATIVE_STEERING_SENTINEL in the answer.";
+      const secondSteering = "Keep the answer to one sentence.";
       const finalText = "COOPERATIVE_STEERING_COMPLETE";
       const steeringGateway = startFakeGateway([
         fakeGatewayToolCall("cooperative_steering_tool", "terminal", {
@@ -2953,9 +2954,19 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       await session.waitForComposer(TIMEOUT);
       await session.sendText("Run the cooperative steering fixture.");
       await session.waitForText("Running while", TIMEOUT);
-      await session.sendText(steering);
-      await session.waitForText("Waiting for tool · Esc to steer now", TIMEOUT);
-      expect(await session.capturePane()).not.toContain("queued 1");
+      await session.sendText(firstSteering);
+      await session.sendText(secondSteering);
+      await Bun.sleep(150);
+      const pendingPane = await session.capturePane();
+      expect(pendingPane).toContain(firstSteering);
+      expect(pendingPane).toContain(`${secondSteering} · Esc to steer now`);
+      expect(pendingPane.indexOf(firstSteering)).toBeLessThan(
+        pendingPane.indexOf(secondSteering),
+      );
+      expect(countOccurrences(pendingPane, "Esc to steer now")).toBe(1);
+      expect(pendingPane).not.toContain("Waiting for tool");
+      expect(pendingPane).not.toContain("pending message");
+      expect(pendingPane).not.toContain("queued 1");
       expect(steeringGateway.requests).toHaveLength(1);
 
       writeFileSync(releasePath, "release\n");
@@ -2968,8 +2979,11 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const continuedBody = steeringGateway.requests[1]!.body;
       const trace = readFileSync(tracePath, "utf8");
       expect(continuedBody.indexOf("COOPERATIVE_TOOL_DONE")).toBeGreaterThanOrEqual(0);
-      expect(continuedBody.indexOf(steering)).toBeGreaterThan(
+      expect(continuedBody.indexOf(firstSteering)).toBeGreaterThan(
         continuedBody.indexOf("COOPERATIVE_TOOL_DONE"),
+      );
+      expect(continuedBody.indexOf(secondSteering)).toBeGreaterThan(
+        continuedBody.indexOf(firstSteering),
       );
       expect(continuedBody).toContain("live user update");
       expect(trace).toContain("event=prompt_steering_consumed");
@@ -3029,7 +3043,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       await session.sendText("Run the immediate steering fixture.");
       await session.waitForText("Running sleep 30", TIMEOUT);
       await session.sendText(steering);
-      await session.waitForText("Waiting for tool · Esc to steer now", TIMEOUT);
+      await session.waitForText(`${steering} · Esc to steer now`, TIMEOUT);
       expect(steeringGateway.requests).toHaveLength(1);
 
       await session.sendKeys("Escape");

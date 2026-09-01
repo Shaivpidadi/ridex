@@ -156,12 +156,17 @@ const RenderReconciliation = union(enum) {
 
 const QueuedCardProjection = struct {
     cards: []render_input.QueuedPromptCard = &.{},
+    steering_messages: [][]u8 = &.{},
+    ordinary_count: usize = 0,
+    paused: bool = false,
     row_count: u16 = 0,
     editor_active: bool = false,
 
     fn deinit(self: *QueuedCardProjection, alloc: std.mem.Allocator) void {
         for (self.cards) |card| alloc.free(card.bytes);
         if (self.cards.len > 0) alloc.free(self.cards);
+        for (self.steering_messages) |message| alloc.free(message);
+        if (self.steering_messages.len > 0) alloc.free(self.steering_messages);
         self.* = .{};
     }
 };
@@ -331,14 +336,31 @@ fn previewWithPendingCard(
     return next;
 }
 
-// Queued prompts stay collapsed behind their summary row until the review is
-// opened; only then does the banner expand into one card per queued prompt.
+// Steering text stays visible while ordinary queued prompts remain collapsed
+// until review opens. Every slice in the result is owned for one render frame.
 fn buildQueuedCardProjection(comptime App: type, app: *App) !QueuedCardProjection {
-    if (comptime !@hasField(App, "queued_prompt_review")) return .{};
+    var projection: QueuedCardProjection = .{};
+    errdefer projection.deinit(app.alloc);
+    const queue_preview = app.worker.queuePreview();
+    const steering_count = if (comptime @hasField(@TypeOf(queue_preview), "steering_count"))
+        queue_preview.steering_count
+    else
+        0;
+    projection.ordinary_count = queue_preview.count -| steering_count;
+    projection.paused = if (comptime @hasField(@TypeOf(queue_preview), "paused"))
+        queue_preview.paused
+    else
+        false;
+    if (comptime @hasDecl(@TypeOf(app.worker), "snapshotSteeringMessages")) {
+        if (steering_count > 0) {
+            projection.steering_messages = try app.worker.snapshotSteeringMessages(app.alloc);
+        }
+    }
+    if (comptime !@hasField(App, "queued_prompt_review")) return projection;
     const review_entries = app.queued_prompt_review.entries;
     if (!app.queued_prompt_review.visible or
         !app.queued_prompt_review.active() or
-        review_entries.len == 0) return .{};
+        review_entries.len == 0) return projection;
     const draft_count = review_entries.len;
 
     const measurement = try input_queue_runtime.measureVisibleReviewRows(
@@ -407,11 +429,10 @@ fn buildQueuedCardProjection(comptime App: type, app: *App) !QueuedCardProjectio
         cards[built] = .{ .bytes = bytes };
     }
 
-    return .{
-        .cards = cards,
-        .row_count = measurement.card_rows,
-        .editor_active = measurement.editor_active,
-    };
+    projection.cards = cards;
+    projection.row_count = measurement.card_rows;
+    projection.editor_active = measurement.editor_active;
+    return projection;
 }
 
 noinline fn approvalScreenNeedsClear(
@@ -535,8 +556,6 @@ pub fn Runtime(comptime App: type) type {
             shimmer_pos: i16,
             queued_cards: *const QueuedCardProjection,
         ) render_input.RenderContext {
-            const queue_preview = app.worker.queuePreview();
-
             const model_query = app.input_runtime.picker.activeModelPickerQuery(&app.input_runtime.edit_state);
             const pending_model = if (app.input_runtime.picker.hasPendingModelPickerSelection()) app.input_runtime.picker.model_picker_pending_model.items else null;
             var model_picker_stage: picker_state.ModelPickerStage = .model;
@@ -640,20 +659,12 @@ pub fn Runtime(comptime App: type) type {
                     app.permission_engine.mode
                 else
                     .ask,
-                .queued_count = if (queued_cards.cards.len > 0) queued_cards.cards.len else queue_preview.count,
-                .steering_count = if (comptime @hasField(@TypeOf(queue_preview), "steering_count"))
-                    queue_preview.steering_count
+                .queued_count = if (queued_cards.cards.len > 0)
+                    queued_cards.cards.len
                 else
-                    0,
-                .steering_waiting_on_tool = if (comptime @hasField(@TypeOf(queue_preview), "steering_count"))
-                    queue_preview.steering_count > 0 and
-                        shell_runtime.activeToolActivityCount(&app.shell) > 0
-                else
-                    false,
-                .queued_paused = if (comptime @hasField(@TypeOf(queue_preview), "paused"))
-                    queue_preview.paused
-                else
-                    false,
+                    queued_cards.ordinary_count + queued_cards.steering_messages.len,
+                .steering_messages = queued_cards.steering_messages,
+                .queued_paused = queued_cards.paused,
                 .queued_cancel_all_available = if (comptime @hasField(App, "queued_prompt_review"))
                     app.queued_prompt_review.active() and
                         app.queued_prompt_review.reason.? == .post_cancel and

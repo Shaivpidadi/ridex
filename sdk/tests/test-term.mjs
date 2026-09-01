@@ -39,7 +39,7 @@ const terminal = {
     output.push(chunk);
     streamedText += streamedDecoder.decode(chunk, { stream: true });
     if (draftVisibleAt === undefined && streamedText.includes(liveDraft)) draftVisibleAt = performance.now();
-    if (pendingVisibleAt === undefined && streamedText.includes("1 pending message")) pendingVisibleAt = performance.now();
+    if (pendingVisibleAt === undefined && streamedText.includes(`${liveDraft} · Esc to steer now`)) pendingVisibleAt = performance.now();
     process.stdout.write(chunk);
   },
   async drain() {

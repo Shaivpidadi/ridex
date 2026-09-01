@@ -9,6 +9,7 @@ const display_width = @import("../../core/shared/display_width.zig");
 const list_window = @import("../../core/shared/list_window.zig");
 const skill_runtime = @import("../../core/skills/skill_runtime.zig");
 const types = @import("../../core/shared/types.zig");
+const text_utils = @import("../../core/shared/text_utils.zig");
 const paste_blocks = @import("../../core/input/pasted_blocks.zig");
 const core_input_runtime = @import("../../core/input/runtime.zig");
 const visual_layout = @import("../input/visual_layout.zig");
@@ -54,13 +55,10 @@ pub const ComposedInputRows = struct {
     }
 };
 
-// Pending prompts stay hidden here. Ordinary queued work advertises review,
-// while active-turn steering reports its wait and interrupt action.
+// Ordinary queued work stays collapsed until review opens.
 pub fn composeQueuedSummaryRow(
     alloc: Allocator,
     queued_count: usize,
-    steering_count: usize,
-    steering_waiting_on_tool: bool,
     queued_paused: bool,
     width: u16,
 ) !std.ArrayList(u8) {
@@ -68,20 +66,49 @@ pub fn composeQueuedSummaryRow(
     try row.appendSlice(alloc, ui_render.hint_style);
 
     // The paused hint row already owns the controls, so it drops the affordance.
-    const affordance = if (queued_paused or steering_count > 0) "" else " · ↑ to edit";
+    const affordance = if (queued_paused) "" else " · ↑ to edit";
     var row_buf: [max_top_row_len]u8 = undefined;
     const label = if (queued_count == 0)
         "queued"
-    else if (steering_count > 0 and steering_waiting_on_tool)
-        "Waiting for tool · Esc to steer now"
-    else if (steering_count > 0)
-        std.fmt.bufPrint(&row_buf, "{d} pending message{s}", .{ queued_count, if (queued_count == 1) "" else "s" }) catch "pending messages"
     else if (queued_count == 1)
         std.fmt.bufPrint(&row_buf, "1 queued message{s}", .{affordance}) catch "1 queued message"
     else
         std.fmt.bufPrint(&row_buf, "{d} queued messages{s}", .{ queued_count, affordance }) catch "queued messages";
 
     try row_text.appendClipped(alloc, &row, label, width);
+    try row.appendSlice(alloc, ui_render.reset_style);
+    return row;
+}
+
+pub fn composeSteeringMessageRow(
+    alloc: Allocator,
+    message: []const u8,
+    show_escape_hint: bool,
+    width: u16,
+) !std.ArrayList(u8) {
+    var row: std.ArrayList(u8) = .empty;
+    try row.appendSlice(alloc, ui_render.hint_style);
+    var safe_message = try text_utils.encodeTerminalSafe(
+        alloc,
+        message,
+        std.math.maxInt(usize),
+    );
+    defer safe_message.deinit(alloc);
+
+    const escape_hint = " · Esc to steer now";
+    const width_usize: usize = width;
+    const escape_width = display_width.visibleWidth(escape_hint);
+    if (show_escape_hint and width_usize > escape_width) {
+        try row_text.appendSingleLineEllipsized(
+            alloc,
+            &row,
+            safe_message.bytes,
+            width_usize - escape_width,
+        );
+        try row.appendSlice(alloc, escape_hint);
+    } else {
+        try row_text.appendSingleLineEllipsized(alloc, &row, safe_message.bytes, width_usize);
+    }
     try row.appendSlice(alloc, ui_render.reset_style);
     return row;
 }
@@ -106,24 +133,35 @@ pub fn composeQueueReviewHintRow(
 }
 
 test "collapsed queue banner counts the waiting prompts and offers the review" {
-    var single = try composeQueuedSummaryRow(std.testing.allocator, 1, 0, false, false, 80);
+    var single = try composeQueuedSummaryRow(std.testing.allocator, 1, false, 80);
     defer single.deinit(std.testing.allocator);
     try std.testing.expect(std.mem.find(u8, single.items, "1 queued message · ↑ to edit") != null);
 
-    var many = try composeQueuedSummaryRow(std.testing.allocator, 3, 0, false, false, 80);
+    var many = try composeQueuedSummaryRow(std.testing.allocator, 3, false, 80);
     defer many.deinit(std.testing.allocator);
     try std.testing.expect(std.mem.find(u8, many.items, "3 queued messages · ↑ to edit") != null);
 }
 
-test "collapsed queue banner identifies pending steering" {
-    var row = try composeQueuedSummaryRow(std.testing.allocator, 1, 1, true, false, 80);
-    defer row.deinit(std.testing.allocator);
+test "steering rows show actual messages and only the final escape hint" {
+    var first = try composeSteeringMessageRow(std.testing.allocator, "First steer", false, 80);
+    defer first.deinit(std.testing.allocator);
+    var final = try composeSteeringMessageRow(std.testing.allocator, "Second steer", true, 80);
+    defer final.deinit(std.testing.allocator);
 
-    try std.testing.expect(std.mem.find(u8, row.items, "Waiting for tool · Esc to steer now") != null);
+    try std.testing.expect(std.mem.find(u8, first.items, "First steer") != null);
+    try std.testing.expect(std.mem.find(u8, first.items, "Esc to steer now") == null);
+    try std.testing.expect(std.mem.find(u8, final.items, "Second steer · Esc to steer now") != null);
+}
+
+test "steering rows visibly escape terminal control bytes" {
+    var unsafe = try composeSteeringMessageRow(std.testing.allocator, "before\x1b[2Jafter", true, 80);
+    defer unsafe.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.find(u8, unsafe.items, "before\\x1b[2Jafter · Esc to steer now") != null);
+    try std.testing.expect(std.mem.find(u8, unsafe.items, "\x1b[2J") == null);
 }
 
 test "collapsed queue banner drops the affordance while the review is paused" {
-    var row = try composeQueuedSummaryRow(std.testing.allocator, 2, 0, false, true, 80);
+    var row = try composeQueuedSummaryRow(std.testing.allocator, 2, true, 80);
     defer row.deinit(std.testing.allocator);
 
     try std.testing.expect(std.mem.find(u8, row.items, "2 queued messages") != null);
@@ -427,7 +465,7 @@ pub fn composeHintRow(
         ctx.has_api_key or (ctx.auth_picker.active and ctx.auth_picker.include_skip),
         ctx.model,
         ctx.permission_mode,
-        ctx.queued_count -| ctx.steering_count,
+        ctx.queued_count -| ctx.steering_messages.len,
         active_label,
         ctx.fast_mode,
         ctx.model_supports_fast,
