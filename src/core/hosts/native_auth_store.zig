@@ -535,18 +535,35 @@ fn observe_keychain_profile(
     const stored = try keychain.load_document(alloc);
     defer if (stored) |bytes| secret.zeroAndFree(alloc, bytes);
     const stored_version = if (stored) |bytes| try declared_version(alloc, bytes) else null;
-    if (stored) |bytes| {
-        if (stored_version == 2) {
-            return .{ .state = .current, .document = try auth_store.Document.parse(alloc, bytes) };
-        }
-        if (stored_version != null and stored_version != 1) return error.InvalidAuthDocument;
+    var current = if (stored) |bytes|
+        if (stored_version == 2)
+            try auth_store.Document.parse(alloc, bytes)
+        else
+            null
+    else
+        null;
+    defer if (current) |*document| document.deinit(alloc);
+    if (stored_version != null and stored_version != 1 and stored_version != 2) {
+        return error.InvalidAuthDocument;
     }
 
     var profile = try observe_profile(alloc, fx_dir);
     defer profile.deinit(alloc);
+    if (profile.state == .malformed_current) return error.InvalidAuthDocument;
     var document = profile.take_document() orelse auth_store.Document{};
     errdefer document.deinit(alloc);
     var found = profile.state != .empty;
+    var needs_migration = found;
+    if (current) |*keychain_document| {
+        const merged = try merge_auth_documents(
+            alloc,
+            keychain_document,
+            &document,
+        );
+        document.deinit(alloc);
+        document = merged;
+        found = true;
+    }
     if (stored) |bytes| {
         if (document.get(.fx_login) == null) {
             if (stored_version == 1) {
@@ -554,23 +571,46 @@ fn observe_keychain_profile(
                 document.deinit(alloc);
                 document = next;
                 found = true;
+                needs_migration = true;
             }
         }
         if (stored_version == null and !found) return error.InvalidAuthDocument;
     }
     if (try keychain.load_api_key(alloc)) |key| {
         defer secret.zeroAndFree(alloc, key);
-        const next = try document.replaced(alloc, .stored_key, key);
-        document.deinit(alloc);
-        document = next;
-        found = true;
+        if (document.get(.stored_key) == null) {
+            const next = try document.replaced(alloc, .stored_key, key);
+            document.deinit(alloc);
+            document = next;
+            found = true;
+            needs_migration = true;
+        }
     }
     return if (found)
-        .{ .state = .legacy, .document = document }
+        .{
+            .state = if (current != null and !needs_migration) .current else .legacy,
+            .document = document,
+        }
     else blk: {
         document.deinit(alloc);
         break :blk .{ .state = .empty };
     };
+}
+
+fn merge_auth_documents(
+    alloc: Allocator,
+    primary: *const auth_store.Document,
+    fallback: *const auth_store.Document,
+) !auth_store.Document {
+    var merged: auth_store.Document = .{};
+    errdefer merged.deinit(alloc);
+    for (std.meta.tags(auth_store.StoredSource)) |source| {
+        const value = primary.get(source) orelse fallback.get(source) orelse continue;
+        const next = try merged.replaced(alloc, source, value);
+        merged.deinit(alloc);
+        merged = next;
+    }
+    return merged;
 }
 
 fn commit_and_verify_keychain(
@@ -948,6 +988,98 @@ test "source mutations share one document without losing unrelated credentials" 
         .chatgpt_subscription,
         .inspect,
     )) == null);
+}
+
+test "Keychain mutations merge current portable credentials before cleanup" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+
+    var verified_home = io_mod.VerifiedDir{
+        .dir = try tmp.dir.openDir(std.testing.io, ".", .{ .iterate = true }),
+    };
+    defer verified_home.close();
+    var fx_dir = try io_mod.openOrCreateVerifiedPrivateDir(
+        &verified_home,
+        profile_paths.root_dir_name,
+    );
+    defer fx_dir.close();
+    try io_mod.durableReplaceVerified(
+        alloc,
+        &fx_dir,
+        profile_paths.auth_file_name,
+        "{\"version\":2,\"credentials\":{\"chatgpt_subscription\":{\"session\":{\"version\":1,\"access_token\":\"portable-codex\"}}}}\n",
+    );
+
+    var fake = FakeKeychain{
+        .alloc = alloc,
+        .document = try alloc.dupe(
+            u8,
+            "{\"version\":2,\"credentials\":{\"fx_login\":{\"session\":{\"version\":1,\"access_token\":\"keychain-vercel\"}}}}\n",
+        ),
+    };
+    defer fake.deinit();
+    {
+        var mutation = try begin_profile_entry_mutation(home, .stored_key);
+        defer mutation.deinit();
+        mutation.backend = .macos_keychain;
+        mutation.keychain = fake.backend();
+        try mutation.save(alloc, "new-gateway-key");
+    }
+
+    var stored = try auth_store.Document.parse(alloc, fake.document.?);
+    defer stored.deinit(alloc);
+    try std.testing.expectEqualStrings(
+        "{\"version\":1,\"access_token\":\"keychain-vercel\"}",
+        stored.get(.fx_login).?,
+    );
+    try std.testing.expectEqualStrings(
+        "{\"version\":1,\"access_token\":\"portable-codex\"}",
+        stored.get(.chatgpt_subscription) orelse
+            return error.TestExpectedPortableCredential,
+    );
+    try std.testing.expectEqualStrings(
+        "new-gateway-key",
+        stored.get(.stored_key).?,
+    );
+    try std.testing.expectError(
+        error.FileNotFound,
+        fx_dir.dir.statFile(std.testing.io, profile_paths.auth_file_name, .{}),
+    );
+
+    try io_mod.durableReplaceVerified(
+        alloc,
+        &fx_dir,
+        profile_paths.auth_file_name,
+        "{\"version\":2,\"credentials\":{\"grok_subscription\":{\"session\":{\"version\":1,\"access_token\":\"portable-grok\"}}}}\n",
+    );
+    var logout = try begin_profile_entry_mutation(home, .fx_login);
+    defer logout.deinit();
+    logout.backend = .macos_keychain;
+    logout.keychain = fake.backend();
+    try std.testing.expectEqual(DeleteOutcome.deleted, try logout.delete(alloc));
+
+    var after_logout = try auth_store.Document.parse(alloc, fake.document.?);
+    defer after_logout.deinit(alloc);
+    try std.testing.expect(after_logout.get(.fx_login) == null);
+    try std.testing.expectEqualStrings(
+        "{\"version\":1,\"access_token\":\"portable-codex\"}",
+        after_logout.get(.chatgpt_subscription).?,
+    );
+    try std.testing.expectEqualStrings(
+        "{\"version\":1,\"access_token\":\"portable-grok\"}",
+        after_logout.get(.grok_subscription).?,
+    );
+    try std.testing.expectEqualStrings(
+        "new-gateway-key",
+        after_logout.get(.stored_key).?,
+    );
+    try std.testing.expectError(
+        error.FileNotFound,
+        fx_dir.dir.statFile(std.testing.io, profile_paths.auth_file_name, .{}),
+    );
 }
 
 test "active entry mutation migrates an unexpired legacy subscription" {
