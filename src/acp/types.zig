@@ -2,9 +2,19 @@ const std = @import("std");
 const build_options = @import("build_options");
 const jsonrpc = @import("jsonrpc.zig");
 const core_types = @import("../core/shared/types.zig");
+const io_mod = @import("../core/shared/io.zig");
 
 const Allocator = std.mem.Allocator;
 const writeJsonStr = jsonrpc.writeJsonStr;
+
+pub const MessageIdBuffer = [32]u8;
+
+pub fn generateMessageId(storage: *MessageIdBuffer) []const u8 {
+    var random_bytes: [16]u8 = undefined;
+    io_mod.getIo().random(&random_bytes);
+    storage.* = std.fmt.bytesToHex(random_bytes, .lower);
+    return storage;
+}
 
 pub const protocol_version: u32 = 1;
 
@@ -126,15 +136,34 @@ pub fn writeSessionUpdate(w: *std.Io.Writer, session_id: []const u8, update_json
     try w.writeAll("}");
 }
 
-pub fn writeAgentMessageChunk(w: *std.Io.Writer, text: []const u8) !void {
-    try w.writeAll("{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{\"type\":\"text\",\"text\":");
+pub fn writeAgentMessageChunk(w: *std.Io.Writer, message_id: []const u8, text: []const u8) !void {
+    try w.writeAll("{\"sessionUpdate\":\"agent_message_chunk\",\"messageId\":");
+    try writeJsonStr(message_id, w);
+    try w.writeAll(",\"content\":{\"type\":\"text\",\"text\":");
     try writeJsonStr(text, w);
     try w.writeAll("}}");
 }
 
-pub fn writeUserMessageChunk(w: *std.Io.Writer, text: []const u8) !void {
-    try w.writeAll("{\"sessionUpdate\":\"user_message_chunk\",\"content\":{\"type\":\"text\",\"text\":");
+pub fn writeUserMessageChunk(w: *std.Io.Writer, message_id: []const u8, text: []const u8) !void {
+    try w.writeAll("{\"sessionUpdate\":\"user_message_chunk\",\"messageId\":");
+    try writeJsonStr(message_id, w);
+    try w.writeAll(",\"content\":{\"type\":\"text\",\"text\":");
     try writeJsonStr(text, w);
+    try w.writeAll("}}");
+}
+
+pub fn writeUserImageChunk(
+    w: *std.Io.Writer,
+    message_id: []const u8,
+    media_type: []const u8,
+    bytes: []const u8,
+) !void {
+    try w.writeAll("{\"sessionUpdate\":\"user_message_chunk\",\"messageId\":");
+    try writeJsonStr(message_id, w);
+    try w.writeAll(",\"content\":{\"type\":\"image\",\"data\":\"");
+    try std.base64.standard.Encoder.encodeWriter(w, bytes);
+    try w.writeAll("\",\"mimeType\":");
+    try writeJsonStr(media_type, w);
     try w.writeAll("}}");
 }
 
@@ -191,12 +220,12 @@ pub fn writeToolCallUpdateWithCommandResult(
     try w.writeAll("}");
 }
 
-pub fn writeInitializeResponse(w: *std.Io.Writer) !void {
+pub fn writeInitializeResponse(w: *std.Io.Writer, image_prompts: bool) !void {
     try w.writeAll("{\"protocolVersion\":");
     try w.print("{d}", .{protocol_version});
     try w.writeAll(",\"agentCapabilities\":{");
     try w.writeAll("\"loadSession\":true,");
-    try w.writeAll("\"promptCapabilities\":{\"image\":false,\"audio\":false,\"embeddedContext\":true},");
+    try w.print("\"promptCapabilities\":{{\"image\":{s},\"audio\":false,\"embeddedContext\":true}},", .{if (image_prompts) "true" else "false"});
     try w.writeAll("\"mcpCapabilities\":{\"http\":true,\"sse\":true},");
     try w.writeAll("\"sessionCapabilities\":{\"list\":{},\"resume\":{},\"close\":{}}");
     try w.writeAll("},\"agentInfo\":{\"name\":\"fx\",\"title\":\"fx\",\"version\":");
@@ -217,12 +246,28 @@ pub fn writeAvailableCommandsUpdate(w: *std.Io.Writer, commands_json: []const u8
     try w.writeAll("}");
 }
 
+pub fn writeSessionInfoUpdate(w: *std.Io.Writer, title: []const u8, updated_at: []const u8) !void {
+    try w.writeAll("{\"sessionUpdate\":\"session_info_update\",\"title\":");
+    try writeJsonStr(title, w);
+    try w.writeAll(",\"updatedAt\":");
+    try writeJsonStr(updated_at, w);
+    try w.writeAll("}");
+}
+
+pub fn writeUsageUpdate(w: *std.Io.Writer, used: u64, size: u64, complete_cost: ?f64) !void {
+    try w.print("{{\"sessionUpdate\":\"usage_update\",\"used\":{d},\"size\":{d}", .{ used, size });
+    if (complete_cost) |amount| {
+        try w.print(",\"cost\":{{\"amount\":{d},\"currency\":\"USD\"}}", .{amount});
+    }
+    try w.writeAll("}");
+}
+
 test "writeAgentMessageChunk produces valid json" {
     const alloc = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-    try writeAgentMessageChunk(&out.writer, "Hello world");
-    const expected = "{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{\"type\":\"text\",\"text\":\"Hello world\"}}";
+    try writeAgentMessageChunk(&out.writer, "message-1", "Hello world");
+    const expected = "{\"sessionUpdate\":\"agent_message_chunk\",\"messageId\":\"message-1\",\"content\":{\"type\":\"text\",\"text\":\"Hello world\"}}";
     try std.testing.expectEqualStrings(expected, out.writer.buffered());
 }
 
@@ -334,7 +379,7 @@ test "writeInitializeResponse contains required fields" {
     const alloc = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-    try writeInitializeResponse(&out.writer);
+    try writeInitializeResponse(&out.writer, true);
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, out.writer.buffered(), .{});
     defer parsed.deinit();
 
@@ -347,7 +392,7 @@ test "writeInitializeResponse contains required fields" {
         build_options.app_version,
         parsed.value.object.get("agentInfo").?.object.get("version").?.string,
     );
-    try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "\"image\":false") != null);
+    try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "\"image\":true") != null);
     try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "\"list\":{}") != null);
     try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "\"resume\":{}") != null);
     try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "\"close\":{}") != null);
@@ -359,9 +404,20 @@ test "writeUserMessageChunk produces valid json" {
     const alloc = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-    try writeUserMessageChunk(&out.writer, "User says hello");
+    try writeUserMessageChunk(&out.writer, "message-2", "User says hello");
     try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "\"user_message_chunk\"") != null);
     try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "User says hello") != null);
+}
+
+test "writeUsageUpdate omits unproven cost" {
+    const alloc = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try writeUsageUpdate(&out.writer, 8, 128_000, null);
+    try std.testing.expectEqualStrings(
+        "{\"sessionUpdate\":\"usage_update\",\"used\":8,\"size\":128000}",
+        out.writer.buffered(),
+    );
 }
 
 test "writeSessionUpdate wraps update with sessionId" {

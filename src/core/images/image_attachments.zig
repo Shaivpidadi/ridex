@@ -470,6 +470,70 @@ pub fn captureBoundImageAttachment(
     return attachment;
 }
 
+/// Captures caller-supplied image bytes into the immutable session snapshot
+/// contract. The caller owns the returned attachment and must release it with
+/// `types.freeImageAttachment` or `discardImageAttachment`.
+pub fn captureInlineImageBytes(
+    alloc: std.mem.Allocator,
+    image_id: usize,
+    declared_media_type: []const u8,
+    bytes: []const u8,
+    snapshot_dir: []const u8,
+) !types.ImageAttachment {
+    if (image_id == 0) return error.InvalidImageId;
+    if (bytes.len == 0 or declared_media_type.len == 0) return error.UnsupportedImageType;
+    if (bytes.len > max_image_bytes) return error.ImageTooLarge;
+
+    var snapshot_dir_handle = try openOrCreateSnapshotDirectoryNoFollow(snapshot_dir);
+    defer snapshot_dir_handle.close(io_mod.getIo());
+    var random_suffix: u64 = undefined;
+    io_mod.getIo().random(std.mem.asBytes(&random_suffix));
+    const source_name = try std.fmt.allocPrint(
+        alloc,
+        "image-{d}.acp-source.{x}",
+        .{ image_id, random_suffix },
+    );
+    defer alloc.free(source_name);
+    defer deleteSnapshotFile(snapshot_dir_handle, source_name, "capture_acp_source");
+
+    {
+        var source = try snapshot_dir_handle.createFile(
+            io_mod.getIo(),
+            source_name,
+            .{
+                .truncate = false,
+                .exclusive = true,
+                .permissions = std.Io.File.Permissions.fromMode(0o600),
+                .resolve_beneath = true,
+            },
+        );
+        defer source.close(io_mod.getIo());
+        try source.writeStreamingAll(io_mod.getIo(), bytes);
+        try source.sync(io_mod.getIo());
+    }
+
+    const source_path = try std.fs.path.join(alloc, &.{ snapshot_dir, source_name });
+    defer alloc.free(source_path);
+    var attachment = types.ImageAttachment{
+        .id = image_id,
+        .path = try alloc.dupe(u8, source_path),
+        .media_type = try alloc.dupe(u8, declared_media_type),
+    };
+    errdefer discardImageAttachment(alloc, attachment);
+    try captureImageSnapshot(alloc, &attachment, snapshot_dir);
+    if (!std.mem.eql(u8, attachment.media_type, declared_media_type)) {
+        return error.ImageSnapshotMediaTypeMismatch;
+    }
+
+    const durable_path = try alloc.dupe(
+        u8,
+        attachment.snapshot_path orelse return error.MissingImageSnapshot,
+    );
+    alloc.free(attachment.path);
+    attachment.path = durable_path;
+    return attachment;
+}
+
 fn captureImageSnapshotFromOpenFileWithBudget(
     alloc: std.mem.Allocator,
     attachment: *types.ImageAttachment,

@@ -113,6 +113,7 @@ pub const InvocationObservation = struct {
         usage_outcome: stream_provider.UsageOutcome,
     ) !void {
         const ledger = self.usage orelse return;
+        ledger.observeContextUsage(self.sequence, completion.usage);
         switch (usage_outcome) {
             .unavailable => |availability| {
                 const delivery: DeliveryOutcome = switch (availability) {
@@ -373,6 +374,8 @@ pub const Usage = struct {
     reasoning_tokens: ?u64,
     request_count: ?u64,
     billable_web_search_calls: u64 = 0,
+    latest_context_sequence: u64 = 0,
+    latest_context_used: ?u64 = null,
     lines_added: u64 = 0,
     lines_removed: u64 = 0,
     models: std.ArrayList(ModelAggregate) = .empty,
@@ -1480,6 +1483,37 @@ pub const Usage = struct {
         self.dirty = true;
     }
 
+    pub const LiveContextSnapshot = struct {
+        used: u64,
+        complete_cost: ?f64,
+    };
+
+    /// Returns the latest provider-reported context usage. This state is
+    /// intentionally runtime-only: a restored billing aggregate cannot prove
+    /// how much context the next model request currently occupies.
+    pub fn liveContextSnapshot(self: *Usage) ?LiveContextSnapshot {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        return .{
+            .used = self.latest_context_used orelse return null,
+            .complete_cost = if (self.billing == .complete and std.math.isFinite(self.total_cost))
+                self.total_cost
+            else
+                null,
+        };
+    }
+
+    fn observeContextUsage(self: *Usage, sequence: u64, provider_usage: types.Usage) void {
+        const input = provider_usage.input_tokens orelse return;
+        const output = provider_usage.output_tokens orelse return;
+        const used = std.math.add(u64, input, output) catch return;
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        if (sequence < self.latest_context_sequence) return;
+        self.latest_context_sequence = sequence;
+        self.latest_context_used = used;
+    }
+
     /// Returns an owned point-in-time snapshot. The caller must call `deinit`.
     pub fn snapshot(self: *Usage, alloc: Allocator) !Snapshot {
         self.finishReconciliationIfDone();
@@ -1661,6 +1695,8 @@ pub const Usage = struct {
             self.active_started_at_ms = session_started_at_ms;
         }
         self.active_sequence_count = 0;
+        self.latest_context_sequence = 0;
+        self.latest_context_used = null;
         self.total_cost = copied.total_cost;
         self.input_tokens = copied.input_tokens;
         self.output_tokens = copied.output_tokens;
@@ -2121,6 +2157,8 @@ pub const Usage = struct {
         self.wall_duration_ms = 0;
         self.active_started_at_ms = io_mod.milliTimestamp();
         self.active_sequence_count = 0;
+        self.latest_context_sequence = 0;
+        self.latest_context_used = null;
         self.total_cost = 0;
         self.input_tokens = 0;
         self.output_tokens = 0;
@@ -3273,6 +3311,17 @@ fn exactUsageOrigin(provider: model_provider.ProviderId) []const u8 {
         .codex => "exact/codex",
         .grok => "exact/grok",
     };
+}
+
+test "live context usage keeps the newest completed provider observation" {
+    var usage = Usage.initFresh();
+    defer usage.deinit(std.testing.allocator);
+
+    usage.observeContextUsage(2, .{ .input_tokens = 30, .output_tokens = 7 });
+    usage.observeContextUsage(1, .{ .input_tokens = 1, .output_tokens = 1 });
+    const snapshot = usage.liveContextSnapshot().?;
+    try std.testing.expectEqual(@as(u64, 37), snapshot.used);
+    try std.testing.expectEqual(@as(?f64, 0), snapshot.complete_cost);
 }
 
 test "direct exact generation IDs are deterministic and provider scoped" {

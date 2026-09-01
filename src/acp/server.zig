@@ -48,6 +48,7 @@ const writeJsonStr = jsonrpc.writeJsonStr;
 const legacy_url_completion_timeout_ms: i64 = 10 * 60 * 1000;
 
 const AcpMethod = enum {
+    request_cancel,
     initialize,
     session_cancel,
     session_new,
@@ -62,6 +63,7 @@ const AcpMethod = enum {
     unknown,
 
     fn parse(method: []const u8) AcpMethod {
+        if (std.mem.eql(u8, method, "$/cancel_request")) return .request_cancel;
         if (std.mem.eql(u8, method, "initialize")) return .initialize;
         if (std.mem.eql(u8, method, "session/cancel")) return .session_cancel;
         if (std.mem.eql(u8, method, "session/new")) return .session_new;
@@ -79,6 +81,7 @@ const AcpMethod = enum {
     fn waitsForActivePrompt(self: AcpMethod) bool {
         return switch (self) {
             .initialize,
+            .request_cancel,
             .session_cancel,
             .session_set_mode,
             .session_new,
@@ -95,6 +98,20 @@ const AcpMethod = enum {
         };
     }
 };
+
+const SessionTargetDecision = enum {
+    exact,
+    missing,
+    inactive,
+    mismatch,
+};
+
+fn decideSessionTarget(active_session_id: ?[]const u8, supplied: ?std.json.Value) SessionTargetDecision {
+    const active = active_session_id orelse return .inactive;
+    const value = supplied orelse return .missing;
+    if (value != .string or value.string.len == 0) return .missing;
+    return if (std.mem.eql(u8, active, value.string)) .exact else .mismatch;
+}
 
 pub const Config = acp_runner.Config;
 
@@ -717,7 +734,7 @@ pub fn runWithTransport(
     }
     // Release any prompt thread parked on a pending approval before
     // state.deinit() joins it, or shutdown deadlocks.
-    handleCancel(&state);
+    handleCancel(&state, false);
 }
 
 fn shouldRespondToMessage(msg: *const jsonrpc.Message) bool {
@@ -796,32 +813,58 @@ pub fn awaitOutboundResponse(state: *ServerState, id: u64, kind: OutboundKind) ?
             return response;
         }
         state.outbound_cond.wait(io_mod.getIo(), &state.outbound_mutex) catch {
-            cancelOutboundRequestLocked(state, id);
+            _ = cancelOutboundRequestLocked(state, id);
         };
     }
 }
 
 pub fn cancelOutboundRequest(state: *ServerState, id: u64) void {
     state.outbound_mutex.lockUncancelable(io_mod.getIo());
-    defer state.outbound_mutex.unlock(io_mod.getIo());
-    cancelOutboundRequestLocked(state, id);
+    const changed = cancelOutboundRequestLocked(state, id);
+    state.outbound_mutex.unlock(io_mod.getIo());
+    if (changed) publishRequestCancellation(state, id);
 }
 
-fn cancelOutboundRequestLocked(state: *ServerState, id: u64) void {
-    const pending = state.pending_outbound.getPtr(id) orelse return;
-    if (pending.response != null) return;
+fn cancelOutboundRequestLocked(state: *ServerState, id: u64) bool {
+    const pending = state.pending_outbound.getPtr(id) orelse return false;
+    if (pending.response != null) return false;
     pending.response = .{ .cancelled = true };
     state.outbound_cond.broadcast(io_mod.getIo());
+    return true;
 }
 
-fn cancelPendingOutbound(state: *ServerState) void {
+fn cancelPendingOutbound(state: *ServerState, notify_client: bool) void {
+    var cancelled_ids: [max_pending_outbound]u64 = undefined;
+    var cancelled_count: usize = 0;
     state.outbound_mutex.lockUncancelable(io_mod.getIo());
-    defer state.outbound_mutex.unlock(io_mod.getIo());
-    var pending = state.pending_outbound.valueIterator();
+    var pending = state.pending_outbound.iterator();
     while (pending.next()) |entry| {
-        if (entry.response == null) entry.response = .{ .cancelled = true };
+        if (entry.value_ptr.response != null) continue;
+        entry.value_ptr.response = .{ .cancelled = true };
+        cancelled_ids[cancelled_count] = entry.key_ptr.*;
+        cancelled_count += 1;
     }
     state.outbound_cond.broadcast(io_mod.getIo());
+    state.outbound_mutex.unlock(io_mod.getIo());
+
+    if (!notify_client) return;
+    for (cancelled_ids[0..cancelled_count]) |id| publishRequestCancellation(state, id);
+}
+
+fn publishRequestCancellation(state: *ServerState, id: u64) void {
+    var params: std.Io.Writer.Allocating = .init(state.alloc);
+    defer params.deinit();
+    params.writer.print("{{\"requestId\":{d}}}", .{id}) catch |err| {
+        debug_trace.logf("acp", "request cancellation serialization failed id={d} err={s}", .{ id, @errorName(err) });
+        return;
+    };
+    state.writer.writeNotification(
+        state.alloc,
+        "$/cancel_request",
+        params.writer.buffered(),
+    ) catch |err| {
+        debug_trace.logf("acp", "request cancellation publication failed id={d} err={s}", .{ id, @errorName(err) });
+    };
 }
 
 pub fn reserveLegacyUrl(
@@ -1068,11 +1111,15 @@ pub fn cancelPermissionRequest(state: *ServerState, id: u64) void {
 }
 
 fn dispatchNotification(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void {
-    _ = alloc;
     reapActivePrompt(state, false);
     if (!state.initialized) return;
     switch (AcpMethod.parse(msg.method)) {
-        .session_cancel => handleCancel(state),
+        .request_cancel => handleRequestCancellation(state, alloc, msg.params_raw),
+        .session_cancel => {
+            if (notificationTargetsActiveSession(state, alloc, msg.params_raw)) {
+                handleCancel(state, true);
+            }
+        },
         else => {},
     }
 }
@@ -1093,7 +1140,8 @@ fn dispatch(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void 
     }
 
     if (method == .session_cancel) {
-        handleCancel(state);
+        if (!try requireActiveSessionTarget(state, alloc, msg)) return;
+        handleCancel(state, true);
         return state.writer.writeResponse(alloc, msg.id, "null");
     }
 
@@ -1130,6 +1178,7 @@ fn dispatch(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void 
         .session_set_config_option => handleSetConfigOption(state, alloc, msg),
         .session_set_mode => handleSetMode(state, alloc, msg),
         .initialize,
+        .request_cancel,
         .session_cancel,
         .session_remove,
         .unknown,
@@ -1140,8 +1189,49 @@ fn dispatch(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void 
     };
 }
 
+fn requestIdsEqual(lhs: jsonrpc.RequestId, rhs: jsonrpc.RequestId) bool {
+    return switch (lhs) {
+        .integer => |value| switch (rhs) {
+            .integer => |other| value == other,
+            else => false,
+        },
+        .string => |value| switch (rhs) {
+            .string => |other| std.mem.eql(u8, value, other),
+            else => false,
+        },
+        .null => rhs == .null,
+    };
+}
+
+fn requestIdFromValue(value: std.json.Value) ?jsonrpc.RequestId {
+    return switch (value) {
+        .integer => |id| .{ .integer = id },
+        .string => |id| .{ .string = id },
+        .null => .null,
+        else => null,
+    };
+}
+
+fn handleRequestCancellation(
+    state: *ServerState,
+    alloc: Allocator,
+    params: ?[]const u8,
+) void {
+    const raw = params orelse return;
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, raw, .{}) catch return;
+    defer parsed.deinit();
+    if (parsed.value != .object) return;
+    const value = parsed.value.object.get("requestId") orelse return;
+    const requested = requestIdFromValue(value) orelse return;
+    const active = state.active_prompt orelse return;
+    const active_id = active.msg.id orelse return;
+    if (!requestIdsEqual(active_id, requested)) return;
+    handleCancel(state, true);
+}
+
 fn startPrompt(state: *ServerState, alloc: Allocator, msg: *const jsonrpc.Message) !void {
-    const session = if (state.active_session) |*active| active else return state.writer.writeError(alloc, msg.id, prompt_handler.no_active_session_rpc_error);
+    if (!try requireActiveSessionTarget(state, alloc, msg)) return;
+    const session = if (state.active_session) |*active| active else unreachable;
     const active = try alloc.create(ActivePrompt);
     errdefer alloc.destroy(active);
     active.* = .{
@@ -1162,6 +1252,81 @@ fn startPrompt(state: *ServerState, alloc: Allocator, msg: *const jsonrpc.Messag
         active.thread = try std.Thread.spawn(.{}, promptWorkerMain, .{active});
         state.active_prompt = active;
     }
+}
+
+fn parsedSessionTargetDecision(state: *const ServerState, root: std.json.Value) SessionTargetDecision {
+    const active_id = if (state.active_session) |session| session.session_id else null;
+    const supplied = if (root == .object) root.object.get("sessionId") else null;
+    return decideSessionTarget(active_id, supplied);
+}
+
+fn writeSessionTargetError(
+    state: *ServerState,
+    alloc: Allocator,
+    id: ?jsonrpc.RequestId,
+    decision: SessionTargetDecision,
+) !void {
+    const message: []const u8 = switch (decision) {
+        .exact => return,
+        .inactive => "No active session",
+        .missing => "Missing sessionId",
+        .mismatch => "Session is not active",
+    };
+    try state.writer.writeError(alloc, id, .{
+        .code = ErrorCode.invalid_params,
+        .message = message,
+    });
+}
+
+fn requireParsedActiveSessionTarget(
+    state: *ServerState,
+    alloc: Allocator,
+    id: ?jsonrpc.RequestId,
+    root: std.json.Value,
+) !bool {
+    const decision = parsedSessionTargetDecision(state, root);
+    if (decision == .exact) return true;
+    try writeSessionTargetError(state, alloc, id, decision);
+    return false;
+}
+
+fn requireActiveSessionTarget(
+    state: *ServerState,
+    alloc: Allocator,
+    msg: *const jsonrpc.Message,
+) !bool {
+    const params = msg.params_raw orelse {
+        try state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_params,
+            .message = "Missing params",
+        });
+        return false;
+    };
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, params, .{}) catch {
+        try state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_params,
+            .message = "Invalid params",
+        });
+        return false;
+    };
+    defer parsed.deinit();
+    return requireParsedActiveSessionTarget(state, alloc, msg.id, parsed.value);
+}
+
+fn notificationTargetsActiveSession(
+    state: *const ServerState,
+    alloc: Allocator,
+    params: ?[]const u8,
+) bool {
+    const raw = params orelse return false;
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, raw, .{}) catch return false;
+    defer parsed.deinit();
+    const decision = parsedSessionTargetDecision(state, parsed.value);
+    if (decision != .exact) {
+        debug_trace.logf("acp", "ignored session notification target reason={s}", .{@tagName(decision)});
+        return false;
+    }
+    return true;
 }
 
 fn promptWorkerMain(active: *ActivePrompt) void {
@@ -1447,21 +1612,21 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-    try acp_types.writeInitializeResponse(&out.writer);
+    try acp_types.writeInitializeResponse(&out.writer, !host_target.is_wasm);
     try state.writer.writeResponse(alloc, msg.id, out.writer.buffered());
 }
 
-fn handleCancel(state: *ServerState) void {
+fn handleCancel(state: *ServerState, notify_client: bool) void {
     if (state.active_session) |*session| {
         debug_trace.eventf("interrupt", "cancel_requested", .{}, "source=acp active_tool_known=false", .{});
         session.cancel_flag.store(true, .seq_cst);
     }
-    cancelPendingOutbound(state);
+    cancelPendingOutbound(state, notify_client);
     clearPendingLegacyUrls(state);
 }
 
 pub fn cancelAndReapActivePrompt(state: *ServerState) void {
-    handleCancel(state);
+    handleCancel(state, true);
     reapActivePrompt(state, true);
 }
 
@@ -1526,6 +1691,7 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
 
     const root = parsed.value;
     if (root != .object) return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "Params must be object" });
+    if (!try requireParsedActiveSessionTarget(state, alloc, msg.id, root)) return;
 
     const config_id = blk: {
         if (root.object.get("configId")) |v| {
@@ -1852,6 +2018,8 @@ fn handleSetMode(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !
         return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "Invalid params" });
     defer parsed.deinit();
 
+    if (!try requireParsedActiveSessionTarget(state, alloc, msg.id, parsed.value)) return;
+
     if (parsed.value == .object) {
         if (parsed.value.object.get("modeId")) |v| {
             if (v == .string) {
@@ -2025,17 +2193,30 @@ test "ACP permission responses map canonical option ids" {
 }
 
 test "ACP outbound waiters resolve to deny on cancellation" {
+    const Capture = struct {
+        saw_request_cancellation: bool = false,
+
+        fn write(raw: ?*anyopaque, frame: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (std.mem.find(u8, frame, "\"method\":\"$/cancel_request\"") != null and
+                std.mem.find(u8, frame, "\"requestId\":3") != null)
+            {
+                self.saw_request_cancellation = true;
+            }
+        }
+    };
+    var capture = Capture{};
     var state = ServerState{
         .alloc = std.testing.allocator,
         .cfg = undefined,
-        .writer = jsonrpc.Writer.init(),
+        .writer = jsonrpc.Writer.initCallback(&capture, Capture.write),
     };
     defer state.pending_outbound.deinit(state.alloc);
 
     const id = beginPermissionRequest(&state) orelse return error.TestExpectedEqual;
     const concurrent = beginPermissionRequest(&state) orelse return error.TestExpectedEqual;
 
-    cancelPendingOutbound(&state);
+    cancelPendingOutbound(&state, false);
     try std.testing.expectEqual(types.ToolPermissionDecision.deny, awaitPermissionDecision(&state, id));
     try std.testing.expectEqual(types.ToolPermissionDecision.deny, awaitPermissionDecision(&state, concurrent));
     try std.testing.expectEqual(@as(usize, 0), state.pending_outbound.count());
@@ -2044,6 +2225,7 @@ test "ACP outbound waiters resolve to deny on cancellation" {
     try std.testing.expect(second != id);
     cancelPermissionRequest(&state, second);
     try std.testing.expectEqual(types.ToolPermissionDecision.deny, awaitPermissionDecision(&state, second));
+    try std.testing.expect(capture.saw_request_cancellation);
 }
 
 test "ACP outbound responses correlate out of order and ignore unknown ids" {

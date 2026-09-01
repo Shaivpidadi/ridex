@@ -8,6 +8,7 @@ const mcp_servers = @import("mcp_servers.zig");
 const server = @import("server.zig");
 const session_test_controls = @import("session_test_controls.zig");
 const session_codec = @import("../core/session/session_codec.zig");
+const session_display_metadata = @import("../core/session/session_display_metadata.zig");
 const session_store = @import("../core/session/session_store.zig");
 const js_host_session_store = @import("../core/session/js_host_session_store.zig");
 const session_runtime = @import("../core/session/session.zig");
@@ -20,13 +21,13 @@ const model_catalog = @import("../core/gateway/model_catalog.zig");
 const provider_set = @import("../core/gateway/provider_set.zig");
 const host = @import("../core/hosts/host.zig");
 const host_target = @import("../core/hosts/target.zig");
+const image_attachments = @import("../core/images/image_attachments.zig");
 const credentials = @import("../core/auth/credentials.zig");
 const model_provider = @import("../core/config/model_provider.zig");
 const mode_registry = @import("../core/modes/mode_registry.zig");
 const subagent_resume_admission = @import("../core/subagent/resume_admission.zig");
 const types = @import("../core/shared/types.zig");
 const context_contract = @import("../core/workspace/context_contract.zig");
-const command_specs = @import("../core/slash_commands/command_specs.zig");
 const test_builtin_gateway = if (builtin.is_test)
     @import("../builtins/gateway.zig")
 else
@@ -282,9 +283,7 @@ fn writeNewSessionResponse(
 
     try state.writer.writeResponse(alloc, msg.id, out.writer.buffered());
 
-    const commands_json = try buildSlashCommandsJson(alloc);
-    defer alloc.free(commands_json);
-    try sendAvailableCommands(state, alloc, session_id, commands_json);
+    try sendAvailableCommands(state, alloc, session_id, "[]");
 }
 
 pub fn handleLoadWasmSession(state: *server.ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void {
@@ -306,6 +305,7 @@ pub fn handleLoadWasmSession(state: *server.ServerState, alloc: Allocator, msg: 
     if (state.active_session) |*active| {
         if (sameSessionId(active.session_id, session_id)) {
             for (active.session_rt.history.items) |turn| try sendHistoryTurnAsUpdates(state, alloc, session_id, turn);
+            try sendActiveSessionInfoUpdate(state, alloc);
             return writeLoadSessionResponse(state, alloc, msg, active.model);
         }
     }
@@ -367,6 +367,7 @@ pub fn handleLoadWasmSession(state: *server.ServerState, alloc: Allocator, msg: 
     model_owned = false;
     session_rt_owned = false;
     for (state.active_session.?.session_rt.history.items) |turn| try sendHistoryTurnAsUpdates(state, alloc, session_id, turn);
+    try sendActiveSessionInfoUpdate(state, alloc);
     try writeLoadSessionResponse(state, alloc, msg, state.active_session.?.model);
 }
 
@@ -527,6 +528,7 @@ fn handleRestoreSession(
                 session_id,
                 if (active.writable) |*writable| writable.state.recovery_checkpoint else null,
             );
+            try sendActiveSessionInfoUpdate(state, alloc);
             return writeLoadSessionResponse(
                 state,
                 alloc,
@@ -653,6 +655,7 @@ fn handleRestoreSession(
         session_id,
         state.active_session.?.writable.?.state.recovery_checkpoint,
     );
+    try sendActiveSessionInfoUpdate(state, alloc);
 
     try writeLoadSessionResponse(
         state,
@@ -753,7 +756,7 @@ fn sendPendingRecoveryUpdate(
     checkpoint: ?session_codec.RecoveryCheckpoint,
 ) !void {
     const recovery = checkpoint orelse return;
-    try sendUserHistoryChunk(state, alloc, session_id, recovery.user.text);
+    try sendUserHistoryTurn(state, alloc, session_id, recovery.user);
     try sendExecutionHistory(state, alloc, session_id, recovery.execution);
     if (recovery.assistant_source.len > 0) {
         try sendAgentHistoryChunk(state, alloc, session_id, recovery.assistant_source);
@@ -1130,14 +1133,12 @@ fn parseListCursor(raw: []const u8) !session_store.ResumableSessionContinuation 
 }
 
 fn sendHistoryTurnAsUpdates(state: *server.ServerState, alloc: Allocator, session_id: []const u8, turn: types.HistoryTurn) !void {
-    const user_text: []const u8 = switch (turn) {
-        .assistant => |a| a.user.text,
-        .background_command => |b| b.user.text,
-        .interrupted => |i| i.user.text,
-        .compacted_summary => |c| c.summary,
-    };
-
-    try sendUserHistoryChunk(state, alloc, session_id, user_text);
+    switch (turn) {
+        .assistant => |assistant| try sendUserHistoryTurn(state, alloc, session_id, assistant.user),
+        .background_command => |background| try sendUserHistoryTurn(state, alloc, session_id, background.user),
+        .interrupted => |interrupted| try sendUserHistoryTurn(state, alloc, session_id, interrupted.user),
+        .compacted_summary => |compacted| try sendUserHistoryText(state, alloc, session_id, compacted.summary),
+    }
 
     switch (turn) {
         .assistant => |assistant| {
@@ -1169,13 +1170,62 @@ fn sendHistoryTurnAsUpdates(state: *server.ServerState, alloc: Allocator, sessio
     }
 }
 
-fn sendUserHistoryChunk(state: *server.ServerState, alloc: Allocator, session_id: []const u8, text: []const u8) !void {
+fn sendUserHistoryTurn(
+    state: *server.ServerState,
+    alloc: Allocator,
+    session_id: []const u8,
+    user: types.UserTurn,
+) !void {
+    var message_id: acp_types.MessageIdBuffer = undefined;
+    const stable_message_id = acp_types.generateMessageId(&message_id);
+    try sendUserHistoryChunk(state, alloc, session_id, stable_message_id, user.text);
+    for (user.images) |attachment| {
+        var snapshot = try image_attachments.loadVerifiedSnapshot(alloc, attachment, .{});
+        defer snapshot.deinit(alloc);
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        try out.writer.writeAll("{\"sessionId\":");
+        try writeJsonStr(session_id, &out.writer);
+        try out.writer.writeAll(",\"update\":");
+        try acp_types.writeUserImageChunk(
+            &out.writer,
+            stable_message_id,
+            snapshot.media_type,
+            snapshot.bytes,
+        );
+        try out.writer.writeAll("}");
+        try state.writer.writeNotification(alloc, "session/update", out.writer.buffered());
+    }
+}
+
+fn sendUserHistoryText(state: *server.ServerState, alloc: Allocator, session_id: []const u8, user_text: []const u8) !void {
+    var message_id: acp_types.MessageIdBuffer = undefined;
+    try sendUserHistoryChunk(
+        state,
+        alloc,
+        session_id,
+        acp_types.generateMessageId(&message_id),
+        user_text,
+    );
+}
+
+fn sendUserHistoryChunk(
+    state: *server.ServerState,
+    alloc: Allocator,
+    session_id: []const u8,
+    message_id: []const u8,
+    text: []const u8,
+) !void {
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
     try out.writer.writeAll("{\"sessionId\":");
     try writeJsonStr(session_id, &out.writer);
     try out.writer.writeAll(",\"update\":");
-    try acp_types.writeUserMessageChunk(&out.writer, text);
+    try acp_types.writeUserMessageChunk(
+        &out.writer,
+        message_id,
+        text,
+    );
     try out.writer.writeAll("}");
     try state.writer.writeNotification(alloc, "session/update", out.writer.buffered());
 }
@@ -1192,12 +1242,17 @@ fn sendExecutionHistory(
 }
 
 fn sendAgentHistoryChunk(state: *server.ServerState, alloc: Allocator, session_id: []const u8, text: []const u8) !void {
+    var message_id: acp_types.MessageIdBuffer = undefined;
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
     try out.writer.writeAll("{\"sessionId\":");
     try writeJsonStr(session_id, &out.writer);
     try out.writer.writeAll(",\"update\":");
-    try acp_types.writeAgentMessageChunk(&out.writer, text);
+    try acp_types.writeAgentMessageChunk(
+        &out.writer,
+        acp_types.generateMessageId(&message_id),
+        text,
+    );
     try out.writer.writeAll("}");
     try state.writer.writeNotification(alloc, "session/update", out.writer.buffered());
 }
@@ -1213,47 +1268,55 @@ fn sendAvailableCommands(state: *server.ServerState, alloc: Allocator, session_i
     try state.writer.writeNotification(alloc, "session/update", out.writer.buffered());
 }
 
-fn buildSlashCommandsJson(alloc: Allocator) ![]u8 {
+pub fn sendActiveSessionInfoUpdate(state: *server.ServerState, alloc: Allocator) !void {
+    const active = if (state.active_session) |*session| session else return;
+    var metadata = try session_display_metadata.deriveFromHistory(
+        alloc,
+        active.session_rt.history.items,
+    );
+    defer metadata.deinit(alloc);
+    const updated_at_ms = if (active.writable) |*writable|
+        writable.state.updated_at_ms
+    else if (active.wasm_state) |durable|
+        durable.updated_at_ms
+    else
+        io_mod.milliTimestamp();
+    const updated_at = try formatIso8601(alloc, @max(updated_at_ms, 0));
+    defer alloc.free(updated_at);
+
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
+    try out.writer.writeAll("{\"sessionId\":");
+    try writeJsonStr(active.session_id, &out.writer);
+    try out.writer.writeAll(",\"update\":");
+    try acp_types.writeSessionInfoUpdate(&out.writer, metadata.title, updated_at);
+    try out.writer.writeAll("}");
+    try state.writer.writeNotification(alloc, "session/update", out.writer.buffered());
+}
 
-    const commands = [_]struct { name: []const u8, description: []const u8, hint: ?[]const u8 }{
-        .{ .name = "compact", .description = "Compact conversation history", .hint = null },
-        .{ .name = "undo", .description = "Undo last file change", .hint = null },
-        .{ .name = "changes", .description = "Show file changes in this session", .hint = null },
-        .{ .name = "review", .description = "Toggle post-edit review", .hint = null },
-        .{ .name = "clear", .description = "Clear the screen", .hint = null },
-        .{ .name = "reset", .description = "Reset session", .hint = null },
-        .{ .name = "help", .description = "Show available commands", .hint = null },
-        .{ .name = "status", .description = "Show current status", .hint = null },
-        .{ .name = "model", .description = "Switch model", .hint = "model name" },
-        .{ .name = "permissions", .description = "Show permission settings", .hint = null },
-        .{ .name = "allowlist", .description = "Manage persistent allow rules", .hint = "add command \"git *\"" },
-        .{ .name = "rules", .description = "Show active rules", .hint = null },
-        .{ .name = "settings", .description = "Show settings", .hint = null },
-        .{ .name = "credits", .description = "Show credit balance", .hint = null },
-        .{ .name = "mcp", .description = "Show MCP server status", .hint = null },
-        .{ .name = "skills", .description = "Show installed skills", .hint = null },
-        .{ .name = "fast", .description = "Toggle fast mode for supported models", .hint = null },
-    };
+pub fn sendActiveSessionUsageUpdate(state: *server.ServerState, alloc: Allocator) !void {
+    const active = if (state.active_session) |*session| session else return;
+    const usage = active.session_rt.usage.liveContextSnapshot() orelse return;
+    const provider_bundle = state.cfg.provider_set.select(active.provider);
+    const capabilities = state.capability_resolver.available(
+        active.model,
+        provider_bundle.fallbackModelCapabilities(active.model),
+    );
+    const context_window = capabilities.context_window orelse return;
 
-    try out.writer.writeAll("[");
-    for (commands, 0..) |cmd, i| {
-        if (i > 0) try out.writer.writeAll(",");
-        try out.writer.writeAll("{\"name\":");
-        try writeJsonStr(cmd.name, &out.writer);
-        try out.writer.writeAll(",\"description\":");
-        try writeJsonStr(cmd.description, &out.writer);
-        if (cmd.hint) |hint| {
-            try out.writer.writeAll(",\"input\":{\"hint\":");
-            try writeJsonStr(hint, &out.writer);
-            try out.writer.writeAll("}");
-        }
-        try out.writer.writeAll("}");
-    }
-    try out.writer.writeAll("]");
-
-    return try alloc.dupe(u8, out.writer.buffered());
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try out.writer.writeAll("{\"sessionId\":");
+    try writeJsonStr(active.session_id, &out.writer);
+    try out.writer.writeAll(",\"update\":");
+    try acp_types.writeUsageUpdate(
+        &out.writer,
+        usage.used,
+        context_window,
+        usage.complete_cost,
+    );
+    try out.writer.writeAll("}");
+    try state.writer.writeNotification(alloc, "session/update", out.writer.buffered());
 }
 
 fn formatIso8601(alloc: Allocator, timestamp_ms: i64) ![]u8 {
@@ -1362,40 +1425,6 @@ test "formatIso8601 produces valid format" {
     try std.testing.expect(result.len > 0);
     try std.testing.expect(std.mem.endsWith(u8, result, "Z"));
     try std.testing.expect(std.mem.find(u8, result, "T") != null);
-}
-
-test "buildSlashCommandsJson produces valid array" {
-    const alloc = std.testing.allocator;
-    const json = try buildSlashCommandsJson(alloc);
-    defer alloc.free(json);
-    try std.testing.expect(json.len > 0);
-    try std.testing.expect(json[0] == '[');
-    try std.testing.expect(json[json.len - 1] == ']');
-    try std.testing.expect(std.mem.find(u8, json, "compact") != null);
-}
-
-test "buildSlashCommandsJson includes all expected commands" {
-    const alloc = std.testing.allocator;
-    const json = try buildSlashCommandsJson(alloc);
-    defer alloc.free(json);
-
-    const expected_commands = [_][]const u8{
-        "compact",   "undo",  "changes",  "review",  "clear",
-        "reset",     "help",  "status",   "model",   "permissions",
-        "allowlist", "rules", "settings", "credits", "mcp",
-        "skills",    "fast",
-    };
-    for (expected_commands) |cmd| {
-        try std.testing.expect(std.mem.find(u8, json, cmd) != null);
-    }
-    try std.testing.expect(std.mem.find(u8, json, "\"name\":\"summary\"") == null);
-}
-
-test "buildSlashCommandsJson includes input hint for model" {
-    const alloc = std.testing.allocator;
-    const json = try buildSlashCommandsJson(alloc);
-    defer alloc.free(json);
-    try std.testing.expect(std.mem.find(u8, json, "\"input\":{\"hint\":\"model name\"}") != null);
 }
 
 test "formatIso8601 produces known timestamp" {
