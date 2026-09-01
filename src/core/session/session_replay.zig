@@ -67,6 +67,18 @@ pub fn readLineAt(
 }
 
 pub fn readFirstGeneration(alloc: Allocator, file: std.Io.File) !Identifier {
+    var envelope = try readSessionStarted(alloc, file);
+    defer envelope.deinit(alloc);
+    return envelope.log_generation;
+}
+
+pub fn readSubagentChildIdentity(alloc: Allocator, file: std.Io.File) !bool {
+    var envelope = try readSessionStarted(alloc, file);
+    defer envelope.deinit(alloc);
+    return envelope.event.session_started.subagent_child;
+}
+
+fn readSessionStarted(alloc: Allocator, file: std.Io.File) !session_event.Envelope {
     const length = try file.length(io_mod.getIo());
     const first = try readLineAt(alloc, file, 0, length) orelse
         return error.InvalidSessionFormat;
@@ -76,11 +88,11 @@ pub fn readFirstGeneration(alloc: Allocator, file: std.Io.File) !Identifier {
         error.UnsupportedEventSchema => return error.UnsupportedSessionSchema,
         else => return error.InvalidSessionFormat,
     };
-    defer envelope.deinit(alloc);
+    errdefer envelope.deinit(alloc);
     if (envelope.seq != 1 or envelope.kind() != .session_started) {
         return error.InvalidSessionFormat;
     }
-    return envelope.log_generation;
+    return envelope;
 }
 
 pub fn scanCommitPosition(

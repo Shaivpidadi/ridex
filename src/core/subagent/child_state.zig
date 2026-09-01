@@ -495,9 +495,10 @@ pub fn isManagedChildSession(
 ) !bool {
     if (try hasManagedChildMarker(sessions, alloc, session_id)) return true;
 
-    var state = try sessions.loadReadOnly(alloc, session_id);
-    defer state.deinit(alloc);
-    return state.subagent_child;
+    return sessions.loadSubagentChildIdentity(alloc, session_id) catch |err| switch (err) {
+        error.SessionNotFound => false,
+        else => return err,
+    };
 }
 
 /// Checks only immutable current and legacy child markers. Callers that

@@ -1333,6 +1333,30 @@ pub const Root = struct {
         return state;
     }
 
+    /// Reads the immutable child-privacy bit from the first event without
+    /// replaying history or acquiring the commit lock. State replacement and
+    /// compaction preserve this bit for the lifetime of the session.
+    pub fn loadSubagentChildIdentity(
+        self: *const Root,
+        alloc: Allocator,
+        session_id: []const u8,
+    ) !bool {
+        var sessions = self.sessions orelse return error.SessionNotFound;
+        try session_layout.validateSessionId(session_id);
+        var session_dir = openSessionDir(
+            &sessions,
+            session_id,
+            .read_only,
+        ) catch |err| switch (err) {
+            error.FileNotFound => return error.SessionNotFound,
+            else => return err,
+        };
+        defer session_dir.close();
+        var log_file = try openManagedFile(&session_dir, events_file, .read_only);
+        defer log_file.close(io_mod.getIo());
+        return session_replay.readSubagentChildIdentity(alloc, log_file);
+    }
+
     pub fn admitResumeView(
         self: *Root,
         alloc: Allocator,

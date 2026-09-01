@@ -1513,6 +1513,16 @@ pub const Store = struct {
         return state;
     }
 
+    /// Reads only the immutable initial-event child identity for a materialized
+    /// schema-v3 session. Index-only and legacy rows have no such payload.
+    pub fn loadSubagentChildIdentity(
+        self: Store,
+        alloc: Allocator,
+        session_id: []const u8,
+    ) !bool {
+        return self.canonical_root.loadSubagentChildIdentity(alloc, session_id);
+    }
+
     /// Reads one bounded chronological history page without acquiring the
     /// session writer lock. The cursor is opaque and anchored to the history
     /// length that produced it, so later appends cannot duplicate older pages.
