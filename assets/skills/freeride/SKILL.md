@@ -1,0 +1,161 @@
+---
+name: freeride
+description: >-
+  Diagnose and fix the FreeRide gateway that serves this agent's models.
+  Use whenever model requests fail or stall (connection refused, HTTP 503,
+  "All providers failed", "No providers have usable keys", provider
+  unavailable/rate limit notices, empty model list, slow first token),
+  whenever the user asks about the daemon, providers, API keys, models,
+  cooldowns, or telemetry, and before touching anything under ~/.freeride
+  or ~/.ridex.
+---
+
+# FreeRide operations
+
+This agent (ridex) does not talk to model vendors directly. Every request
+goes to **FreeRide**, a local gateway daemon on `http://127.0.0.1:11343`,
+which fans out across free-tier providers — OpenRouter, Groq, NVIDIA NIM,
+HuggingFace, Cerebras, Cloudflare Workers AI, and local Ollama — with
+automatic failover when one rate-limits or errors. If model requests break,
+the fault is almost always in this chain, and you can diagnose and fix it
+yourself with the commands below.
+
+```
+ridex (this agent) ──fx gateway dialect──▶ FreeRide :11343 ──failover──▶ free providers
+```
+
+Architecture facts that matter for diagnosis:
+
+- The port is hard-coded to **11343**; FreeRide refuses to auto-pick another.
+- Requests walk a health-ordered chain of (provider, key) pairs. A failing
+  key is put on **cooldown**: rate limit → the provider's Retry-After, else
+  60s; invalid/auth-rejected key → 5 min; daily quota exhausted → 60 min.
+- Model ids `freeride/coding` (this agent's default), `freeride/fast`,
+  `freeride/quality`, `freeride/free`, and `auto` are routing presets, not
+  real models — the gateway picks a concrete free model per request.
+  Concrete ids from the model list also work verbatim.
+- Streaming commits after the first token: a provider dying mid-stream
+  truncates that one response (known limitation); just retry the turn.
+- Inbound auth is ignored — any Bearer token works against FreeRide. The
+  real provider keys live server-side in `~/.freeride/.env`.
+
+## First move: read the gateway's own diagnosis
+
+Always start with these two, cheapest first:
+
+```bash
+curl -sf -m 3 http://127.0.0.1:11343/health
+freeride doctor
+```
+
+`/health` returns `{"ok": true, "version": ..., "providers": [...],
+"keyed_providers": [...]}`. Read it precisely:
+
+- **Connection refused / timeout** → the daemon isn't running (see next
+  section).
+- **`keyed_providers` is empty** → no provider holds a usable key right
+  now: either none were configured (`freeride init`) or all are cooling
+  (`freeride keys` shows which and when they return). `providers` alone
+  is NOT a key signal — openrouter is always registered, keyed or not.
+
+`freeride doctor` checks Python, PATH, `~/.freeride/`, every provider env
+var, the port, and telemetry, and prints a per-check verdict with the fix
+inline.
+
+## Daemon lifecycle
+
+The launcher manages the daemon; state lives in `~/.ridex/`:
+
+| command          | effect |
+|---|---|
+| `ridex start`    | start the daemon (clears a previous stop) |
+| `ridex stop`     | stop it — **sticks** via `~/.ridex/daemon.stopped` until `ridex start` |
+| `ridex restart`  | stop + wait for the port to free + start |
+| `ridex doctor`   | agent binary + daemon + key report (wraps `freeride doctor`) |
+
+- Daemon log: `~/.ridex/daemon.log` (falls back to
+  `~/.freeride/autospawn.log` for gateways started by `freeride run`).
+- "Connection refused" while `~/.ridex/daemon.stopped` exists means the
+  user stopped it deliberately — say so and suggest `ridex start`; do not
+  restart it yourself without being asked to get it running.
+- "port 11343 already in use" in the log → something else owns the port:
+  `lsof -nP -iTCP:11343 -sTCP:LISTEN`.
+
+## Reading failures
+
+**Structured 503 (JSON body)** — the gateway exhausted its chain. The body
+lists exactly what was tried:
+
+```json
+{"error": {"message": "All providers failed.", "tried": [
+  {"provider": "openrouter", "last_error": "rate_limit", "keys_tried": 2},
+  {"provider": "groq", "last_error": "auth", "keys_tried": 1}]}}
+```
+
+Act on `last_error` per provider:
+
+- `rate_limit` — transient; keys return automatically (`freeride keys`
+  shows "soonest back"). More keys per provider = more headroom.
+- `auth` — that provider's key is invalid/revoked. Fix the value in
+  `~/.freeride/.env` or re-run `freeride init`, then `freeride reload`.
+- `quota_exhausted` — daily/monthly cap; that key is out for ~1h+. Another
+  provider's key is the real fix.
+- `model_not_found` — a concrete model id retired upstream; the catalog
+  cache is invalidated automatically, so retry, or use `auto`/a preset.
+- `unavailable` / timeouts — provider-side outage; failover already
+  skipped it, so persistent failure means every configured provider is
+  down or keyless.
+
+**In-stream error** — a streamed turn can end with an `error` part and
+`finishReason "error"` instead of an HTTP error; same taxonomy, read the
+message.
+
+**Empty model list** (`ridex models` shows only the presets) → no keyed
+provider is reachable; same fix as empty `keyed_providers`.
+
+## Keys
+
+- Stored ONLY in `~/.freeride/.env` (`OPENROUTER_API_KEY`, `GROQ_API_KEY`,
+  `NIM_API_KEY`/`NVIDIA_API_KEY`, `HUGGINGFACE_API_KEY`,
+  `CEREBRAS_API_KEY`, `CLOUDFLARE_API_TOKEN`+`CLOUDFLARE_ACCOUNT_ID`,
+  `OLLAMA_BASE_URL`). Numbered variants (`OPENROUTER_API_KEY_2`, …) add
+  failover headroom on the same provider.
+- `freeride keys` — per-provider: how many keys, how many available vs
+  cooling, and when the soonest returns.
+- `freeride init` — the interactive wizard; after any `.env` edit run
+  `freeride reload` (hot-reloads the registry, no restart).
+- A key that "was working yesterday" and now 401s is usually stale in
+  `~/.freeride/.env` while the user updated it somewhere else — verify
+  against `.env`, not shell env.
+- **Never print, echo, or paste key values** — not in output, not in
+  commands that would display them (`cat ~/.freeride/.env` is off-limits;
+  use `grep -c` / `grep -o '^[A-Z_]*'` shapes instead). Never send keys
+  anywhere except `~/.freeride/.env`.
+
+## Deeper tools
+
+- `freeride providers` — live per-provider health/latency from the gateway.
+- `freeride bench` — per-provider latency comparison.
+- `freeride audit-models` — probe every catalog model, persist health
+  verdicts that smart-routing uses to skip broken ids.
+- `~/.freeride/cooldown.json` — cooldown state (key hashes only, safe to
+  read); `~/.freeride/events.jsonl` — request/failover event log, grep by
+  request id from the `X-FreeRide-Request-Id` response header.
+- `freeride telemetry` — audit what the default-on aggregate beacon sends
+  (tokens/provider counts only); `freeride telemetry off` disables it.
+- `freeride upgrade` — update the gateway package.
+- Slow first token on free tiers is normal (the gateway holds the
+  connection with keepalives while providers warm up); tens of seconds of
+  silence is not a hang.
+
+## Escalation order
+
+1. `/health` reachable? → daemon problem: log, stop-marker, port.
+2. `keyed_providers` non-empty? → key problem: `freeride keys`,
+   `freeride init` + `freeride reload`.
+3. Requests still 503 → read the `tried` list and fix the named
+   `last_error`s; check `freeride providers` for a full outage.
+4. Weird model behavior (wrong model, refused id) → `ridex models`,
+   prefer `freeride/coding` or `auto`.
+5. Bug in the gateway itself → `~/.freeride/events.jsonl` around the
+   failing request id, then report with `freeride --version`.
