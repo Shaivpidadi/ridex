@@ -2005,10 +2005,13 @@ test "loadStartupState applies core env overrides" {
 
     try std.testing.expect(state.workspace_root.len > 0);
     try std.testing.expectEqualStrings("env-model", state.selected_model);
-    try std.testing.expectEqualStrings("default-model", state.configured_model);
+    try std.testing.expectEqualStrings(model_provider.freeride_default_model, state.configured_model);
     try std.testing.expectEqual(config_runtime.ModelSource.process_override, state.model_source);
     try std.testing.expect(!state.fast_mode);
-    try std.testing.expectEqualStrings("gateway-key", state.apiKey().?);
+    // The freeride default provider always resolves its synthetic local
+    // credential — a real AI_GATEWAY_API_KEY only applies under the
+    // Vercel gateway provider.
+    try std.testing.expectEqualStrings(credentials.freeride_local_token, state.apiKey().?);
     try std.testing.expectEqual(credentials.Source.ai_gateway_api_key, state.credential.?.source);
     try std.testing.expectEqual(PermissionMode.auto, state.permission_mode);
     try std.testing.expectEqual(@as(usize, 37), state.agent_step_limit);
@@ -2023,6 +2026,7 @@ test "loadStartupState defaults fast mode on only for the compiled Gateway defau
     try tmp.dir.createDirPath(io_mod.getIo(), "configured");
     try tmp.dir.createDirPath(io_mod.getIo(), "disabled");
     try tmp.dir.createDirPath(io_mod.getIo(), "codex");
+    try tmp.dir.createDirPath(io_mod.getIo(), "gwdefault");
 
     const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
     defer std.testing.allocator.free(home_root);
@@ -2034,11 +2038,13 @@ test "loadStartupState defaults fast mode on only for the compiled Gateway defau
     defer std.testing.allocator.free(disabled_root);
     const codex_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "codex");
     defer std.testing.allocator.free(codex_root);
+    const gwdefault_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "gwdefault");
+    defer std.testing.allocator.free(gwdefault_root);
 
     const fixture = try std.fmt.allocPrint(
         std.testing.allocator,
-        "{{\"workspaces\":{{\"{s}\":{{\"model\":\"openai/gpt-5\"}},\"{s}\":{{\"fast_mode\":false}},\"{s}\":{{\"provider\":\"codex\",\"codex_model\":\"gpt-5.4-mini\"}}}}}}\n",
-        .{ configured_root, disabled_root, codex_root },
+        "{{\"workspaces\":{{\"{s}\":{{\"provider\":\"gateway\",\"model\":\"openai/gpt-5\"}},\"{s}\":{{\"fast_mode\":false}},\"{s}\":{{\"provider\":\"codex\",\"codex_model\":\"gpt-5.4-mini\"}},\"{s}\":{{\"provider\":\"gateway\"}}}}}}\n",
+        .{ configured_root, disabled_root, codex_root, gwdefault_root },
     );
     defer std.testing.allocator.free(fixture);
     try writeFixtureFile(tmp.dir, "home/.fx/settings.json", fixture);
@@ -2046,11 +2052,22 @@ test "loadStartupState defaults fast mode on only for the compiled Gateway defau
     var env = try TestEnv.install(std.testing.allocator, &.{.{ .key = "HOME", .value = home_root }});
     defer env.deinit();
 
+    // No settings: the freeride default provider pins its coding preset
+    // and fast mode stays off (it is a Vercel gateway feature).
     var absent = try loadStartupStateForWorkspace(std.testing.allocator, absent_root, "zai/glm-5.2", 25);
     defer absent.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("zai/glm-5.2", absent.selected_model);
-    try std.testing.expectEqualStrings("zai/glm-5.2", absent.configured_model);
-    try std.testing.expect(absent.fast_mode);
+    try std.testing.expectEqual(model_provider.ProviderId.freeride, absent.provider);
+    try std.testing.expectEqualStrings(model_provider.freeride_default_model, absent.selected_model);
+    try std.testing.expectEqualStrings(model_provider.freeride_default_model, absent.configured_model);
+    try std.testing.expect(!absent.fast_mode);
+
+    // Gateway provider with no saved model: the compiled default applies
+    // and fast mode defaults on.
+    var gwdefault = try loadStartupStateForWorkspace(std.testing.allocator, gwdefault_root, "zai/glm-5.2", 25);
+    defer gwdefault.deinit(std.testing.allocator);
+    try std.testing.expectEqual(model_provider.ProviderId.gateway, gwdefault.provider);
+    try std.testing.expectEqualStrings("zai/glm-5.2", gwdefault.selected_model);
+    try std.testing.expect(gwdefault.fast_mode);
 
     var configured = try loadStartupStateForWorkspace(std.testing.allocator, configured_root, "zai/glm-5.2", 25);
     defer configured.deinit(std.testing.allocator);

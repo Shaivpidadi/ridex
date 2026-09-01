@@ -1051,6 +1051,11 @@ pub fn Runtime(comptime App: type) type {
                 app.providerSet()
             else
                 provider_set.Set{
+                    .freeride = .{
+                        .capabilities = tool_context.provider_capabilities,
+                        .agent_stream = tool_context.agent_stream_provider,
+                        .permission_reviewer = tool_context.permission_reviewer_provider,
+                    },
                     .gateway = .{
                         .capabilities = tool_context.provider_capabilities,
                         .agent_stream = tool_context.agent_stream_provider,

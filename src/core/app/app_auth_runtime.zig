@@ -1398,7 +1398,7 @@ test "interactive subscription sign-in rejects active and queued work before OAu
             switch (provider) {
                 .codex => try Runtime(BusySignInApp).beginChatGptSignIn(&app),
                 .grok => try Runtime(BusySignInApp).beginGrokSignIn(&app),
-                .gateway => unreachable,
+                .freeride, .gateway => unreachable,
             }
 
             try std.testing.expectEqual(@as(usize, 0), app.auth.start_count);
