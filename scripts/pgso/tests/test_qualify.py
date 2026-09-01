@@ -595,6 +595,7 @@ class PgsoQualificationTests(unittest.TestCase):
         paths = PipelinePaths.create(self.root / "run")
         paths.merged_profile.write_bytes(b"production profile")
         built_selectors: list[str] = []
+        supplement_events: list[str] = []
 
         def fake_build(_toolchain, _repo_root, output_dir, plan):
             built_selectors.append(plan.selector)
@@ -616,12 +617,18 @@ class PgsoQualificationTests(unittest.TestCase):
             )
 
         def fake_create(_toolchain, **kwargs):
+            supplement_events.append(f"create:{kwargs['output_text'].stem}")
             output_text = kwargs["output_text"]
             output_text.write_text("supplement\n")
             return ProfileSupplement(
                 text="supplement\n",
                 function_names=("fx;core.output.diff.compute",),
                 total_counter_value=8,
+            )
+
+        def fake_merge(_toolchain, **kwargs):
+            supplement_events.append(
+                f"merge:{kwargs['supplement_text'].stem}"
             )
 
         with (
@@ -634,7 +641,8 @@ class PgsoQualificationTests(unittest.TestCase):
                 side_effect=fake_create,
             ),
             mock.patch(
-                "scripts.pgso.qualify.merge_profile_supplement"
+                "scripts.pgso.qualify.merge_profile_supplement",
+                side_effect=fake_merge,
             ) as merge,
         ):
             linked = build_profile_linked_benchmarks(
@@ -652,6 +660,13 @@ class PgsoQualificationTests(unittest.TestCase):
             tuple(built_selectors),
         )
         self.assertEqual(len(BENCHMARK_PLANS), merge.call_count)
+        self.assertEqual(
+            [
+                *(f"create:{plan.selector}" for plan in BENCHMARK_PLANS),
+                *(f"merge:{plan.selector}" for plan in BENCHMARK_PLANS),
+            ],
+            supplement_events,
+        )
 
         def fake_map(_toolchain, **kwargs):
             kwargs["output_text"].write_text("mapped text\n")
