@@ -68,7 +68,7 @@ const CredentialRefreshMode = runtime_deps.CredentialRefreshMode;
 
 const http_error_detail_max_bytes: usize = 4096;
 const post_tool_decision_prompt =
-    "Continue the original task. If work remains and you can proceed, briefly tell the user what you are doing next, then perform that action with the appropriate tool. Do not end the turn with only a progress update. If the task is complete, respond with the result. If a genuine blocker prevents further action, explain the blocker and what is needed to continue.";
+    "Continue the task using the latest user guidance. If work remains and you can proceed, briefly tell the user what you are doing next, then perform that action with the appropriate tool. Do not end the turn with only a progress update. If the task is complete, respond with the result. If a genuine blocker prevents further action, explain the blocker and what is needed to continue.";
 const repeated_terminal_validation_notice =
     "Repeated terminal validation failures stopped the tool loop. The invalid terminal calls were not executed and produced no terminal effect.";
 const repeated_malformed_arguments_notice =
@@ -96,6 +96,30 @@ fn append_post_tool_decision_prompt(
     return projected;
 }
 
+fn append_pending_steering_after_assistant(
+    deps: *const AgentRuntimeDeps,
+    arena: Allocator,
+    within_turn_suffix: *std.ArrayList(ChatMessage),
+    turn_id: u64,
+    assistant_text: []const u8,
+) !bool {
+    const take_steering = deps.take_steering orelse return false;
+    const guidance = try take_steering(deps.ctx, arena, turn_id);
+    if (guidance.len == 0) return false;
+
+    try within_turn_suffix.append(arena, .{
+        .role = .assistant,
+        .content = assistant_text,
+    });
+    for (guidance) |text| {
+        try within_turn_suffix.append(arena, .{
+            .role = .user,
+            .content = try runtime_execution_memory.steeringMessage(arena, text),
+        });
+    }
+    return true;
+}
+
 test "append_post_tool_decision_prompt appends one no-cache user message only when pending" {
     const alloc = std.testing.allocator;
     const source = [_]ChatMessage{.{ .role = .system, .content = "system" }};
@@ -108,7 +132,7 @@ test "append_post_tool_decision_prompt appends one no-cache user message only wh
     try std.testing.expectEqual(@as(usize, 2), projected.len);
     try std.testing.expectEqual(types.ChatRole.user, projected[1].role);
     try std.testing.expectEqualStrings(
-        "Continue the original task. If work remains and you can proceed, briefly tell the user what you are doing next, then perform that action with the appropriate tool. Do not end the turn with only a progress update. If the task is complete, respond with the result. If a genuine blocker prevents further action, explain the blocker and what is needed to continue.",
+        "Continue the task using the latest user guidance. If work remains and you can proceed, briefly tell the user what you are doing next, then perform that action with the appropriate tool. Do not end the turn with only a progress update. If the task is complete, respond with the result. If a genuine blocker prevents further action, explain the blocker and what is needed to continue.",
         projected[1].content.?,
     );
     try std.testing.expectEqual(types.ChatCachePolicy.no_cache, projected[1].cache_policy);
@@ -5119,6 +5143,19 @@ fn processQueuedPromptLoop(
                 rendered,
             );
 
+            if (agent_steps.allowsStep(config.agent_step_limit, step + 1) and
+                try append_pending_steering_after_assistant(
+                    deps,
+                    arena,
+                    &within_turn_suffix,
+                    turn_id,
+                    history_text,
+                ))
+            {
+                try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
+                continue;
+            }
+
             if (!lifecycle.view.hasStop() or stop_state.dispatched) {
                 if (!has_content) {
                     try deps.push_text(deps.ctx, .{ .operational = rendered });
@@ -7727,24 +7764,17 @@ fn processQueuedPromptLoop(
             const final_text = try runtime_assistant_stream.normalizeAssistantTextForDisplay(arena, raw_final);
             const rendered = if (final_text.len > 0) final_text else "Done.";
 
-            // Close the model-response race: guidance admitted while this step
-            // was streaming converts the terminal response into an assistant
-            // prefix followed by a new user steering message.
-            if (agent_steps.allowsStep(config.agent_step_limit, step + 1)) {
-                if (deps.take_steering) |take_steering| {
-                    const guidance = try take_steering(deps.ctx, arena, turn_id);
-                    if (guidance.len > 0) {
-                        try within_turn_suffix.append(arena, .{ .role = .assistant, .content = rendered });
-                        for (guidance) |text| {
-                            try within_turn_suffix.append(arena, .{
-                                .role = .user,
-                                .content = try runtime_execution_memory.steeringMessage(arena, text),
-                            });
-                        }
-                        try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
-                        continue;
-                    }
-                }
+            if (agent_steps.allowsStep(config.agent_step_limit, step + 1) and
+                try append_pending_steering_after_assistant(
+                    deps,
+                    arena,
+                    &within_turn_suffix,
+                    turn_id,
+                    rendered,
+                ))
+            {
+                try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
+                continue;
             }
 
             if (!lifecycle.view.hasStop() or stop_state.dispatched) {

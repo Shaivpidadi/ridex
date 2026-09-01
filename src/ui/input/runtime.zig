@@ -345,7 +345,6 @@ fn subagentActionFromDecoded(action: input_action.Action) ?subagent_input.Action
         .toggle_full_transcript,
         .toggle_permission_mode,
         .open_all_sessions,
-        .steer_submit,
         .paste_start,
         .paste_end,
         .ignore,
@@ -4930,7 +4929,7 @@ test "input escape parser handles cmd+arrow as home/end" {
     try std.testing.expectEqual(@as(u8, 0), stage);
 }
 
-test "input escape parser handles ctrl+enter as steering submit" {
+test "input escape parser treats ctrl+enter as ordinary submit" {
     // ESC[13;5u is Kitty's Ctrl+Enter encoding.
     var stage: u8 = 1;
     var param: u16 = 0;
@@ -4940,7 +4939,7 @@ test "input escape parser handles ctrl+enter as steering submit" {
     try std.testing.expectEqual(@as(?InputEscapeAction, null), consumeInputEscapeByte(&stage, &param, &param2, '3'));
     try std.testing.expectEqual(@as(?InputEscapeAction, null), consumeInputEscapeByte(&stage, &param, &param2, ';'));
     try std.testing.expectEqual(@as(?InputEscapeAction, null), consumeInputEscapeByte(&stage, &param, &param2, '5'));
-    try std.testing.expectEqual(@as(?InputEscapeAction, .steer_submit), consumeInputEscapeByte(&stage, &param, &param2, 'u'));
+    try std.testing.expectEqual(@as(?InputEscapeAction, .{ .remapped_byte = '\r' }), consumeInputEscapeByte(&stage, &param, &param2, 'u'));
     try std.testing.expectEqual(@as(u8, 0), stage);
 }
 

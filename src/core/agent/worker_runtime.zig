@@ -623,19 +623,27 @@ pub const WorkerRuntime = struct {
         self.worker_cancel_requested.store(true, .seq_cst);
     }
 
-    pub fn requestCancelWithQueueReview(self: *WorkerRuntime) bool {
+    pub fn requestInteractiveCancel(self: *WorkerRuntime) bool {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());
 
-        const paused = self.beginQueueReviewLocked(.post_cancel);
-        debug_trace.logf("worker", "cancel requested processing={s} queued={d} queue_paused={s}", .{
+        const steering_pending = for (self.queued_prompts.items) |prompt| {
+            if (prompt.steer_target_turn_id == self.active_turn_id) break true;
+        } else false;
+        const paused = if (steering_pending)
+            false
+        else
+            self.beginQueueReviewLocked(.post_cancel);
+        debug_trace.logf("worker", "cancel requested processing={s} queued={d} steering_pending={s} queue_paused={s}", .{
             if (self.worker_processing) "true" else "false",
             self.queued_prompt_count,
+            if (steering_pending) "true" else "false",
             if (paused) "true" else "false",
         });
-        debug_trace.eventf("interrupt", "cancel_requested", .{}, "processing={s} queued={d} queue_paused={s} active_tool_known=false", .{
+        debug_trace.eventf("interrupt", "cancel_requested", .{}, "processing={s} queued={d} steering_pending={s} queue_paused={s} active_tool_known=false", .{
             if (self.worker_processing) "true" else "false",
             self.queued_prompt_count,
+            if (steering_pending) "true" else "false",
             if (paused) "true" else "false",
         });
         self.worker_cancel_requested.store(true, .seq_cst);
@@ -792,9 +800,13 @@ pub const WorkerRuntime = struct {
         try self.admitPrompt(alloc, prompt, false);
     }
 
-    /// Transfers `prompt` to the active turn when steering is requested and the
-    /// turn still accepts guidance. Otherwise it enters the ordinary FIFO.
-    pub fn admitPrompt(
+    pub fn admitInteractivePrompt(self: *WorkerRuntime, alloc: std.mem.Allocator, prompt: QueuedPrompt) !void {
+        try self.admitPrompt(alloc, prompt, true);
+    }
+
+    /// Targets eligible interactive input to the active turn. Other input
+    /// remains in the ordinary FIFO.
+    fn admitPrompt(
         self: *WorkerRuntime,
         alloc: std.mem.Allocator,
         prompt: QueuedPrompt,
@@ -913,6 +925,11 @@ pub const WorkerRuntime = struct {
 
     fn beginQueueReviewLocked(self: *WorkerRuntime, reason: QueueReviewReason) bool {
         if (self.queued_prompts.items.len == 0) return false;
+        if (reason == .manual) {
+            for (self.queued_prompts.items) |prompt| {
+                if (prompt.steer_target_turn_id == self.active_turn_id) return false;
+            }
+        }
         if (self.queue_admission) |current| {
             if (reason == .post_cancel and current != .post_cancel) {
                 self.queue_admission = .post_cancel;
@@ -3124,6 +3141,24 @@ fn freeEventList(alloc: std.mem.Allocator, events: *std.ArrayList(WorkerEvent)) 
     events.deinit(alloc);
 }
 
+test "interactive prompt admission derives steering from active worker state" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.worker_processing = true;
+    runtime.active_turn_id = 41;
+
+    try runtime.admitInteractivePrompt(alloc, try makePrompt(alloc, "steer", "model"));
+
+    const guidance = try runtime.takeSteering(alloc, 41);
+    defer {
+        for (guidance) |text| alloc.free(text);
+        alloc.free(guidance);
+    }
+    try std.testing.expectEqual(@as(usize, 1), guidance.len);
+    try std.testing.expectEqualStrings("steer", guidance[0]);
+}
+
 test "active prompt admission drains steering in FIFO order" {
     const alloc = std.testing.allocator;
     var runtime = WorkerRuntime{};
@@ -3131,8 +3166,8 @@ test "active prompt admission drains steering in FIFO order" {
     runtime.worker_processing = true;
     runtime.active_turn_id = 41;
 
-    try runtime.admitPrompt(alloc, try makePrompt(alloc, "first", "model"), true);
-    try runtime.admitPrompt(alloc, try makePrompt(alloc, "second", "model"), true);
+    try runtime.admitInteractivePrompt(alloc, try makePrompt(alloc, "first", "model"));
+    try runtime.admitInteractivePrompt(alloc, try makePrompt(alloc, "second", "model"));
     const guidance = try runtime.takeSteering(alloc, 41);
     defer {
         for (guidance) |text| alloc.free(text);
@@ -3147,27 +3182,15 @@ test "active prompt admission drains steering in FIFO order" {
     try std.testing.expectEqualStrings("second", runtime.worker_events.items[1].append_user_feedback);
 }
 
-test "queue review atomically blocks steering consumption and edits by prompt identity" {
+test "manual queue review does not intercept active steering" {
     const alloc = std.testing.allocator;
     var runtime = WorkerRuntime{};
     defer runtime.deinit(alloc);
     runtime.worker_processing = true;
     runtime.active_turn_id = 41;
 
-    try runtime.admitPrompt(alloc, try makePrompt(alloc, "before", "model"), true);
-    try std.testing.expect(runtime.beginQueueReview(.manual));
-
-    const drafts = try runtime.snapshotQueuedPromptDrafts(alloc);
-    defer freeQueuedPromptDrafts(alloc, drafts);
-    try std.testing.expectEqual(@as(usize, 1), drafts.len);
-    try std.testing.expectEqual(PromptDraftKind.steering, drafts[0].kind);
-    try std.testing.expectEqual(@as(usize, 0), (try runtime.takeSteering(alloc, 41)).len);
-
-    const edited_text = try alloc.dupe(u8, "after");
-    alloc.free(drafts[0].prompt);
-    drafts[0].prompt = edited_text;
-    try std.testing.expect(try runtime.replaceQueuedPromptDrafts(alloc, drafts));
-    try std.testing.expect(runtime.resumeQueueReview());
+    try runtime.admitInteractivePrompt(alloc, try makePrompt(alloc, "before", "model"));
+    try std.testing.expect(!runtime.beginQueueReview(.manual));
 
     const guidance = try runtime.takeSteering(alloc, 41);
     defer {
@@ -3175,34 +3198,7 @@ test "queue review atomically blocks steering consumption and edits by prompt id
         alloc.free(guidance);
     }
     try std.testing.expectEqual(@as(usize, 1), guidance.len);
-    try std.testing.expectEqualStrings("after", guidance[0]);
-}
-
-test "queue review commits steering edit after active turn demotes it" {
-    const alloc = std.testing.allocator;
-    var runtime = WorkerRuntime{};
-    defer runtime.deinit(alloc);
-    runtime.worker_processing = true;
-    runtime.active_turn_id = 41;
-
-    try runtime.admitPrompt(alloc, try makePrompt(alloc, "before", "model"), true);
-    try std.testing.expect(runtime.beginQueueReview(.manual));
-
-    const drafts = try runtime.snapshotQueuedPromptDrafts(alloc);
-    defer freeQueuedPromptDrafts(alloc, drafts);
-    try std.testing.expectEqual(@as(usize, 1), drafts.len);
-    try std.testing.expectEqual(PromptDraftKind.steering, drafts[0].kind);
-
-    runtime.finishProcessing();
-    try std.testing.expect(runtime.queued_prompts.items[0].steer_target_turn_id == null);
-
-    const edited_text = try alloc.dupe(u8, "after");
-    alloc.free(drafts[0].prompt);
-    drafts[0].prompt = edited_text;
-    try std.testing.expect(try runtime.replaceQueuedPromptDrafts(alloc, drafts));
-
-    try std.testing.expectEqualStrings("after", runtime.queued_prompts.items[0].prompt);
-    try std.testing.expect(runtime.queued_prompts.items[0].steer_target_turn_id == null);
+    try std.testing.expectEqualStrings("before", guidance[0]);
 }
 
 test "late steering keeps admission order when demoted on finish" {
@@ -3212,8 +3208,8 @@ test "late steering keeps admission order when demoted on finish" {
     runtime.worker_processing = true;
     runtime.active_turn_id = 9;
 
-    try runtime.admitPrompt(alloc, try makePrompt(alloc, "steer first", "model"), true);
-    try runtime.admitPrompt(alloc, try makePrompt(alloc, "queue second", "model"), false);
+    try runtime.admitInteractivePrompt(alloc, try makePrompt(alloc, "steer first", "model"));
+    try runtime.enqueuePrompt(alloc, try makePrompt(alloc, "queue second", "model"));
     runtime.finishProcessing();
 
     try std.testing.expect(!runtime.worker_processing);
@@ -3231,8 +3227,8 @@ test "clear queued prompts also clears steering" {
     runtime.worker_processing = true;
     runtime.active_turn_id = 9;
 
-    try runtime.admitPrompt(alloc, try makePrompt(alloc, "steer", "model"), true);
-    try runtime.admitPrompt(alloc, try makePrompt(alloc, "queued", "model"), false);
+    try runtime.admitInteractivePrompt(alloc, try makePrompt(alloc, "steer", "model"));
+    try runtime.enqueuePrompt(alloc, try makePrompt(alloc, "queued", "model"));
     runtime.clearQueuedPrompts(alloc, &.{});
 
     try std.testing.expectEqual(@as(usize, 0), runtime.queuePreview().count);
@@ -3240,12 +3236,12 @@ test "clear queued prompts also clears steering" {
     try std.testing.expectEqual(@as(usize, 0), (try runtime.takeSteering(alloc, 9)).len);
 }
 
-test "idle steer request uses ordinary queue" {
+test "idle interactive admission uses ordinary queue" {
     const alloc = std.testing.allocator;
     var runtime = WorkerRuntime{};
     defer runtime.deinit(alloc);
 
-    try runtime.admitPrompt(alloc, try makePrompt(alloc, "next", "model"), true);
+    try runtime.admitInteractivePrompt(alloc, try makePrompt(alloc, "next", "model"));
     try std.testing.expectEqual(@as(usize, 1), runtime.queuedPromptCount());
     try std.testing.expect(runtime.queued_prompts.items[0].steer_target_turn_id == null);
 }
@@ -4274,13 +4270,31 @@ test "explicit cancellation pauses queued admission for post-cancel review" {
     runtime.worker_processing = true;
     try runtime.enqueuePrompt(alloc, try makePrompt(alloc, "queued", "model"));
 
-    try std.testing.expect(runtime.requestCancelWithQueueReview());
+    try std.testing.expect(runtime.requestInteractiveCancel());
     try std.testing.expect(runtime.isCancelRequested());
     try std.testing.expectEqual(QueueReviewReason.post_cancel, runtime.queueReviewReason().?);
     var snapshot = try runtime.snapshotState(alloc);
     defer snapshot.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), snapshot.queued_count);
     try std.testing.expectEqual(QueueReviewReason.post_cancel, snapshot.queue_review_reason.?);
+}
+
+test "explicit cancellation keeps targeted steering runnable" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.worker_processing = true;
+    runtime.active_turn_id = 17;
+    try runtime.admitInteractivePrompt(alloc, try makePrompt(alloc, "steer now", "model"));
+
+    try std.testing.expect(!runtime.requestInteractiveCancel());
+    try std.testing.expect(runtime.isCancelRequested());
+    try std.testing.expect(runtime.queueReviewReason() == null);
+
+    runtime.finishProcessing();
+    const next = (try runtime.tryTakeNextPrompt(alloc)).?;
+    defer freeQueuedPrompt(alloc, next);
+    try std.testing.expectEqualStrings("steer now", next.prompt);
 }
 
 test "turn start hold rejects busy worker and blocks take while held" {

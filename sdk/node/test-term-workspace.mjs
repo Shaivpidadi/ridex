@@ -16,7 +16,7 @@ const encoder = new TextEncoder();
 const requestDecoder = new TextDecoder();
 const stderrDecoder = new TextDecoder();
 const POST_TOOL_DECISION_PROMPT =
-  "Continue the original task. If work remains and you can proceed, briefly tell the user what you are doing next, then perform that action with the appropriate tool. Do not end the turn with only a progress update. If the task is complete, respond with the result. If a genuine blocker prevents further action, explain the blocker and what is needed to continue.";
+  "Continue the task using the latest user guidance. If work remains and you can proceed, briefly tell the user what you are doing next, then perform that action with the appropriate tool. Do not end the turn with only a progress update. If the task is complete, respond with the result. If a genuine blocker prevents further action, explain the blocker and what is needed to continue.";
 const catalog = {
   object: "list",
   data: [{ id: "test/workspace-model", type: "language", released: 1, tags: ["tool-use"], context_window: 128000, max_tokens: 8192 }],

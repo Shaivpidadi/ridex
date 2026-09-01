@@ -215,6 +215,36 @@ test "processQueuedPrompt accounts exact direct-provider usage without deferred 
     try std.testing.expectEqual(@as(?u64, 1), snapshot.request_count);
 }
 
+test "terminal assistant completion continues with steering admitted during the response" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{
+        .{ .content = "Original answer" },
+        .{ .content = "Updated answer" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    const steering = [_][]const u8{"change direction"};
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    hooks.steering_messages = &steering;
+    hooks.steering_take_at = 2;
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
+    try expectBodyContainsInOrder(&gateway, 1, &.{
+        "Original answer",
+        "user_steering",
+        "change direction",
+    });
+    try std.testing.expectEqualStrings("Updated answer", hooks.finish_assistant_text.?);
+    try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
+    const execution = hooks.history_turns.items[0].assistant.execution;
+    try std.testing.expectEqual(@as(usize, 1), execution.steering.len);
+    try std.testing.expectEqualStrings("change direction", execution.steering[0]);
+}
+
 fn makeOwnedProviderPrompt(alloc: Allocator, text: []const u8, model: []const u8) !QueuedPrompt {
     const prompt = try alloc.dupe(u8, text);
     errdefer alloc.free(prompt);
@@ -649,7 +679,7 @@ test "processQueuedPrompt post-Vision decision prompt leaves the selected-model 
         &gateway,
         2,
         .user,
-        "Continue the original task. If work remains and you can proceed, briefly tell the user what you are doing next, then perform that action with the appropriate tool. Do not end the turn with only a progress update. If the task is complete, respond with the result. If a genuine blocker prevents further action, explain the blocker and what is needed to continue.",
+        "Continue the task using the latest user guidance. If work remains and you can proceed, briefly tell the user what you are doing next, then perform that action with the appropriate tool. Do not end the turn with only a progress update. If the task is complete, respond with the result. If a genuine blocker prevents further action, explain the blocker and what is needed to continue.",
     );
     try std.testing.expectEqual(@as(?std.http.Status, null), hooks.http_status);
     try std.testing.expectEqualStrings("Recovered final answer", hooks.finish_assistant_text.?);
@@ -3390,7 +3420,7 @@ test "processQueuedPrompt keeps supplied system prompt components in stable orde
         };
         try expectBodyContainsInOrder(&gateway, request_index, &order);
     }
-    try expectGatewayPromptTailText(&gateway, 1, .user, "Continue the original task. If work remains and you can proceed, briefly tell the user what you are doing next, then perform that action with the appropriate tool. Do not end the turn with only a progress update. If the task is complete, respond with the result. If a genuine blocker prevents further action, explain the blocker and what is needed to continue.");
+    try expectGatewayPromptTailText(&gateway, 1, .user, "Continue the task using the latest user guidance. If work remains and you can proceed, briefly tell the user what you are doing next, then perform that action with the appropriate tool. Do not end the turn with only a progress update. If the task is complete, respond with the result. If a genuine blocker prevents further action, explain the blocker and what is needed to continue.");
 
     try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
     const persisted = hooks.history_turns.items[0].assistant;
@@ -3449,7 +3479,7 @@ test "processQueuedPrompt refreshes runtime overlay each step and preserves turn
     try expectGatewayPromptRoles(&gateway, 1, &second_request_roles);
     const second_request_order = [_][]const u8{ "runtime overlay step two", "user prompt", "Checking.", "\"value\":\"ok\"" };
     try expectBodyContainsInOrder(&gateway, 1, &second_request_order);
-    try expectGatewayPromptTailText(&gateway, 1, .user, "Continue the original task. If work remains and you can proceed, briefly tell the user what you are doing next, then perform that action with the appropriate tool. Do not end the turn with only a progress update. If the task is complete, respond with the result. If a genuine blocker prevents further action, explain the blocker and what is needed to continue.");
+    try expectGatewayPromptTailText(&gateway, 1, .user, "Continue the task using the latest user guidance. If work remains and you can proceed, briefly tell the user what you are doing next, then perform that action with the appropriate tool. Do not end the turn with only a progress update. If the task is complete, respond with the result. If a genuine blocker prevents further action, explain the blocker and what is needed to continue.");
 }
 
 test "processQueuedPrompt refreshes and acknowledges parent deliveries for each tool step" {
@@ -3680,7 +3710,7 @@ test "processQueuedPrompt projects history exactly once into each gateway reques
         try expectGatewayPromptTextCount(&gateway, i, "past assistant unique history needle", 1);
         try expectGatewayPromptTextCount(&gateway, i, "user prompt", 1);
     }
-    try expectGatewayPromptTailText(&gateway, 1, .user, "Continue the original task. If work remains and you can proceed, briefly tell the user what you are doing next, then perform that action with the appropriate tool. Do not end the turn with only a progress update. If the task is complete, respond with the result. If a genuine blocker prevents further action, explain the blocker and what is needed to continue.");
+    try expectGatewayPromptTailText(&gateway, 1, .user, "Continue the task using the latest user guidance. If work remains and you can proceed, briefly tell the user what you are doing next, then perform that action with the appropriate tool. Do not end the turn with only a progress update. If the task is complete, respond with the result. If a genuine blocker prevents further action, explain the blocker and what is needed to continue.");
 }
 
 test "processQueuedPrompt keeps completed history before the final current user prompt" {
@@ -3824,7 +3854,7 @@ test "processQueuedPrompt preserves a confirmed provider tool result across reco
         &gateway,
         1,
         .user,
-        "Continue the original task. If work remains and you can proceed, briefly tell the user what you are doing next, then perform that action with the appropriate tool. Do not end the turn with only a progress update. If the task is complete, respond with the result. If a genuine blocker prevents further action, explain the blocker and what is needed to continue.",
+        "Continue the task using the latest user guidance. If work remains and you can proceed, briefly tell the user what you are doing next, then perform that action with the appropriate tool. Do not end the turn with only a progress update. If the task is complete, respond with the result. If a genuine blocker prevents further action, explain the blocker and what is needed to continue.",
     );
     const execution = hooks.history_turns.items[0].assistant.execution;
     try std.testing.expectEqual(@as(usize, 1), execution.tool_steps.len);
@@ -3874,7 +3904,7 @@ test "processQueuedPrompt preserves a confirmed provider tool result across reco
         &restored_gateway,
         0,
         .user,
-        "Continue the original task. If work remains and you can proceed, briefly tell the user what you are doing next, then perform that action with the appropriate tool. Do not end the turn with only a progress update. If the task is complete, respond with the result. If a genuine blocker prevents further action, explain the blocker and what is needed to continue.",
+        "Continue the task using the latest user guidance. If work remains and you can proceed, briefly tell the user what you are doing next, then perform that action with the appropriate tool. Do not end the turn with only a progress update. If the task is complete, respond with the result. If a genuine blocker prevents further action, explain the blocker and what is needed to continue.",
     );
 }
 
@@ -3961,7 +3991,7 @@ test "processQueuedPrompt pauses uncertain tool recovery with an inspection acti
 
 test "processQueuedPrompt suppresses a repeated confirmed provider tool identity" {
     const alloc = std.testing.allocator;
-    const decision_prompt = "Continue the original task. If work remains and you can proceed, briefly tell the user what you are doing next, then perform that action with the appropriate tool. Do not end the turn with only a progress update. If the task is complete, respond with the result. If a genuine blocker prevents further action, explain the blocker and what is needed to continue.";
+    const decision_prompt = "Continue the task using the latest user guidance. If work remains and you can proceed, briefly tell the user what you are doing next, then perform that action with the appropriate tool. Do not end the turn with only a progress update. If the task is complete, respond with the result. If a genuine blocker prevents further action, explain the blocker and what is needed to continue.";
     const calls = [_]ToolCall{.{
         .id = "provider_search_repeat",
         .name = "perplexity_search",
@@ -4653,7 +4683,7 @@ test "processQueuedPrompt fails closed without stable credential authority" {
 
 test "processQueuedPrompt counts only failed provider attempts across tool followups" {
     const alloc = std.testing.allocator;
-    const decision_prompt = "Continue the original task. If work remains and you can proceed, briefly tell the user what you are doing next, then perform that action with the appropriate tool. Do not end the turn with only a progress update. If the task is complete, respond with the result. If a genuine blocker prevents further action, explain the blocker and what is needed to continue.";
+    const decision_prompt = "Continue the task using the latest user guidance. If work remains and you can proceed, briefly tell the user what you are doing next, then perform that action with the appropriate tool. Do not end the turn with only a progress update. If the task is complete, respond with the result. If a genuine blocker prevents further action, explain the blocker and what is needed to continue.";
     const first_calls = [_]ToolCall{
         toolCall("call_first", "read_file", "{\"path\":\"first.txt\"}"),
     };

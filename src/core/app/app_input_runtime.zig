@@ -659,7 +659,6 @@ pub fn Runtime(comptime App: type) type {
                             decoded.subagent_action,
                             decoded.cancel_pending,
                             input_limits.composer_bytes,
-                            max_prompt_history,
                         )) {
                             .done => {},
                             .remapped_byte => |byte| {
@@ -1034,7 +1033,6 @@ pub fn Runtime(comptime App: type) type {
             subagent_action: ?subagent_input.Action,
             was_cancel_pending: bool,
             max_input_len: usize,
-            max_prompt_history: usize,
         ) !ResolvedEscapeRoute {
             switch (resolved) {
                 .remapped_byte, .paste_start, .paste_end, .ignore => {},
@@ -1219,7 +1217,6 @@ pub fn Runtime(comptime App: type) type {
                 .composer_shortcut,
                 .toggle_full_transcript,
                 => unreachable,
-                .steer_submit => try submit_rt.submitSteering(app, max_prompt_history),
                 .page_up,
                 .page_down,
                 .mouse_wheel,
@@ -5711,7 +5708,6 @@ test "app_input_runtime ctrl-l preserves an active inline picker" {
         null,
         false,
         4096,
-        100,
     );
     try std.testing.expect(app.skills.menu.active);
     try std.testing.expectEqualStrings("$man", app.input_runtime.edit_state.input.items);
@@ -9003,7 +8999,6 @@ test "app_input_runtime active multiline history moves vertically before advanci
         null,
         false,
         4096,
-        100,
     );
     try std.testing.expectEqualStrings("older", app.input_runtime.edit_state.input.items);
 
@@ -11863,7 +11858,6 @@ const FakeSubmitApp = struct {
     transcript: std.ArrayList(u8) = .empty,
     last_command: ?[]u8 = null,
     last_prompt: ?[]u8 = null,
-    last_steering: ?[]u8 = null,
     last_images: []types.ImageAttachment = &.{},
     last_skill_tokens: std.ArrayList(registered_entities.SkillTokenSpan) = .empty,
     notice_topic: std.ArrayList(u8) = .empty,
@@ -11902,7 +11896,6 @@ const FakeSubmitApp = struct {
         self.notice_body.deinit(self.alloc);
         if (self.last_command) |text| self.alloc.free(text);
         if (self.last_prompt) |text| self.alloc.free(text);
-        if (self.last_steering) |text| self.alloc.free(text);
         types.freeImageAttachmentSlice(self.alloc, self.last_images);
         self.clearLastSkillTokens();
         self.last_skill_tokens.deinit(self.alloc);
@@ -11992,14 +11985,6 @@ const FakeSubmitApp = struct {
 
     pub fn enqueuePrompt(self: *FakeSubmitApp, text: []const u8) !bool {
         return self.enqueuePromptWithSkillBindings(text, &.{});
-    }
-
-    pub fn steerPrompt(self: *FakeSubmitApp, text: []const u8) !bool {
-        if (!self.queue_admitted) return false;
-        const copy = try self.alloc.dupe(u8, text);
-        if (self.last_steering) |old| self.alloc.free(old);
-        self.last_steering = copy;
-        return true;
     }
 
     pub fn enqueuePromptWithSkillBindings(
@@ -12199,7 +12184,6 @@ test "composer shortcut line delete handles decoded and raw mutations" {
             null,
             false,
             4096,
-            100,
         );
         try std.testing.expectEqualStrings("alpha\nright\ngamma", app.input_runtime.edit_state.input.items);
         try std.testing.expect(app.shell.render_requests.hasReason(.footer));
@@ -12280,7 +12264,6 @@ test "composer shortcut line delete preserves no-op picker redraw and metadata s
         null,
         false,
         4096,
-        100,
     );
     try std.testing.expect(app.shell.render_requests.hasReason(.footer));
     try std.testing.expectEqual(picker_state.ModelPickerStage.effort, app.input_runtime.picker.model_picker_stage);
@@ -12297,7 +12280,6 @@ test "composer shortcut line delete preserves no-op picker redraw and metadata s
         null,
         false,
         4096,
-        100,
     );
     try std.testing.expect(!app.shell.render_requests.hasReason(.footer));
     try std.testing.expectEqual(picker_state.ModelPickerStage.fast, app.input_runtime.picker.model_picker_stage);
@@ -14450,20 +14432,15 @@ test "app_input_runtime paste edit keeps the original history draft reachable" {
     try std.testing.expectEqualStrings("unsent draft", app.input_runtime.composer_history.draftText().?);
 }
 
-test "ctrl+enter submits steering while ordinary submit keeps queue semantics" {
+test "ordinary submit uses one interactive prompt path" {
     const alloc = std.testing.allocator;
     var app = FakeSubmitApp{ .alloc = alloc };
     defer app.deinit();
     app.stream.active = true;
 
     try app.input_runtime.edit_state.input.appendSlice(alloc, "steer now");
-    try input_submit_runtime.SubmitRuntime(FakeSubmitApp).submitSteering(&app, 100);
-    try std.testing.expectEqualStrings("steer now", app.last_steering.?);
-    try std.testing.expect(app.last_prompt == null);
-
-    try app.input_runtime.edit_state.input.appendSlice(alloc, "queue next");
     try input_submit_runtime.SubmitRuntime(FakeSubmitApp).submit(&app, 100);
-    try std.testing.expectEqualStrings("queue next", app.last_prompt.?);
+    try std.testing.expectEqualStrings("steer now", app.last_prompt.?);
 }
 
 test "app_input_runtime small paste opens skills menu for matching dollar token" {

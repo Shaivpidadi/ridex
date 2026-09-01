@@ -419,9 +419,7 @@ pub fn buildHintLine(
         var queued_buf: [32]u8 = undefined;
         appendStatusSegment(out, &end, std.fmt.bufPrint(&queued_buf, "queued {d}", .{queued_count}) catch "");
     }
-    if (stream_active and !awaiting_permission) {
-        appendStatusSegment(out, &end, "enter queue");
-    }
+    _ = stream_active;
     const status_limit = @min(@as(usize, width), out.len);
     const show_effort = model_supports_effort and !effort.isDefault();
     const show_fast = model_supports_fast and fast_mode;
@@ -942,10 +940,10 @@ test "dev build label drops an unresolved revision" {
     try std.testing.expectEqualStrings(expected, label);
 }
 
-test "buildHintLine advertises queue without persistent steering hint while streaming" {
+test "buildHintLine does not advertise queue or steering modes while streaming" {
     var buf: [128]u8 = undefined;
     const line = buildHintLine(true, false, true, "openai/gpt-5", .ask, 0, null, false, false, .auto, false, .{}, 120, &buf);
-    try std.testing.expect(std.mem.find(u8, line, "enter queue") != null);
+    try std.testing.expect(std.mem.find(u8, line, "enter queue") == null);
     try std.testing.expect(std.mem.find(u8, line, "ctrl+enter steer") == null);
 }
 

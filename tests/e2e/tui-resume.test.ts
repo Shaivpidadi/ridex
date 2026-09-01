@@ -2640,7 +2640,6 @@ test.skipIf(!tmuxAvailable())(
         if (/^└ (?:Running|Ran) /.test(row)) return "<command status>";
         if (/^│  \d+ output lines$/.test(row)) return "<output count>";
         if (/^│  \d+ more lines · → to expand$/.test(row)) return "<fold count>";
-        if (row.includes("enter queue ·")) return "<status line>";
         if (/^(?:auto · )?gpt-5$/.test(row)) return "<status line>";
         return row;
       });

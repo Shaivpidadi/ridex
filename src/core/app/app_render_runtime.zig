@@ -645,6 +645,11 @@ pub fn Runtime(comptime App: type) type {
                     queue_preview.steering_count
                 else
                     0,
+                .steering_waiting_on_tool = if (comptime @hasField(@TypeOf(queue_preview), "steering_count"))
+                    queue_preview.steering_count > 0 and
+                        shell_runtime.activeToolActivityCount(&app.shell) > 0
+                else
+                    false,
                 .queued_paused = if (comptime @hasField(@TypeOf(queue_preview), "paused"))
                     queue_preview.paused
                 else

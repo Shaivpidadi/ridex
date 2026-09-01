@@ -24,11 +24,22 @@ const ToolCall = types.ToolCall;
 const Config = runtime_config.Config;
 const ToolExecutionStatus = runtime_tool_contracts.ToolExecutionStatus;
 
-const steering_open = "<user_steering>\n";
+const steering_open =
+    "<user_steering>\n" ++
+    "Apply this live user update to the current task. Continue working unless the user asks you to stop, the task is complete, or a genuine blocker prevents progress.\n\n";
 const steering_close = "\n</user_steering>";
 
 pub fn steeringMessage(alloc: Allocator, text: []const u8) ![]u8 {
     return std.fmt.allocPrint(alloc, steering_open ++ "{s}" ++ steering_close, .{text});
+}
+
+test "steering message tells the model to apply the update and continue" {
+    const message = try steeringMessage(std.testing.allocator, "focus on rendering");
+    defer std.testing.allocator.free(message);
+
+    try std.testing.expect(std.mem.find(u8, message, "live user update") != null);
+    try std.testing.expect(std.mem.find(u8, message, "Continue working") != null);
+    try std.testing.expectEqualStrings("focus on rendering", steeringText(message).?);
 }
 
 pub fn persistedStatusForCurrentFxLocalResult(
@@ -1033,11 +1044,15 @@ test "large result storage redacts secret-bearing output before preview and disk
 
 test "execution memory persists consumed steering without protocol wrappers" {
     const alloc = std.testing.allocator;
+    const first = try steeringMessage(alloc, "focus on rendering");
+    defer alloc.free(first);
+    const second = try steeringMessage(alloc, "run the focused test");
+    defer alloc.free(second);
     const messages = [_]ChatMessage{
         .{ .role = .user, .content = "ordinary user context" },
-        .{ .role = .user, .content = "<user_steering>\nfocus on rendering\n</user_steering>" },
+        .{ .role = .user, .content = first },
         .{ .role = .assistant, .content = "continuing" },
-        .{ .role = .user, .content = "<user_steering>\nrun the focused test\n</user_steering>" },
+        .{ .role = .user, .content = second },
     };
 
     const execution = try buildExecutionMemory(alloc, &messages);

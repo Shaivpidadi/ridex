@@ -3970,7 +3970,7 @@ test "processQueuedPrompt denied registered run command compatibility never reac
 
 test "processQueuedPrompt legacy auto denial retains lifecycle source" {
     const alloc = std.testing.allocator;
-    const decision_prompt = "Continue the original task. If work remains and you can proceed, briefly tell the user what you are doing next, then perform that action with the appropriate tool. Do not end the turn with only a progress update. If the task is complete, respond with the result. If a genuine blocker prevents further action, explain the blocker and what is needed to continue.";
+    const decision_prompt = "Continue the task using the latest user guidance. If work remains and you can proceed, briefly tell the user what you are doing next, then perform that action with the appropriate tool. Do not end the turn with only a progress update. If the task is complete, respond with the result. If a genuine blocker prevents further action, explain the blocker and what is needed to continue.";
     const calls = [_]ToolCall{toolCall("call_1", "write_file", "{\"path\":\"a\",\"content\":\"x\"}")};
     const completions = [_]FakeCompletion{
         .{ .tool_calls = &calls },
@@ -4323,7 +4323,7 @@ test "batched permission feedback follows every tool result before the next gate
 
 test "completed tool batch appends one action-oriented decision prompt to the next provider request" {
     const alloc = std.testing.allocator;
-    const decision_prompt = "Continue the original task. If work remains and you can proceed, briefly tell the user what you are doing next, then perform that action with the appropriate tool. Do not end the turn with only a progress update. If the task is complete, respond with the result. If a genuine blocker prevents further action, explain the blocker and what is needed to continue.";
+    const decision_prompt = "Continue the task using the latest user guidance. If work remains and you can proceed, briefly tell the user what you are doing next, then perform that action with the appropriate tool. Do not end the turn with only a progress update. If the task is complete, respond with the result. If a genuine blocker prevents further action, explain the blocker and what is needed to continue.";
     const calls = [_]ToolCall{
         toolCall("call_first", "terminal", "{\"action\":\"exec\",\"command\":\"printf first\"}"),
         toolCall("call_second", "terminal", "{\"action\":\"exec\",\"command\":\"printf second\"}"),
@@ -4376,7 +4376,7 @@ test "completed tool batch appends one action-oriented decision prompt to the ne
 
 test "post-tool provider retry retains exactly one action-oriented decision prompt" {
     const alloc = std.testing.allocator;
-    const decision_prompt = "Continue the original task. If work remains and you can proceed, briefly tell the user what you are doing next, then perform that action with the appropriate tool. Do not end the turn with only a progress update. If the task is complete, respond with the result. If a genuine blocker prevents further action, explain the blocker and what is needed to continue.";
+    const decision_prompt = "Continue the task using the latest user guidance. If work remains and you can proceed, briefly tell the user what you are doing next, then perform that action with the appropriate tool. Do not end the turn with only a progress update. If the task is complete, respond with the result. If a genuine blocker prevents further action, explain the blocker and what is needed to continue.";
     const calls = [_]ToolCall{
         toolCall("call_retry", "terminal", "{\"action\":\"exec\",\"command\":\"printf retry\"}"),
     };
