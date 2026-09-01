@@ -30,7 +30,6 @@ const skill_runtime = @import("../skills/skill_runtime.zig");
 const subagent_model_contract = @import("../subagent/model_contract.zig");
 const subagent_tool_host = @import("../subagent/tool_host.zig");
 const subagent_tool_provider = @import("../subagent/tool_provider.zig");
-const subagent_tool_result = @import("../subagent/tool_result.zig");
 const session_runtime = @import("../session/session.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
 const session_codec_mod = @import("../session/session_codec.zig");
@@ -1775,15 +1774,10 @@ const SubagentProviderState = struct {
 
 fn subagentProviderFailure(
     alloc: Allocator,
-    child_id: ?[]const u8,
     error_code: []const u8,
-    retryable: bool,
 ) Allocator.Error!subagent_tool_provider.Result {
-    _ = retryable;
     const body = subagent_model_contract.encodeResultAlloc(alloc, .{
         .ok = false,
-        .child_id = child_id,
-        .status = "rejected",
         .error_code = error_code,
     }) catch return error.OutOfMemory;
     return .{ .status = .failure, .body = body };
@@ -1794,30 +1788,14 @@ fn executeSubagentProvider(
     arena: Allocator,
     request: *subagent_model_contract.Request,
     invocation_id: []const u8,
-) Allocator.Error!subagent_tool_provider.Result {
+) subagent_tool_provider.ExecuteError!subagent_tool_provider.Result {
     const state: *SubagentProviderState = @ptrCast(@alignCast(raw_context.?));
     const ctx = state.runtime;
     const host = ctx.subagent_host orelse
-        return subagentProviderFailure(arena, null, "host_unavailable", false);
+        return subagentProviderFailure(arena, "host_unavailable");
     const caller_id = ctx.subagent_caller_id orelse
-        return subagentProviderFailure(arena, null, "caller_unavailable", false);
-    const identity_epoch = if (request.* == .wait)
-        0
-    else switch (try persistedSubagentIdentity(
-        arena,
-        ctx.current_turn_messages,
-        ctx.session.history.items,
-        invocation_id,
-    )) {
-        .absent => host.issueOperationIdentity(invocation_id, .model),
-        .replay => |epoch| epoch,
-        .corrupt => return subagentProviderFailure(
-            arena,
-            request.childId(),
-            "host_failure",
-            true,
-        ),
-    };
+        return subagentProviderFailure(arena, "caller_unavailable");
+    const identity_epoch = host.issueOperationIdentity(invocation_id);
     const output = host.executeManaged(arena, request, .{
         .caller_id = caller_id,
         .invocation_id = invocation_id,
@@ -1835,229 +1813,16 @@ fn executeSubagentProvider(
         .max_result_bytes = ctx.max_tool_result_bytes,
         .timestamp_ms = io_mod.milliTimestamp(),
         .identity_epoch = identity_epoch,
+        .cancel_flag = runtimeCancelFlag(ctx),
     }) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
-        return subagentProviderFailure(
-            arena,
-            request.childId(),
-            "host_failure",
-            true,
-        );
+        if (err == error.Cancelled) return error.Cancelled;
+        return subagentProviderFailure(arena, "host_failure");
     };
     return .{
         .status = if (output.success) .success else .failure,
         .body = output.body,
     };
-}
-
-const PersistedSubagentIdentity = union(enum) {
-    absent,
-    replay: u64,
-    corrupt,
-};
-
-fn persistedSubagentIdentity(
-    arena: Allocator,
-    current_turn_messages: []const ChatMessage,
-    history: []const session_runtime.HistoryTurn,
-    invocation_id: []const u8,
-) !PersistedSubagentIdentity {
-    switch (try currentTurnSubagentIdentity(
-        arena,
-        current_turn_messages,
-        invocation_id,
-    )) {
-        .absent => {},
-        .replay => |epoch| return .{ .replay = epoch },
-        .corrupt => return .corrupt,
-    }
-
-    var turn_index = history.len;
-    while (turn_index != 0) {
-        turn_index -= 1;
-        const execution = switch (history[turn_index]) {
-            .assistant => |entry| entry.execution,
-            .interrupted => |entry| entry.execution,
-            .compacted_summary => continue,
-        };
-        var step_index = execution.tool_steps.len;
-        while (step_index != 0) {
-            step_index -= 1;
-            const step = execution.tool_steps[step_index];
-            var call_index = step.tool_calls.len;
-            while (call_index != 0) {
-                call_index -= 1;
-                const persisted_call = step.tool_calls[call_index];
-                if (!std.mem.eql(u8, persisted_call.id, invocation_id)) continue;
-                var matching_calls: usize = 0;
-                for (step.tool_calls) |candidate| {
-                    if (std.mem.eql(u8, candidate.id, invocation_id)) {
-                        matching_calls += 1;
-                    }
-                }
-                if (matching_calls != 1) return .corrupt;
-                if (!canonicalSubagentCall(persisted_call)) return .corrupt;
-                const result = canonicalPersistedSubagentResult(
-                    step.tool_results,
-                    invocation_id,
-                ) orelse
-                    return .corrupt;
-                const epoch = try persistedSubagentEpoch(
-                    arena,
-                    result.output,
-                    result.status,
-                    invocation_id,
-                ) orelse
-                    return .corrupt;
-                return .{ .replay = epoch };
-            }
-        }
-    }
-    return .absent;
-}
-
-fn currentTurnSubagentIdentity(
-    arena: Allocator,
-    messages: []const ChatMessage,
-    invocation_id: []const u8,
-) !PersistedSubagentIdentity {
-    var result_index = messages.len;
-    while (result_index != 0) {
-        result_index -= 1;
-        const result = messages[result_index];
-        if (result.role != .tool) continue;
-        const result_call_id = result.tool_call_id orelse continue;
-        if (!std.mem.eql(u8, result_call_id, invocation_id)) continue;
-        const call = canonicalCurrentTurnSubagentCall(
-            messages,
-            result_index,
-            invocation_id,
-        ) orelse return .corrupt;
-        if (!canonicalSubagentCall(call) or
-            result.tool_name == null or
-            !std.mem.eql(u8, result.tool_name.?, subagent_tool_name) or
-            result.content == null or
-            result.tool_result_status == null or
-            result.tool_calls.len != 0 or
-            result.images.len != 0 or
-            result.permission_feedback)
-        {
-            return .corrupt;
-        }
-        const epoch = try persistedSubagentEpoch(
-            arena,
-            result.content.?,
-            result.tool_result_status.?,
-            invocation_id,
-        ) orelse return .corrupt;
-        return .{ .replay = epoch };
-    }
-    return .absent;
-}
-
-fn canonicalCurrentTurnSubagentCall(
-    messages: []const ChatMessage,
-    result_index: usize,
-    invocation_id: []const u8,
-) ?ToolCall {
-    var assistant_index = result_index;
-    while (assistant_index != 0) {
-        assistant_index -= 1;
-        switch (messages[assistant_index].role) {
-            .tool => continue,
-            .assistant => break,
-            .system, .user => return null,
-        }
-    }
-    if (messages[assistant_index].role != .assistant) return null;
-
-    var matching_call: ?ToolCall = null;
-    for (messages[assistant_index].tool_calls) |call| {
-        if (!std.mem.eql(u8, call.id, invocation_id)) continue;
-        if (matching_call != null) return null;
-        matching_call = call;
-    }
-
-    var matching_results: usize = 0;
-    var index = assistant_index + 1;
-    while (index < messages.len and messages[index].role == .tool) : (index += 1) {
-        const call_id = messages[index].tool_call_id orelse continue;
-        if (std.mem.eql(u8, call_id, invocation_id)) matching_results += 1;
-    }
-    if (matching_results != 1) return null;
-    return matching_call;
-}
-
-fn canonicalSubagentCall(call: ToolCall) bool {
-    return std.mem.eql(u8, call.name, subagent_tool_name) and
-        call.argument_integrity == .valid and
-        call.provider_result == null and
-        call.final_identity == .valid and
-        call.provenance == .fx_local;
-}
-
-fn canonicalPersistedSubagentResult(
-    results: []const session_runtime.PersistedToolResult,
-    call_id: []const u8,
-) ?session_runtime.PersistedToolResult {
-    var matching: ?session_runtime.PersistedToolResult = null;
-    for (results) |result| {
-        if (!std.mem.eql(u8, result.tool_call_id, call_id)) continue;
-        if (matching != null or
-            !std.mem.eql(u8, result.tool_name, subagent_tool_name) or
-            result.provider_native)
-        {
-            return null;
-        }
-        matching = result;
-    }
-    return matching;
-}
-
-fn persistedSubagentEpoch(
-    arena: Allocator,
-    output: []const u8,
-    status: session_runtime.PersistedToolStatus,
-    invocation_id: []const u8,
-) !?u64 {
-    var parsed = std.json.parseFromSlice(std.json.Value, arena, output, .{}) catch |err|
-        return switch (err) {
-            error.OutOfMemory => error.OutOfMemory,
-            else => null,
-        };
-    defer parsed.deinit();
-    if (parsed.value != .object) return null;
-    const ok_value = parsed.value.object.get("ok") orelse return null;
-    if (ok_value != .bool) return null;
-    const expected_status: session_runtime.PersistedToolStatus =
-        if (ok_value.bool) .success else .failure;
-    if (status != expected_status) return null;
-    const operation_value = parsed.value.object.get("operation_id") orelse
-        return null;
-    if (operation_value != .string) return null;
-    const child_value = parsed.value.object.get("child_id") orelse return null;
-    if (child_value != .null and child_value != .string) return null;
-    const status_value = parsed.value.object.get("status") orelse return null;
-    if (status_value != .string or status_value.string.len == 0) return null;
-    const error_value = parsed.value.object.get("error_code") orelse return null;
-    if (error_value != .null and error_value != .string) return null;
-    const result_value = parsed.value.object.get("result") orelse return null;
-    if (result_value != .null and result_value != .string) return null;
-    const operation_id = operation_value.string;
-    const identity = subagent_tool_result.parseBoundOperationId(operation_id) orelse
-        return null;
-    if (identity.source != .model or
-        identity.authority != .manager or
-        identity.epoch == 0 or
-        !subagent_tool_result.boundOperationMatchesInvocation(
-            operation_id,
-            invocation_id,
-            .model,
-        ))
-    {
-        return null;
-    }
-    return identity.epoch;
 }
 
 fn noopOutput(_: *anyopaque, _: ?types.ToolLifecycleId, _: command_contract.CommandOutputStream, _: []const u8) !void {}

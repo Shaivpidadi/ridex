@@ -603,36 +603,23 @@ fn project_subagent_result_content(
     defer parsed.deinit();
     if (parsed.value != .object) return null;
     const object = parsed.value.object;
-    if (object.count() == 5 and object.get("ok") != null and
-        object.get("child_id") != null and object.get("status") != null and
+    if (object.count() == 3 and object.get("ok") != null and
         object.get("result") != null and object.get("error_code") != null)
     {
         return null;
     }
     const ok = object.get("ok") orelse return null;
-    const child_id = object.get("child_id") orelse return null;
-    const status = object.get("status") orelse return null;
     const error_code = object.get("error_code") orelse return null;
     const result = object.get("result") orelse .null;
-    if (ok != .bool or (child_id != .null and child_id != .string) or
-        status != .string or (error_code != .null and error_code != .string) or
+    if (ok != .bool or (error_code != .null and error_code != .string) or
         (result != .null and result != .string))
     {
         return null;
     }
 
     const arena = parsed.arena.allocator();
-    const model_child_id = if (child_id == .string)
-        std.json.Value{ .string = try subagent_model_contract.modelChildIdAlloc(
-            arena,
-            child_id.string,
-        ) }
-    else
-        child_id;
     var compact = std.json.Value{ .object = .empty };
     try compact.object.put(arena, "ok", ok);
-    try compact.object.put(arena, "child_id", model_child_id);
-    try compact.object.put(arena, "status", status);
     try compact.object.put(arena, "result", result);
     try compact.object.put(arena, "error_code", error_code);
     var out: std.Io.Writer.Allocating = .init(alloc);
@@ -953,7 +940,7 @@ fn normalized_terminal_request_arguments(
 }
 
 fn managed_subagent_action(action: []const u8) ?[]const u8 {
-    for ([_][]const u8{ "run", "message", "wait", "stop" }) |known| {
+    for ([_][]const u8{ "run", "message" }) |known| {
         if (std.mem.eql(u8, action, known)) return known;
     }
     return null;
@@ -1159,9 +1146,9 @@ test "subagent request normalization follows effective attempt advertisement" {
     };
     const registry = tool_dispatch.Registry{ .tools = &.{nested} };
     const calls = [_]ToolCall{
-        .{ .id = "flat", .name = "subagent", .arguments_json = "{\"action\":\"wait\",\"child_id\":\"child-1\"}" },
+        .{ .id = "flat", .name = "subagent", .arguments_json = "{\"action\":\"run\",\"task\":\"review\"}" },
         .{ .id = "message", .name = "subagent", .arguments_json = "{\"request\":{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"review\"}}" },
-        .{ .id = "canonical", .name = "subagent", .arguments_json = "{\"request\":{\"action\":\"stop\",\"child_id\":\"child-3\"}}" },
+        .{ .id = "canonical", .name = "subagent", .arguments_json = "{\"request\":{\"action\":\"run\",\"task\":\"canonical\"}}" },
         .{ .id = "legacy", .name = "subagent", .arguments_json = "{\"command\":{\"lifecycle\":{\"id\":\"child-4\",\"action\":\"cancel\"}}}" },
     };
 
@@ -1176,7 +1163,7 @@ test "subagent request normalization follows effective attempt advertisement" {
     );
     try std.testing.expect(normalized.ptr != calls[0..].ptr);
     try std.testing.expectEqualStrings(
-        "{\"request\":{\"action\":\"wait\",\"child_id\":\"child-1\"}}",
+        "{\"request\":{\"action\":\"run\",\"task\":\"review\"}}",
         normalized[0].arguments_json,
     );
     try std.testing.expectEqualStrings(
@@ -6382,11 +6369,23 @@ fn processQueuedPromptLoop(
                 null,
             );
 
-            const parallel_candidate_len = if (successful_vision_mode != .required and
+            const parallel_group = if (successful_vision_mode != .required and
                 !context_delta and
-                (root_action_permission_mode == .auto or root_action_permission_mode == .yolo) and
                 deps.live_tool_authority == null)
-                runtime_parallel_execution.parallelReadOnlyPrefixLen(deps.tool_registry, effective_tool_calls[tool_call_index..])
+                runtime_parallel_execution.leadingParallelGroup(
+                    deps.tool_registry,
+                    effective_tool_calls[tool_call_index..],
+                )
+            else
+                runtime_parallel_execution.LeadingGroup{};
+            const parallel_permission_eligible = switch (parallel_group.kind) {
+                .none => false,
+                .read_only => root_action_permission_mode == .auto or
+                    root_action_permission_mode == .yolo,
+                .subagent => true,
+            };
+            const parallel_candidate_len = if (parallel_permission_eligible)
+                parallel_group.len
             else
                 0;
             const parallel_len = if (parallel_candidate_len > 1) parallel: {
@@ -6676,7 +6675,13 @@ fn processQueuedPromptLoop(
                             };
                         }
                     }
-                    debug_trace.eventf("tool", "parallel_read_only_start", step_ctx, "count={d}", .{executable_calls.items.len});
+                    debug_trace.eventf(
+                        "tool",
+                        "parallel_tool_group_start",
+                        step_ctx,
+                        "kind={s} count={d}",
+                        .{ @tagName(parallel_group.kind), executable_calls.items.len },
+                    );
                     const parallel_execution_root_user_context = try buildToolExecutionRootUserContext(
                         arena,
                         root_user_intent_context,
@@ -6695,7 +6700,7 @@ fn processQueuedPromptLoop(
                         .classification_complete = executable_classification_complete.items,
                     };
                     if (comptime host_target.is_wasm) {
-                        parallel_run = try runtime_parallel_execution.runSequentialReadOnlyCalls(arena, executable_calls.items, .{
+                        parallel_run = try runtime_parallel_execution.runSequentialCalls(arena, executable_calls.items, .{
                             .exec_ctx = &parallel_exec_ctx,
                             .execute = runtime_parallel_execution.parallelHookExecute,
                             .format_ctx = &parallel_exec_ctx,
@@ -6703,7 +6708,7 @@ fn processQueuedPromptLoop(
                             .cancel_flag = config.cancel_flag,
                         });
                     } else {
-                        parallel_run = try runtime_parallel_execution.runParallelReadOnlyCalls(arena, executable_calls.items, .{
+                        parallel_run = try runtime_parallel_execution.runParallelCalls(arena, executable_calls.items, .{
                             .exec_ctx = &parallel_exec_ctx,
                             .execute = runtime_parallel_execution.parallelHookExecute,
                             .format_ctx = &parallel_exec_ctx,
@@ -6751,10 +6756,13 @@ fn processQueuedPromptLoop(
                 );
                 debug_trace.eventf(
                     "tool",
-                    "parallel_read_only_finish",
+                    "parallel_tool_group_finish",
                     step_ctx,
-                    "count={d}",
-                    .{if (parallel_run) |run| run.attempts.len else 0},
+                    "kind={s} count={d}",
+                    .{
+                        @tagName(parallel_group.kind),
+                        if (parallel_run) |run| run.attempts.len else 0,
+                    },
                 );
                 if (config.cancel_flag.load(.seq_cst)) {
                     runtime_telemetry.traceCancelObserved(step_ctx, true);

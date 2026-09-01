@@ -65,8 +65,6 @@ fn decodeFailure(
 ) !tool_dispatch.DecodeResult {
     return .{ .failure = try model_contract.encodeResultAlloc(ctx.allocator, .{
         .ok = false,
-        .child_id = null,
-        .status = "rejected",
         .error_code = code,
     }) };
 }
@@ -86,7 +84,6 @@ fn validationErrorCode(err: model_contract.ValidationError) []const u8 {
         error.OutOfMemory => unreachable,
         error.InvalidTask => "invalid_task",
         error.InvalidAgent => "invalid_agent",
-        error.InvalidChildId => "invalid_child_id",
         error.InvalidInstructions => "invalid_instructions",
         error.InvalidMessage => "invalid_message",
     };
@@ -106,24 +103,12 @@ fn parseRoot(value: std.json.Value) DecodeError!model_contract.RequestInput {
             .task = try requiredString(request, "task"),
         } };
     }
-    if (std.mem.eql(u8, action, "wait")) {
-        try rejectUnknown(request, &.{ "action", "child_id" });
-        return .{ .wait = .{
-            .child_id = try requiredString(request, "child_id"),
-        } };
-    }
     if (std.mem.eql(u8, action, "message")) {
         try rejectUnknown(request, &.{ "action", "agent", "instructions", "message" });
         return .{ .message = .{
             .agent = try requiredString(request, "agent"),
             .instructions = try optionalString(request, "instructions"),
             .message = try requiredString(request, "message"),
-        } };
-    }
-    if (std.mem.eql(u8, action, "stop")) {
-        try rejectUnknown(request, &.{ "action", "child_id" });
-        return .{ .stop = .{
-            .child_id = try requiredString(request, "child_id"),
         } };
     }
     return error.InvalidEnum;
@@ -179,8 +164,6 @@ pub fn call(
     const provider = ctx.subagent_provider orelse {
         const body = model_contract.encodeResultAlloc(ctx.allocator, .{
             .ok = false,
-            .child_id = null,
-            .status = "rejected",
             .error_code = "host_unavailable",
         }) catch return error.OutOfMemory;
         return .{ .failure = body };
@@ -196,8 +179,8 @@ pub fn call(
     };
 }
 
-pub fn readsOnly(input: tool_dispatch.ToolInput) bool {
-    return input.as(Input).request == .wait;
+pub fn readsOnly(_: tool_dispatch.ToolInput) bool {
+    return false;
 }
 
 pub fn isIrreversible(_: tool_dispatch.ToolInput) bool {
@@ -265,7 +248,7 @@ test "call executes a validated managed request through the provider" {
     const alloc = std.testing.allocator;
     const decoded = try decode(
         .{ .allocator = alloc, .tool_call_id = "call-1" },
-        "{\"request\":{\"action\":\"wait\",\"child_id\":\"01J00000000000000000000000\"}}",
+        "{\"request\":{\"action\":\"run\",\"task\":\"review this\"}}",
     );
     var fixture = Fixture{};
     switch (decoded) {
@@ -289,28 +272,27 @@ test "call executes a validated managed request through the provider" {
                 .failure => return error.TestUnexpectedResult,
             }
             try std.testing.expect(fixture.request.? == &input.as(Input).request);
-            try std.testing.expectEqual(model_contract.Action.wait, fixture.request.?.action());
+            try std.testing.expectEqual(model_contract.Action.run, fixture.request.?.action());
             try std.testing.expectEqualStrings("call-1", fixture.invocation_id.?);
         },
     }
     try std.testing.expectEqual(@as(usize, 1), fixture.calls);
 }
 
-test "decode accepts managed actions and bounded canonical forms" {
+test "decode accepts only delegation intents" {
     try expectRequestTag("{\"request\":{\"action\":\"run\",\"task\":\"do it\"}}", .run);
-    try expectRequestTag("{\"request\":{\"action\":\"wait\",\"child_id\":\"01J00000000000000000000000\"}}", .wait);
-    try expectRequestTag("{\"action\":\"wait\",\"child_id\":\"01J00000000000000000000000\"}", .wait);
     try expectRequestTag("{\"request\":{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"next\"}}", .message);
     try expectRequestTag("{\"request\":{\"action\":\"message\",\"agent\":\"reviewer\",\"instructions\":\"Review strictly.\",\"message\":\"next\"}}", .message);
-    try expectRequestTag("{\"request\":{\"action\":\"stop\",\"child_id\":\"01J00000000000000000000000\"}}", .stop);
+    try expectDecodeFailure("{\"request\":{\"action\":\"wait\",\"child_id\":\"01J00000000000000000000000\"}}", "invalid_enum");
+    try expectDecodeFailure("{\"request\":{\"action\":\"stop\",\"child_id\":\"01J00000000000000000000000\"}}", "invalid_enum");
     try expectDecodeFailure("{\"request\":{\"action\":\"cancel\",\"child_id\":\"01J00000000000000000000000\"}}", "invalid_enum");
 }
 
 test "decode rejects manager input cross-action fields and unknown actions" {
     try expectDecodeFailure("{\"command\":{\"create\":{\"name\":\"worker\"}}}", "missing_field");
-    try expectDecodeFailure("{\"request\":{\"action\":\"wait\",\"child_id\":\"01J00000000000000000000000\",\"task\":\"wrong\"}}", "unknown_field");
+    try expectDecodeFailure("{\"request\":{\"action\":\"wait\",\"child_id\":\"01J00000000000000000000000\",\"task\":\"wrong\"}}", "invalid_enum");
     try expectDecodeFailure("{\"request\":{\"action\":\"inspect\",\"child_id\":\"01J00000000000000000000000\"}}", "invalid_enum");
-    try expectDecodeFailure("{\"request\":{\"action\":\"wait\"}}", "missing_field");
+    try expectDecodeFailure("{\"request\":{\"action\":\"wait\"}}", "invalid_enum");
     try expectDecodeFailure("{\"request\":null}", "invalid_field_type");
 }
 

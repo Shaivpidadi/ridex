@@ -13,25 +13,8 @@ pub const max_message_bytes: usize = 64 * 1024;
 pub const max_agent_name_bytes: usize = 64;
 pub const max_instructions_bytes: usize = 64 * 1024;
 pub const max_cancellation_reason_bytes: usize = 512;
-pub const max_operation_id_bytes: usize = 128;
 pub const max_admission_items: usize = 256;
 pub const max_admission_item_bytes: usize = 4096;
-
-pub const OperationIdentitySource = enum {
-    model,
-    human,
-};
-
-pub const OperationIdentityAuthority = enum {
-    process_local,
-    manager,
-};
-
-pub const BoundOperationIdentity = struct {
-    source: OperationIdentitySource,
-    epoch: u64,
-    authority: OperationIdentityAuthority,
-};
 
 pub const QueuedMessage = struct {
     id: []u8,
@@ -183,7 +166,6 @@ pub fn captureAdmission(
 
 pub const ValidationError = error{
     InvalidId,
-    InvalidOperationId,
 };
 
 pub fn validateId(id: []const u8) ValidationError!void {
@@ -207,17 +189,6 @@ pub fn validInstructions(instructions: []const u8) bool {
     if (instructions.len > max_instructions_bytes or
         !std.unicode.utf8ValidateSlice(instructions)) return false;
     return std.mem.findScalar(u8, instructions, 0) == null;
-}
-
-pub fn validateOperationId(id: []const u8) ValidationError!void {
-    if (id.len == 0 or id.len > max_operation_id_bytes) {
-        return error.InvalidOperationId;
-    }
-    for (id) |byte| {
-        if (std.ascii.isControl(byte) or std.ascii.isWhitespace(byte)) {
-            return error.InvalidOperationId;
-        }
-    }
 }
 
 fn validateStrings(values: []const []const u8) AdmissionError!void {
@@ -258,13 +229,6 @@ fn cloneStrings(
 fn freeStrings(alloc: Allocator, values: [][]u8) void {
     for (values) |value| alloc.free(value);
     if (values.len > 0) alloc.free(values);
-}
-
-test "operation identifiers reject whitespace and controls" {
-    try validateOperationId("fxop:valid");
-    try std.testing.expectError(error.InvalidOperationId, validateOperationId(""));
-    try std.testing.expectError(error.InvalidOperationId, validateOperationId("bad id"));
-    try std.testing.expectError(error.InvalidOperationId, validateOperationId("bad\n"));
 }
 
 test "captured admission owns independent authority slices" {

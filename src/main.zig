@@ -4094,7 +4094,6 @@ test {
     _ = @import("core/subagent/domain.zig");
     _ = @import("core/subagent/child_state.zig");
     _ = @import("core/subagent/managed_owner.zig");
-    _ = @import("core/subagent/tool_result.zig");
     _ = @import("core/subagent/resume_admission.zig");
     _ = @import("core/subagent/execution.zig");
     _ = @import("core/subagent/tool_host.zig");

@@ -6,7 +6,6 @@ const domain = @import("domain.zig");
 const execution = @import("execution.zig");
 const managed_owner = @import("managed_owner.zig");
 const model_contract = @import("model_contract.zig");
-const tool_result = @import("tool_result.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const mcp_access = @import("../mcp/access_policy.zig");
@@ -21,6 +20,7 @@ const tool_set_contract = @import("../tooling/tool_set.zig");
 const types = @import("../shared/types.zig");
 
 const Allocator = std.mem.Allocator;
+const terminal_wait_pulse_ms: u64 = 100;
 
 pub const Defaults = struct {
     provider: model_provider.ProviderId,
@@ -62,6 +62,7 @@ pub const ExecuteOptions = struct {
     max_result_bytes: usize,
     timestamp_ms: i64,
     identity_epoch: u64 = 0,
+    cancel_flag: ?*std.atomic.Value(bool) = null,
 };
 
 pub const ManagedExecutionResult = struct {
@@ -193,11 +194,10 @@ pub const Runtime = struct {
     pub fn issueOperationIdentity(
         self: *Runtime,
         invocation_id: []const u8,
-        source: domain.OperationIdentitySource,
     ) u64 {
         _ = self;
         var hash = std.crypto.hash.sha2.Sha256.init(.{});
-        hash.update(@tagName(source));
+        hash.update("model");
         hash.update(&.{0});
         hash.update(invocation_id);
         var digest: [32]u8 = undefined;
@@ -212,48 +212,29 @@ pub const Runtime = struct {
         options: ExecuteOptions,
     ) !ManagedExecutionResult {
         _ = options.max_result_bytes;
-        const identity_epoch = if (request.* == .wait)
-            0
-        else if (options.identity_epoch != 0)
+        const identity_epoch = if (options.identity_epoch != 0)
             options.identity_epoch
         else
-            self.issueOperationIdentity(options.invocation_id, .model);
-        const operation_id = if (identity_epoch == 0)
-            null
-        else
-            try tool_result.boundOperationIdAlloc(
-                alloc,
-                options.invocation_id,
-                .model,
-                identity_epoch,
-            );
-        defer if (operation_id) |value| alloc.free(value);
+            self.issueOperationIdentity(options.invocation_id);
+        const operation_id = try operationIdAlloc(
+            alloc,
+            options.invocation_id,
+            identity_epoch,
+        );
+        defer alloc.free(operation_id);
 
         return switch (request.*) {
-            .wait => |value| self.observeManagedState(
-                alloc,
-                value.child_id,
-                null,
-                model_contract.wait_ms,
-            ),
-            .stop => |value| self.stopManaged(
-                alloc,
-                value.child_id,
-                operation_id.?,
-            ),
             .run, .message => blk: {
                 if (!std.mem.eql(u8, options.caller_id, self.root_id)) {
                     break :blk self.encodeManaged(alloc, .{
                         .ok = false,
-                        .operation_id = operation_id,
-                        .status = "rejected",
                         .error_code = "caller_unavailable",
                     });
                 }
                 var admitted = try self.admitManagedWork(
                     alloc,
                     request.*,
-                    operation_id.?,
+                    operation_id,
                     options,
                 );
                 defer admitted.deinit(alloc);
@@ -261,9 +242,6 @@ pub const Runtime = struct {
                     .rejected => |failure| {
                         break :blk self.encodeManaged(alloc, .{
                             .ok = false,
-                            .operation_id = operation_id,
-                            .child_id = failure.child_id,
-                            .status = "rejected",
                             .error_code = failure.code,
                         });
                     },
@@ -272,8 +250,7 @@ pub const Runtime = struct {
                         const result = try self.observeManagedState(
                             alloc,
                             ready.child_id,
-                            operation_id,
-                            model_contract.initial_observe_ms,
+                            options.cancel_flag,
                         );
                         break :blk result;
                     },
@@ -429,7 +406,6 @@ pub const Runtime = struct {
                     registry.children[registry.children.len - 1].id,
                 );
             },
-            .wait, .stop => unreachable,
         }
     }
 
@@ -463,38 +439,39 @@ pub const Runtime = struct {
         self: *Runtime,
         alloc: Allocator,
         child_id: []const u8,
-        operation_id: ?[]const u8,
-        timeout_ms: u64,
+        cancel_flag: ?*std.atomic.Value(bool),
     ) !ManagedExecutionResult {
-        const observation = self.managed.wait(child_id, .{
-            .clock = .awake,
-            .raw = .fromMilliseconds(@intCast(timeout_ms)),
-        }) catch |err| return self.encodeManaged(alloc, .{
-            .ok = false,
-            .operation_id = operation_id,
-            .child_id = child_id,
-            .status = "rejected",
-            .error_code = switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                error.ChildUnavailable => "child_unavailable",
-                error.StateUnavailable => "state_unavailable",
-            },
-        });
-        const result = switch (observation.phase) {
-            .idle, .finished, .interrupted => try self.managedResultText(
+        while (true) {
+            if (cancel_flag) |flag| {
+                if (flag.load(.seq_cst)) {
+                    self.managed.cancel(child_id) catch |err| switch (err) {
+                        error.ChildUnavailable => {},
+                    };
+                    return error.Cancelled;
+                }
+            }
+            const observation = self.managed.wait(child_id, .{
+                .clock = .awake,
+                .raw = .fromMilliseconds(terminal_wait_pulse_ms),
+            }) catch |err| return self.encodeManaged(alloc, .{
+                .ok = false,
+                .error_code = switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.ChildUnavailable => "child_unavailable",
+                    error.StateUnavailable => "state_unavailable",
+                },
+            });
+            switch (observation.phase) {
+                .running, .awaiting_approval => continue,
+                .idle, .finished, .interrupted => {},
+            }
+            const result = try self.managedResultText(alloc, child_id);
+            defer if (result) |text| alloc.free(text);
+            return self.encodeManaged(
                 alloc,
-                child_id,
-            ),
-            .running, .awaiting_approval => null,
-        };
-        defer if (result) |text| alloc.free(text);
-        return self.encodeManaged(alloc, .{
-            .ok = true,
-            .operation_id = operation_id,
-            .child_id = child_id,
-            .status = managedStatus(observation),
-            .result = result,
-        });
+                terminalResult(observation, result),
+            );
+        }
     }
 
     fn managedResultText(
@@ -514,68 +491,111 @@ pub const Runtime = struct {
         return @as(?[]u8, try alloc.dupe(u8, text));
     }
 
-    fn stopManaged(
-        self: *Runtime,
-        alloc: Allocator,
-        child_id: []const u8,
-        operation_id: []const u8,
-    ) !ManagedExecutionResult {
-        self.managed.cancel(child_id) catch |err| switch (err) {
-            error.ChildUnavailable => {
-                var lock = self.managed.state_store.acquireLock(alloc) catch {
-                    return self.encodeManaged(alloc, .{
-                        .ok = false,
-                        .operation_id = operation_id,
-                        .child_id = child_id,
-                        .status = "rejected",
-                        .error_code = "child_unavailable",
-                    });
-                };
-                defer lock.release();
-                var registry = try self.managed.state_store.load(alloc);
-                defer registry.deinit(alloc);
-                const child = registry.findById(child_id) orelse {
-                    return self.encodeManaged(alloc, .{
-                        .ok = false,
-                        .operation_id = operation_id,
-                        .child_id = child_id,
-                        .status = "rejected",
-                        .error_code = "child_unavailable",
-                    });
-                };
-                if (child.active) |active| {
-                    try registry.finish(alloc, child_id, active.id, .cancelled);
-                    try self.managed.state_store.save(alloc, registry);
-                }
-            },
-        };
-        return self.encodeManaged(alloc, .{
-            .ok = true,
-            .operation_id = operation_id,
-            .child_id = child_id,
-            .status = "stopped",
-        });
-    }
-
     fn encodeManaged(
         self: *Runtime,
         alloc: Allocator,
         result: model_contract.Result,
     ) !ManagedExecutionResult {
         _ = self;
-        const projected_child_id = if (result.child_id) |child_id|
-            try model_contract.modelChildIdAlloc(alloc, child_id)
-        else
-            null;
-        defer if (projected_child_id) |child_id| alloc.free(child_id);
-        var projected = result;
-        projected.child_id = projected_child_id;
         return .{
             .success = result.ok,
-            .body = try model_contract.encodeResultAlloc(alloc, projected),
+            .body = try model_contract.encodeResultAlloc(alloc, result),
         };
     }
 };
+
+fn operationIdAlloc(
+    alloc: Allocator,
+    invocation_id: []const u8,
+    epoch: u64,
+) ![]u8 {
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(invocation_id, &digest, .{});
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    return std.fmt.allocPrint(alloc, "fxop:2:m:{d}:{s}", .{ epoch, &hex });
+}
+
+test "internal operation identity is deterministic and invocation-bound" {
+    const alloc = std.testing.allocator;
+    const first = try operationIdAlloc(alloc, "call-1", 41);
+    defer alloc.free(first);
+    const replay = try operationIdAlloc(alloc, "call-1", 41);
+    defer alloc.free(replay);
+    const changed = try operationIdAlloc(alloc, "call-2", 41);
+    defer alloc.free(changed);
+    try std.testing.expectEqualStrings(first, replay);
+    try std.testing.expect(!std.mem.eql(u8, first, changed));
+    try std.testing.expect(std.mem.startsWith(u8, first, "fxop:2:m:41:"));
+}
+
+fn terminalResult(
+    observation: managed_owner.Observation,
+    result: ?[]const u8,
+) model_contract.Result {
+    return switch (observation.outcome orelse return .{
+        .ok = false,
+        .result = result,
+        .error_code = "child_result_unavailable",
+    }) {
+        .completed => if (result != null) .{
+            .ok = true,
+            .result = result,
+        } else .{
+            .ok = false,
+            .error_code = "child_result_unavailable",
+        },
+        .failed => .{
+            .ok = false,
+            .result = result,
+            .error_code = "child_failed",
+        },
+        .cancelled => .{
+            .ok = false,
+            .result = result,
+            .error_code = "child_cancelled",
+        },
+        .interrupted => .{
+            .ok = false,
+            .result = result,
+            .error_code = "child_interrupted",
+        },
+    };
+}
+
+test "terminal result projects every managed outcome without a lifecycle phase" {
+    const completed = terminalResult(.{
+        .phase = .finished,
+        .outcome = .completed,
+    }, "done");
+    try std.testing.expect(completed.ok);
+    try std.testing.expectEqualStrings("done", completed.result.?);
+    try std.testing.expect(completed.error_code == null);
+
+    const cases = [_]struct {
+        outcome: child_state.Outcome,
+        error_code: []const u8,
+    }{
+        .{ .outcome = .failed, .error_code = "child_failed" },
+        .{ .outcome = .cancelled, .error_code = "child_cancelled" },
+        .{ .outcome = .interrupted, .error_code = "child_interrupted" },
+    };
+    for (cases) |case| {
+        const projected = terminalResult(.{
+            .phase = .interrupted,
+            .outcome = case.outcome,
+        }, "partial");
+        try std.testing.expect(!projected.ok);
+        try std.testing.expectEqualStrings("partial", projected.result.?);
+        try std.testing.expectEqualStrings(case.error_code, projected.error_code.?);
+    }
+
+    const missing = terminalResult(.{
+        .phase = .finished,
+        .outcome = .completed,
+    }, null);
+    try std.testing.expect(!missing.ok);
+    try std.testing.expectEqualStrings("child_result_unavailable", missing.error_code.?);
+}
 
 fn managedAdmissionReady(
     alloc: Allocator,
@@ -605,7 +625,6 @@ fn makeManagedWork(
     const message = switch (request) {
         .run => |value| value.task,
         .message => |value| value.message,
-        .wait, .stop => unreachable,
     };
     const id = try alloc.dupe(u8, operation_id);
     errdefer alloc.free(id);
@@ -625,20 +644,6 @@ fn makeManagedWork(
         .root_user_evidence_complete = options.root_user_evidence_complete,
         .permission_mode = options.parent_permission_mode,
         .created_at_ms = options.timestamp_ms,
-    };
-}
-
-fn managedStatus(observation: managed_owner.Observation) []const u8 {
-    return switch (observation.phase) {
-        .running, .awaiting_approval => "running",
-        .idle => "idle",
-        .interrupted => "interrupted",
-        .finished => switch (observation.outcome orelse return "completed") {
-            .completed => "completed",
-            .failed => "failed",
-            .cancelled => "stopped",
-            .interrupted => "interrupted",
-        },
     };
 }
 

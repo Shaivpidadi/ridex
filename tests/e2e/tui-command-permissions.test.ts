@@ -164,15 +164,6 @@ function subagentCreateCall(
   }, toolCallId);
 }
 
-function subagentInspectCall(toolCallId: string, childId: string) {
-  return gatewayToolCall("subagent", {
-    request: {
-      action: "wait",
-      child_id: childId,
-    },
-  }, toolCallId);
-}
-
 function toolCalls(command: string, callIds: string[]) {
   return sse([
     ...callIds.map((toolCallId) => ({
@@ -2699,34 +2690,22 @@ describe("effect-aware command permissions", () => {
       const rootPrompt = "DELEGATE_ONE_APPROVAL_TASK";
       const childPrompt = "Request permission to create the delegated marker.";
       const createId = "direct_child_create";
-      const waitId = "direct_child_wait";
       const commandId = "direct_child_command";
-      let childId = "";
       writeFileSync(stderrPath, "");
 
       const gateway = startDynamicFakeGateway((body) => {
-        if (body.includes(`\"toolCallId\":\"${waitId}\"`)) {
-          expect(toolResultText(body, waitId)).toContain("CHILD_PERMISSION_DENIED");
-          return finalText("PARENT_OBSERVED_CHILD_DENIAL");
-        }
         if (body.includes(`\"toolCallId\":\"${commandId}\"`)) {
           return finalText("CHILD_PERMISSION_DENIED");
         }
         if (body.includes(`\"toolCallId\":\"${createId}\"`)) {
           const created = JSON.parse(toolResultText(body, createId)) as {
-            child_id: string;
-            status: string;
+            ok: boolean;
             result?: string;
           };
-          childId = created.child_id;
-          if (created.status === "completed") {
-            expect(created.result).toContain("CHILD_PERMISSION_DENIED");
-            return finalText("PARENT_OBSERVED_CHILD_DENIAL");
-          }
-          expect(created.status).toBe("running");
-          return gatewayToolCall("subagent", {
-            request: { action: "wait", child_id: childId },
-          }, waitId);
+          expect(created.ok).toBe(true);
+          expect(created.result).toContain("CHILD_PERMISSION_DENIED");
+          expect(toolResultText(body, createId)).not.toContain("child_id");
+          return finalText("PARENT_OBSERVED_CHILD_DENIAL");
         }
         if (currentUserText(body).includes(childPrompt)) {
           expect(body).not.toContain('"name":"subagent"');
@@ -2761,7 +2740,6 @@ describe("effect-aware command permissions", () => {
       expect(existsSync(markerPath)).toBe(false);
       await activeSession.sendKeys("3");
       await activeSession.waitForText("PARENT_OBSERVED_CHILD_DENIAL", TIMEOUT);
-      expect(childId.length).toBeGreaterThan(0);
       expect(existsSync(markerPath)).toBe(false);
       await activeSession.sendText("/quit");
       expect(await activeSession.waitForSessionEnd(5_000)).toBe(true);

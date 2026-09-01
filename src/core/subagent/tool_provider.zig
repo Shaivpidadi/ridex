@@ -15,12 +15,14 @@ pub const Result = struct {
     body: []u8,
 };
 
+pub const ExecuteError = Allocator.Error || error{Cancelled};
+
 pub const ExecuteFn = *const fn (
     ?*anyopaque,
     Allocator,
     *model_contract.Request,
     []const u8,
-) Allocator.Error!Result;
+) ExecuteError!Result;
 
 /// Host-facing executor for one validated registered subagent request. The
 /// caller retains request ownership; the provider may inspect it during the
@@ -34,7 +36,7 @@ pub const Provider = struct {
         alloc: Allocator,
         request: *model_contract.Request,
         invocation_id: []const u8,
-    ) Allocator.Error!Result {
+    ) ExecuteError!Result {
         return self.execute_fn(
             self.context,
             alloc,
@@ -55,7 +57,7 @@ test "provider forwards the validated managed request and invocation identity" {
             alloc: Allocator,
             request: *model_contract.Request,
             invocation_id: []const u8,
-        ) Allocator.Error!Result {
+        ) ExecuteError!Result {
             const self: *@This() = @ptrCast(@alignCast(raw_context.?));
             self.calls += 1;
             self.request = request;
@@ -68,8 +70,8 @@ test "provider forwards the validated managed request and invocation identity" {
     };
 
     var fixture = Fixture{};
-    var request = model_contract.Request{ .stop = .{
-        .child_id = @constCast("child-1"),
+    var request = model_contract.Request{ .run = .{
+        .task = @constCast("review this"),
     } };
     const provider = Provider{
         .context = &fixture,

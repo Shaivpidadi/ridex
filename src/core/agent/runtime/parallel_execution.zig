@@ -36,6 +36,36 @@ pub fn parallelReadOnlyPrefixLen(registry: tool_dispatch.Registry, calls: []cons
     return len;
 }
 
+fn isSubagentCall(registry: tool_dispatch.Registry, call: ToolCall) bool {
+    if (call.provider_result != null) return false;
+    const tool = registry.lookup(call.name) orelse return false;
+    return tool.executor_kind == .subagent and tool.activity_kind == .subagent;
+}
+
+fn parallelSubagentPrefixLen(registry: tool_dispatch.Registry, calls: []const ToolCall) usize {
+    var len: usize = 0;
+    while (len < calls.len and isSubagentCall(registry, calls[len])) : (len += 1) {}
+    return len;
+}
+
+pub const GroupKind = enum { none, read_only, subagent };
+
+pub const LeadingGroup = struct {
+    kind: GroupKind = .none,
+    len: usize = 0,
+};
+
+pub fn leadingParallelGroup(
+    registry: tool_dispatch.Registry,
+    calls: []const ToolCall,
+) LeadingGroup {
+    const read_only_len = parallelReadOnlyPrefixLen(registry, calls);
+    if (read_only_len > 0) return .{ .kind = .read_only, .len = read_only_len };
+    const subagent_len = parallelSubagentPrefixLen(registry, calls);
+    if (subagent_len > 0) return .{ .kind = .subagent, .len = subagent_len };
+    return .{};
+}
+
 pub const ParallelToolResult = struct {
     call_id: []const u8,
     tool_name: []const u8,
@@ -94,7 +124,7 @@ const ParallelWorkerSlot = struct {
     owner_cancelled_at_error: bool = false,
 };
 
-pub fn runSequentialReadOnlyCalls(
+pub fn runSequentialCalls(
     alloc: Allocator,
     calls: []const ToolCall,
     options: ParallelRunOptions,
@@ -136,7 +166,7 @@ pub fn runSequentialReadOnlyCalls(
     return .{ .attempts = attempts, .first_cancelled_index = first_cancelled_index };
 }
 
-pub fn runParallelReadOnlyCalls(
+pub fn runParallelCalls(
     alloc: Allocator,
     calls: []const ToolCall,
     options: ParallelRunOptions,
@@ -287,7 +317,7 @@ fn duplicateParallelToolResult(alloc: Allocator, call: ToolCall, execution: Tool
             .tool_name = tool_name,
             .execution = .{
                 .status = .failure,
-                .model_output = try alloc.dupe(u8, "Parallel read-only tool returned an unsupported side-effect payload."),
+                .model_output = try alloc.dupe(u8, "Parallel tool returned an unsupported side-effect payload."),
             },
         };
     }
@@ -421,12 +451,12 @@ const ParallelTestFixture = struct {
     max_in_flight: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
 };
 
-fn runParallelReadOnlyCallsForTest(
+fn runParallelCallsForTest(
     alloc: Allocator,
     calls: []const ToolCall,
     fixture: *ParallelTestFixture,
 ) Allocator.Error!ParallelRunResult {
-    return runParallelReadOnlyCalls(alloc, calls, .{
+    return runParallelCalls(alloc, calls, .{
         .exec_ctx = fixture,
         .execute = parallelTestExecute,
         .format_ctx = fixture,
@@ -503,6 +533,24 @@ test "parallel classifier keeps only a leading safe read-only group" {
     try std.testing.expect(!isReadOnlyCall(registry, calls[2]));
 }
 
+test "parallel classifier keeps one leading registered subagent group" {
+    const builtin_tools = @import("../../../builtins/tools.zig");
+    const tools = [_]tool_dispatch.Tool{
+        builtin_tools.subagent,
+        builtin_tools.read_file,
+    };
+    const registry = tool_dispatch.Registry{ .tools = &tools };
+    const calls = [_]ToolCall{
+        toolCall("child_1", "subagent", "{\"request\":{\"action\":\"run\",\"task\":\"first\"}}"),
+        toolCall("child_2", "subagent", "{\"request\":{\"action\":\"run\",\"task\":\"second\"}}"),
+        toolCall("read_1", "read_file", "{\"path\":\"README.md\"}"),
+    };
+
+    const group = leadingParallelGroup(registry, &calls);
+    try std.testing.expectEqual(GroupKind.subagent, group.kind);
+    try std.testing.expectEqual(@as(usize, 2), group.len);
+}
+
 test "parallel classifier admits approval-bearing web fetch read groups" {
     const builtin_tools = @import("../../../builtins/tools.zig");
     const tools = [_]tool_dispatch.Tool{
@@ -576,7 +624,7 @@ test "parallel read-only execution preserves order and failure fan-in" {
     };
     var fixture = ParallelTestFixture{ .plans = &plans };
 
-    var run = try runParallelReadOnlyCallsForTest(alloc, &calls, &fixture);
+    var run = try runParallelCallsForTest(alloc, &calls, &fixture);
     defer run.deinit(alloc);
 
     try std.testing.expectEqual(@as(usize, 3), run.attempts.len);
@@ -605,7 +653,7 @@ test "parallel read-only execution preserves exact cancelled identity and comple
     };
     var fixture = ParallelTestFixture{ .plans = &plans };
 
-    var run = try runParallelReadOnlyCallsForTest(alloc, &calls, &fixture);
+    var run = try runParallelCallsForTest(alloc, &calls, &fixture);
     defer run.deinit(alloc);
 
     try std.testing.expect(fixture.cancel_flag.load(.seq_cst));
@@ -629,7 +677,7 @@ test "parallel workers start no execution when owner cancellation is already set
     var fixture = ParallelTestFixture{ .plans = &plans };
     fixture.cancel_flag.store(true, .seq_cst);
 
-    var run = try runParallelReadOnlyCallsForTest(alloc, &calls, &fixture);
+    var run = try runParallelCallsForTest(alloc, &calls, &fixture);
     defer run.deinit(alloc);
 
     try std.testing.expectEqual(@as(?usize, 0), run.first_cancelled_index);
@@ -652,7 +700,7 @@ test "parallel read-only execution does not relabel earlier ordinary cancellatio
     };
     var fixture = ParallelTestFixture{ .plans = &plans };
 
-    var run = try runParallelReadOnlyCallsForTest(alloc, &calls, &fixture);
+    var run = try runParallelCallsForTest(alloc, &calls, &fixture);
     defer run.deinit(alloc);
 
     try std.testing.expect(fixture.cancel_flag.load(.seq_cst));
@@ -685,7 +733,7 @@ test "parallel read-only execution reports no active call when cancellation foll
     };
     var fixture = ParallelTestFixture{ .plans = &plans };
 
-    var run = try runParallelReadOnlyCallsForTest(alloc, &calls, &fixture);
+    var run = try runParallelCallsForTest(alloc, &calls, &fixture);
     defer run.deinit(alloc);
 
     try std.testing.expect(fixture.cancel_flag.load(.seq_cst));

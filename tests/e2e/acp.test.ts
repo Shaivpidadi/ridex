@@ -6839,6 +6839,79 @@ describe("acp: model-independent", () => {
   );
 
   test(
+    "ACP cancellation interrupts terminal subagent waiting and keeps the server usable",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-subagent-cancel-");
+      const childPrompt = "Remain active until the parent ACP prompt is cancelled.";
+      const heldChild = deferred<Response>();
+      const gateway = startFakeGateway([
+        fakeGatewayToolCall("acp_cancel_child", "subagent", {
+          request: { action: "run", task: childPrompt },
+        }),
+        () => heldChild.promise,
+        finalText("ACP_SUBAGENT_CANCEL_FOLLOWUP_OK"),
+      ]);
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        await startCodeSession(client);
+
+        const promptId = 6810;
+        const cancelId = 6811;
+        sendPrompt(client, promptId, "Start the cancellable subagent fixture.");
+        await waitForCondition(
+          "the held subagent request",
+          () => gateway.requests.length === 2,
+          TIMEOUT,
+        );
+        client.send({
+          jsonrpc: "2.0",
+          id: cancelId,
+          method: "session/cancel",
+          params: {},
+        });
+
+        const responses = new Map<number, any>();
+        const deadline = Date.now() + 3_000;
+        while (responses.size < 2 && Date.now() < deadline) {
+          let message: any;
+          try {
+            message = await client.readLine(
+              Math.max(100, deadline - Date.now()),
+            );
+          } catch (err) {
+            if (err instanceof AcpReadTimeoutError) break;
+            throw err;
+          }
+          if (message.id === promptId || message.id === cancelId) {
+            responses.set(message.id, message);
+          }
+        }
+        expect(responses.get(cancelId)?.result).toBeNull();
+        expect(responses.get(promptId)?.result?.stopReason).toBe("cancelled");
+
+        heldChild.resolve(finalText("late child completion"));
+        const followUp = await runPrompt(
+          client,
+          "Confirm the ACP server remains usable after child cancellation.",
+          TIMEOUT,
+        );
+        expect(followUp.promptResult.result.stopReason).toBe("end_turn");
+        expect(JSON.stringify(followUp)).toContain("ACP_SUBAGENT_CANCEL_FOLLOWUP_OK");
+        expect(client.stderr).toBe("");
+      } finally {
+        heldChild.resolve(finalText("late child cleanup"));
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "ACP allow-once command approval executes with shared authority",
     async () => {
       const root = createIsolatedRoot("fx-acp-command-approval-");
