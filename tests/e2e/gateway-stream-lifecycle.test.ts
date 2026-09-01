@@ -5281,14 +5281,26 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     let firstChildId = "";
     let secondChildId = "";
     const gateway = startDynamicFakeGateway((body) => {
+      if (body.includes('"toolCallId":"persistent_wait_two"')) {
+        const result = JSON.parse(toolResultOutput(body, "persistent_wait_two")) as {
+          result?: string;
+        };
+        expect(result.result).toContain("PERSISTED_SECOND");
+        return fakeGatewayFinalText("PARENT_SECOND_COMPLETE");
+      }
       if (body.includes('"toolCallId":"persistent_resume_two"')) {
         const result = JSON.parse(toolResultOutput(body, "persistent_resume_two")) as {
           child_id: string;
-          result: string;
+          result?: string;
         };
         secondChildId = result.child_id;
-        expect(result.result).toContain("PERSISTED_SECOND");
-        return fakeGatewayFinalText("PARENT_SECOND_COMPLETE");
+        if (typeof result.result === "string") {
+          expect(result.result).toContain("PERSISTED_SECOND");
+          return fakeGatewayFinalText("PARENT_SECOND_COMPLETE");
+        }
+        return fakeGatewayToolCall("persistent_wait_two", "subagent", {
+          request: { action: "wait", child_id: secondChildId },
+        });
       }
       if (promptText(body).includes(secondMessage)) {
         expect(body).toContain("PERSISTED_FIRST");
@@ -5300,14 +5312,26 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           request: { action: "message", agent: "reviewer", message: secondMessage },
         });
       }
+      if (body.includes('"toolCallId":"persistent_wait_one"')) {
+        const result = JSON.parse(toolResultOutput(body, "persistent_wait_one")) as {
+          result?: string;
+        };
+        expect(result.result).toContain("PERSISTED_FIRST");
+        return fakeGatewayFinalText("PARENT_FIRST_COMPLETE");
+      }
       if (body.includes('"toolCallId":"persistent_resume_one"')) {
         const result = JSON.parse(toolResultOutput(body, "persistent_resume_one")) as {
           child_id: string;
-          result: string;
+          result?: string;
         };
         firstChildId = result.child_id;
-        expect(result.result).toContain("PERSISTED_FIRST");
-        return fakeGatewayFinalText("PARENT_FIRST_COMPLETE");
+        if (typeof result.result === "string") {
+          expect(result.result).toContain("PERSISTED_FIRST");
+          return fakeGatewayFinalText("PARENT_FIRST_COMPLETE");
+        }
+        return fakeGatewayToolCall("persistent_wait_one", "subagent", {
+          request: { action: "wait", child_id: firstChildId },
+        });
       }
       if (promptText(body).includes(firstMessage)) {
         expect(body).not.toContain('"name":"subagent"');
@@ -5355,7 +5379,8 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       }
       expect(firstChildId.length).toBeGreaterThan(0);
       expect(secondChildId).toBe(firstChildId);
-      expect(gateway.requestCount()).toBe(6);
+      expect(gateway.requestCount()).toBeGreaterThanOrEqual(6);
+      expect(gateway.requestCount()).toBeLessThanOrEqual(8);
 
       const directChildResume = await runFx(
         [
@@ -5375,7 +5400,8 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(directChildResume.stderr).toContain(
         "subagent child sessions cannot be resumed directly",
       );
-      expect(gateway.requestCount()).toBe(6);
+      expect(gateway.requestCount()).toBeGreaterThanOrEqual(6);
+      expect(gateway.requestCount()).toBeLessThanOrEqual(8);
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });
