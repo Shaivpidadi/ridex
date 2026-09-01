@@ -5138,22 +5138,21 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   }, 30_000);
 
-  test("ask fake Gateway exercises one-off and configured persistent subagents", async () => {
+  test("ask fake Gateway exercises one-off and chat-created persistent subagents", async () => {
     const root = createFixtureRoot("subagent-managed-flow");
     const tracePath = join(root.root, "trace.log");
     const firstTask = "Reply exactly CHILD_ONE without using tools.";
+    const persistentInstructions = "Keep the persistent reviewer role across messages.";
+    const replacementInstructions = "Use the replacement reviewer role only.";
+    const testerInstructions = "Keep an independent tester role.";
     const persistentFirst = "Reply exactly PERSIST_ONE without using tools.";
     const persistentSecond = "Reply exactly PERSIST_TWO without using tools.";
+    const persistentThird = "Reply exactly PERSIST_THREE without using tools.";
+    const testerFirst = "Reply exactly TESTER_ONE without using tools.";
     const longTask = "Run a 30-second shell sleep before replying LONG_DONE.";
     let persistentChildId = "";
+    let testerChildId = "";
     let longChildId = "";
-    const agentsDir = join(root.home, ".fx", "agents");
-    mkdirSync(agentsDir, { recursive: true });
-    writeFileSync(join(agentsDir, "reviewer.json"), JSON.stringify({
-      description: "Reviews delegated work.",
-      instructions: "Follow the parent message exactly.",
-    }));
-
     const gateway = startDynamicFakeGateway((body) => {
       if (hasCurrentToolResult(body, "managed_stop_long")) {
         expect(toolResultOutput(body, "managed_stop_long")).toContain('"status":"stopped"');
@@ -5169,6 +5168,38 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           request: { action: "stop", child_id: longChildId },
         });
       }
+      if (hasCurrentToolResult(body, "managed_message_three")) {
+        const result = JSON.parse(toolResultOutput(body, "managed_message_three")) as {
+          child_id: string;
+          status: string;
+          result: string;
+        };
+        expect(result.child_id).toBe(persistentChildId);
+        expect(result.status).toBe("idle");
+        expect(result.result).toContain("PERSIST_THREE");
+        return fakeGatewayToolCall("managed_run_long_1", "subagent", {
+          request: { action: "run", task: longTask },
+        });
+      }
+      if (hasCurrentToolResult(body, "managed_tester_one")) {
+        const result = JSON.parse(toolResultOutput(body, "managed_tester_one")) as {
+          child_id: string;
+          status: string;
+          result: string;
+        };
+        testerChildId = result.child_id;
+        expect(result.status).toBe("idle");
+        expect(result.result).toContain("TESTER_ONE");
+        expect(testerChildId).not.toBe(persistentChildId);
+        return fakeGatewayToolCall("managed_message_three", "subagent", {
+          request: {
+            action: "message",
+            agent: "reviewer",
+            instructions: replacementInstructions,
+            message: persistentThird,
+          },
+        });
+      }
       if (hasCurrentToolResult(body, "managed_message_two")) {
         const result = JSON.parse(toolResultOutput(body, "managed_message_two")) as {
           child_id: string;
@@ -5178,8 +5209,13 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         expect(result.child_id).toBe(persistentChildId);
         expect(result.status).toBe("idle");
         expect(result.result).toContain("PERSIST_TWO");
-        return fakeGatewayToolCall("managed_run_long_1", "subagent", {
-          request: { action: "run", task: longTask },
+        return fakeGatewayToolCall("managed_tester_one", "subagent", {
+          request: {
+            action: "message",
+            agent: "tester",
+            instructions: testerInstructions,
+            message: testerFirst,
+          },
         });
       }
       if (hasCurrentToolResult(body, "managed_message_one")) {
@@ -5210,13 +5246,32 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           request: {
             action: "message",
             agent: "reviewer",
+            instructions: persistentInstructions,
             message: persistentFirst,
           },
         });
       }
       if (body.includes(longTask)) return delayedSuccessfulResponse();
-      if (body.includes(persistentSecond)) return fakeGatewayFinalText("PERSIST_TWO");
-      if (body.includes(persistentFirst)) return fakeGatewayFinalText("PERSIST_ONE");
+      if (body.includes(persistentThird)) {
+        expect(body).toContain(replacementInstructions);
+        expect(body).not.toContain(persistentInstructions);
+        expect(body).not.toContain(testerInstructions);
+        return fakeGatewayFinalText("PERSIST_THREE");
+      }
+      if (body.includes(testerFirst)) {
+        expect(body).toContain(testerInstructions);
+        expect(body).not.toContain(persistentInstructions);
+        expect(body).not.toContain(replacementInstructions);
+        return fakeGatewayFinalText("TESTER_ONE");
+      }
+      if (body.includes(persistentSecond)) {
+        expect(body).toContain(persistentInstructions);
+        return fakeGatewayFinalText("PERSIST_TWO");
+      }
+      if (body.includes(persistentFirst)) {
+        expect(body).toContain(persistentInstructions);
+        return fakeGatewayFinalText("PERSIST_ONE");
+      }
       if (body.includes(firstTask)) return fakeGatewayFinalText("CHILD_ONE");
       return fakeGatewayToolCall("managed_run_one_1", "subagent", {
         request: { action: "run", task: firstTask },
@@ -5247,35 +5302,23 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         "MANAGED_SUBAGENT_OK",
       );
       expect(persistentChildId.length).toBeGreaterThan(0);
+      expect(testerChildId.length).toBeGreaterThan(0);
       expect(longChildId.length).toBeGreaterThan(0);
+      expect(testerChildId).not.toBe(persistentChildId);
+      expect(testerChildId).not.toBe(longChildId);
       expect(persistentChildId).not.toBe(longChildId);
+      expect(existsSync(join(root.home, ".fx", "agents"))).toBe(false);
       expect(persistentChildId.split("-")[1]).toHaveLength(6);
       expect(longChildId.split("-")[1]).toHaveLength(6);
-      for (const request of gateway.requests) {
-        const childRequest = !request.body.includes("<persistent_agents>");
-        if (childRequest) {
-          expect(request.body).not.toContain('"name":"subagent"');
-        } else {
-          expect(request.body).toContain('"name":"subagent"');
-        }
-        expect(request.body).not.toContain('"command":{"create"');
-        expect(request.body).not.toContain('"operation_id"');
-        expect(request.body).not.toContain("<subagent_deliveries");
-      }
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });
     }
   }, 45_000);
-  test("saved ask resume continues one configured persistent child", async () => {
+  test("saved ask resume continues one chat-created persistent child", async () => {
     const root = createFixtureRoot("subagent-persistent-resume");
     const tracePath = join(root.root, "trace.log");
-    const agentsDir = join(root.home, ".fx", "agents");
-    mkdirSync(agentsDir, { recursive: true });
-    writeFileSync(join(agentsDir, "reviewer.json"), JSON.stringify({
-      description: "Reviews delegated work.",
-      instructions: "Remember earlier turns and answer exactly as requested.",
-    }));
+    const persistentInstructions = "Remember earlier turns and answer exactly as requested.";
     const firstMessage = "Reply exactly PERSISTED_FIRST.";
     const secondMessage = "Reply exactly PERSISTED_SECOND.";
     let firstChildId = "";
@@ -5304,6 +5347,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       }
       if (promptText(body).includes(secondMessage)) {
         expect(body).toContain("PERSISTED_FIRST");
+        expect(body).toContain(persistentInstructions);
         expect(body).not.toContain('"name":"subagent"');
         return fakeGatewayFinalText("PERSISTED_SECOND");
       }
@@ -5334,11 +5378,17 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         });
       }
       if (promptText(body).includes(firstMessage)) {
+        expect(body).toContain(persistentInstructions);
         expect(body).not.toContain('"name":"subagent"');
         return fakeGatewayFinalText("PERSISTED_FIRST");
       }
       return fakeGatewayToolCall("persistent_resume_one", "subagent", {
-        request: { action: "message", agent: "reviewer", message: firstMessage },
+        request: {
+          action: "message",
+          agent: "reviewer",
+          instructions: persistentInstructions,
+          message: firstMessage,
+        },
       });
     }, {
       classifierDecision: "clear",

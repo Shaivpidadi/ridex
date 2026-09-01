@@ -266,7 +266,11 @@ fn runOne(slot: *Slot) OneOutcome {
     slot.worker = turn.workerRuntime();
     owner.mutex.unlock(io_mod.getIo());
 
-    var message = snapshot.active.queuedMessage(owner.alloc, owner.state_store.parent_id) catch
+    var message = snapshot.active.queuedMessage(
+        owner.alloc,
+        owner.state_store.parent_id,
+        snapshot.instructions,
+    ) catch
         return .{ .work_id = work_id, .outcome = .failed };
     defer message.deinit(owner.alloc);
     const admission = owner.services.capture(owner.alloc, .{
@@ -317,11 +321,11 @@ fn runOne(slot: *Slot) OneOutcome {
 
 const RunSnapshot = struct {
     active: child_state.ActiveWork,
-    definition: ?child_state.DefinitionSnapshot,
+    instructions: []u8,
 
     fn deinit(self: *RunSnapshot, alloc: Allocator) void {
         self.active.deinit(alloc);
-        if (self.definition) |*definition| definition.deinit(alloc);
+        if (self.instructions.len > 0) alloc.free(self.instructions);
         self.* = undefined;
     }
 };
@@ -333,9 +337,18 @@ fn loadRunSnapshot(owner: *Owner, child_id: []const u8) !RunSnapshot {
     defer registry.deinit(owner.alloc);
     const child = registry.findById(child_id) orelse return error.ChildUnavailable;
     const active = child.active orelse return error.ChildUnavailable;
+    const owned_active = try active.clone(owner.alloc);
+    errdefer {
+        var value = owned_active;
+        value.deinit(owner.alloc);
+    }
+    const instructions: []u8 = if (child.instructions().len == 0)
+        &.{}
+    else
+        try owner.alloc.dupe(u8, child.instructions());
     return .{
-        .active = try active.clone(owner.alloc),
-        .definition = if (child.definition) |definition| try definition.clone(owner.alloc) else null,
+        .active = owned_active,
+        .instructions = instructions,
     };
 }
 

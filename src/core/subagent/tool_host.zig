@@ -1,5 +1,4 @@
 const std = @import("std");
-const agent_config = @import("agent_config.zig");
 const approval_registry = @import("approval_registry.zig");
 const authority = @import("authority.zig");
 const child_state = @import("child_state.zig");
@@ -86,8 +85,6 @@ pub const Runtime = struct {
     root_id: []u8,
     host_authority: authority.HostResolver,
     child_runner: ChildRunner,
-    agent_catalog: agent_config.Catalog,
-    agent_guidance: []u8,
     approvals: approval_registry.Registry,
     authority_resolver: authority.Resolver,
     managed: managed_owner.Owner,
@@ -105,18 +102,12 @@ pub const Runtime = struct {
         errdefer alloc.destroy(runtime);
         const owned_root = try alloc.dupe(u8, root_id);
         errdefer alloc.free(owned_root);
-        var catalog = try agent_config.loadFromHome(alloc, sessions.home_dir);
-        errdefer catalog.deinit(alloc);
-        const guidance = try catalog.promptSectionAlloc(alloc);
-        errdefer alloc.free(guidance);
         runtime.* = .{
             .alloc = alloc,
             .sessions = sessions,
             .root_id = owned_root,
             .host_authority = host_authority,
             .child_runner = child_runner,
-            .agent_catalog = catalog,
-            .agent_guidance = guidance,
             .approvals = undefined,
             .authority_resolver = undefined,
             .managed = undefined,
@@ -142,8 +133,6 @@ pub const Runtime = struct {
     pub fn deinit(self: *Runtime) void {
         self.managed.deinit();
         self.approvals.deinit();
-        self.agent_catalog.deinit(self.alloc);
-        self.alloc.free(self.agent_guidance);
         self.alloc.free(self.root_id);
         const alloc = self.alloc;
         self.* = undefined;
@@ -176,10 +165,6 @@ pub const Runtime = struct {
 
     pub fn recoveryState(self: *const Runtime) RecoveryState {
         return self.recovery_state.load(.acquire);
-    }
-
-    pub fn agentGuidance(self: *const Runtime) []const u8 {
-        return self.agent_guidance;
     }
 
     pub fn pendingApprovalRequest(
@@ -382,7 +367,7 @@ pub const Runtime = struct {
                 defer alloc.free(child_id);
                 try registry.appendOneOff(alloc, child_id, active);
                 try self.managed.state_store.save(alloc, registry);
-                try self.ensureManagedChildSession(alloc, child_id, null, options.defaults);
+                try self.ensureManagedChildSession(alloc, child_id, options.defaults);
                 return managedAdmissionReady(
                     alloc,
                     registry.children[registry.children.len - 1].id,
@@ -406,26 +391,25 @@ pub const Runtime = struct {
                     const started = try registry.startPersistentWork(
                         alloc,
                         message.agent,
+                        message.instructions,
                         active,
                     );
                     try self.managed.state_store.save(alloc, registry);
                     return managedAdmissionReady(alloc, started.id);
                 }
-                const definition = self.agent_catalog.find(message.agent) orelse
-                    return managedAdmissionRejected(alloc, null, "unknown_agent");
                 const child_id = try session_store.generateSessionId(alloc);
                 defer alloc.free(child_id);
                 try registry.appendPersistent(
                     alloc,
                     child_id,
-                    definition.*,
+                    message.agent,
+                    message.instructions orelse "",
                     active,
                 );
                 try self.managed.state_store.save(alloc, registry);
                 try self.ensureManagedChildSession(
                     alloc,
                     child_id,
-                    definition,
                     options.defaults,
                 );
                 return managedAdmissionReady(
@@ -441,14 +425,12 @@ pub const Runtime = struct {
         self: *Runtime,
         alloc: Allocator,
         child_id: []const u8,
-        definition: ?*const agent_config.Definition,
         defaults: Defaults,
     ) !void {
         var state = try freshChildState(
             alloc,
             child_id,
             self.sessions.workspace_root,
-            definition,
             defaults,
         );
         defer state.deinit(alloc);
@@ -669,7 +651,6 @@ fn freshChildState(
     alloc: Allocator,
     child_id: []const u8,
     workspace_root: []const u8,
-    definition: ?*const agent_config.Definition,
     defaults: Defaults,
 ) !session_codec.DurableSessionState {
     const now = io_mod.milliTimestamp();
@@ -679,10 +660,7 @@ fn freshChildState(
     errdefer alloc.free(origin);
     const workspace = try alloc.dupe(u8, workspace_root);
     errdefer alloc.free(workspace);
-    const model = try alloc.dupe(
-        u8,
-        if (definition) |value| value.model orelse defaults.model else defaults.model,
-    );
+    const model = try alloc.dupe(u8, defaults.model);
     errdefer alloc.free(model);
     return .{
         .id = id,
@@ -694,7 +672,7 @@ fn freshChildState(
         .preferences = .{
             .provider = defaults.provider,
             .model = model,
-            .effort = if (definition) |value| value.effort orelse defaults.effort else defaults.effort,
+            .effort = defaults.effort,
             .fast_mode = defaults.fast_mode,
         },
         .history = try alloc.alloc(types.HistoryTurn, 0),

@@ -186,7 +186,7 @@ const ask_user_question_question_schema = model_tool_schema.ObjectSchema{
 };
 
 const subagent_description =
-    "Delegate work without managing child lifecycle. Use run for one temporary child and one task. Use message with an exact configured agent name to create or continue that persistent conversation in this parent session. A running response includes a child ID for wait or stop. fx owns creation, resume, observation, permissions, persistence, and cleanup.";
+    "Delegate work without managing child lifecycle. Use run for one temporary child and one task. Use message with a stable name to create or continue a persistent conversation in this parent session. Optional instructions replace only that child's system overlay; fx preserves its trusted base prompt. A running response includes a child ID for wait or stop. fx owns creation, resume, observation, permissions, persistence, and cleanup.";
 
 const subagent_model_run_properties = [_]model_tool_schema.Property{
     .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{"run"} } },
@@ -200,7 +200,8 @@ const subagent_model_wait_properties = [_]model_tool_schema.Property{
 
 const subagent_model_message_properties = [_]model_tool_schema.Property{
     .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{"message"} } },
-    .{ .name = "agent", .json_type = .string, .bounds = &.{ .min_length = 1 }, .description = "Exact configured persistent-agent name shown in the current fx context." },
+    .{ .name = "agent", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = subagent_domain.max_agent_name_bytes }, .description = "Stable lowercase name for one persistent conversation in this parent session. A new valid name creates it; later calls continue it." },
+    .{ .name = "instructions", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = subagent_domain.max_instructions_bytes }, .description = "Optional persistent instructions for this child. When present, replaces its child-specific system overlay before this message; when omitted, preserves the existing overlay. Cannot replace fx's trusted base prompt or widen authority." },
     .{ .name = "message", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = subagent_domain.max_message_bytes }, .description = "Next message for that named agent. fx creates it on first use and continues it afterward." },
 };
 
@@ -924,7 +925,7 @@ test "built-in model-facing tool contract stays byte exact" {
 
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
-        "b8e4297a1f9fc65dcdffca37b9c818c54a08a1a1b873010ebbc8646f53c140e1",
+        "74bc0ffc264251edd05bd0a64ddd8a46a3ff62dcbcf7b404f147d53e7725b6b9",
         &actual_hex,
     );
 }
@@ -1329,12 +1330,13 @@ test "built-in subagent owns product metadata schema and callbacks" {
 
     try std.testing.expectEqualStrings("subagent", subagent.name);
     try std.testing.expect(std.mem.find(u8, subagent.description, "one temporary child") != null);
-    try std.testing.expect(std.mem.find(u8, subagent.description, "configured agent name") != null);
+    try std.testing.expect(std.mem.find(u8, subagent.description, "stable name") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"request\":{") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"required\":[\"request\"]") != null);
     for ([_][]const u8{ "run", "message", "wait", "stop" }) |action| {
         try std.testing.expect(std.mem.find(u8, schema_json, action) != null);
     }
+    try std.testing.expect(std.mem.find(u8, schema_json, "\"instructions\":") != null);
     for ([_][]const u8{
         "\"command\":",
         "\"relationship\":",

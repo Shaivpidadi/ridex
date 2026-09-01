@@ -4092,7 +4092,6 @@ test {
     _ = @import("core/session/web_fetch_artifacts.zig");
     _ = @import("core/skills/skill_runtime.zig");
     _ = @import("core/subagent/domain.zig");
-    _ = @import("core/subagent/agent_config.zig");
     _ = @import("core/subagent/child_state.zig");
     _ = @import("core/subagent/managed_owner.zig");
     _ = @import("core/subagent/tool_result.zig");

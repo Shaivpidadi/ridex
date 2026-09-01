@@ -1,5 +1,4 @@
 const std = @import("std");
-const agent_config = @import("agent_config.zig");
 const domain = @import("domain.zig");
 const io_mod = @import("../shared/io.zig");
 const session_child_store = @import("../session/session_child_store.zig");
@@ -16,36 +15,35 @@ const lock_deadline_ms: u64 = 2_000;
 const max_state_bytes: usize = 512 * 1024;
 pub const max_children: usize = 256;
 
-pub const Kind = enum { one_off, persistent };
-pub const Phase = enum { idle, running, awaiting_approval, interrupted, finished };
-pub const Outcome = enum { completed, failed, cancelled, interrupted };
-
-pub const DefinitionSnapshot = struct {
+const PersistentIdentity = struct {
     agent: []u8,
     instructions: []u8,
-    model: ?[]u8 = null,
-    effort: ?types.ReasoningEffort = null,
 
-    pub fn deinit(self: *DefinitionSnapshot, alloc: Allocator) void {
+    fn deinit(self: *PersistentIdentity, alloc: Allocator) void {
         alloc.free(self.agent);
-        alloc.free(self.instructions);
-        if (self.model) |model| alloc.free(model);
+        if (self.instructions.len > 0) alloc.free(self.instructions);
         self.* = undefined;
     }
 
-    pub fn clone(self: DefinitionSnapshot, alloc: Allocator) !DefinitionSnapshot {
+    fn clone(self: PersistentIdentity, alloc: Allocator) !PersistentIdentity {
         const agent = try alloc.dupe(u8, self.agent);
         errdefer alloc.free(agent);
-        const instructions = try alloc.dupe(u8, self.instructions);
-        errdefer alloc.free(instructions);
         return .{
             .agent = agent,
-            .instructions = instructions,
-            .model = if (self.model) |model| try alloc.dupe(u8, model) else null,
-            .effort = self.effort,
+            .instructions = if (self.instructions.len == 0)
+                &.{}
+            else
+                try alloc.dupe(u8, self.instructions),
         };
     }
 };
+
+pub const Kind = union(enum) {
+    one_off,
+    persistent: PersistentIdentity,
+};
+pub const Phase = enum { idle, running, awaiting_approval, interrupted, finished };
+pub const Outcome = enum { completed, failed, cancelled, interrupted };
 
 pub const ActiveWork = struct {
     id: []u8,
@@ -86,12 +84,31 @@ pub const ActiveWork = struct {
         };
     }
 
-    pub fn queuedMessage(self: ActiveWork, alloc: Allocator, parent_id: []const u8) !domain.QueuedMessage {
+    pub fn queuedMessage(
+        self: ActiveWork,
+        alloc: Allocator,
+        parent_id: []const u8,
+        instructions: []const u8,
+    ) !domain.QueuedMessage {
+        const id = try alloc.dupe(u8, self.id);
+        errdefer alloc.free(id);
+        const source_id = try alloc.dupe(u8, parent_id);
+        errdefer alloc.free(source_id);
+        const content = try alloc.dupe(u8, self.message);
+        errdefer alloc.free(content);
+        const overlay: []u8 = if (instructions.len == 0)
+            &.{}
+        else
+            try alloc.dupe(u8, instructions);
+        errdefer if (overlay.len > 0) alloc.free(overlay);
+        const root_context = try alloc.dupe(u8, self.root_user_intent_context);
+        errdefer if (root_context.len > 0) alloc.free(root_context);
         return .{
-            .id = try alloc.dupe(u8, self.id),
-            .source_id = try alloc.dupe(u8, parent_id),
-            .content = try alloc.dupe(u8, self.message),
-            .root_user_intent_context = try alloc.dupe(u8, self.root_user_intent_context),
+            .id = id,
+            .source_id = source_id,
+            .content = content,
+            .system_prompt_overlay = overlay,
+            .root_user_intent_context = root_context,
             .root_user_messages = try cloneStrings(alloc, self.root_user_messages),
             .root_user_evidence_complete = self.root_user_evidence_complete,
             .created_at_ms = self.created_at_ms,
@@ -102,7 +119,6 @@ pub const ActiveWork = struct {
 pub const Child = struct {
     id: []u8,
     kind: Kind,
-    definition: ?DefinitionSnapshot = null,
     phase: Phase,
     work_generation: u64 = 0,
     active: ?ActiveWork = null,
@@ -112,7 +128,10 @@ pub const Child = struct {
 
     pub fn deinit(self: *Child, alloc: Allocator) void {
         alloc.free(self.id);
-        if (self.definition) |*definition| definition.deinit(alloc);
+        switch (self.kind) {
+            .one_off => {},
+            .persistent => |*persistent| persistent.deinit(alloc),
+        }
         if (self.active) |*active| active.deinit(alloc);
         if (self.last_work_id) |id| alloc.free(id);
         self.* = undefined;
@@ -121,14 +140,19 @@ pub const Child = struct {
     fn clone(self: Child, alloc: Allocator) !Child {
         const id = try alloc.dupe(u8, self.id);
         errdefer alloc.free(id);
-        var definition = if (self.definition) |value| try value.clone(alloc) else null;
-        errdefer if (definition) |*value| value.deinit(alloc);
+        var kind = switch (self.kind) {
+            .one_off => Kind.one_off,
+            .persistent => |persistent| Kind{ .persistent = try persistent.clone(alloc) },
+        };
+        errdefer switch (kind) {
+            .one_off => {},
+            .persistent => |*persistent| persistent.deinit(alloc),
+        };
         var active = if (self.active) |value| try value.clone(alloc) else null;
         errdefer if (active) |*value| value.deinit(alloc);
         return .{
             .id = id,
-            .kind = self.kind,
-            .definition = definition,
+            .kind = kind,
             .phase = self.phase,
             .work_generation = self.work_generation,
             .active = active,
@@ -139,7 +163,17 @@ pub const Child = struct {
     }
 
     pub fn agentName(self: Child) ?[]const u8 {
-        return if (self.definition) |definition| definition.agent else null;
+        return switch (self.kind) {
+            .one_off => null,
+            .persistent => |persistent| persistent.agent,
+        };
+    }
+
+    pub fn instructions(self: Child) []const u8 {
+        return switch (self.kind) {
+            .one_off => "",
+            .persistent => |persistent| persistent.instructions,
+        };
     }
 };
 
@@ -189,10 +223,8 @@ pub const Registry = struct {
 
     pub fn findPersistent(self: *Registry, agent: []const u8) ?*Child {
         for (self.children) |*child| {
-            if (child.kind != .persistent) continue;
-            if (child.agentName()) |name| {
-                if (std.mem.eql(u8, name, agent)) return child;
-            }
+            const name = child.agentName() orelse continue;
+            if (std.mem.eql(u8, name, agent)) return child;
         }
         return null;
     }
@@ -245,21 +277,28 @@ pub const Registry = struct {
         self: *Registry,
         alloc: Allocator,
         child_id: []const u8,
-        definition: agent_config.Definition,
+        agent: []const u8,
+        instructions: []const u8,
         active: ActiveWork,
     ) !void {
-        if (self.findPersistent(definition.name) != null) return error.AgentAlreadyExists;
-        var snapshot = DefinitionSnapshot{
-            .agent = try alloc.dupe(u8, definition.name),
-            .instructions = try alloc.dupe(u8, definition.instructions),
-            .model = if (definition.model) |model| try alloc.dupe(u8, model) else null,
-            .effort = definition.effort,
+        if (!domain.validAgentName(agent) or
+            !domain.validInstructions(instructions)) return error.InvalidState;
+        if (self.findPersistent(agent) != null) return error.AgentAlreadyExists;
+        const owned_agent = try alloc.dupe(u8, agent);
+        errdefer alloc.free(owned_agent);
+        const owned_instructions: []u8 = if (instructions.len == 0)
+            &.{}
+        else
+            try alloc.dupe(u8, instructions);
+        errdefer if (owned_instructions.len > 0) alloc.free(owned_instructions);
+        var persistent = PersistentIdentity{
+            .agent = owned_agent,
+            .instructions = owned_instructions,
         };
-        errdefer snapshot.deinit(alloc);
+        errdefer persistent.deinit(alloc);
         try self.appendChild(alloc, .{
             .id = try alloc.dupe(u8, child_id),
-            .kind = .persistent,
-            .definition = snapshot,
+            .kind = .{ .persistent = persistent },
             .phase = .running,
             .work_generation = 1,
             .active = try active.clone(alloc),
@@ -281,16 +320,38 @@ pub const Registry = struct {
         self: *Registry,
         alloc: Allocator,
         agent: []const u8,
+        instructions: ?[]const u8,
         active: ActiveWork,
     ) !*Child {
+        if (instructions) |value| {
+            if (value.len == 0 or !domain.validInstructions(value)) {
+                return error.InvalidState;
+            }
+        }
         const child = self.findPersistent(agent) orelse return error.ChildNotFound;
         switch (child.phase) {
             .idle, .interrupted => {},
             .running, .awaiting_approval => return error.ChildBusy,
             .finished => return error.ChildNotFound,
         }
+        var next_active = try active.clone(alloc);
+        errdefer next_active.deinit(alloc);
+        const next_instructions: ?[]u8 = if (instructions) |value|
+            if (value.len == 0) &.{} else try alloc.dupe(u8, value)
+        else
+            null;
+        errdefer if (next_instructions) |value| {
+            if (value.len > 0) alloc.free(value);
+        };
+        if (instructions != null) switch (child.kind) {
+            .one_off => return error.ChildNotFound,
+            .persistent => |*persistent| {
+                if (persistent.instructions.len > 0) alloc.free(persistent.instructions);
+                persistent.instructions = next_instructions.?;
+            },
+        };
         if (child.active) |*old| old.deinit(alloc);
-        child.active = try active.clone(alloc);
+        child.active = next_active;
         child.phase = .running;
         child.work_generation +|= 1;
         self.generation +|= 1;
@@ -313,7 +374,10 @@ pub const Registry = struct {
         child.last_outcome = outcome;
         child.active.?.deinit(alloc);
         child.active = null;
-        child.phase = if (child.kind == .persistent) .idle else .finished;
+        child.phase = switch (child.kind) {
+            .one_off => .finished,
+            .persistent => .idle,
+        };
         self.generation +|= 1;
     }
 
@@ -489,18 +553,17 @@ fn renderChild(writer: *std.Io.Writer, child: Child) !void {
     try std.json.Stringify.value(child.id, .{}, writer);
     try writer.writeAll(",\"kind\":");
     try std.json.Stringify.value(@tagName(child.kind), .{}, writer);
-    try writer.writeAll(",\"definition\":");
-    if (child.definition) |definition| {
-        try writer.writeAll("{\"agent\":");
-        try std.json.Stringify.value(definition.agent, .{}, writer);
-        try writer.writeAll(",\"instructions\":");
-        try std.json.Stringify.value(definition.instructions, .{}, writer);
-        try writer.writeAll(",\"model\":");
-        try writeOptionalString(writer, definition.model);
-        try writer.writeAll(",\"effort\":");
-        try writeOptionalString(writer, if (definition.effort) |*effort| effort.label() else null);
-        try writer.writeByte('}');
-    } else try writer.writeAll("null");
+    try writer.writeAll(",\"persistent\":");
+    switch (child.kind) {
+        .one_off => try writer.writeAll("null"),
+        .persistent => |persistent| {
+            try writer.writeAll("{\"agent\":");
+            try std.json.Stringify.value(persistent.agent, .{}, writer);
+            try writer.writeAll(",\"instructions\":");
+            try std.json.Stringify.value(persistent.instructions, .{}, writer);
+            try writer.writeByte('}');
+        },
+    }
     try writer.writeAll(",\"phase\":");
     try std.json.Stringify.value(@tagName(child.phase), .{}, writer);
     try writer.print(",\"work_generation\":{d},\"active\":", .{child.work_generation});
@@ -569,16 +632,23 @@ fn parseRegistry(alloc: Allocator, bytes: []const u8, parent_id: []const u8) !Re
 
 fn parseChild(alloc: Allocator, value: std.json.Value) !Child {
     const source = try object(value);
-    try exactFields(source, &.{ "id", "kind", "definition", "phase", "work_generation", "active", "last_work_id", "last_request_fingerprint", "last_outcome" });
+    try exactFields(source, &.{ "id", "kind", "persistent", "phase", "work_generation", "active", "last_work_id", "last_request_fingerprint", "last_outcome" });
     const id_value = try string(source, "id");
     domain.validateId(id_value) catch return error.InvalidState;
-    const kind = std.meta.stringToEnum(Kind, try string(source, "kind")) orelse return error.InvalidState;
+    const kind_name = try string(source, "kind");
     const phase = std.meta.stringToEnum(Phase, try string(source, "phase")) orelse return error.InvalidState;
-    var definition = if (source.get("definition")) |definition_value|
-        if (definition_value == .null) null else try parseDefinition(alloc, definition_value)
+    const persistent_value = source.get("persistent") orelse return error.InvalidState;
+    var kind = if (std.mem.eql(u8, kind_name, "one_off")) blk: {
+        if (persistent_value != .null) return error.InvalidState;
+        break :blk Kind.one_off;
+    } else if (std.mem.eql(u8, kind_name, "persistent"))
+        Kind{ .persistent = try parsePersistent(alloc, persistent_value) }
     else
         return error.InvalidState;
-    errdefer if (definition) |*item| item.deinit(alloc);
+    errdefer switch (kind) {
+        .one_off => {},
+        .persistent => |*persistent| persistent.deinit(alloc),
+    };
     var active = if (source.get("active")) |active_value|
         if (active_value == .null) null else try parseActive(alloc, active_value)
     else
@@ -587,7 +657,6 @@ fn parseChild(alloc: Allocator, value: std.json.Value) !Child {
     return .{
         .id = try alloc.dupe(u8, id_value),
         .kind = kind,
-        .definition = definition,
         .phase = phase,
         .work_generation = try unsigned(source, "work_generation"),
         .active = active,
@@ -603,21 +672,22 @@ fn parseChild(alloc: Allocator, value: std.json.Value) !Child {
     };
 }
 
-fn parseDefinition(alloc: Allocator, value: std.json.Value) !DefinitionSnapshot {
+fn parsePersistent(alloc: Allocator, value: std.json.Value) !PersistentIdentity {
     const source = try object(value);
-    try exactFields(source, &.{ "agent", "instructions", "model", "effort" });
+    try exactFields(source, &.{ "agent", "instructions" });
     const agent = try string(source, "agent");
-    if (!agent_config.validName(agent)) return error.InvalidState;
+    if (!domain.validAgentName(agent)) return error.InvalidState;
     const instructions = try string(source, "instructions");
-    if (instructions.len == 0 or instructions.len > agent_config.max_instructions_bytes) return error.InvalidState;
+    if (!domain.validInstructions(instructions)) return error.InvalidState;
+    const owned_agent = try alloc.dupe(u8, agent);
+    errdefer alloc.free(owned_agent);
+    const owned_instructions: []u8 = if (instructions.len == 0)
+        &.{}
+    else
+        try alloc.dupe(u8, instructions);
     return .{
-        .agent = try alloc.dupe(u8, agent),
-        .instructions = try alloc.dupe(u8, instructions),
-        .model = try optionalStringAlloc(alloc, source, "model"),
-        .effort = if (try optionalString(source, "effort")) |raw|
-            types.ReasoningEffort.parse(raw) orelse return error.InvalidState
-        else
-            null,
+        .agent = owned_agent,
+        .instructions = owned_instructions,
     };
 }
 
@@ -658,7 +728,16 @@ fn parseActive(alloc: Allocator, value: std.json.Value) !ActiveWork {
 
 fn validateRegistry(registry: Registry) !void {
     for (registry.children, 0..) |child, index| {
-        if ((child.kind == .persistent) != (child.definition != null)) return error.InvalidState;
+        switch (child.kind) {
+            .one_off => {},
+            .persistent => |persistent| {
+                if (!domain.validAgentName(persistent.agent) or
+                    !domain.validInstructions(persistent.instructions))
+                {
+                    return error.InvalidState;
+                }
+            },
+        }
         if ((child.phase == .running or child.phase == .awaiting_approval) != (child.active != null)) return error.InvalidState;
         for (registry.children[0..index]) |prior| {
             if (std.mem.eql(u8, prior.id, child.id)) return error.InvalidState;
@@ -749,14 +828,11 @@ test "parent child state round trips only required delegation state" {
         .created_at_ms = 1,
     };
     defer active.deinit(alloc);
-    var definition = try agent_config.parseDefinition(alloc, "reviewer",
-        \\{"description":"Reviews.","instructions":"Review carefully."}
-    );
-    defer definition.deinit(alloc);
     try registry.appendPersistent(
         alloc,
         "01J00000000000000000000001",
-        definition,
+        "reviewer",
+        "Review carefully.",
         active,
     );
     const encoded = try renderRegistry(alloc, registry);
@@ -768,6 +844,7 @@ test "parent child state round trips only required delegation state" {
     defer decoded.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), decoded.children.len);
     try std.testing.expectEqualStrings("reviewer", decoded.children[0].agentName().?);
+    try std.testing.expectEqualStrings("Review carefully.", decoded.children[0].instructions());
     try std.testing.expectEqual(Phase.running, decoded.children[0].phase);
 }
 
@@ -781,14 +858,25 @@ test "persistent state derives create continue busy and terminal transitions" {
         .created_at_ms = 1,
     };
     defer first.deinit(alloc);
-    var definition = try agent_config.parseDefinition(alloc, "reviewer",
-        \\{"description":"Reviews.","instructions":"Review carefully."}
+    try registry.appendPersistent(
+        alloc,
+        "01J00000000000000000000001",
+        "reviewer",
+        "Review carefully.",
+        first,
     );
-    defer definition.deinit(alloc);
-    try registry.appendPersistent(alloc, "01J00000000000000000000001", definition, first);
     try std.testing.expectError(
         error.ChildBusy,
-        registry.startPersistentWork(alloc, "reviewer", first),
+        registry.startPersistentWork(
+            alloc,
+            "reviewer",
+            "Must not replace while busy.",
+            first,
+        ),
+    );
+    try std.testing.expectEqualStrings(
+        "Review carefully.",
+        registry.children[0].instructions(),
     );
     try registry.finish(alloc, registry.children[0].id, "work-1", .completed);
     var second = ActiveWork{
@@ -797,7 +885,25 @@ test "persistent state derives create continue busy and terminal transitions" {
         .created_at_ms = 2,
     };
     defer second.deinit(alloc);
-    const child = try registry.startPersistentWork(alloc, "reviewer", second);
+    const child = try registry.startPersistentWork(alloc, "reviewer", null, second);
     try std.testing.expectEqual(Phase.running, child.phase);
     try std.testing.expectEqual(@as(u64, 2), child.work_generation);
+    try std.testing.expectEqualStrings("Review carefully.", child.instructions());
+    try registry.finish(alloc, child.id, "work-2", .completed);
+    var third = ActiveWork{
+        .id = try alloc.dupe(u8, "work-3"),
+        .message = try alloc.dupe(u8, "third"),
+        .created_at_ms = 3,
+    };
+    defer third.deinit(alloc);
+    const replaced = try registry.startPersistentWork(
+        alloc,
+        "reviewer",
+        "Audit security only.",
+        third,
+    );
+    try std.testing.expectEqualStrings(
+        "Audit security only.",
+        replaced.instructions(),
+    );
 }

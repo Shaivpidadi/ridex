@@ -1135,10 +1135,6 @@ pub fn Runtime(comptime App: type) type {
                 else
                     .{},
                 .custom_tool_guidance = tool_projection.custom_guidance,
-                .persistent_agents_prompt_section = if (app_session_runtime.Runtime(App).subagentHost(app)) |subagent_host|
-                    subagent_host.agentGuidance()
-                else
-                    "",
                 .agent_step_limit = app.agent_step_limit,
                 .max_tool_result_bytes = job.agent_settings.max_tool_result_bytes,
                 .cancel_flag = &app.worker.worker_cancel_requested,

@@ -1283,7 +1283,7 @@ fn runWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: 
         if (err == error.OneOffSessionNotResumable and !options.json_output) {
             try deps.write_stderr(
                 deps.stderr_ctx,
-                "fx ask: subagent child sessions cannot be resumed directly; message a configured agent from its parent session\n",
+                "fx ask: subagent child sessions cannot be resumed directly; message the named agent from its parent session\n",
             );
             return 1;
         }
@@ -1754,10 +1754,6 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         .advertised_functions = tool_projection.advertised_functions,
         .provider_capabilities = cfg.provider_set.select(ctx.provider).capabilities,
         .custom_tool_guidance = tool_projection.custom_guidance,
-        .persistent_agents_prompt_section = if (ctx.subagent_host) |subagent_host|
-            subagent_host.agentGuidance()
-        else
-            "",
         .agent_step_limit = startup.agent_step_limit,
         .max_tool_result_bytes = startup.max_tool_result_bytes,
         .cancel_flag = ctx.cancelFlag(),
@@ -6817,7 +6813,7 @@ test "fx ask renders one-off resume denial in text and JSON modes" {
         } else {
             try std.testing.expectEqualStrings("", stdout_capture.bytes.items);
             try std.testing.expectEqualStrings(
-                "fx ask: subagent child sessions cannot be resumed directly; message a configured agent from its parent session\n",
+                "fx ask: subagent child sessions cannot be resumed directly; message the named agent from its parent session\n",
                 stderr_capture.bytes.items,
             );
         }

@@ -10,6 +10,8 @@ const Allocator = std.mem.Allocator;
 pub const max_model_bytes: usize = 256;
 pub const max_prompt_bytes: usize = 64 * 1024;
 pub const max_message_bytes: usize = 64 * 1024;
+pub const max_agent_name_bytes: usize = 64;
+pub const max_instructions_bytes: usize = 64 * 1024;
 pub const max_cancellation_reason_bytes: usize = 512;
 pub const max_operation_id_bytes: usize = 128;
 pub const max_admission_items: usize = 256;
@@ -35,6 +37,7 @@ pub const QueuedMessage = struct {
     id: []u8,
     source_id: []u8,
     content: []u8,
+    system_prompt_overlay: []u8 = &.{},
     root_user_intent_context: []u8 = &.{},
     root_user_messages: [][]u8 = &.{},
     root_user_evidence_complete: bool = false,
@@ -44,6 +47,9 @@ pub const QueuedMessage = struct {
         alloc.free(self.id);
         alloc.free(self.source_id);
         alloc.free(self.content);
+        if (self.system_prompt_overlay.len > 0) {
+            alloc.free(self.system_prompt_overlay);
+        }
         if (self.root_user_intent_context.len > 0) {
             alloc.free(self.root_user_intent_context);
         }
@@ -182,6 +188,25 @@ pub const ValidationError = error{
 
 pub fn validateId(id: []const u8) ValidationError!void {
     session_layout.validateSessionId(id) catch return error.InvalidId;
+}
+
+pub fn validAgentName(name: []const u8) bool {
+    if (name.len == 0 or name.len > max_agent_name_bytes) return false;
+    if (!std.ascii.isLower(name[0]) and !std.ascii.isDigit(name[0])) return false;
+    for (name[1..]) |byte| {
+        if (!std.ascii.isLower(byte) and !std.ascii.isDigit(byte) and
+            byte != '_' and byte != '-')
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+pub fn validInstructions(instructions: []const u8) bool {
+    if (instructions.len > max_instructions_bytes or
+        !std.unicode.utf8ValidateSlice(instructions)) return false;
+    return std.mem.findScalar(u8, instructions, 0) == null;
 }
 
 pub fn validateOperationId(id: []const u8) ValidationError!void {

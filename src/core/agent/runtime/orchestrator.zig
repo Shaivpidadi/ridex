@@ -3620,12 +3620,6 @@ fn processQueuedPromptInner(
     if (config.custom_tool_guidance.len > 0) {
         try stable_prefix.append(arena, .{ .role = .system, .content = config.custom_tool_guidance });
     }
-    if (config.persistent_agents_prompt_section.len > 0) {
-        try stable_prefix.append(arena, .{
-            .role = .system,
-            .content = config.persistent_agents_prompt_section,
-        });
-    }
     if (config.skills_prompt_section.len > 0) {
         try stable_prefix.append(arena, .{ .role = .system, .content = config.skills_prompt_section });
     }

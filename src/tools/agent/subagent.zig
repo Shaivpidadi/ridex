@@ -87,6 +87,7 @@ fn validationErrorCode(err: model_contract.ValidationError) []const u8 {
         error.InvalidTask => "invalid_task",
         error.InvalidAgent => "invalid_agent",
         error.InvalidChildId => "invalid_child_id",
+        error.InvalidInstructions => "invalid_instructions",
         error.InvalidMessage => "invalid_message",
     };
 }
@@ -112,9 +113,10 @@ fn parseRoot(value: std.json.Value) DecodeError!model_contract.RequestInput {
         } };
     }
     if (std.mem.eql(u8, action, "message")) {
-        try rejectUnknown(request, &.{ "action", "agent", "message" });
+        try rejectUnknown(request, &.{ "action", "agent", "instructions", "message" });
         return .{ .message = .{
             .agent = try requiredString(request, "agent"),
+            .instructions = try optionalString(request, "instructions"),
             .message = try requiredString(request, "message"),
         } };
     }
@@ -141,6 +143,14 @@ fn requiredString(
 ) DecodeError![]const u8 {
     const value = object.get(key) orelse return error.MissingField;
     return stringValue(value);
+}
+
+fn optionalString(
+    object: std.json.ObjectMap,
+    key: []const u8,
+) DecodeError!?[]const u8 {
+    const value = object.get(key) orelse return null;
+    return try stringValue(value);
 }
 
 fn rejectUnknown(
@@ -291,6 +301,7 @@ test "decode accepts managed actions and bounded canonical forms" {
     try expectRequestTag("{\"request\":{\"action\":\"wait\",\"child_id\":\"01J00000000000000000000000\"}}", .wait);
     try expectRequestTag("{\"action\":\"wait\",\"child_id\":\"01J00000000000000000000000\"}", .wait);
     try expectRequestTag("{\"request\":{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"next\"}}", .message);
+    try expectRequestTag("{\"request\":{\"action\":\"message\",\"agent\":\"reviewer\",\"instructions\":\"Review strictly.\",\"message\":\"next\"}}", .message);
     try expectRequestTag("{\"request\":{\"action\":\"stop\",\"child_id\":\"01J00000000000000000000000\"}}", .stop);
     try expectDecodeFailure("{\"request\":{\"action\":\"cancel\",\"child_id\":\"01J00000000000000000000000\"}}", "invalid_enum");
 }

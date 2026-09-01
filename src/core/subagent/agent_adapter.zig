@@ -235,6 +235,14 @@ pub fn run(
         arena,
         config.advertised_functions,
     );
+    const child_system_prompt = if (message.system_prompt_overlay.len == 0)
+        config.system_prompt
+    else
+        std.fmt.allocPrint(
+            arena,
+            "{s}\n\n<subagent_instructions>\n{s}\n</subagent_instructions>",
+            .{ config.system_prompt, message.system_prompt_overlay },
+        ) catch return error.OutOfMemory;
     debug_trace.eventf(
         "subagent",
         "trace_identity",
@@ -261,7 +269,7 @@ pub fn run(
             .outcome_allocator = turn.alloc,
         },
         .{
-            .system_prompt = config.system_prompt,
+            .system_prompt = child_system_prompt,
             .model_prompt_overlay = config.model_prompt_overlay,
             .skills_prompt_section = config.skills_prompt_section,
             .explicit_skills_prompt_section = config.explicit_skills_prompt_section,
