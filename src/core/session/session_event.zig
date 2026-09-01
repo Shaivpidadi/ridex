@@ -41,6 +41,7 @@ pub const SessionStarted = struct {
     conversation_language: session.ConversationLanguage,
     preferences: session_codec.DurableSessionPreferences,
     usage: ?session_usage.Snapshot = null,
+    work_id: ?[]u8 = null,
 
     fn deinit(self: *SessionStarted, alloc: Allocator) void {
         alloc.free(self.id);
@@ -48,6 +49,7 @@ pub const SessionStarted = struct {
         alloc.free(self.workspace_root);
         self.preferences.deinit(alloc);
         if (self.usage) |*usage| usage.deinit(alloc);
+        if (self.work_id) |work_id| alloc.free(work_id);
         self.* = undefined;
     }
 };
@@ -919,8 +921,13 @@ fn applyDelta(
                 .history = &.{},
                 .total_input_tokens = 0,
                 .total_output_tokens = 0,
+                .last_subagent_work_id = if (payload.work_id) |work_id|
+                    try alloc.dupe(u8, work_id)
+                else
+                    null,
             };
             errdefer alloc.free(next.id);
+            errdefer if (next.last_subagent_work_id) |work_id| alloc.free(work_id);
             next.origin_workspace_root = try alloc.dupe(u8, payload.origin_workspace_root);
             errdefer alloc.free(next.origin_workspace_root);
             next.workspace_root = try alloc.dupe(u8, payload.workspace_root);
@@ -1051,6 +1058,7 @@ fn validateEnvelope(envelope: Envelope) !void {
                 .total_input_tokens = 0,
                 .total_output_tokens = 0,
                 .usage = payload.usage,
+                .last_subagent_work_id = payload.work_id,
             };
             try session_codec.validateState(state);
         },
@@ -1147,6 +1155,10 @@ fn writePayload(writer: *std.Io.Writer, event: Event) !void {
                 try writer.writeAll(",\"usage\":");
                 try session_usage.writeSnapshot(writer, usage);
             }
+            if (payload.work_id) |work_id| {
+                try writer.writeAll(",\"work_id\":");
+                try writeJsonString(writer, work_id);
+            }
             try writer.writeByte('}');
         },
         .preferences_changed => |payload| {
@@ -1242,25 +1254,20 @@ fn parsePayload(alloc: Allocator, kind: Kind, value: std.json.Value) !Event {
     return switch (kind) {
         .session_started => blk: {
             const source = try requireObject(value);
-            const object = if (source.count() == 6)
-                try exactObject(value, &.{
-                    "id",
-                    "created_at_ms",
-                    "origin_workspace_root",
-                    "workspace_root",
-                    "conversation_language",
-                    "preferences",
-                })
-            else
-                try exactObject(value, &.{
-                    "id",
-                    "created_at_ms",
-                    "origin_workspace_root",
-                    "workspace_root",
-                    "conversation_language",
-                    "preferences",
-                    "usage",
-                });
+            if (source.count() < 6 or source.count() > 8) {
+                return error.InvalidEventFrame;
+            }
+            try rejectUnknownKeys(source, &.{
+                "id",
+                "created_at_ms",
+                "origin_workspace_root",
+                "workspace_root",
+                "conversation_language",
+                "preferences",
+                "usage",
+                "work_id",
+            });
+            const object = source;
             const id = try dupeString(alloc, object, "id");
             errdefer alloc.free(id);
             const origin = try dupeString(alloc, object, "origin_workspace_root");
@@ -1283,6 +1290,11 @@ fn parsePayload(alloc: Allocator, kind: Kind, value: std.json.Value) !Event {
             else
                 null;
             errdefer if (usage) |*snapshot| snapshot.deinit(alloc);
+            const work_id = if (object.get("work_id") != null)
+                try dupeString(alloc, object, "work_id")
+            else
+                null;
+            errdefer if (work_id) |id_value| alloc.free(id_value);
             break :blk .{ .session_started = .{
                 .id = id,
                 .created_at_ms = try requireI64(object, "created_at_ms"),
@@ -1293,6 +1305,7 @@ fn parsePayload(alloc: Allocator, kind: Kind, value: std.json.Value) !Event {
                 ) catch return error.InvalidEventFrame,
                 .preferences = preferences,
                 .usage = usage,
+                .work_id = work_id,
             } };
         },
         .preferences_changed => blk: {

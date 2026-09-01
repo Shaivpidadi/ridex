@@ -280,3 +280,43 @@ test "managed child marker is hidden from external resume" {
         resumeForExternalPrompt(store, alloc, .{ .id = "child" }, workspace, .{}),
     );
 }
+
+test "subagent work identity hides a partial child without owner sidecar" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.fx");
+    try tmp.dir.createDirPath(std.testing.io, "workspace");
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+
+    var store = try session_store.Store.initFromHome(alloc, home, workspace);
+    defer store.deinit(alloc);
+    var durable = session_codec.DurableSessionState{
+        .id = try alloc.dupe(u8, "partial-child"),
+        .origin_workspace_root = try alloc.dupe(u8, workspace),
+        .workspace_root = try alloc.dupe(u8, workspace),
+        .created_at_ms = 1,
+        .updated_at_ms = 1,
+        .conversation_language = session.ConversationLanguage.literal("en"),
+        .history = try alloc.alloc(session.HistoryTurn, 0),
+        .total_input_tokens = 0,
+        .total_output_tokens = 0,
+        .preferences = .{
+            .model = try alloc.dupe(u8, "test"),
+            .effort = .auto,
+            .fast_mode = false,
+        },
+        .last_subagent_work_id = try alloc.dupe(u8, "work-1"),
+    };
+    defer durable.deinit(alloc);
+    var writable = try store.startWritableSession(alloc, durable);
+    writable.deinit(alloc);
+
+    try std.testing.expectError(
+        error.OneOffSessionNotResumable,
+        ensureExternalPromptAllowed(store, alloc, "partial-child", false),
+    );
+}

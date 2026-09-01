@@ -520,17 +520,24 @@ pub fn isManagedChildSession(
         .subagent_control,
         legacy_control_file,
     ) catch |err| switch (err) {
-        error.FileNotFound => return false,
+        error.FileNotFound => null,
         else => return err,
     };
-    defer legacy.deinit();
-    const bytes = try legacy.readToEnd(alloc, max_state_bytes);
-    defer alloc.free(bytes);
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
-    defer parsed.deinit();
-    if (parsed.value != .object) return error.InvalidState;
-    const parent = parsed.value.object.get("parent_id") orelse return false;
-    return parent == .string;
+    if (legacy) |*file| {
+        defer file.deinit();
+        const bytes = try file.readToEnd(alloc, max_state_bytes);
+        defer alloc.free(bytes);
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidState;
+        if (parsed.value.object.get("parent_id")) |parent| {
+            if (parent == .string) return true;
+        }
+    }
+
+    var state = try sessions.loadReadOnly(alloc, session_id);
+    defer state.deinit(alloc);
+    return state.last_subagent_work_id != null;
 }
 
 fn renderRegistry(alloc: Allocator, registry: Registry) ![]u8 {

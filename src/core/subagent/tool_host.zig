@@ -350,6 +350,12 @@ pub const Runtime = struct {
                     "operation_conflict",
                 );
             }
+            try self.ensureManagedChildSession(
+                alloc,
+                existing.id,
+                operation_id,
+                options.defaults,
+            );
             return managedAdmissionReady(alloc, existing.id);
         }
 
@@ -367,7 +373,12 @@ pub const Runtime = struct {
                 defer alloc.free(child_id);
                 try registry.appendOneOff(alloc, child_id, active);
                 try self.managed.state_store.save(alloc, registry);
-                try self.ensureManagedChildSession(alloc, child_id, options.defaults);
+                try self.ensureManagedChildSession(
+                    alloc,
+                    child_id,
+                    active.id,
+                    options.defaults,
+                );
                 return managedAdmissionReady(
                     alloc,
                     registry.children[registry.children.len - 1].id,
@@ -410,6 +421,7 @@ pub const Runtime = struct {
                 try self.ensureManagedChildSession(
                     alloc,
                     child_id,
+                    active.id,
                     options.defaults,
                 );
                 return managedAdmissionReady(
@@ -425,12 +437,14 @@ pub const Runtime = struct {
         self: *Runtime,
         alloc: Allocator,
         child_id: []const u8,
+        work_id: []const u8,
         defaults: Defaults,
     ) !void {
         var state = try freshChildState(
             alloc,
             child_id,
             self.sessions.workspace_root,
+            work_id,
             defaults,
         );
         defer state.deinit(alloc);
@@ -651,6 +665,7 @@ fn freshChildState(
     alloc: Allocator,
     child_id: []const u8,
     workspace_root: []const u8,
+    work_id: []const u8,
     defaults: Defaults,
 ) !session_codec.DurableSessionState {
     const now = io_mod.milliTimestamp();
@@ -662,6 +677,8 @@ fn freshChildState(
     errdefer alloc.free(workspace);
     const model = try alloc.dupe(u8, defaults.model);
     errdefer alloc.free(model);
+    const last_subagent_work_id = try alloc.dupe(u8, work_id);
+    errdefer alloc.free(last_subagent_work_id);
     return .{
         .id = id,
         .origin_workspace_root = origin,
@@ -678,6 +695,7 @@ fn freshChildState(
         .history = try alloc.alloc(types.HistoryTurn, 0),
         .total_input_tokens = 0,
         .total_output_tokens = 0,
+        .last_subagent_work_id = last_subagent_work_id,
     };
 }
 

@@ -5315,6 +5315,85 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       rmSync(root.root, { recursive: true, force: true });
     }
   }, 45_000);
+
+  test("persistent child starts new work after unobserved completion", async () => {
+    const root = createFixtureRoot("subagent-unobserved-completion");
+    const tracePath = join(root.root, "trace.log");
+    const firstMessage = "Complete the held first persistent turn.";
+    const secondMessage = "Reply exactly SECOND_TURN_DONE.";
+    let childId = "";
+    let releaseFirst!: (response: Response) => void;
+    const firstResponse = new Promise<Response>((resolve) => {
+      releaseFirst = resolve;
+    });
+    const gateway = startDynamicFakeGateway((body) => {
+      if (hasCurrentToolResult(body, "unobserved_second")) {
+        const result = JSON.parse(toolResultOutput(body, "unobserved_second")) as {
+          child_id: string;
+          status: string;
+          result?: string;
+        };
+        expect(result.child_id).toBe(childId);
+        expect(result.status).toBe("idle");
+        expect(result.result).toContain("SECOND_TURN_DONE");
+        return fakeGatewayFinalText("UNOBSERVED_COMPLETION_OK");
+      }
+      if (hasCurrentToolResult(body, "unobserved_first")) {
+        const result = JSON.parse(toolResultOutput(body, "unobserved_first")) as {
+          child_id: string;
+          status: string;
+        };
+        childId = result.child_id;
+        expect(result.status).toBe("running");
+        releaseFirst(fakeGatewayFinalText("FIRST_TURN_DONE"));
+        return new Promise<Response>((resolve) => {
+          setTimeout(() => resolve(fakeGatewayToolCall(
+            "unobserved_second",
+            "subagent",
+            { request: { action: "message", agent: "reviewer", message: secondMessage } },
+          )), 250);
+        });
+      }
+      if (body.includes(secondMessage)) {
+        expect(body).toContain("FIRST_TURN_DONE");
+        return fakeGatewayFinalText("SECOND_TURN_DONE");
+      }
+      if (body.includes(firstMessage)) return firstResponse;
+      return fakeGatewayToolCall("unobserved_first", "subagent", {
+        request: { action: "message", agent: "reviewer", message: firstMessage },
+      });
+    }, {
+      classifierDecision: "clear",
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+    });
+
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "Exercise unobserved child completion."],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 10_000,
+        },
+      );
+      if (result.code !== 0) {
+        const trace = existsSync(tracePath)
+          ? readFileSync(tracePath, "utf8")
+          : "<no trace>";
+        throw new Error(
+          `unobserved completion failed: code=${result.code}\nstdout=${result.stdout}\nstderr=${result.stderr}\ntrace=${trace}`,
+        );
+      }
+      expect(parseAskJson(result.stdout).output).toContain(
+        "UNOBSERVED_COMPLETION_OK",
+      );
+      expect(childId.length).toBeGreaterThan(0);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 15_000);
+
   test("saved ask resume continues one chat-created persistent child", async () => {
     const root = createFixtureRoot("subagent-persistent-resume");
     const tracePath = join(root.root, "trace.log");

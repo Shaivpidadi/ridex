@@ -95,6 +95,7 @@ pub const TurnContext = struct {
     loaded: *session_store.LoadedWritableSession,
     live_authority: ?*authority_mod.Resolver = null,
     approval_registry: ?*approval_registry_mod.Registry = null,
+    approval_worker_route: ?approval_registry_mod.WorkerRoute = null,
     child_id: ?[]const u8 = null,
     active_work_id: ?[]const u8 = null,
     phase_context: ?*anyopaque = null,
@@ -339,6 +340,8 @@ pub const TurnContext = struct {
     ) (approval_registry_mod.Error || authority_mod.Error)!void {
         const registry = self.approval_registry orelse
             return error.RegistryClosed;
+        const worker_route = self.approval_worker_route orelse
+            return error.RegistryClosed;
         const child_id = self.child_id orelse return error.ChildNotAttached;
         const work_id = self.active_work_id orelse return error.StaleRequest;
         var authority = try self.resolveLiveAuthority(alloc);
@@ -351,7 +354,7 @@ pub const TurnContext = struct {
             work_id,
             request,
             grants,
-            &self.worker,
+            worker_route,
             io_mod.milliTimestamp(),
         ) catch |err| {
             try self.transitionPhase(work_id, .running);

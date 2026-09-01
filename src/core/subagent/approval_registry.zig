@@ -20,13 +20,55 @@ pub const Error = error{
 
 pub const ResolveResult = enum { accepted, rejected };
 
+pub const WorkerRoute = struct {
+    context: *anyopaque,
+    submit_fn: *const fn (
+        *anyopaque,
+        u64,
+        permission_request.OwnedPermissionResponse,
+        ?worker_runtime.WorkerRuntime.PermissionCommit,
+    ) worker_runtime.WorkerRuntime.PermissionCommitError!worker_runtime.PermissionSubmissionResult,
+    cancel_fn: *const fn (*anyopaque) void,
+    pin_fn: *const fn (*anyopaque) bool,
+    release_fn: *const fn (*anyopaque) void,
+
+    fn eql(self: WorkerRoute, other: WorkerRoute) bool {
+        return self.context == other.context and
+            self.submit_fn == other.submit_fn and
+            self.cancel_fn == other.cancel_fn and
+            self.pin_fn == other.pin_fn and
+            self.release_fn == other.release_fn;
+    }
+
+    fn submit(
+        self: WorkerRoute,
+        request_id: u64,
+        response: permission_request.OwnedPermissionResponse,
+        commit: ?worker_runtime.WorkerRuntime.PermissionCommit,
+    ) worker_runtime.WorkerRuntime.PermissionCommitError!worker_runtime.PermissionSubmissionResult {
+        return self.submit_fn(self.context, request_id, response, commit);
+    }
+
+    fn cancel(self: WorkerRoute) void {
+        self.cancel_fn(self.context);
+    }
+
+    fn pin(self: WorkerRoute) bool {
+        return self.pin_fn(self.context);
+    }
+
+    fn release(self: WorkerRoute) void {
+        self.release_fn(self.context);
+    }
+};
+
 const Binding = struct {
     request_id: []u8,
     child_id: []u8,
     root_id: []u8,
     work_id: []u8,
     request: permission_request.OwnedPermissionRequest,
-    worker: *worker_runtime.WorkerRuntime,
+    worker: WorkerRoute,
     worker_request_id: u64,
 
     fn deinit(self: *Binding, alloc: Allocator) void {
@@ -103,7 +145,7 @@ pub const Registry = struct {
         work_id: []const u8,
         request: permission_request.PermissionRequest,
         _: []const types.PermissionGrant,
-        worker: *worker_runtime.WorkerRuntime,
+        worker: WorkerRoute,
         _: i64,
     ) Error!void {
         self.mutex.lockUncancelable(io_mod.getIo());
@@ -113,7 +155,7 @@ pub const Registry = struct {
             const existing = self.bindings.items[index];
             if (!std.mem.eql(u8, existing.child_id, child_id) or
                 !std.mem.eql(u8, existing.work_id, work_id) or
-                existing.worker != worker or
+                !existing.worker.eql(worker) or
                 existing.worker_request_id != request.id)
             {
                 return error.RequestConflict;
@@ -183,12 +225,24 @@ pub const Registry = struct {
             self.mutex.unlock(io_mod.getIo());
             return error.WrongChild;
         }
+        if (!binding.worker.pin()) {
+            var removed = self.bindings.orderedRemove(index);
+            self.pending_revision +|= 1;
+            self.mutex.unlock(io_mod.getIo());
+            defer removed.deinit(self.alloc);
+            if (feedback_owned) {
+                self.alloc.free(owned_feedback.?);
+                feedback_owned = false;
+            }
+            return .rejected;
+        }
         var removed = self.bindings.orderedRemove(index);
         self.pending_revision +|= 1;
         self.mutex.unlock(io_mod.getIo());
         defer removed.deinit(self.alloc);
+        defer removed.worker.release();
 
-        const submission = removed.worker.submitPermissionResponseAfterCommit(
+        const submission = removed.worker.submit(
             removed.worker_request_id,
             permission_request.OwnedPermissionResponse.init(
                 self.alloc,
@@ -198,7 +252,7 @@ pub const Registry = struct {
             .{ .context = self, .commit_fn = commitNoop },
         ) catch |err| {
             feedback_owned = false;
-            removed.worker.cancelApprovalTurn();
+            removed.worker.cancel();
             return switch (err) {
                 error.OutOfMemory => error.OutOfMemory,
                 error.PermissionCapacityExceeded => error.CapacityExceeded,
@@ -213,8 +267,6 @@ pub const Registry = struct {
     pub fn invalidateChild(
         self: *Registry,
         child_id: []const u8,
-        _: anytype,
-        _: i64,
     ) Error!usize {
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
@@ -224,7 +276,7 @@ pub const Registry = struct {
             index -= 1;
             if (!std.mem.eql(u8, self.bindings.items[index].child_id, child_id)) continue;
             var removed = self.bindings.orderedRemove(index);
-            removed.worker.cancelApprovalTurn();
+            removed.worker.cancel();
             removed.deinit(self.alloc);
             changed += 1;
         }
@@ -232,17 +284,11 @@ pub const Registry = struct {
         return changed;
     }
 
-    pub fn detachWorkerRoutes(self: *Registry) void {
-        self.mutex.lockUncancelable(io_mod.getIo());
-        defer self.mutex.unlock(io_mod.getIo());
-        for (self.bindings.items) |*binding| binding.worker.cancelApprovalTurn();
-    }
-
     pub fn deinit(self: *Registry) void {
         self.mutex.lockUncancelable(io_mod.getIo());
         self.closed = true;
         for (self.bindings.items) |*binding| {
-            binding.worker.cancelApprovalTurn();
+            binding.worker.cancel();
             binding.deinit(self.alloc);
         }
         self.bindings.deinit(self.alloc);

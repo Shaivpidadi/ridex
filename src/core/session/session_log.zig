@@ -2174,6 +2174,7 @@ fn createNativeSession(
             .conversation_language = initial_state.conversation_language,
             .preferences = initial_state.preferences,
             .usage = initial_state.usage orelse synthesized_usage.?,
+            .work_id = initial_state.last_subagent_work_id,
         } },
     };
     const line = try session_event.encodeFrame(alloc, envelope);
@@ -4166,6 +4167,7 @@ fn compactCanonicalLog(
             .conversation_language = loaded.state.conversation_language,
             .preferences = loaded.state.preferences,
             .usage = loaded.state.usage,
+            .work_id = loaded.state.last_subagent_work_id,
         } },
     };
     const first_line = try session_event.encodeFrame(alloc, session_started);
@@ -4334,6 +4336,7 @@ fn makeCleanupCandidatesForTest(
             .conversation_language = loaded.state.conversation_language,
             .preferences = loaded.state.preferences,
             .usage = loaded.state.usage,
+            .work_id = loaded.state.last_subagent_work_id,
         } },
     };
     const line = try session_event.encodeFrame(alloc, envelope);
