@@ -282,6 +282,23 @@ pub fn Runtime(comptime App: type) type {
             try app.worker.propagateHistoryTurn(std.heap.c_allocator, turn, max_history_turns);
         }
 
+        pub fn commitContextCompaction(
+            app: *App,
+            turn: types.HistoryTurn,
+            max_history_turns: usize,
+        ) !void {
+            if (comptime @hasDecl(@TypeOf(app.worker), "commitContextCompaction")) {
+                try app.worker.commitContextCompaction(
+                    std.heap.c_allocator,
+                    turn,
+                    max_history_turns,
+                );
+                return;
+            }
+            try propagateHistoryTurn(app, turn, max_history_turns);
+            try pushEvent(app, .{ .context_compaction = turn });
+        }
+
         pub fn propagateGrant(app: *App, tool_name: []const u8, target_path: []const u8) !void {
             if (comptime @hasDecl(App, "propagateGrant")) {
                 try app.propagateGrant(tool_name, target_path);

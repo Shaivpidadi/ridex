@@ -1176,6 +1176,29 @@ pub fn streamGatewayCompletion(
     );
 }
 
+pub fn streamGatewayCompletionBounded(
+    alloc: std.mem.Allocator,
+    request: StreamRequest,
+    callback_ctx: *anyopaque,
+    on_content_chunk: StreamCallback,
+    on_tool_start: ?ToolStartCallback,
+    deadline: std.Io.Clock.Timestamp,
+    cancel_flag: *std.atomic.Value(bool),
+) !StreamResult {
+    if (cancel_flag.load(.seq_cst)) return error.Cancelled;
+    const expected_provider_tool_name = try expectedProviderToolName(alloc, request.payload);
+    var operation = BoundedStreamingGatewayOperation{
+        .alloc = alloc,
+        .request = request,
+        .callback_ctx = callback_ctx,
+        .on_content_chunk = on_content_chunk,
+        .on_tool_start = on_tool_start,
+        .expected_provider_tool_name = expected_provider_tool_name,
+        .cancel_flag = cancel_flag,
+    };
+    return runBoundedStreamOperation(alloc, cancel_flag, deadline, &operation);
+}
+
 fn expectedProviderToolName(alloc: std.mem.Allocator, payload: []const u8) !?[]const u8 {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, payload, .{});
     defer parsed.deinit();
@@ -1293,6 +1316,29 @@ const BoundedGatewayOperation = struct {
             self.cancel_flag,
             self.expected_provider_tool_name,
             false,
+        );
+    }
+};
+
+const BoundedStreamingGatewayOperation = struct {
+    alloc: std.mem.Allocator,
+    request: StreamRequest,
+    callback_ctx: *anyopaque,
+    on_content_chunk: StreamCallback,
+    on_tool_start: ?ToolStartCallback,
+    expected_provider_tool_name: ?[]const u8,
+    cancel_flag: *std.atomic.Value(bool),
+
+    fn run(self: *@This()) !StreamResult {
+        return streamGatewayCompletionCore(
+            self.alloc,
+            self.request,
+            self.callback_ctx,
+            self.on_content_chunk,
+            self.on_tool_start,
+            self.cancel_flag,
+            self.expected_provider_tool_name,
+            true,
         );
     }
 };

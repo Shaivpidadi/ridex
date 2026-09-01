@@ -1031,11 +1031,10 @@ pub fn Runtime(comptime App: type) type {
             );
             var messages: std.ArrayList(ChatMessage) = .empty;
             defer messages.deinit(arena);
-            try session_runtime.appendActiveContextHistoryChatMessages(
+            try session_runtime.appendCompactionHistoryChatMessages(
                 arena,
                 &messages,
                 job.history,
-                job.context_history_start,
             );
             const source_tokens = runtime_prompt_context.estimateCompactionSourceTokens(
                 messages.items,

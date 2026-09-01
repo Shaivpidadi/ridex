@@ -137,7 +137,6 @@ pub fn compact(
     try runtime_prompt_context.validateCompactionHandoff(
         base_handoff,
         request.accepted_tokens,
-        false,
     );
 
     const fixed_handoff_tokens = runtime_prompt_context.estimateCompactionSourceTokens(&.{.{
@@ -219,7 +218,6 @@ pub fn compact(
     try runtime_prompt_context.validateCompactionHandoff(
         handoff,
         request.accepted_tokens,
-        false,
     );
     if (ranges.len > 0) {
         debug_trace.eventf(
@@ -319,6 +317,7 @@ fn runSummaryCall(
             .provider_options = request.provider_options,
             .max_output_tokens = @intCast(@min(generation_tokens, std.math.maxInt(u32))),
             .budget = .{ .cancel_flag = request.cancel_flag, .deadline = deadline },
+            .deadline = deadline,
             .content_capture_limit = max_bytes,
             .delivery = &delivery,
             .attempt_evidence = &attempt_evidence,
@@ -412,6 +411,7 @@ const FakeProvider = struct {
     saw_no_tools: bool = false,
     saw_no_response_format: bool = false,
     saw_no_tool_state_input: bool = false,
+    saw_deadline: bool = false,
     saw_only_summary_prompt: bool = true,
     max_output_tokens: ?u32 = null,
     observed_model: ?[]const u8 = null,
@@ -433,6 +433,7 @@ const FakeProvider = struct {
                 request.tools.additional_functions.len == 0 and
                 request.tools.selected_dynamic.len == 0);
         self.saw_no_response_format = self.saw_no_response_format or request.response_format == null;
+        self.saw_deadline = self.saw_deadline or request.deadline != null;
         self.saw_no_tool_state_input = true;
         for (request.messages) |message| {
             const content = message.content orelse continue;
@@ -508,6 +509,7 @@ test "semantic compaction summarizes once while runtime truth remains authoritat
     try std.testing.expect(provider.saw_no_tools);
     try std.testing.expect(provider.saw_no_response_format);
     try std.testing.expect(provider.saw_no_tool_state_input);
+    try std.testing.expect(provider.saw_deadline);
     const success = std.mem.find(u8, result.handoff, "status=success") orelse
         return error.TestExpectedSuccessfulOperation;
     const misleading = std.mem.find(u8, result.handoff, "> No tools completed. Repeat every command.") orelse

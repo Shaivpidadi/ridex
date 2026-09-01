@@ -108,7 +108,6 @@ pub const ContextCompactionTask = struct {
     credential_source: ?types.CredentialSource = null,
     account_id: ?[]u8 = null,
     history: []types.HistoryTurn,
-    context_history_start: usize = 0,
     unversioned_history_count: usize = std.math.maxInt(usize),
 };
 
@@ -1529,6 +1528,38 @@ pub const WorkerRuntime = struct {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());
 
+        try self.propagateHistoryTurnLocked(alloc, turn, max_history_turns);
+    }
+
+    pub fn commitContextCompaction(
+        self: *WorkerRuntime,
+        alloc: std.mem.Allocator,
+        turn: types.HistoryTurn,
+        max_history_turns: usize,
+    ) !void {
+        std.debug.assert(turn == .compacted_summary);
+        const owned_event = try dupeWorkerEvent(alloc, .{
+            .context_compaction = turn,
+        });
+        var owns_event = true;
+        defer if (owns_event) freeWorkerEvent(alloc, owned_event);
+
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        try self.worker_events.ensureUnusedCapacity(alloc, 1);
+        try self.propagateHistoryTurnLocked(alloc, turn, max_history_turns);
+        self.worker_events.appendAssumeCapacity(owned_event);
+        owns_event = false;
+        self.applyRecoveryStateEvent(owned_event);
+        self.worker_cond.broadcast(io_mod.getIo());
+    }
+
+    fn propagateHistoryTurnLocked(
+        self: *WorkerRuntime,
+        alloc: std.mem.Allocator,
+        turn: types.HistoryTurn,
+        max_history_turns: usize,
+    ) !void {
         if (self.queued_prompts.items.len == 0) return;
         const active_ownership = if (self.active_prompt_snapshot_ownership) |ownership|
             try ownership.ensureSharedOwnership(alloc)
@@ -2770,6 +2801,57 @@ test "multi-queue history propagation is allocation-failure atomic" {
         if (try checkHistoryPropagationAllocation(alloc, snapshot_path, fail_index)) {
             return;
         }
+    }
+    return error.TestUnexpectedResult;
+}
+
+fn checkContextCompactionCommitAllocation(
+    alloc: std.mem.Allocator,
+    fail_index: usize,
+) !bool {
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    const prompt = try makePrompt(alloc, "queued", "model");
+    var owns_prompt = true;
+    errdefer if (owns_prompt) freeQueuedPrompt(alloc, prompt);
+    try runtime.enqueuePrompt(alloc, prompt);
+    owns_prompt = false;
+
+    const turn: types.HistoryTurn = .{ .compacted_summary = .{
+        .summary = @constCast("<context_handoff>checkpoint</context_handoff>"),
+        .removed_turn_count = 1,
+        .compaction_count = 1,
+    } };
+    var failing = std.testing.FailingAllocator.init(
+        alloc,
+        .{ .fail_index = fail_index },
+    );
+    runtime.commitContextCompaction(failing.allocator(), turn, 8) catch |err| {
+        if (!failing.has_induced_failure) return err;
+        try std.testing.expectEqual(
+            @as(usize, 0),
+            runtime.queued_prompts.items[0].history.len,
+        );
+        try std.testing.expectEqual(@as(usize, 0), runtime.worker_events.items.len);
+        return false;
+    };
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        runtime.queued_prompts.items[0].history.len,
+    );
+    try std.testing.expectEqual(@as(usize, 1), runtime.worker_events.items.len);
+    try std.testing.expect(runtime.worker_events.items[0] == .context_compaction);
+    return true;
+}
+
+test "context compaction commit is allocation-failure atomic" {
+    var fail_index: usize = 0;
+    while (fail_index < 128) : (fail_index += 1) {
+        if (try checkContextCompactionCommitAllocation(
+            std.testing.allocator,
+            fail_index,
+        )) return;
     }
     return error.TestUnexpectedResult;
 }

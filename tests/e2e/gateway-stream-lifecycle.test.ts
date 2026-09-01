@@ -4205,6 +4205,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       const tracePath = join(root.root, "trace.log");
       const stderrPath = join(root.root, "stderr.log");
       const callId = "manual_compaction_large_result";
+      const inlineCallId = "manual_compaction_inline_result";
       const bodySentinel = "MANUAL_COMPACTION_BODY_SENTINEL";
       writeFileSync(
         join(root.workspace, "manual-compaction-large.txt"),
@@ -4214,9 +4215,13 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         join(root.workspace, ".fx.json"),
         JSON.stringify({ max_tool_result_bytes: 1024 }),
       );
+      writeFileSync(join(root.workspace, "manual-compaction-inline.txt"), "inline result\n");
       const responses = [
         fakeGatewayToolCall(callId, "read_file", {
           path: "manual-compaction-large.txt",
+        }),
+        fakeGatewayToolCall(inlineCallId, "read_file", {
+          path: "manual-compaction-inline.txt",
         }),
         fakeGatewayFinalText("FIRST_REPLY_COMPACTION_SENTINEL"),
         fakeGatewayFinalText("SECOND_REPLY_COMPACTION_SENTINEL"),
@@ -4224,6 +4229,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           "Continue the compacted session. Preserve FIRST_PROMPT_COMPACTION_SENTINEL and SECOND_PROMPT_COMPACTION_SENTINEL.",
         ),
         fakeGatewayFinalText("compaction restart complete"),
+        fakeGatewayFinalText("Second compaction preserved the restored session."),
       ];
       const gateway = startGateway(() =>
         responses.shift() ?? new Response("unexpected request", { status: 500 })
@@ -4291,8 +4297,8 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           "Continue the compacted session.",
         );
 
-        expect(gateway.requests).toHaveLength(4);
-        const compactRequest = JSON.parse(gateway.requests[3].body) as {
+        expect(gateway.requests).toHaveLength(5);
+        const compactRequest = JSON.parse(gateway.requests[4].body) as {
           tools?: unknown[];
           toolChoice?: { type?: string };
           responseFormat?: unknown;
@@ -4318,9 +4324,9 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         );
         expect(resumed.code).toBe(0);
         expect(resumed.stderr).toBe("");
-        expect(gateway.requests).toHaveLength(5);
+        expect(gateway.requests).toHaveLength(6);
 
-        const request = JSON.parse(gateway.requests[4].body) as {
+        const request = JSON.parse(gateway.requests[5].body) as {
           prompt: Array<{ role: string; content: unknown }>;
         };
         const userTexts = request.prompt
@@ -4356,6 +4362,44 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           "SECOND_PROMPT_COMPACTION_SENTINEL",
           "compaction restart probe",
         ]);
+
+        const resumedStderrPath = join(root.root, "resumed-stderr.log");
+        tui = await TmuxSession.create({
+          cmd: `${FX_BIN} --resume ${sessionId}`,
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          stderrPath: resumedStderrPath,
+        });
+        await tui.waitForComposer(15_000);
+        await tui.sendText("/compact");
+        await tui.waitForText("Context compacted.", 15_000);
+        await tui.sendText("/quit");
+        await tui.waitForSessionEnd(15_000);
+        tui = null;
+
+        expect(gateway.requests).toHaveLength(7);
+        const secondCompactRequest = JSON.parse(gateway.requests[6].body) as {
+          tools?: unknown[];
+          prompt?: Array<{ role: string; content: unknown }>;
+        };
+        expect(secondCompactRequest.tools).toEqual([]);
+        const secondCompactText = JSON.stringify(secondCompactRequest.prompt);
+        expect(secondCompactText).toContain("FIRST_PROMPT_COMPACTION_SENTINEL");
+        expect(secondCompactText).toContain("SECOND_PROMPT_COMPACTION_SENTINEL");
+        expect(secondCompactText).not.toContain("context_handoff");
+        expect(readFileSync(resumedStderrPath, "utf8")).toBe("");
+
+        const afterSecondCompact = await runFx(
+          ["session", "--id", sessionId, "--json"],
+          { cwd: root.workspace, env: { HOME: root.home } },
+        );
+        expect(afterSecondCompact.code).toBe(0);
+        const secondCanonical = JSON.parse(afterSecondCompact.stdout) as {
+          history: Array<{ kind: string; summary?: string }>;
+        };
+        const secondSummary = secondCanonical.history.at(-1)?.summary ?? "";
+        expect(secondSummary).toContain(callId);
+        expect(secondSummary).toContain(inlineCallId);
       } finally {
         if (tui) await tui.kill();
         gateway.stop();

@@ -830,14 +830,11 @@ pub fn Bindings(comptime App: type) type {
         ) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             const turn = types.HistoryTurn{ .compacted_summary = summary };
-            try app_worker_runtime.Runtime(App).propagateHistoryTurn(
+            try app_worker_runtime.Runtime(App).commitContextCompaction(
                 app,
                 turn,
                 app.session.max_history_turns,
             );
-            try app_worker_runtime.Runtime(App).pushEvent(app, .{
-                .context_compaction = turn,
-            });
         }
 
         fn agentSetRecoveryCheckpoint(

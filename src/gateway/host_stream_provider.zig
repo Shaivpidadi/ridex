@@ -67,6 +67,7 @@ pub fn initContext(
 }
 
 fn stream(raw: ?*anyopaque, alloc: Allocator, request: stream_provider.ModelRequest) anyerror!stream_provider.Result {
+    if (deadlineExpired(request.deadline)) return error.Timeout;
     const context: *ProviderContext = @ptrCast(@alignCast(raw.?));
     const transport = context.transport;
     const payload = request.prepared_request_body orelse
@@ -108,6 +109,7 @@ fn stream(raw: ?*anyopaque, alloc: Allocator, request: stream_provider.ModelRequ
     var status_code: u16 = 0;
     while (true) {
         if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
+        if (deadlineExpired(request.deadline)) return error.Timeout;
         const status_result = transport.status(handle, &status_code);
         if (status_result == 1) break;
         if (status_result == -2) return error.Cancelled;
@@ -118,12 +120,25 @@ fn stream(raw: ?*anyopaque, alloc: Allocator, request: stream_provider.ModelRequ
     const status: std.http.Status = @enumFromInt(status_code);
     if (status != .ok) return .{ .failed = .{
         .kind = failureKind(status),
-        .detail = try readBody(alloc, transport, handle, request.cancel_flag, request.cooperative_pulse),
+        .detail = try readBody(
+            alloc,
+            transport,
+            handle,
+            request.cancel_flag,
+            request.deadline,
+            request.cooperative_pulse,
+        ),
         .ownership = .owned,
     } };
 
     var reader: HostStreamReader = undefined;
-    reader.init(transport, handle, request.cancel_flag, request.cooperative_pulse);
+    reader.init(
+        transport,
+        handle,
+        request.cancel_flag,
+        request.deadline,
+        request.cooperative_pulse,
+    );
     var events = request.events;
     const completion = gateway_client.consumeGatewaySseStream(
         alloc,
@@ -135,7 +150,12 @@ fn stream(raw: ?*anyopaque, alloc: Allocator, request: stream_provider.ModelRequ
         request.cancel_flag,
         request.content_capture_limit,
     ) catch |err| switch (err) {
-        error.ReadFailed => return if (request.cancel_flag.load(.seq_cst) or reader.aborted) error.Cancelled else error.HostStreamFailed,
+        error.ReadFailed => return if (reader.timed_out)
+            error.Timeout
+        else if (request.cancel_flag.load(.seq_cst) or reader.aborted)
+            error.Cancelled
+        else
+            error.HostStreamFailed,
         else => return err,
     };
     return .{ .completed = .{
@@ -223,12 +243,26 @@ fn pulse(value: ?stream_provider.CooperativePulse) !void {
     if (value) |callback| try callback.pulse();
 }
 
-fn readBody(alloc: Allocator, transport: Transport, handle: i32, cancel_flag: *std.atomic.Value(bool), cooperative_pulse: ?stream_provider.CooperativePulse) ![]u8 {
+fn deadlineExpired(deadline: ?std.Io.Clock.Timestamp) bool {
+    const value = deadline orelse return false;
+    const now = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
+    return !std.Io.Clock.Timestamp.compare(now, .lt, value);
+}
+
+fn readBody(
+    alloc: Allocator,
+    transport: Transport,
+    handle: i32,
+    cancel_flag: *std.atomic.Value(bool),
+    deadline: ?std.Io.Clock.Timestamp,
+    cooperative_pulse: ?stream_provider.CooperativePulse,
+) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(alloc);
     var chunk: [4096]u8 = undefined;
     while (true) {
         if (cancel_flag.load(.seq_cst)) return error.Cancelled;
+        if (deadlineExpired(deadline)) return error.Timeout;
         const count = transport.next(handle, &chunk);
         if (count == -3) {
             try pulse(cooperative_pulse);
@@ -248,17 +282,27 @@ const HostStreamReader = struct {
     transport: Transport = undefined,
     handle: i32 = -1,
     cancel_flag: *std.atomic.Value(bool) = undefined,
+    deadline: ?std.Io.Clock.Timestamp = null,
     cooperative_pulse: ?stream_provider.CooperativePulse = null,
     last_cooperative_pulse: ?std.Io.Clock.Timestamp = null,
     aborted: bool = false,
+    timed_out: bool = false,
     buffer: [16 * 1024]u8 = undefined,
     interface: std.Io.Reader = undefined,
 
-    fn init(self: *@This(), transport: Transport, handle: i32, cancel_flag: *std.atomic.Value(bool), cooperative_pulse: ?stream_provider.CooperativePulse) void {
+    fn init(
+        self: *@This(),
+        transport: Transport,
+        handle: i32,
+        cancel_flag: *std.atomic.Value(bool),
+        deadline: ?std.Io.Clock.Timestamp,
+        cooperative_pulse: ?stream_provider.CooperativePulse,
+    ) void {
         self.* = .{
             .transport = transport,
             .handle = handle,
             .cancel_flag = cancel_flag,
+            .deadline = deadline,
             .cooperative_pulse = cooperative_pulse,
             .last_cooperative_pulse = if (cooperative_pulse != null)
                 std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake)
@@ -284,6 +328,11 @@ const HostStreamReader = struct {
         return error.ReadFailed;
     }
 
+    fn abortDeadline(self: *@This()) std.Io.Reader.Error {
+        self.timed_out = true;
+        return error.ReadFailed;
+    }
+
     fn pulseAt(self: *@This(), now: std.Io.Clock.Timestamp) !void {
         if (self.cooperative_pulse == null) return;
         self.last_cooperative_pulse = now;
@@ -301,6 +350,7 @@ const HostStreamReader = struct {
     fn readHost(self: *@This(), dest: []u8) std.Io.Reader.Error!usize {
         while (true) {
             if (self.cancel_flag.load(.seq_cst)) return self.abortRead();
+            if (deadlineExpired(self.deadline)) return self.abortDeadline();
             if (self.cooperative_pulse != null) {
                 self.pulseIfDueAt(std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake)) catch return error.ReadFailed;
             }
@@ -369,7 +419,7 @@ test "error response bodies are bounded" {
 
     try std.testing.expectError(
         error.HostStreamFailed,
-        readBody(std.testing.allocator, transport, 1, &cancel_flag, null),
+        readBody(std.testing.allocator, transport, 1, &cancel_flag, null, null),
     );
 }
 
@@ -398,9 +448,37 @@ test "host stream reader omits pulse timing state without callback" {
         .status_fn = FakeTransport.status,
         .next_fn = FakeTransport.next,
         .close_fn = FakeTransport.close,
-    }, 1, &cancel_flag, null);
+    }, 1, &cancel_flag, null, null);
 
     try std.testing.expect(reader.last_cooperative_pulse == null);
+}
+
+test "host stream reader stops at its provider deadline" {
+    const FakeTransport = struct {
+        fn open(_: ?*anyopaque, _: []const u8, _: []const u8, _: []const u8, _: []const u8) anyerror!i32 {
+            return 1;
+        }
+        fn status(_: ?*anyopaque, _: i32, _: *u16) i32 {
+            return 0;
+        }
+        fn next(_: ?*anyopaque, _: i32, _: []u8) i32 {
+            return -3;
+        }
+        fn close(_: ?*anyopaque, _: i32) void {}
+    };
+
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var reader: HostStreamReader = undefined;
+    reader.init(.{
+        .context = null,
+        .open_fn = FakeTransport.open,
+        .status_fn = FakeTransport.status,
+        .next_fn = FakeTransport.next,
+        .close_fn = FakeTransport.close,
+    }, 1, &cancel_flag, std.Io.Clock.Timestamp.now(std.testing.io, .awake), null);
+    var buffer: [1]u8 = undefined;
+    try std.testing.expectError(error.ReadFailed, reader.readHost(&buffer));
+    try std.testing.expect(reader.timed_out);
 }
 
 test "host stream reader throttles cooperative pulses" {

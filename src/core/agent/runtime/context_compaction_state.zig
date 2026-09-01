@@ -11,8 +11,7 @@ pub const OperationStatus = enum {
 };
 
 pub const OperationFact = struct {
-    call_source_index: usize,
-    result_source_index: ?usize,
+    sequence: usize,
     call_id: []const u8,
     tool_name: []const u8,
     arguments_json: []const u8,
@@ -21,7 +20,6 @@ pub const OperationFact = struct {
 };
 
 pub const PermissionFeedbackFact = struct {
-    source_index: usize,
     call_id: ?[]const u8,
     text: []const u8,
 };
@@ -37,11 +35,6 @@ pub const CheckpointFacts = struct {
     }
 };
 
-const FoundResult = struct {
-    source_index: usize,
-    message: types.ChatMessage,
-};
-
 pub fn projectCheckpointFacts(
     alloc: Allocator,
     messages: []const types.ChatMessage,
@@ -51,54 +44,74 @@ pub fn projectCheckpointFacts(
     var permission_feedback: std.ArrayList(PermissionFeedbackFact) = .empty;
     errdefer permission_feedback.deinit(alloc);
 
-    for (messages, 0..) |message, source_index| {
+    var message_index: usize = 0;
+    while (message_index < messages.len) {
+        const message = messages[message_index];
         if (message.permission_feedback) {
-            const text = message.content orelse continue;
-            if (text.len == 0) continue;
+            const text = message.content orelse {
+                message_index += 1;
+                continue;
+            };
+            if (text.len == 0) {
+                message_index += 1;
+                continue;
+            }
             try permission_feedback.append(alloc, .{
-                .source_index = source_index,
                 .call_id = message.tool_call_id,
                 .text = text,
             });
+            message_index += 1;
             continue;
         }
-        if (message.role != .assistant) continue;
-        for (message.tool_calls) |call| {
-            if (containsCallId(operations.items, call.id)) {
+        if (message.role == .tool) return error.InvalidExecutionHistory;
+        if (message.role != .assistant or message.tool_calls.len == 0) {
+            message_index += 1;
+            continue;
+        }
+
+        for (message.tool_calls, 0..) |call, call_index| {
+            if (call.id.len == 0 or call.name.len == 0) {
                 return error.InvalidExecutionHistory;
             }
-            const result = try findUniqueResult(messages, call.id);
-            if (result) |found| {
-                if (found.source_index <= source_index) {
+            for (message.tool_calls[call_index + 1 ..]) |later| {
+                if (std.mem.eql(u8, call.id, later.id)) {
                     return error.InvalidExecutionHistory;
                 }
-                if (found.message.tool_name) |name| {
-                    if (!std.mem.eql(u8, name, call.name)) {
-                        return error.InvalidExecutionHistory;
-                    }
+            }
+        }
+
+        const results = try alloc.alloc(?types.ChatMessage, message.tool_calls.len);
+        defer alloc.free(results);
+        @memset(results, null);
+        var result_index = message_index + 1;
+        while (result_index < messages.len and messages[result_index].role == .tool) : (result_index += 1) {
+            const result = messages[result_index];
+            const call_id = result.tool_call_id orelse return error.InvalidExecutionHistory;
+            const matched_index = findToolCallIndex(message.tool_calls, call_id) orelse
+                return error.InvalidExecutionHistory;
+            if (results[matched_index] != null) return error.InvalidExecutionHistory;
+            if (result.tool_name) |name| {
+                if (!std.mem.eql(u8, name, message.tool_calls[matched_index].name)) {
+                    return error.InvalidExecutionHistory;
                 }
             }
+            results[matched_index] = result;
+        }
+
+        for (message.tool_calls, results) |call, result| {
             try operations.append(alloc, .{
-                .call_source_index = source_index,
-                .result_source_index = if (result) |found| found.source_index else null,
+                .sequence = operations.items.len + 1,
                 .call_id = call.id,
                 .tool_name = call.name,
                 .arguments_json = call.arguments_json,
                 .status = if (result) |found|
-                    statusFromResult(found.message.tool_result_status)
+                    statusFromResult(found.tool_result_status)
                 else
                     .incomplete,
-                .result_memory = if (result) |found| found.message.tool_result_memory else null,
+                .result_memory = if (result) |found| found.tool_result_memory else null,
             });
         }
-    }
-
-    for (messages) |message| {
-        if (message.role != .tool) continue;
-        const call_id = message.tool_call_id orelse return error.InvalidExecutionHistory;
-        if (!containsCallId(operations.items, call_id)) {
-            return error.InvalidExecutionHistory;
-        }
+        message_index = result_index;
     }
 
     const owned_operations = try operations.toOwnedSlice(alloc);
@@ -205,26 +218,11 @@ pub fn renderHandoff(
     return out.toOwnedSlice() catch return error.OutOfMemory;
 }
 
-fn findUniqueResult(
-    messages: []const types.ChatMessage,
-    call_id: []const u8,
-) !?FoundResult {
-    var found: ?FoundResult = null;
-    for (messages, 0..) |message, source_index| {
-        if (message.role != .tool) continue;
-        const result_call_id = message.tool_call_id orelse continue;
-        if (!std.mem.eql(u8, result_call_id, call_id)) continue;
-        if (found != null) return error.InvalidExecutionHistory;
-        found = .{ .source_index = source_index, .message = message };
+fn findToolCallIndex(calls: []const types.ToolCall, id: []const u8) ?usize {
+    for (calls, 0..) |call, index| {
+        if (std.mem.eql(u8, call.id, id)) return index;
     }
-    return found;
-}
-
-fn containsCallId(operations: []const OperationFact, call_id: []const u8) bool {
-    for (operations) |operation| {
-        if (std.mem.eql(u8, operation.call_id, call_id)) return true;
-    }
-    return false;
+    return null;
 }
 
 fn statusFromResult(status: ?types.PersistedToolStatus) OperationStatus {
@@ -236,7 +234,7 @@ fn statusFromResult(status: ?types.PersistedToolStatus) OperationStatus {
 }
 
 fn writeOperation(writer: *std.Io.Writer, operation: OperationFact) !void {
-    try writer.writeAll("- operation call_id=");
+    try writer.print("- operation sequence={d} call_id=", .{operation.sequence});
     try std.json.Stringify.value(operation.call_id, .{}, writer);
     try writer.writeAll(" tool=");
     try std.json.Stringify.value(operation.tool_name, .{}, writer);
@@ -341,6 +339,19 @@ test "deterministic checkpoint rejects orphan and duplicate tool results" {
         projectCheckpointFacts(std.testing.allocator, &duplicate),
     );
 
+    const duplicate_calls = [_]types.ToolCall{
+        .{ .id = "same", .name = "terminal", .arguments_json = "{}" },
+        .{ .id = "same", .name = "terminal", .arguments_json = "{}" },
+    };
+    const duplicate_batch = [_]types.ChatMessage{.{
+        .role = .assistant,
+        .tool_calls = &duplicate_calls,
+    }};
+    try std.testing.expectError(
+        error.InvalidExecutionHistory,
+        projectCheckpointFacts(std.testing.allocator, &duplicate_batch),
+    );
+
     const out_of_order = [_]types.ChatMessage{
         .{ .role = .tool, .tool_call_id = "late-call", .tool_result_status = .success },
         .{ .role = .assistant, .tool_calls = &.{.{ .id = "late-call", .name = "terminal", .arguments_json = "{}" }} },
@@ -349,6 +360,38 @@ test "deterministic checkpoint rejects orphan and duplicate tool results" {
         error.InvalidExecutionHistory,
         projectCheckpointFacts(std.testing.allocator, &out_of_order),
     );
+}
+
+test "separate tool groups may reuse a provider call id" {
+    const first_calls = [_]types.ToolCall{.{
+        .id = "reused-call-id",
+        .name = "terminal",
+        .arguments_json = "{\"command\":\"printf first\"}",
+    }};
+    const second_calls = [_]types.ToolCall{.{
+        .id = "reused-call-id",
+        .name = "terminal",
+        .arguments_json = "{\"command\":\"printf second\"}",
+    }};
+    const messages = [_]types.ChatMessage{
+        .{ .role = .assistant, .tool_calls = &first_calls },
+        .{ .role = .tool, .content = "first", .tool_call_id = "reused-call-id", .tool_name = "terminal", .tool_result_status = .failure },
+        .{ .role = .assistant, .tool_calls = &second_calls },
+        .{ .role = .tool, .content = "second", .tool_call_id = "reused-call-id", .tool_name = "terminal", .tool_result_status = .success },
+    };
+
+    var facts = try projectCheckpointFacts(std.testing.allocator, &messages);
+    defer facts.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), facts.operations.len);
+    try std.testing.expectEqual(@as(usize, 1), facts.operations[0].sequence);
+    try std.testing.expectEqual(OperationStatus.failure, facts.operations[0].status);
+    try std.testing.expectEqual(@as(usize, 2), facts.operations[1].sequence);
+    try std.testing.expectEqual(OperationStatus.success, facts.operations[1].status);
+
+    const handoff = try renderHandoff(std.testing.allocator, facts, &.{});
+    defer std.testing.allocator.free(handoff);
+    try std.testing.expect(std.mem.find(u8, handoff, "sequence=1") != null);
+    try std.testing.expect(std.mem.find(u8, handoff, "sequence=2") != null);
 }
 
 test "oversized arguments render as bounded exact identity" {

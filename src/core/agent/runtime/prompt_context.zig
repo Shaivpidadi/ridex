@@ -100,16 +100,13 @@ pub fn planCompaction(input: CompactionPlanInput) CompactionPlan {
 pub const CompactionHandoffError = error{
     EmptyCompactionHandoff,
     InvalidCompactionHandoff,
-    CompactionToolCallRejected,
     CompactionHandoffTooLarge,
 };
 
 pub fn validateCompactionHandoff(
     text: []const u8,
     accepted_tokens: usize,
-    saw_tool_call: bool,
 ) CompactionHandoffError!void {
-    if (saw_tool_call) return error.CompactionToolCallRejected;
     if (!std.unicode.utf8ValidateSlice(text)) return error.InvalidCompactionHandoff;
     if (std.mem.trim(u8, text, " \t\r\n").len == 0) {
         return error.EmptyCompactionHandoff;
@@ -497,15 +494,11 @@ test "manual compaction shares the budget and stops after a smaller source" {
 test "handoff acceptance is structural and bounded" {
     try std.testing.expectError(
         error.EmptyCompactionHandoff,
-        validateCompactionHandoff(" \n\t", 10, false),
-    );
-    try std.testing.expectError(
-        error.CompactionToolCallRejected,
-        validateCompactionHandoff("# Objective\nContinue.", 10, true),
+        validateCompactionHandoff(" \n\t", 10),
     );
     try std.testing.expectError(
         error.CompactionHandoffTooLarge,
-        validateCompactionHandoff("one two three four five six seven eight nine ten eleven", 4, false),
+        validateCompactionHandoff("one two three four five six seven eight nine ten eleven", 4),
     );
-    try validateCompactionHandoff("# Objective\nContinue safely.", 16, false);
+    try validateCompactionHandoff("# Objective\nContinue safely.", 16);
 }

@@ -3196,35 +3196,30 @@ fn buildCanonicalCompactionWindow(
     alloc: Allocator,
     history: []const HistoryTurn,
     within_turn_suffix: []const ChatMessage,
-    handoff: ?[]const u8,
-    retained_history_tail: []const ChatMessage,
-    compacted_suffix_len: usize,
 ) !std.ArrayList(ChatMessage) {
     var messages: std.ArrayList(ChatMessage) = .empty;
     errdefer messages.deinit(alloc);
-    if (handoff) |active_handoff| {
-        try messages.append(alloc, .{
-            .role = .user,
-            .content = active_handoff,
-            .cache_policy = .no_cache,
-        });
-        try messages.appendSlice(alloc, retained_history_tail);
-        try messages.appendSlice(
-            alloc,
-            within_turn_suffix[@min(compacted_suffix_len, within_turn_suffix.len)..],
-        );
-    } else {
-        try session_runtime.appendCompactionHistoryChatMessages(
-            alloc,
-            &messages,
-            history,
-        );
-        try messages.appendSlice(alloc, within_turn_suffix);
-    }
+    try session_runtime.appendCompactionHistoryChatMessages(
+        alloc,
+        &messages,
+        history,
+    );
+    try messages.appendSlice(alloc, within_turn_suffix);
     return messages;
 }
 
-test "repeated compaction source replaces the prior suffix with its handoff" {
+test "repeated compaction source keeps canonical history and the complete active suffix" {
+    const history = [_]HistoryTurn{
+        .{ .assistant = .{
+            .user = .{ .text = @constCast("canonical user") },
+            .assistant = @constCast("canonical assistant"),
+        } },
+        .{ .compacted_summary = .{
+            .summary = @constCast("prior handoff must not become source"),
+            .removed_turn_count = 1,
+            .compaction_count = 1,
+        } },
+    };
     const suffix = [_]ChatMessage{
         .{ .role = .assistant, .content = "old assistant" },
         .{ .role = .tool, .content = "old result" },
@@ -3233,18 +3228,20 @@ test "repeated compaction source replaces the prior suffix with its handoff" {
     };
     var messages = try buildCanonicalCompactionWindow(
         std.testing.allocator,
-        &.{},
+        &history,
         &suffix,
-        "prior handoff",
-        &.{},
-        2,
     );
     defer messages.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(@as(usize, 3), messages.items.len);
-    try std.testing.expectEqualStrings("prior handoff", messages.items[0].content.?);
-    try std.testing.expectEqualStrings("new assistant", messages.items[1].content.?);
-    try std.testing.expectEqualStrings("new result", messages.items[2].content.?);
+    try std.testing.expectEqual(@as(usize, 6), messages.items.len);
+    try std.testing.expectEqualStrings("canonical user", messages.items[0].content.?);
+    try std.testing.expectEqualStrings("canonical assistant", messages.items[1].content.?);
+    try std.testing.expectEqualStrings("old assistant", messages.items[2].content.?);
+    try std.testing.expectEqualStrings("new result", messages.items[5].content.?);
+    for (messages.items) |message| {
+        try std.testing.expect(message.content == null or
+            std.mem.find(u8, message.content.?, "prior handoff") == null);
+    }
 }
 
 fn latestCompactionCount(history: []const HistoryTurn) usize {
@@ -4038,9 +4035,6 @@ fn processQueuedPromptLoop(
                             arena,
                             job.history,
                             within_turn_suffix.items,
-                            active_compaction_handoff,
-                            active_compaction_history_tail,
-                            compacted_suffix_len,
                         );
                         defer compaction_messages.deinit(arena);
                         const result_storage: runtime_context_compaction.ResultStorage =

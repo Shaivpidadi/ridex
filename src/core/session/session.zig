@@ -1725,6 +1725,11 @@ pub const SessionRuntime = struct {
         if (context_history_start > history.len) return error.InvalidContextHistoryStart;
         try self.restore(alloc, language, history);
         self.context_history_start = context_history_start;
+        if (context_history_start < self.history.items.len and
+            isCurrentCompactionCheckpoint(self.history.items[context_history_start]))
+        {
+            self.unversioned_history_len = 0;
+        }
     }
 
     pub fn restoreWithPermissionState(
@@ -1939,6 +1944,9 @@ pub const SessionRuntime = struct {
         owns_copy = false;
         if (turn == .compacted_summary) {
             self.context_history_start = self.history.items.len - 1;
+            if (isCurrentCompactionCheckpoint(turn)) {
+                self.unversioned_history_len = 0;
+            }
         }
     }
 
@@ -2526,6 +2534,17 @@ pub fn appendCompactionHistoryChatMessages(
             false,
         );
     }
+}
+
+fn isCurrentCompactionCheckpoint(turn: HistoryTurn) bool {
+    return switch (turn) {
+        .compacted_summary => |entry| std.mem.startsWith(
+            u8,
+            entry.summary,
+            "<context_handoff>",
+        ),
+        else => false,
+    };
 }
 
 /// Projects the active model window from one complete canonical snapshot.
@@ -5460,6 +5479,58 @@ test "restored history keeps an in-memory unversioned prefix boundary" {
     runtime.reset(alloc);
     try std.testing.expectEqual(@as(usize, 0), runtime.unversionedHistoryEnd());
     try std.testing.expectEqual(@as(usize, 0), runtime.contextHistoryStart());
+}
+
+test "current checkpoint clears restored unversioned history provenance" {
+    const alloc = std.testing.allocator;
+    const restored_history = [_]HistoryTurn{
+        try makeAssistantTurn(alloc, "legacy prompt", "legacy reply"),
+        .{ .compacted_summary = .{
+            .summary = try alloc.dupe(
+                u8,
+                "<context_handoff>\ncurrent checkpoint\n</context_handoff>",
+            ),
+            .removed_turn_count = 1,
+            .compaction_count = 1,
+        } },
+    };
+    defer for (restored_history) |turn| freeHistoryTurn(alloc, turn);
+
+    var runtime: SessionRuntime = .{ .max_history_turns = 8 };
+    defer runtime.deinit(alloc);
+    try runtime.restoreWithContextHistoryStart(
+        alloc,
+        ConversationLanguage.literal("en"),
+        &restored_history,
+        1,
+    );
+    try std.testing.expectEqual(@as(usize, 0), runtime.unversionedHistoryEnd());
+
+    try runtime.appendAssistantHistoryTurn(alloc, "fresh", "fresh reply");
+    try std.testing.expectEqual(@as(usize, 0), runtime.unversionedHistoryEnd());
+}
+
+test "legacy checkpoint keeps restored provenance conservative" {
+    const alloc = std.testing.allocator;
+    const restored_history = [_]HistoryTurn{
+        try makeAssistantTurn(alloc, "legacy prompt", "legacy reply"),
+        .{ .compacted_summary = .{
+            .summary = try alloc.dupe(u8, "legacy free-form summary"),
+            .removed_turn_count = 1,
+            .compaction_count = 1,
+        } },
+    };
+    defer for (restored_history) |turn| freeHistoryTurn(alloc, turn);
+
+    var runtime: SessionRuntime = .{ .max_history_turns = 8 };
+    defer runtime.deinit(alloc);
+    try runtime.restoreWithContextHistoryStart(
+        alloc,
+        ConversationLanguage.literal("en"),
+        &restored_history,
+        1,
+    );
+    try std.testing.expectEqual(@as(usize, 2), runtime.unversionedHistoryEnd());
 }
 
 test "compacted failed turn does not claim user interruption" {
