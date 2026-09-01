@@ -1725,7 +1725,7 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
       expect(existsSync(target)).toBe(false);
       expect(gateway.requests).toHaveLength(2);
       expect(gateway.requests[1]!.body).toContain(
-        'operation call_id=\\"oversized_write\\" tool=\\"write_file\\" status=failure',
+        'call_id=\\"oversized_write\\" tool=\\"write_file\\" status=failure',
       );
       expectCleanStderr(stderrPath);
     },
