@@ -2,7 +2,6 @@ const std = @import("std");
 const model_contract = @import("../../core/subagent/model_contract.zig");
 const tool_provider = @import("../../core/subagent/tool_provider.zig");
 const tool_dispatch = @import("../../core/tooling/tool_dispatch.zig");
-const types = @import("../../core/shared/types.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -86,7 +85,7 @@ fn validationErrorCode(err: model_contract.ValidationError) []const u8 {
     return switch (err) {
         error.OutOfMemory => unreachable,
         error.InvalidTask => "invalid_task",
-        error.InvalidModel => "invalid_model",
+        error.InvalidAgent => "invalid_agent",
         error.InvalidChildId => "invalid_child_id",
         error.InvalidMessage => "invalid_message",
     };
@@ -101,14 +100,9 @@ fn parseRoot(value: std.json.Value) DecodeError!model_contract.RequestInput {
     const action = try requiredString(request, "action");
 
     if (std.mem.eql(u8, action, "run")) {
-        try rejectUnknown(request, &.{ "action", "task", "model", "effort" });
+        try rejectUnknown(request, &.{ "action", "task" });
         return .{ .run = .{
             .task = try requiredString(request, "task"),
-            .model = try optionalString(request, "model"),
-            .effort = if (try optionalString(request, "effort")) |raw|
-                types.ReasoningEffort.parse(raw) orelse return error.InvalidEnum
-            else
-                null,
         } };
     }
     if (std.mem.eql(u8, action, "wait")) {
@@ -117,14 +111,14 @@ fn parseRoot(value: std.json.Value) DecodeError!model_contract.RequestInput {
             .child_id = try requiredString(request, "child_id"),
         } };
     }
-    if (std.mem.eql(u8, action, "send")) {
-        try rejectUnknown(request, &.{ "action", "child_id", "message" });
-        return .{ .send = .{
-            .child_id = try requiredString(request, "child_id"),
+    if (std.mem.eql(u8, action, "message")) {
+        try rejectUnknown(request, &.{ "action", "agent", "message" });
+        return .{ .message = .{
+            .agent = try requiredString(request, "agent"),
             .message = try requiredString(request, "message"),
         } };
     }
-    if (std.mem.eql(u8, action, "stop") or std.mem.eql(u8, action, "cancel")) {
+    if (std.mem.eql(u8, action, "stop")) {
         try rejectUnknown(request, &.{ "action", "child_id" });
         return .{ .stop = .{
             .child_id = try requiredString(request, "child_id"),
@@ -147,14 +141,6 @@ fn requiredString(
 ) DecodeError![]const u8 {
     const value = object.get(key) orelse return error.MissingField;
     return stringValue(value);
-}
-
-fn optionalString(
-    object: std.json.ObjectMap,
-    key: []const u8,
-) DecodeError!?[]const u8 {
-    const value = object.get(key) orelse return null;
-    return try stringValue(value);
 }
 
 fn rejectUnknown(
@@ -304,9 +290,9 @@ test "decode accepts managed actions and bounded canonical forms" {
     try expectRequestTag("{\"request\":{\"action\":\"run\",\"task\":\"do it\"}}", .run);
     try expectRequestTag("{\"request\":{\"action\":\"wait\",\"child_id\":\"01J00000000000000000000000\"}}", .wait);
     try expectRequestTag("{\"action\":\"wait\",\"child_id\":\"01J00000000000000000000000\"}", .wait);
-    try expectRequestTag("{\"request\":{\"action\":\"send\",\"child_id\":\"01J00000000000000000000000\",\"message\":\"next\"}}", .send);
+    try expectRequestTag("{\"request\":{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"next\"}}", .message);
     try expectRequestTag("{\"request\":{\"action\":\"stop\",\"child_id\":\"01J00000000000000000000000\"}}", .stop);
-    try expectRequestTag("{\"request\":{\"action\":\"cancel\",\"child_id\":\"01J00000000000000000000000\"}}", .stop);
+    try expectDecodeFailure("{\"request\":{\"action\":\"cancel\",\"child_id\":\"01J00000000000000000000000\"}}", "invalid_enum");
 }
 
 test "decode rejects manager input cross-action fields and unknown actions" {

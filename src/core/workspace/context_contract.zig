@@ -495,7 +495,7 @@ const current_inventory = [_]EntrypointInventory{
         .transient_context = "tool_runtime transient context each model step over the child SessionRuntime with noninteractive output callbacks and no live user question path",
         .tools = "identical to the launching surface's own gateway tool advertisement: permission-filtered builtins, deferred MCP discovery tools, and the subagent tool for nested children",
         .permission = "per-child ask/auto/yolo mode (new children default to yolo) resolves live host authority per action for tools, roots, integrations, rules, and grants, revalidating the retained action identity whenever the authority generation advances before the effect",
-        .session = "ordinary child session resumed for write from the shared session store for one-off and persistent children, canonical child history restored from and committed back to that session, and per-child model and effort from the stored child configuration",
+        .session = "internal child session resumed for write by its saved parent, canonical child history restored from and committed back to that session, and persistent agent instructions plus model and effort from the parent's immutable profile snapshot",
         .drift_status = .intentional,
         .drift = "separate child session and history, noninteractive child callbacks, approvals projected to the parent and human surfaces, and bounded parent/child delivery instead of transcript merging",
     },
@@ -679,7 +679,7 @@ test "entrypoint context inventory snapshot documents current deltas" {
         \\  transient_context: tool_runtime transient context each model step over the child SessionRuntime with noninteractive output callbacks and no live user question path
         \\  tools: identical to the launching surface's own gateway tool advertisement: permission-filtered builtins, deferred MCP discovery tools, and the subagent tool for nested children
         \\  permission: per-child ask/auto/yolo mode (new children default to yolo) resolves live host authority per action for tools, roots, integrations, rules, and grants, revalidating the retained action identity whenever the authority generation advances before the effect
-        \\  session: ordinary child session resumed for write from the shared session store for one-off and persistent children, canonical child history restored from and committed back to that session, and per-child model and effort from the stored child configuration
+        \\  session: internal child session resumed for write by its saved parent, canonical child history restored from and committed back to that session, and persistent agent instructions plus model and effort from the parent's immutable profile snapshot
         \\  drift_status: intentional
         \\  drift: separate child session and history, noninteractive child callbacks, approvals projected to the parent and human surfaces, and bounded parent/child delivery instead of transcript merging
         \\

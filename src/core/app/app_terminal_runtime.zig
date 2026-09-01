@@ -14,12 +14,6 @@ const shell_resolver = @import("../terminal/shell_resolver.zig");
 const max_direct_output_bytes: usize = 64 * 1024;
 const start_wait_ceiling_ms: u64 = 20_000;
 
-pub const OpenRequestResult = enum {
-    accepted,
-    occupied,
-    rejected,
-};
-
 pub const ExitPreparation = enum {
     ready,
     deferred,
@@ -161,27 +155,6 @@ pub fn Runtime(comptime App: type) type {
                 .transport_role = .interactive,
                 .max_output_bytes = max_direct_output_bytes,
             });
-        }
-
-        pub fn requestOpen(app: *App, session_id: []const u8) OpenRequestResult {
-            const admission = app.terminal_takeover.requestOpen(
-                App,
-                app,
-                session_id,
-            ) catch |err| {
-                writeAdmissionFailure(app, @errorName(err)) catch |notice_err| {
-                    debug_trace.logf(
-                        "terminal",
-                        "terminal open rejection notice failed err={s}",
-                        .{@errorName(notice_err)},
-                    );
-                };
-                return .rejected;
-            };
-            return switch (admission) {
-                .accepted => .accepted,
-                .occupied => .occupied,
-            };
         }
 
         pub fn prepareGracefulExit(_: *App) ExitPreparation {

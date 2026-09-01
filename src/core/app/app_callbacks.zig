@@ -25,7 +25,6 @@ const io_mod = @import("../shared/io.zig");
 const session_runtime = @import("../session/session.zig");
 const session_codec = @import("../session/session_codec.zig");
 const session_usage = @import("../session/session_usage.zig");
-const parent_delivery_projector = @import("../subagent/parent_delivery_projector.zig");
 const types = @import("../shared/types.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const assistant_presentation = @import("../agent/assistant_presentation.zig");
@@ -284,8 +283,6 @@ pub fn Bindings(comptime App: type) type {
                     null,
                 .finalize_turn = agentFinalizeTurn,
                 .take_steering = if (comptime @hasDecl(@TypeOf(app.worker), "takeSteering")) agentTakeSteering else null,
-                .prepare_parent_turn_context = agentPrepareParentTurnContext,
-                .acknowledge_parent_turn_context = agentAcknowledgeParentTurnContext,
                 .append_runtime_context = agentAppendRuntimeContext,
                 .append_static_context = agentAppendStaticContext,
                 .validate_tool_call = agentValidateToolCall,
@@ -566,45 +563,6 @@ pub fn Bindings(comptime App: type) type {
             const app: *App = @ptrCast(@alignCast(ctx));
             if (comptime @hasDecl(App, "appendStaticContextMessage")) {
                 try app.appendStaticContextMessage(arena, messages);
-            }
-        }
-
-        fn agentPrepareParentTurnContext(
-            ctx: *anyopaque,
-            arena: Allocator,
-        ) !?agent_runtime.PreparedParentTurnContext {
-            const app: *App = @ptrCast(@alignCast(ctx));
-            if (comptime @hasField(App, "session_persistence")) {
-                const host = app_session_runtime.Runtime(App).subagentHost(app) orelse return null;
-                const session_id = app_session_runtime.Runtime(App).activeSessionId(app) orelse return null;
-                return parent_delivery_projector.prepare(
-                    arena,
-                    host.sessions,
-                    session_id,
-                    host.manager.options.child_store,
-                );
-            }
-            return null;
-        }
-
-        fn agentAcknowledgeParentTurnContext(
-            ctx: *anyopaque,
-            arena: Allocator,
-            acknowledgements: []const agent_runtime.ParentTurnDeliveryAck,
-        ) void {
-            const app: *App = @ptrCast(@alignCast(ctx));
-            if (comptime @hasField(App, "session_persistence")) {
-                const host = app_session_runtime.Runtime(App).subagentHost(app) orelse return;
-                const retirement_ready = parent_delivery_projector
-                    .acknowledgeWithRetirementSignal(
-                    arena,
-                    host.sessions,
-                    host.manager.options.child_store,
-                    acknowledgements,
-                );
-                if (retirement_ready) {
-                    host.requestRetirementSweep(io_mod.milliTimestamp());
-                }
             }
         }
 
@@ -1738,8 +1696,8 @@ test "agent deps forward app callbacks through core types" {
     defer app.deinit();
 
     const deps = Bindings(FakeApp).agentRuntimeDeps(&app);
-    try std.testing.expect(deps.prepare_parent_turn_context != null);
-    try std.testing.expect(deps.acknowledge_parent_turn_context != null);
+    try std.testing.expect(deps.prepare_parent_turn_context == null);
+    try std.testing.expect(deps.acknowledge_parent_turn_context == null);
     try deps.push_text(deps.ctx, .{ .assistant_rendered = "hello" });
     try deps.finalize_turn(deps.ctx, 9, .completed, .length_limited);
     try deps.propagate_history_turn(deps.ctx, .{ .compacted_summary = .{

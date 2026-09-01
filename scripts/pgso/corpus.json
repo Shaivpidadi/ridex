@@ -106,7 +106,6 @@
     {"name": "e2e-tui-resume-brutal", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-resume-brutal.test.ts"], "test_file": "tui-resume-brutal.test.ts"},
     {"name": "e2e-tui-permissions", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-permissions.test.ts"], "test_file": "tui-permissions.test.ts"},
     {"name": "e2e-tui-interrupt-recovery", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-interrupt-recovery.test.ts"], "test_file": "tui-interrupt-recovery.test.ts"},
-    {"name": "e2e-tui-subagent-manager", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-subagent-manager.test.ts"], "test_file": "tui-subagent-manager.test.ts"},
     {"name": "e2e-tui-terminal-tool", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-terminal-tool.test.ts"], "test_file": "tui-terminal-tool.test.ts"},
     {"name": "e2e-tui-native-clear-recovery", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-native-clear-recovery.test.ts"], "test_file": "tui-native-clear-recovery.test.ts"},
     {"name": "e2e-tui-gateway-stream-lifecycle", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-gateway-stream-lifecycle.test.ts"], "test_file": "tui-gateway-stream-lifecycle.test.ts"}

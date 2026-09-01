@@ -8,7 +8,6 @@ const session_json = @import("session_json.zig");
 const session_log = @import("session_log.zig");
 const session_projection = @import("session_projection.zig");
 const session_display_metadata = @import("session_display_metadata.zig");
-const subagent_control_store = @import("../subagent/control_store.zig");
 const Allocator = std.mem.Allocator;
 
 const authority = @import("session_authority.zig");
@@ -492,19 +491,6 @@ fn inspectDoctorManagedChildren(
         };
         entries.deinit();
     }
-    subagent_control_store.validateManagedRecord(
-        alloc,
-        &capability,
-        session_id,
-    ) catch |err| {
-        if (err == error.OutOfMemory) return err;
-        const kind: DoctorIssueKind = switch (err) {
-            error.ControlPathUnsafe, error.PrivateStatePermissionsUnsupported => .unsafe_path,
-            else => .canonical_state_invalid,
-        };
-        try appendDoctorDiagnostic(diagnostics, alloc, session_id, kind, null);
-        return;
-    };
 }
 
 /// Classifies a session directory into a read-only candidate, dispatching on

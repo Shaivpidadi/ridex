@@ -431,7 +431,6 @@ pub fn composeHintRow(
     else
         null;
     var hint_buf: [max_status_line_len]u8 = undefined;
-    var hint_with_subagents_buf: [max_status_line_len + 128]u8 = undefined;
     const base_hint_line = ui_render.buildHintLine(
         ctx.stream.active,
         approval_active,
@@ -454,24 +453,6 @@ pub fn composeHintRow(
         "press ctrl+c again to exit"
     else if (auth_hint) |hint|
         hint
-    else if (ctx.selected_subagent_label) |label|
-        if (ctx.selected_subagent_status) |status|
-            std.fmt.bufPrint(
-                &hint_with_subagents_buf,
-                "{s} · {s} · {s}",
-                .{
-                    label,
-                    switch (status) {
-                        .awaiting_approval => "approval",
-                        else => @tagName(status),
-                    },
-                    base_hint_line,
-                },
-            ) catch base_hint_line
-        else
-            base_hint_line
-    else if (ctx.subagent_view_active)
-        std.fmt.bufPrint(&hint_with_subagents_buf, "Subagent manager · tracked {d} · ctrl+x exit", .{ctx.subagent_count}) catch base_hint_line
     else
         base_hint_line;
 
@@ -1095,11 +1076,6 @@ fn testRenderContext(input: *const InputRuntime) RenderContext {
         .has_api_key = true,
         .model = "gpt-5.1",
         .queued_count = 0,
-        .subagent_count = 0,
-        .subagent_view_active = false,
-        .selected_subagent_id = null,
-        .selected_subagent_label = null,
-        .selected_subagent_status = null,
         .input = input,
     };
 }
@@ -1573,11 +1549,6 @@ test "compose hint row keeps model in left hint text" {
         .has_api_key = true,
         .model = "gpt-5.1",
         .queued_count = 0,
-        .subagent_count = 0,
-        .subagent_view_active = false,
-        .selected_subagent_id = null,
-        .selected_subagent_label = null,
-        .selected_subagent_status = null,
         .fast_mode = true,
         .model_supports_fast = true,
         .input = &input,
@@ -1664,7 +1635,7 @@ test "compose hint row replaces model status with subscription sign-in controls"
     }
 }
 
-test "compose hint row uses dots in subagent view" {
+test "compose hint row keeps configured fast mode visible" {
     var input = InputRuntime{};
     defer input.deinit(std.testing.allocator);
 
@@ -1673,49 +1644,6 @@ test "compose hint row uses dots in subagent view" {
         .has_api_key = true,
         .model = "gpt-5.1",
         .queued_count = 0,
-        .subagent_count = 2,
-        .subagent_view_active = true,
-        .selected_subagent_id = null,
-        .selected_subagent_label = null,
-        .selected_subagent_status = null,
-        .input = &input,
-    };
-
-    var row = try composeHintRow(std.testing.allocator, false, null, ctx, 96);
-    defer row.deinit(std.testing.allocator);
-
-    try std.testing.expect(std.mem.find(u8, row.items, "Subagent manager · tracked 2 · ctrl+x exit") != null);
-    try std.testing.expect(std.mem.find(u8, row.items, " | ") == null);
-}
-
-test "compose hint row keeps active child identity ahead of model status" {
-    var input = InputRuntime{};
-    defer input.deinit(std.testing.allocator);
-    var ctx = testRenderContext(&input);
-    ctx.selected_subagent_label = "header-child";
-    ctx.selected_subagent_status = .awaiting_approval;
-
-    var row = try composeHintRow(std.testing.allocator, false, null, ctx, 64);
-    defer row.deinit(std.testing.allocator);
-
-    try std.testing.expect(std.mem.find(u8, row.items, "header-child · approval") != null);
-    try std.testing.expect(std.mem.find(u8, row.items, "gpt-5.1") != null);
-}
-
-test "compose hint row omits the inactive subagent manager marker" {
-    var input = InputRuntime{};
-    defer input.deinit(std.testing.allocator);
-
-    const ctx: RenderContext = .{
-        .stream = .{},
-        .has_api_key = true,
-        .model = "gpt-5.1",
-        .queued_count = 0,
-        .subagent_count = 2,
-        .subagent_view_active = false,
-        .selected_subagent_id = null,
-        .selected_subagent_label = null,
-        .selected_subagent_status = null,
         .fast_mode = true,
         .model_supports_fast = true,
         .input = &input,
@@ -1725,11 +1653,9 @@ test "compose hint row omits the inactive subagent manager marker" {
     defer row.deinit(std.testing.allocator);
 
     try std.testing.expect(std.mem.find(u8, row.items, "gpt-5.1 · ⚡︎") != null);
-    try std.testing.expect(std.mem.find(u8, row.items, "subagents 2") == null);
-    try std.testing.expect(std.mem.find(u8, row.items, "ctrl+x manager") == null);
 }
 
-test "compose hint row does not advertise background terminals or the manager shortcut" {
+test "compose hint row does not advertise background terminals" {
     var input = InputRuntime{};
     defer input.deinit(std.testing.allocator);
     var ctx = testRenderContext(&input);
@@ -1740,7 +1666,6 @@ test "compose hint row does not advertise background terminals or the manager sh
 
     try std.testing.expect(std.mem.find(u8, row.items, "gpt-5.1") != null);
     try std.testing.expect(std.mem.find(u8, row.items, "background (") == null);
-    try std.testing.expect(std.mem.find(u8, row.items, "ctrl+x manager") == null);
 }
 
 test "compose hint row right-aligns upgrade status" {
@@ -1752,11 +1677,6 @@ test "compose hint row right-aligns upgrade status" {
         .has_api_key = true,
         .model = "gpt-5.1",
         .queued_count = 0,
-        .subagent_count = 0,
-        .subagent_view_active = false,
-        .selected_subagent_id = null,
-        .selected_subagent_label = null,
-        .selected_subagent_status = null,
         .upgrade_status = "update ready: ctrl+g to reload",
         .statusline = .{
             .workspace_label = "/a/long/workspace/path/that/uses/the/statusline-tail",
@@ -1782,11 +1702,6 @@ test "compose hint row right-aligns upgrade status after styled auto mode" {
         .model = "openai/gpt-4o",
         .permission_mode = .auto,
         .queued_count = 0,
-        .subagent_count = 0,
-        .subagent_view_active = false,
-        .selected_subagent_id = null,
-        .selected_subagent_label = null,
-        .selected_subagent_status = null,
         .upgrade_status = "update ready: ctrl+g to reload",
         .input = &input,
     };

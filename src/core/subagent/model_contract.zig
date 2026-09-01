@@ -1,67 +1,46 @@
 const std = @import("std");
+const agent_config = @import("agent_config.zig");
 const domain = @import("domain.zig");
-const text_utils = @import("../shared/text_utils.zig");
-const types = @import("../shared/types.zig");
 
 const Allocator = std.mem.Allocator;
 
 pub const initial_observe_ms: u64 = 1_000;
-const wait_ms: u64 = 30_000;
+pub const wait_ms: u64 = 30_000;
 const max_error_code_bytes: usize = 64;
 
-pub const Action = enum {
-    run,
-    wait,
-    send,
-    stop,
-};
+pub const Action = enum { run, message, wait, stop };
 
-pub const RunInput = struct {
-    task: []const u8,
-    model: ?[]const u8 = null,
-    effort: ?types.ReasoningEffort = null,
-};
-
-pub const ChildInput = struct {
-    child_id: []const u8,
-};
-
-pub const SendInput = struct {
-    child_id: []const u8,
+pub const RunInput = struct { task: []const u8 };
+pub const MessageInput = struct {
+    agent: []const u8,
     message: []const u8,
 };
+pub const ChildInput = struct { child_id: []const u8 };
 
 pub const RequestInput = union(Action) {
     run: RunInput,
+    message: MessageInput,
     wait: ChildInput,
-    send: SendInput,
     stop: ChildInput,
 };
 
 pub const Request = union(Action) {
-    run: struct {
-        task: []u8,
-        model: ?[]u8,
-        effort: ?types.ReasoningEffort,
-    },
-    wait: struct { child_id: []u8 },
-    send: struct {
-        child_id: []u8,
+    run: struct { task: []u8 },
+    message: struct {
+        agent: []u8,
         message: []u8,
     },
+    wait: struct { child_id: []u8 },
     stop: struct { child_id: []u8 },
 
     pub fn deinit(self: *Request, alloc: Allocator) void {
         switch (self.*) {
-            .run => |value| {
-                alloc.free(value.task);
-                if (value.model) |model| alloc.free(model);
-            },
-            .wait => |value| alloc.free(value.child_id),
-            .send => |value| {
-                alloc.free(value.child_id);
+            .run => |value| alloc.free(value.task),
+            .message => |value| {
+                alloc.free(value.agent);
                 alloc.free(value.message);
             },
+            .wait => |value| alloc.free(value.child_id),
             .stop => |value| alloc.free(value.child_id),
         }
         self.* = undefined;
@@ -73,73 +52,28 @@ pub const Request = union(Action) {
 
     pub fn childId(self: Request) ?[]const u8 {
         return switch (self) {
-            .run => null,
+            .run, .message => null,
             .wait => |value| value.child_id,
-            .send => |value| value.child_id,
             .stop => |value| value.child_id,
         };
     }
 
-    /// Returns an owned internal command. The caller frees it with
-    /// `domain.Command.deinit`.
-    pub fn toDomainCommand(self: Request, alloc: Allocator) domain.ValidationError!domain.Command {
-        var name_buffer: [domain.max_name_bytes]u8 = undefined;
-        return domain.validateCommand(alloc, switch (self) {
-            .run => |value| .{ .create = .{
-                .name = generatedName(value.task, &name_buffer),
-                .mode = .persistent,
-                .prompt = value.task,
-                .model = value.model,
-                .effort = value.effort,
-            } },
-            .wait => |value| .{ .inspect = .{
-                .id = value.child_id,
-                .sections = &.{.status},
-                .wait = .{
-                    .until = .settled,
-                    .timeout_ms = wait_ms,
-                },
-            } },
-            .send => |value| .{ .message = .{ .send = .{
-                .id = value.child_id,
-                .content = value.message,
-            } } },
-            .stop => |value| .{ .lifecycle = .{
-                .id = value.child_id,
-                .action = .cancel,
-            } },
-        });
+    pub fn agentName(self: Request) ?[]const u8 {
+        return switch (self) {
+            .message => |value| value.agent,
+            .run, .wait, .stop => null,
+        };
     }
 };
-
-fn generatedName(
-    task: []const u8,
-    buffer: *[domain.max_name_bytes]u8,
-) []const u8 {
-    const first_line = if (std.mem.indexOfScalar(u8, task, '\n')) |index|
-        task[0..index]
-    else
-        task;
-    const trimmed = std.mem.trim(u8, first_line, " \t\r");
-    if (trimmed.len == 0) return "delegate";
-    const prefix = text_utils.utf8PrefixByBytes(trimmed, buffer.len);
-    @memcpy(buffer[0..prefix.len], prefix);
-    for (buffer[0..prefix.len]) |*byte| {
-        if (byte.* < 0x20 or byte.* == 0x7f) byte.* = ' ';
-    }
-    const generated = std.mem.trimEnd(u8, buffer[0..prefix.len], " \t\r");
-    return if (generated.len == 0) "delegate" else generated;
-}
 
 pub const ValidationError = error{
     OutOfMemory,
     InvalidTask,
-    InvalidModel,
+    InvalidAgent,
     InvalidChildId,
     InvalidMessage,
 };
 
-/// Validates and owns one model-facing request.
 pub fn validateRequest(
     alloc: Allocator,
     input: RequestInput,
@@ -147,33 +81,21 @@ pub fn validateRequest(
     return switch (input) {
         .run => |value| blk: {
             try validateText(value.task, domain.max_prompt_bytes, error.InvalidTask);
-            if (value.model) |model| {
-                try validateText(model, domain.max_model_bytes, error.InvalidModel);
-            }
-            const task = try alloc.dupe(u8, value.task);
-            errdefer alloc.free(task);
-            const model = if (value.model) |model|
-                try alloc.dupe(u8, model)
-            else
-                null;
-            break :blk .{ .run = .{
-                .task = task,
-                .model = model,
-                .effort = value.effort,
+            break :blk .{ .run = .{ .task = try alloc.dupe(u8, value.task) } };
+        },
+        .message => |value| blk: {
+            if (!agent_config.validName(value.agent)) return error.InvalidAgent;
+            try validateText(value.message, domain.max_message_bytes, error.InvalidMessage);
+            const agent = try alloc.dupe(u8, value.agent);
+            errdefer alloc.free(agent);
+            break :blk .{ .message = .{
+                .agent = agent,
+                .message = try alloc.dupe(u8, value.message),
             } };
         },
         .wait => |value| .{ .wait = .{
             .child_id = try validateChildIdAlloc(alloc, value.child_id),
         } },
-        .send => |value| blk: {
-            try validateText(value.message, domain.max_message_bytes, error.InvalidMessage);
-            const child_id = try validateChildIdAlloc(alloc, value.child_id);
-            errdefer alloc.free(child_id);
-            break :blk .{ .send = .{
-                .child_id = child_id,
-                .message = try alloc.dupe(u8, value.message),
-            } };
-        },
         .stop => |value| .{ .stop = .{
             .child_id = try validateChildIdAlloc(alloc, value.child_id),
         } },
@@ -186,7 +108,8 @@ fn validateText(
     invalid: ValidationError,
 ) ValidationError!void {
     if (value.len == 0 or value.len > max_bytes or
-        !std.unicode.utf8ValidateSlice(value) or std.mem.findScalar(u8, value, 0) != null)
+        !std.unicode.utf8ValidateSlice(value) or
+        std.mem.findScalar(u8, value, 0) != null)
     {
         return invalid;
     }
@@ -248,53 +171,72 @@ fn lowerHex(value: []const u8, expected_len: usize) bool {
     return true;
 }
 
+pub const Kind = enum { one_off, persistent };
+pub const Phase = enum { idle, running, awaiting_approval, interrupted, finished };
 pub const Snapshot = struct {
-    mode: domain.Mode,
-    state: domain.State,
+    kind: Kind,
+    phase: Phase,
 };
 
 pub const RejectCode = enum {
     child_unavailable,
-    child_not_messageable,
+    child_busy,
+    child_not_persistent,
 };
 
 pub const Plan = union(enum) {
-    create_and_observe,
-    inspect_wait,
-    send,
+    create_one_off,
+    create_persistent,
+    continue_persistent,
+    observe,
     cancel,
     no_op,
     reject: RejectCode,
 };
 
-/// Purely selects the effect to perform from a validated request and an
-/// optional authoritative child snapshot.
 pub fn plan(request: Request, snapshot: ?Snapshot) Plan {
     return switch (request) {
-        .run => .create_and_observe,
-        .wait => .inspect_wait,
-        .send => if (snapshot) |child|
-            if (child.mode == .persistent and switch (child.state) {
-                .idle, .queued, .running, .awaiting_approval => true,
-                .interrupted, .completed, .failed, .cancelled, .archived => false,
-            })
-                .send
-            else
-                .{ .reject = .child_not_messageable }
-        else
-            .{ .reject = .child_unavailable },
-        .stop => if (snapshot) |child| switch (child.state) {
-            .queued, .running, .awaiting_approval, .interrupted => .cancel,
-            .idle, .completed, .failed, .cancelled, .archived => .no_op,
+        .run => .create_one_off,
+        .message => if (snapshot) |child| switch (child.kind) {
+            .one_off => .{ .reject = .child_not_persistent },
+            .persistent => switch (child.phase) {
+                .idle, .interrupted => .continue_persistent,
+                .running, .awaiting_approval => .{ .reject = .child_busy },
+                .finished => .{ .reject = .child_unavailable },
+            },
+        } else .create_persistent,
+        .wait => .observe,
+        .stop => if (snapshot) |child| switch (child.phase) {
+            .running, .awaiting_approval, .interrupted => .cancel,
+            .idle, .finished => .no_op,
         } else .{ .reject = .child_unavailable },
     };
+}
+
+pub fn requestFingerprint(request: Request) [32]u8 {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("fx.subagent.request.v1\x00");
+    hash.update(@tagName(request.action()));
+    hash.update("\x00");
+    switch (request) {
+        .run => |value| hash.update(value.task),
+        .message => |value| {
+            hash.update(value.agent);
+            hash.update("\x00");
+            hash.update(value.message);
+        },
+        .wait => |value| hash.update(value.child_id),
+        .stop => |value| hash.update(value.child_id),
+    }
+    return hash.finalResult();
 }
 
 pub const Result = struct {
     ok: bool,
     operation_id: ?[]const u8 = null,
-    child_id: ?[]const u8,
+    child_id: ?[]const u8 = null,
     status: []const u8,
+    result: ?[]const u8 = null,
     error_code: ?[]const u8 = null,
     retryable: bool = false,
 };
@@ -302,18 +244,22 @@ pub const Result = struct {
 pub fn encodeResultAlloc(alloc: Allocator, result: Result) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
-    try out.writer.print("{{\"ok\":{s},\"operation_id\":", .{if (result.ok) "true" else "false"});
+    try out.writer.print("{{\"ok\":{s},\"operation_id\":", .{
+        if (result.ok) "true" else "false",
+    });
     try writeOptionalString(&out.writer, result.operation_id);
     try out.writer.writeAll(",\"child_id\":");
     try writeOptionalString(&out.writer, result.child_id);
     try out.writer.writeAll(",\"status\":");
     try std.json.Stringify.value(result.status, .{}, &out.writer);
+    try out.writer.writeAll(",\"result\":");
+    try writeOptionalString(&out.writer, result.result);
     try out.writer.writeAll(",\"error_code\":");
     try writeOptionalString(
         &out.writer,
         if (result.error_code) |code| code[0..@min(code.len, max_error_code_bytes)] else null,
     );
-    try out.writer.print(",\"retryable\":{s}}}", .{if (result.retryable) "true" else "false"});
+    try out.writer.writeByte('}');
     return out.toOwnedSlice();
 }
 
@@ -325,109 +271,75 @@ fn writeOptionalString(writer: *std.Io.Writer, value: ?[]const u8) !void {
     }
 }
 
-test "managed request validation owns input and maps to internal commands" {
+test "minimal request validation owns one-off and persistent intent" {
     const alloc = std.testing.allocator;
-    var request = try validateRequest(alloc, .{ .run = .{
-        .task = "inspect the failure",
-        .model = "openai/gpt-5.6-sol",
-        .effort = .literal("high"),
+    var run = try validateRequest(alloc, .{ .run = .{ .task = "review this" } });
+    defer run.deinit(alloc);
+    try std.testing.expectEqual(Action.run, run.action());
+    try std.testing.expectEqual(Plan.create_one_off, plan(run, null));
+
+    var message = try validateRequest(alloc, .{ .message = .{
+        .agent = "reviewer",
+        .message = "review this",
     } });
-    defer request.deinit(alloc);
-    var command = try request.toDomainCommand(alloc);
-    defer command.deinit(alloc);
-    try std.testing.expect(command == .create);
-    try std.testing.expectEqual(domain.Mode.persistent, command.create.mode);
-    try std.testing.expect(!command.create.permission_mode_explicit);
-    try std.testing.expectEqualStrings("inspect the failure", command.create.prompt.?);
-    try std.testing.expectEqualStrings("inspect the failure", command.create.configuration.name);
+    defer message.deinit(alloc);
+    try std.testing.expectEqual(Action.message, message.action());
+    try std.testing.expectEqual(Plan.create_persistent, plan(message, null));
 }
 
-test "managed display names are deterministic bounded task summaries" {
-    var buffer: [domain.max_name_bytes]u8 = undefined;
-    try std.testing.expectEqualStrings(
-        "first line",
-        generatedName("  first line\nsecond line", &buffer),
-    );
-    try std.testing.expectEqualStrings("delegate", generatedName(" \nnext", &buffer));
-    try std.testing.expectEqualStrings("delegate", generatedName("\x01", &buffer));
-}
-
-test "managed planner covers every child state without hidden lifecycle effects" {
+test "persistent planning derives continue busy and stop" {
     const alloc = std.testing.allocator;
-    var send = try validateRequest(alloc, .{ .send = .{
-        .child_id = "01J00000000000000000000000",
+    var message = try validateRequest(alloc, .{ .message = .{
+        .agent = "reviewer",
         .message = "continue",
     } });
-    defer send.deinit(alloc);
+    defer message.deinit(alloc);
+    try std.testing.expectEqual(
+        Plan.continue_persistent,
+        plan(message, .{ .kind = .persistent, .phase = .idle }),
+    );
+    const busy = plan(message, .{ .kind = .persistent, .phase = .running });
+    try std.testing.expectEqual(RejectCode.child_busy, busy.reject);
+
     var stop = try validateRequest(alloc, .{ .stop = .{
         .child_id = "01J00000000000000000000000",
     } });
     defer stop.deinit(alloc);
-    var wait = try validateRequest(alloc, .{ .wait = .{
-        .child_id = "01J00000000000000000000000",
-    } });
-    defer wait.deinit(alloc);
-    try std.testing.expect(plan(wait, null) == .inspect_wait);
-
-    inline for (std.meta.tags(domain.State)) |state| {
-        const snapshot = Snapshot{ .mode = .persistent, .state = state };
-        const send_plan = plan(send, snapshot);
-        const stop_plan = plan(stop, snapshot);
-        switch (state) {
-            .idle, .queued, .running, .awaiting_approval => try std.testing.expect(send_plan == .send),
-            .interrupted, .completed, .failed, .cancelled, .archived => try std.testing.expect(send_plan == .reject),
-        }
-        switch (state) {
-            .queued, .running, .awaiting_approval, .interrupted => try std.testing.expect(stop_plan == .cancel),
-            .idle, .completed, .failed, .cancelled, .archived => try std.testing.expect(stop_plan == .no_op),
-        }
-    }
-    try std.testing.expect(plan(send, .{ .mode = .one_off, .state = .running }) == .reject);
+    try std.testing.expectEqual(
+        Plan.cancel,
+        plan(stop, .{ .kind = .persistent, .phase = .interrupted }),
+    );
+    try std.testing.expectEqual(
+        Plan.no_op,
+        plan(stop, .{ .kind = .persistent, .phase = .idle }),
+    );
 }
 
-test "managed result encoding is compact and explicit" {
-    const encoded = try encodeResultAlloc(std.testing.allocator, .{
+test "child handle projection round trips canonical generated IDs" {
+    const alloc = std.testing.allocator;
+    const canonical = "1787307451427-1787307451427093000-eeb3173e6e16f798";
+    const projected = try modelChildIdAlloc(alloc, canonical);
+    defer alloc.free(projected);
+    try std.testing.expectEqualStrings(
+        "1787307451427-093000-eeb3173e6e16f798",
+        projected,
+    );
+    const restored = try validateChildIdAlloc(alloc, projected);
+    defer alloc.free(restored);
+    try std.testing.expectEqualStrings(canonical, restored);
+}
+
+test "compact result encodes final text without manager fields" {
+    const alloc = std.testing.allocator;
+    const encoded = try encodeResultAlloc(alloc, .{
         .ok = true,
         .child_id = "child-1",
-        .status = "running",
+        .status = "completed",
+        .result = "review complete",
     });
-    defer std.testing.allocator.free(encoded);
-    try std.testing.expectEqualStrings(
-        "{\"ok\":true,\"operation_id\":null,\"child_id\":\"child-1\",\"status\":\"running\",\"error_code\":null,\"retryable\":false}",
-        encoded,
-    );
-}
-
-fn checkValidationAllocationFailures(alloc: Allocator) !void {
-    var request = try validateRequest(alloc, .{ .send = .{
-        .child_id = "1788212822437-350000-0924a40611358d88",
-        .message = "continue",
-    } });
-    request.deinit(alloc);
-}
-
-test "managed request validation cleans partial allocation failures" {
-    try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
-        checkValidationAllocationFailures,
-        .{},
-    );
-}
-
-test "managed child IDs use one reversible model-facing representation" {
-    const alloc = std.testing.allocator;
-    const canonical = "1788212822437-1788212822437350000-0924a40611358d88";
-    const compact = try modelChildIdAlloc(alloc, canonical);
-    defer alloc.free(compact);
-    try std.testing.expectEqualStrings(
-        "1788212822437-350000-0924a40611358d88",
-        compact,
-    );
-    var request = try validateRequest(alloc, .{ .wait = .{ .child_id = compact } });
-    defer request.deinit(alloc);
-    try std.testing.expectEqualStrings(canonical, request.wait.child_id);
-
-    const unchanged = try modelChildIdAlloc(alloc, "child-1");
-    defer alloc.free(unchanged);
-    try std.testing.expectEqualStrings("child-1", unchanged);
+    defer alloc.free(encoded);
+    try std.testing.expect(std.mem.find(u8, encoded, "\"result\":\"review complete\"") != null);
+    try std.testing.expect(std.mem.find(u8, encoded, "retryable") == null);
+    try std.testing.expect(std.mem.find(u8, encoded, "requested") == null);
+    try std.testing.expect(std.mem.find(u8, encoded, "cursor") == null);
 }

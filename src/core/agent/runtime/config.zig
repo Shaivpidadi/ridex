@@ -39,6 +39,7 @@ pub const Config = struct {
         .vision_fallback = true,
     },
     custom_tool_guidance: []const u8 = "",
+    persistent_agents_prompt_section: []const u8 = "",
     agent_step_limit: usize,
     max_tool_result_bytes: usize = tool_result_limits.default_max_tool_result_bytes,
     step_limit_notice: []const u8 = default_step_limit_notice,

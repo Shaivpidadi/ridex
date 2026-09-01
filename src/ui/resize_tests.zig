@@ -909,11 +909,6 @@ fn defaultFooterContext(input: *const InputRuntime) render_input.RenderContext {
         .has_api_key = true,
         .model = "test-model",
         .queued_count = 0,
-        .subagent_count = 0,
-        .subagent_view_active = false,
-        .selected_subagent_id = null,
-        .selected_subagent_label = null,
-        .selected_subagent_status = null,
         .input = input,
     };
 }

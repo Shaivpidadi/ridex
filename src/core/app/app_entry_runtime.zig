@@ -243,7 +243,7 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc:
                 return .{ .exit = 1 };
             },
             error.OneOffSessionNotResumable => {
-                writeStderr(deps, "fx: one-off child sessions cannot accept additional prompts; create a persistent child to continue the conversation\n");
+                writeStderr(deps, "fx: subagent child sessions cannot be resumed directly; message a configured agent from its parent session\n");
                 return .{ .exit = 1 };
             },
             error.InvalidSessionFormat => {
@@ -1182,7 +1182,7 @@ test "app entry maps unavailable session state to one expected startup failure" 
         },
         .{
             .init_error = error.OneOffSessionNotResumable,
-            .message = "fx: one-off child sessions cannot accept additional prompts; create a persistent child to continue the conversation\n",
+            .message = "fx: subagent child sessions cannot be resumed directly; message a configured agent from its parent session\n",
         },
     };
 

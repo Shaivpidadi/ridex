@@ -1222,6 +1222,21 @@ pub const WorkerRuntime = struct {
         self.worker_mutex.unlock(io_mod.getIo());
     }
 
+    /// Marks an agent turn that is executed directly rather than dequeued by
+    /// the interactive worker loop. The caller must pair a successful begin
+    /// with `finishProcessing`.
+    pub fn beginDirectProcessing(self: *WorkerRuntime, turn_id: u64) bool {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        if (self.worker_processing or self.worker_stop_requested) return false;
+        self.worker_cancel_requested.store(false, .seq_cst);
+        self.worker_recovery_pause_requested.store(false, .seq_cst);
+        self.worker_connectivity_wait_active.store(false, .seq_cst);
+        self.worker_processing = true;
+        self.active_turn_id = turn_id;
+        return true;
+    }
+
     pub fn waitUntilIdle(self: *WorkerRuntime) void {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());

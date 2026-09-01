@@ -35,7 +35,6 @@ const StreamState = types.StreamState;
 const ActivityProjection = activity_runtime.ActivityProjection;
 const InputRuntime = core_input_runtime.Runtime;
 const TranscriptRuntime = transcript_runtime.TranscriptRuntime;
-const SubagentStatus = @import("../../core/subagent/domain.zig").State;
 
 pub const SkillsMenuProjection = struct {
     active: bool = false,
@@ -396,13 +395,6 @@ pub const RenderContext = struct {
     queued_prompt_cards: []const QueuedPromptCard = &.{},
     queued_prompt_card_rows: u16 = 0,
     queued_editor_active: bool = false,
-    subagent_count: usize,
-    subagent_view_active: bool,
-    selected_subagent_id: ?u64,
-    selected_subagent_label: ?[]const u8,
-    selected_subagent_status: ?SubagentStatus,
-    selected_subagent_tool_calls: usize = 0,
-    selected_subagent_activity: ?[]const u8 = null,
     fast_mode: bool = false,
     model_supports_fast: bool = false,
     effort: types.ReasoningEffort = .auto,
@@ -804,11 +796,6 @@ test "frame-owned thinking activity projects the thinking label" {
         .has_api_key = true,
         .model = "gpt-5.1",
         .queued_count = 0,
-        .subagent_count = 0,
-        .subagent_view_active = false,
-        .selected_subagent_id = null,
-        .selected_subagent_label = null,
-        .selected_subagent_status = null,
         .shimmer_pos = 0,
         .input = &input,
     };
@@ -832,11 +819,6 @@ test "frame-owned activity renders the thinking elapsed counter from the frame c
         .has_api_key = true,
         .model = "gpt-5.1",
         .queued_count = 0,
-        .subagent_count = 0,
-        .subagent_view_active = false,
-        .selected_subagent_id = null,
-        .selected_subagent_label = null,
-        .selected_subagent_status = null,
         .input = &input,
     };
 
@@ -860,11 +842,6 @@ test "frame-owned activity keeps active tools out of the turn status row" {
         .has_api_key = true,
         .model = "gpt-5.1",
         .queued_count = 0,
-        .subagent_count = 0,
-        .subagent_view_active = false,
-        .selected_subagent_id = null,
-        .selected_subagent_label = null,
-        .selected_subagent_status = null,
         .activity = .{ .tool_slot = .{
             .entry_id = 123,
             .fallback_label = "reading src/main.zig",
@@ -907,11 +884,6 @@ test "current frame-owned activity leaves the focused tool in the transcript" {
         .has_api_key = true,
         .model = "test-model",
         .queued_count = 0,
-        .subagent_count = 0,
-        .subagent_view_active = false,
-        .selected_subagent_id = null,
-        .selected_subagent_label = null,
-        .selected_subagent_status = null,
         .activity = .{ .tool_slot = .{
             .entry_id = 123,
             .fallback_label = "● Running\x1b[0m \x1b[38;5;245mzig build test\x1b[0m\n",
@@ -976,11 +948,6 @@ test "frame-owned activity preserves route recovery status tone" {
         .has_api_key = true,
         .model = "gpt-5.1",
         .queued_count = 0,
-        .subagent_count = 0,
-        .subagent_view_active = false,
-        .selected_subagent_id = null,
-        .selected_subagent_label = null,
-        .selected_subagent_status = null,
         .activity = .{ .turn_thinking = .{
             .label = "⚠ API error · attempt 1/3 failed · retrying",
             .tone = .warning,
@@ -1027,11 +994,6 @@ test "frame-owned activity shows live streaming token progress" {
         .has_api_key = true,
         .model = "test-model",
         .queued_count = 0,
-        .subagent_count = 0,
-        .subagent_view_active = false,
-        .selected_subagent_id = null,
-        .selected_subagent_label = null,
-        .selected_subagent_status = null,
         .activity = .none,
         .now_ms = 13_000,
         .input = &input,
@@ -1132,11 +1094,6 @@ test "frame-owned activity uses clipped command activity label" {
         .has_api_key = true,
         .model = "gpt-5.1",
         .queued_count = 0,
-        .subagent_count = 0,
-        .subagent_view_active = false,
-        .selected_subagent_id = null,
-        .selected_subagent_label = null,
-        .selected_subagent_status = null,
         .activity = .{ .tool_slot = .{
             .entry_id = 123,
             .fallback_label = "running read-only tools",

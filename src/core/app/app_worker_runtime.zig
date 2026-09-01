@@ -422,19 +422,16 @@ pub fn Runtime(comptime App: type) type {
                 request.view()
             else
                 null;
-            const child_pending_request: ?permission_request.PermissionRequest = if (worker_pending_request == null) blk: {
-                if (comptime @hasField(App, "subagents")) {
-                    if (comptime @hasDecl(@TypeOf(app.subagents), "mainApprovalRequest")) {
-                        break :blk app.subagents.mainApprovalRequest();
-                    }
-                }
-                break :blk null;
-            } else null;
-            if (comptime @hasField(App, "subagents")) {
-                if (comptime @hasDecl(@TypeOf(app.subagents), "markMainApprovalPresented")) {
-                    app.subagents.markMainApprovalPresented(child_pending_request != null);
-                }
-            }
+            var owned_child_pending = if (worker_pending_request == null)
+                if (app_session_runtime.Runtime(App).subagentHost(app)) |host|
+                    host.pendingApprovalRequest(app.alloc) catch null
+                else
+                    null
+            else
+                null;
+            defer if (owned_child_pending) |*pending| pending.deinit(app.alloc);
+            const child_pending_request: ?permission_request.PermissionRequest =
+                if (owned_child_pending) |*pending| pending.request.view() else null;
             const pending_request = worker_pending_request orelse child_pending_request;
             const management_active = if (comptime @hasField(
                 @TypeOf(app.approval_prompt),
@@ -534,9 +531,6 @@ pub fn Runtime(comptime App: type) type {
             if (!try authorizeInteractiveAdmission(app)) return;
             try drainEvents(app, event_handlers);
             syncState(app, event_handlers.tool_lifecycle);
-            if (comptime @hasDecl(App, "refreshSubagentManagerProjection")) {
-                try app.refreshSubagentManagerProjection();
-            }
 
             const now_ms = io_mod.milliTimestamp();
             if (app.shell.worker_status_state().expire_transient(now_ms)) {
@@ -560,33 +554,6 @@ pub fn Runtime(comptime App: type) type {
             now_ms: i64,
             now_awake: std.Io.Clock.Timestamp,
         ) bool {
-            if (comptime @hasDecl(@TypeOf(app.subagents), "childPresentationView") and
-                @hasDecl(@TypeOf(app.subagents), "childConversationRuntime") and
-                @hasDecl(@TypeOf(app.subagents), "activeRenderRequests"))
-            {
-                if (app.subagents.isViewActive()) {
-                    const view = app.subagents.childPresentationView() orelse return false;
-                    const child_shell = app.subagents.childConversationRuntime() orelse return false;
-                    const requests = app.subagents.activeRenderRequests();
-                    const status_changed = child_shell.worker_status_state().refresh_route_recovery(now_awake);
-                    if (status_changed) requests.request(.footer);
-                    const status_expired = child_shell.worker_status_state().expire_transient(now_ms);
-                    if (status_expired) requests.request(.footer);
-                    if (!view.chat.busy() or !child_shell.shimmer_active) {
-                        return status_changed or status_expired;
-                    }
-                    const previous_deadline = requests.animation_next_deadline_ms;
-                    if (!requests.requestAnimationDue(now_ms)) {
-                        return status_changed or status_expired;
-                    }
-                    debug_trace.logf(
-                        "frame_schedule",
-                        "child_animation_due previous_ms={d} now_ms={d} interval_ms={d}",
-                        .{ previous_deadline, now_ms, render_request.animation_interval_ms },
-                    );
-                    return true;
-                }
-            }
             const status_changed = app.shell.worker_status_state().refresh_route_recovery(now_awake);
             if (status_changed) app.shell.render_requests.request(.footer);
             if (!app.stream.active and !app.pacer.hasCompletedAssistantPresentationTail()) {
@@ -1561,7 +1528,6 @@ const FakeApp = struct {
     replaceable_silent_count: usize = 0,
     replace_count: usize = 0,
     replace_silent_count: usize = 0,
-    subagent_manager_refreshes: usize = 0,
     last_class: transcript_runtime.RawEntryClass = .unknown_raw,
     attention_count: usize = 0,
     last_attention_turn_id: u64 = 0,
@@ -1633,10 +1599,6 @@ const FakeApp = struct {
         self.replace_silent_count += 1;
         try self.transcript.appendSlice(self.alloc, text);
         return false;
-    }
-
-    fn refreshSubagentManagerProjection(self: *FakeApp) !void {
-        self.subagent_manager_refreshes += 1;
     }
 
     fn dispatchAttentionRequired(
@@ -2174,7 +2136,7 @@ test "core.app_worker_runtime keeps visible animation alive after native history
     try std.testing.expect(app.shell.render_requests.hasReason(.animation));
 }
 
-test "core.app_worker_runtime refreshes root and selected child retry countdowns" {
+test "core.app_worker_runtime refreshes root retry countdown" {
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
 
@@ -2202,48 +2164,6 @@ test "core.app_worker_runtime refreshes root and selected child retry countdowns
         .none, .tool_slot => return error.TestUnexpectedResult,
     }
     try std.testing.expect(app.shell.render_requests.hasReason(.footer));
-
-    app.subagents.view_active = true;
-    app.subagents.child_busy = true;
-    app.subagents.child_shell.shimmer_active = true;
-    app.subagents.child_shell.worker_status_state().set_route_recovery(.{
-        .kind = .auto_retry,
-        .failed_attempt = 2,
-        .attempt_limit = 3,
-        .delay_seconds = 4,
-        .retry_deadline = test_awake_timestamp(8_000),
-    }, 0);
-
-    try std.testing.expect(Runtime(FakeApp).advanceVisibleAnimation(
-        &app,
-        NoopBridge.lifecyclePresenter(&app),
-        0,
-        test_awake_timestamp(7_000),
-    ));
-    switch (app.subagents.child_shell.activityProjection()) {
-        .turn_thinking => |projection| try std.testing.expectEqualStrings(
-            "⚠ Provider unavailable · retrying request in 1s · attempt 2/3",
-            projection.label,
-        ),
-        .none, .tool_slot => return error.TestUnexpectedResult,
-    }
-    try std.testing.expect(app.subagents.child_render_requests.hasReason(.footer));
-}
-
-test "core.app_worker_runtime expires selected child worker status while idle" {
-    var app = FakeApp.init(std.testing.allocator);
-    defer app.deinit();
-    app.subagents.view_active = true;
-    app.subagents.child_shell.worker_status_state().set_route_recovery(.{
-        .kind = .auto_recovered,
-        .succeeded_attempt = 2,
-        .attempt_limit = 3,
-    }, 1_000);
-
-    _ = Runtime(FakeApp).advanceVisibleAnimation(&app, NoopBridge.lifecyclePresenter(&app), 2_500, test_awake_timestamp(2_500));
-
-    try std.testing.expect(app.subagents.child_shell.activityProjection() == .none);
-    try std.testing.expect(app.subagents.child_render_requests.hasReason(.footer));
 }
 
 test "core.app_worker_runtime ticks animation for completed assistant presentation tail only" {
@@ -2522,11 +2442,6 @@ test "core.app_worker_runtime suppresses route recovery activity while question 
         .has_api_key = true,
         .model = "gpt-5.1",
         .queued_count = 0,
-        .subagent_count = 0,
-        .subagent_view_active = false,
-        .selected_subagent_id = null,
-        .selected_subagent_label = null,
-        .selected_subagent_status = null,
         .question = .{
             .current_entry = null,
             .current_index = 0,
@@ -4016,7 +3931,6 @@ test "core.app_worker_runtime tick drains events and updates thinking state" {
 
     try tickNoop(&app);
 
-    try std.testing.expectEqual(@as(usize, 1), app.subagent_manager_refreshes);
     try std.testing.expect(app.stream.active);
     try std.testing.expectEqual(@as(usize, 2), app.stream.chunks);
     try std.testing.expectEqual(@as(usize, 1), app.stream.command_count);

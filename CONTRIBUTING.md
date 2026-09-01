@@ -139,7 +139,7 @@ Runtime state lives under `~/.fx/`:
 
 Sessions are global and portable across workspaces. Each session tracks a `workspace_root` that updates when resumed from a different directory.
 
-Subagent children are ordinary sessions with their own `~/.fx/sessions/<child-id>/` directory and their own history. The `subagent/` directory is per session on both sides of the relationship: a parent records create-operation identities there, and a child records its own control state there.
+Subagent children are internal ordinary sessions with their own `~/.fx/sessions/<child-id>/` directory and history. The parent owns one bounded `subagent/children.json` registry; each child carries only an immutable owner marker. Child sessions are hidden from ordinary session discovery and cannot be resumed directly. Named persistent agents are strict profile-owned definitions in `~/.fx/agents/<name>.json`.
 
 ## Skills
 
@@ -407,7 +407,7 @@ Check in the golden file and wire a regression test that re-runs `fx replay` in 
 
 * Do not commit generated state from `.fx/`, `.zig-cache/`, or `zig-out/`
 
-* Do not add a general alternate-screen (`\x1b[?1049h/l`) render path. fx is inline by design except for the five exclusive owner classes represented by `AlternateScreenOwner`: interactive tool-approval review, the full-transcript screen, catalog menus, the ctrl+x subagent manager, and the hosted child-terminal takeover. The terminal-session owner is entered only from the manager after `TerminalHost` grants the human write lease, has no permanent fx chrome, and must release the lease on detach. Every owner must leave or explicitly hand off the alternate buffer and restore the main grid, composer, cursor, paste, mouse, focus, and keyboard modes before resolving, cancelling, or shutting down
+* Do not add a general alternate-screen (`\x1b[?1049h/l`) render path. fx is inline by design except for the three exclusive owner classes represented by `AlternateScreenOwner`: interactive tool-approval review, the full-transcript screen, and catalog menus. Every owner must leave or explicitly hand off the alternate buffer and restore the main grid, composer, cursor, paste, mouse, focus, and keyboard modes before resolving, cancelling, or shutting down
 
 ## Releases
 

@@ -32,7 +32,6 @@ const subagent_agent_adapter = @import("../core/subagent/agent_adapter.zig");
 const subagent_domain = @import("../core/subagent/domain.zig");
 const subagent_execution = @import("../core/subagent/execution.zig");
 const subagent_resume_admission = @import("../core/subagent/resume_admission.zig");
-const parent_delivery_projector = @import("../core/subagent/parent_delivery_projector.zig");
 const usage_recovery = @import("../core/session/usage_recovery.zig");
 const skill_runtime = @import("../core/skills/skill_runtime.zig");
 const skill_invocation = @import("../core/skills/skill_invocation.zig");
@@ -766,6 +765,10 @@ fn buildAgentConfig(state: *server.ServerState, session: *server.ActiveSessionSt
         .advertised_functions = sections.advertised_functions,
         .provider_capabilities = state.cfg.provider_set.select(session.provider).capabilities,
         .custom_tool_guidance = sections.custom_tool_guidance,
+        .persistent_agents_prompt_section = if (state.subagent_host) |subagent_host|
+            subagent_host.agentGuidance()
+        else
+            "",
         .agent_step_limit = session.agent_step_limit,
         .max_tool_result_bytes = session.max_tool_result_bytes,
         .cancel_flag = &session.cancel_flag,
@@ -984,8 +987,6 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
         .context_enabled = ctx.state.context_enabled,
         .finalize_turn = finalizeTurn,
         .release_agent_terminal_lease = releaseAgentTerminalLease,
-        .prepare_parent_turn_context = prepareParentTurnContext,
-        .acknowledge_parent_turn_context = acknowledgeParentTurnContext,
         .append_runtime_context = appendRuntimeContext,
         .append_static_context = appendStaticContext,
         .validate_tool_call = validateToolCall,
@@ -1161,40 +1162,6 @@ fn appendRuntimeContext(raw_ctx: *anyopaque, arena: Allocator, messages: *std.Ar
         .permission_mode = ctx.captured_permission_mode orelse session.permission_mode,
         .tracker = null,
     }, arena, messages);
-}
-
-fn prepareParentTurnContext(
-    raw_ctx: *anyopaque,
-    arena: Allocator,
-) !?agent_runtime.PreparedParentTurnContext {
-    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
-    const subagent_host = ctx.state.subagent_host orelse return null;
-    const session = if (ctx.state.active_session) |*active| active else return null;
-    return parent_delivery_projector.prepare(
-        arena,
-        subagent_host.sessions,
-        session.session_id,
-        subagent_host.manager.options.child_store,
-    );
-}
-
-fn acknowledgeParentTurnContext(
-    raw_ctx: *anyopaque,
-    arena: Allocator,
-    acknowledgements: []const agent_runtime.ParentTurnDeliveryAck,
-) void {
-    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
-    const subagent_host = ctx.state.subagent_host orelse return;
-    const retirement_ready = parent_delivery_projector
-        .acknowledgeWithRetirementSignal(
-        arena,
-        subagent_host.sessions,
-        subagent_host.manager.options.child_store,
-        acknowledgements,
-    );
-    if (retirement_ready) {
-        subagent_host.requestRetirementSweep(io_mod.milliTimestamp());
-    }
 }
 
 fn appendStaticContext(raw_ctx: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) !void {
@@ -3576,8 +3543,8 @@ test "ACP registry callbacks preserve snapshot bytes before transient context" {
         deps.context_registry.?.defaultProvider().id,
     );
     try std.testing.expect(deps.request_prepared_file_mutation_permission != null);
-    try std.testing.expect(deps.prepare_parent_turn_context != null);
-    try std.testing.expect(deps.acknowledge_parent_turn_context != null);
+    try std.testing.expect(deps.prepare_parent_turn_context == null);
+    try std.testing.expect(deps.acknowledge_parent_turn_context == null);
 
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();

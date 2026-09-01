@@ -1547,7 +1547,6 @@ pub fn Runtime(comptime App: type) type {
         fn installFreshLiveSession(app: *App) !void {
             try beginFreshPersistedSession(app);
             enableSessionStores(app);
-            refreshSubagentProjectionAfterSessionInstall(app);
             try finishLiveSessionTransition(app);
         }
 
@@ -1909,7 +1908,6 @@ pub fn Runtime(comptime App: type) type {
             try hydrateResumedSession(app, active.state, display.title, notice);
             active.resume_view_stale = true;
             enableSessionStores(app);
-            refreshSubagentProjectionAfterSessionInstall(app);
         }
 
         fn hydrateResumedSession(
@@ -1983,17 +1981,6 @@ pub fn Runtime(comptime App: type) type {
                 try replayHistoryToSink(app, &sink, state.history);
                 try writeRecoveryCheckpointToSink(app, &sink, state);
             }
-        }
-
-        fn refreshSubagentProjectionAfterSessionInstall(app: *App) void {
-            if (comptime !@hasDecl(App, "refreshSubagentManagerProjectionNow")) return;
-            app.refreshSubagentManagerProjectionNow() catch |err| {
-                debug_trace.logf(
-                    "subagent",
-                    "session projection refresh unavailable err={s}",
-                    .{@errorName(err)},
-                );
-            };
         }
 
         pub fn openSessionPicker(app: *App) !void {
@@ -3055,6 +3042,7 @@ pub fn Runtime(comptime App: type) type {
         }
 
         pub fn subagentHost(app: *App) ?*subagent_tool_host.Runtime {
+            if (comptime !@hasField(App, "session_persistence")) return null;
             return app.session_persistence.subagent_host;
         }
 
@@ -7843,13 +7831,6 @@ test "interactive session resume uses the live transition and shared restore pat
     try std.testing.expect(!app.session_persistence.session_picker.active);
 
     const host = app.session_persistence.subagent_host.?;
-    const recovery_deadline = io_mod.milliTimestamp() + 5_000;
-    while ((host.recoveryState() == .scheduled or
-        host.recoveryState() == .running) and
-        io_mod.milliTimestamp() < recovery_deadline)
-    {
-        std.Thread.yield() catch std.atomic.spinLoopHint();
-    }
     try std.testing.expectEqual(
         subagent_tool_host.RecoveryState.complete,
         host.recoveryState(),

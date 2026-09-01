@@ -39,7 +39,6 @@ const types = @import("../shared/types.zig");
 const assistant_presentation = @import("../agent/assistant_presentation.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const transcript_blocks = @import("../../ui/render_engine/transcript_blocks.zig");
-const ui_subagents = @import("../../ui/subagent/runtime.zig");
 const transcript_runtime = @import("../../ui/transcript/runtime.zig");
 const test_builtin_skills = if (@import("builtin").is_test)
     @import("../../builtins/skills.zig")
@@ -2118,7 +2117,6 @@ fn buildTraceReport(app: anytype) ![]u8 {
     try writeLastInterruptedDetail(&out.writer, app.session.history.items, app.alloc);
     try writeNetworkCallsSummary(&out.writer);
     try writeToolCallsSummary(&out.writer, app.alloc);
-    try writeSubagentsSummary(&out.writer, app.alloc, &app.subagents);
     try writePermissionsSummary(&out.writer, app.permission_engine.grants.items);
     try writeRuntimeContextSummary(&out.writer, app, app.alloc);
     try writeRendererState(&out.writer, app, app.alloc);
@@ -2389,16 +2387,6 @@ fn writeProblemsSummary(writer: *std.Io.Writer, app: anytype, alloc: std.mem.All
         try writeToolCallCompact(writer, call);
     }
 
-    const entries = app.subagents.snapshotEntries(alloc) catch &.{};
-    defer if (entries.len > 0) alloc.free(entries);
-    for (entries) |entry| {
-        if (entry.status != .failed) continue;
-        count += 1;
-        try writer.print("- subagent failed id={s} label=", .{entry.id});
-        try writeMaskedInline(writer, alloc, entry.label);
-        try writer.writeByte('\n');
-    }
-
     var mcp_lease = if (comptime @hasDecl(@TypeOf(app.*), "acquireMcpRuntime"))
         app.acquireMcpRuntime()
     else
@@ -2425,7 +2413,7 @@ fn writeProblemsSummary(writer: *std.Io.Writer, app: anytype, alloc: std.mem.All
         }
     }
 
-    if (count == 0) try writer.writeAll("- no obvious errors captured in recent network, tool, subagent, or MCP state\n");
+    if (count == 0) try writer.writeAll("- no obvious errors captured in recent network, tool, or MCP state\n");
 }
 
 fn writeRuntimeContextSummary(writer: *std.Io.Writer, app: anytype, alloc: std.mem.Allocator) !void {
@@ -2603,26 +2591,6 @@ fn writePermissionsSummary(writer: *std.Io.Writer, grants: []const types.Permiss
     try writer.print("\n## Permissions\npermission grants ({d}):\n", .{grants.len});
     for (grants) |grant| {
         try writer.print("  - {s} :: {s}\n", .{ grant.tool_name, grant.target_path });
-    }
-}
-
-fn writeSubagentsSummary(writer: *std.Io.Writer, alloc: std.mem.Allocator, controller: anytype) !void {
-    const entries = controller.snapshotEntries(alloc) catch {
-        try writer.writeAll("\n## Subagents\n(snapshot failed)\n");
-        return;
-    };
-    defer alloc.free(entries);
-    if (entries.len == 0) {
-        try writer.writeAll("\n## Subagents\n(none)\n");
-        return;
-    }
-    try writer.print("\n## Subagents\ncount={d}\n", .{entries.len});
-    for (entries) |entry| {
-        try writer.print("[{s}] ", .{entry.id});
-        try writeMaskedInline(writer, alloc, entry.label);
-        try writer.print(" status={s} unread={d}", .{ ui_subagents.statusLabelPublic(entry.status), entry.unread_count });
-        if (entry.external_busy) try writer.writeAll(" external_busy=true");
-        try writer.writeByte('\n');
     }
 }
 

@@ -974,7 +974,7 @@ fn handleLoadFailure(
     if (err == error.OneOffSessionNotResumable) {
         return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_params,
-            .message = "One-off child sessions cannot accept additional prompts",
+            .message = "Subagent child sessions cannot be resumed directly",
         });
     }
     if (err == error.InvalidSessionFormat or
@@ -1562,7 +1562,7 @@ test "ACP load maps one-off child denial to invalid params" {
     try std.testing.expect(std.mem.find(
         u8,
         captured,
-        "One-off child sessions cannot accept additional prompts",
+        "Subagent child sessions cannot be resumed directly",
     ) != null);
 }
 

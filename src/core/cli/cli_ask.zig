@@ -55,9 +55,7 @@ const subagent_agent_adapter = @import("../subagent/agent_adapter.zig");
 const subagent_authority = @import("../subagent/authority.zig");
 const subagent_domain = @import("../subagent/domain.zig");
 const subagent_execution = @import("../subagent/execution.zig");
-const subagent_manager = @import("../subagent/manager.zig");
 const subagent_resume_admission = @import("../subagent/resume_admission.zig");
-const parent_delivery_projector = @import("../subagent/parent_delivery_projector.zig");
 const subagent_tool_host = @import("../subagent/tool_host.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const test_builtin_gateway = if (std_builtin.is_test)
@@ -1285,7 +1283,7 @@ fn runWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: 
         if (err == error.OneOffSessionNotResumable and !options.json_output) {
             try deps.write_stderr(
                 deps.stderr_ctx,
-                "fx ask: one-off child sessions cannot accept additional prompts; create a persistent child to continue the conversation\n",
+                "fx ask: subagent child sessions cannot be resumed directly; message a configured agent from its parent session\n",
             );
             return 1;
         }
@@ -1756,6 +1754,10 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         .advertised_functions = tool_projection.advertised_functions,
         .provider_capabilities = cfg.provider_set.select(ctx.provider).capabilities,
         .custom_tool_guidance = tool_projection.custom_guidance,
+        .persistent_agents_prompt_section = if (ctx.subagent_host) |subagent_host|
+            subagent_host.agentGuidance()
+        else
+            "",
         .agent_step_limit = startup.agent_step_limit,
         .max_tool_result_bytes = startup.max_tool_result_bytes,
         .cancel_flag = ctx.cancelFlag(),
@@ -1925,8 +1927,6 @@ fn agentRuntimeDeps(ctx: *AskContext) agent_runtime.AgentRuntimeDeps {
         .context_enabled = ctx.context_enabled,
         .finalize_turn = finalizeTurn,
         .release_agent_terminal_lease = releaseAgentTerminalLease,
-        .prepare_parent_turn_context = prepareParentTurnContext,
-        .acknowledge_parent_turn_context = acknowledgeParentTurnContext,
         .append_runtime_context = appendRuntimeContext,
         .append_static_context = appendStaticContext,
         .validate_tool_call = validateToolCall,
@@ -2088,40 +2088,6 @@ fn appendRuntimeContext(raw_ctx: *anyopaque, arena: Allocator, messages: *std.Ar
         .permission_mode = ctx.permission_mode,
         .tracker = null,
     }, arena, messages);
-}
-
-fn prepareParentTurnContext(
-    raw_ctx: *anyopaque,
-    arena: Allocator,
-) !?agent_runtime.PreparedParentTurnContext {
-    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
-    const subagent_host = ctx.subagent_host orelse return null;
-    const writable = if (ctx.writable) |*value| value else return null;
-    return parent_delivery_projector.prepare(
-        arena,
-        subagent_host.sessions,
-        writable.active_id,
-        subagent_host.manager.options.child_store,
-    );
-}
-
-fn acknowledgeParentTurnContext(
-    raw_ctx: *anyopaque,
-    arena: Allocator,
-    acknowledgements: []const agent_runtime.ParentTurnDeliveryAck,
-) void {
-    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
-    const subagent_host = ctx.subagent_host orelse return;
-    const retirement_ready = parent_delivery_projector
-        .acknowledgeWithRetirementSignal(
-        arena,
-        subagent_host.sessions,
-        subagent_host.manager.options.child_store,
-        acknowledgements,
-    );
-    if (retirement_ready) {
-        subagent_host.requestRetirementSweep(io_mod.milliTimestamp());
-    }
 }
 
 fn appendStaticContext(raw_ctx: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) !void {
@@ -6805,67 +6771,6 @@ fn testAskDurableState(
     };
 }
 
-test "saved ask rejects a canonical one-off child during resume initialization" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
-    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
-    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
-    defer alloc.free(home);
-    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
-    defer alloc.free(workspace);
-    const test_home = try TestAskHome.install(alloc, home);
-    defer test_home.deinit();
-
-    var store = try session_store.Store.initFromHome(alloc, home, workspace);
-    defer store.deinit(alloc);
-    for ([_][]const u8{ "ask-parent", "ask-one-off" }) |session_id| {
-        var state = try testAskDurableState(alloc, workspace, session_id);
-        defer state.deinit(alloc);
-        var writable = try store.startWritableSession(alloc, state);
-        writable.deinit(alloc);
-    }
-    var command = try subagent_domain.validateCommand(alloc, .{ .create = .{
-        .name = "one-off",
-        .mode = .one_off,
-        .prompt = "initial work",
-    } });
-    defer command.deinit(alloc);
-    var manager = subagent_manager.Manager{ .sessions = &store };
-    var result = try manager.execute(alloc, command, .{
-        .actor_id = "ask-parent",
-        .operation_id = "create-one-off",
-        .created_child_id = "ask-one-off",
-        .timestamp_ms = 2,
-    });
-    defer result.deinit(alloc);
-    try std.testing.expectEqual(subagent_domain.OutcomeCode.created, result.receipt.code);
-
-    var stdout_capture: TestCapture = .{};
-    defer stdout_capture.deinit(alloc);
-    var stderr_capture: TestCapture = .{};
-    defer stderr_capture.deinit(alloc);
-    var ctx = AskContext.init(
-        alloc,
-        testConfig(),
-        testPromptRunDeps(
-            &stdout_capture,
-            &stderr_capture,
-            testPresentKeyStartup,
-        ),
-        workspace,
-    );
-    defer ctx.deinit();
-    ctx.requested_resume = .{ .id = "ask-one-off" };
-
-    try std.testing.expectError(
-        error.OneOffSessionNotResumable,
-        ctx.initializeSessionStores(),
-    );
-    try expectAskSessionStoresUnavailable(&ctx);
-}
-
 test "fx ask renders one-off resume denial in text and JSON modes" {
     const alloc = std.testing.allocator;
     const cases = [_]struct {
@@ -6912,7 +6817,7 @@ test "fx ask renders one-off resume denial in text and JSON modes" {
         } else {
             try std.testing.expectEqualStrings("", stdout_capture.bytes.items);
             try std.testing.expectEqualStrings(
-                "fx ask: one-off child sessions cannot accept additional prompts; create a persistent child to continue the conversation\n",
+                "fx ask: subagent child sessions cannot be resumed directly; message a configured agent from its parent session\n",
                 stderr_capture.bytes.items,
             );
         }
@@ -7199,7 +7104,7 @@ test "saved ask propagates store allocation failure" {
     try expectAskSessionStoresUnavailable(&ctx);
 }
 
-test "saved ask initializes subagent host and managed shell runtime" {
+test "saved ask initializes the direct subagent host" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -7226,8 +7131,8 @@ test "saved ask initializes subagent host and managed shell runtime" {
 
     try std.testing.expect(ctx.subagent_host != null);
     const deps = agentRuntimeDeps(&ctx);
-    try std.testing.expect(deps.prepare_parent_turn_context != null);
-    try std.testing.expect(deps.acknowledge_parent_turn_context != null);
+    try std.testing.expect(deps.prepare_parent_turn_context == null);
+    try std.testing.expect(deps.acknowledge_parent_turn_context == null);
     try std.testing.expect(ctx.writable != null);
     try std.testing.expect(ctx.writable.?.state.usage != null);
 

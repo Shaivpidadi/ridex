@@ -128,7 +128,7 @@ Config precedence (highest wins):
 
 Project `.fx.json` accepts only repo-safe defaults: `sandbox`, `max_agent_steps`, `max_tool_result_bytes`, and `context`. Profile-owned keys such as `model`, `effort`, `fast_mode`, `slash_menu_categories`, `startup_scrollback`, `prompt_history`, `statusLine`, `skill_match_fuzzy`, `first_call_tool_choice`, `auto_upgrade`, `permission_mode`, `credential_source`, and `permission` are ignored from project config before their values are parsed.
 
-Runtime state lives under `~/.fx/sessions/<session-id>/` (`session.json`, `background/`, `subagent/`, `logs/`). Sessions are global and portable across workspaces — each session tracks its `workspace_root` which updates when resumed in a different workspace. A subagent child is an ordinary session with its own directory; `subagent/` holds create-operation identities on a parent and the control record on a child.
+Runtime state lives under `~/.fx/sessions/<session-id>/` (`session.json`, `background/`, `subagent/`, `logs/`). Sessions are global and portable across workspaces. Each session tracks its `workspace_root`, which updates when resumed in a different workspace. A subagent child is an internal ordinary session with its own history. Its parent owns one bounded `subagent/children.json` registry, and the child carries only an immutable owner marker. Child sessions stay out of ordinary session discovery and cannot be resumed directly. Named persistent agents are profile-owned JSON files under `~/.fx/agents/`.
 
 ## Permissions
 
@@ -283,7 +283,7 @@ A Full CI result is valid only when it belongs to the exact current commit and a
 
 ## Reproducing Render Bugs
 
-fx's rendering is inline by default and deliberately emits a small ANSI subset. Five owner classes are the narrow exceptions, and each takes the alternate buffer exclusively through `AlternateScreenOwner` in `src/ui/shell_runtime.zig`: interactive permission review, the full-transcript screen, catalog menus, the ctrl+x subagent manager, and a hosted child-terminal takeover. The terminal-session owner is entered only by an explicit manager handoff after the host grants the human write lease; it renders the shared terminal-engine grid without permanent fx chrome and releases that lease on detach. Only one class may own the buffer at a time, and each must leave it and restore the main grid, composer, cursor, paste, mouse, focus, and keyboard modes when it closes. Transcript rendering, question prompts, and command-output expansion remain inline. Three tools exist for reproducing and regression-proofing render bugs:
+fx's rendering is inline by default and deliberately emits a small ANSI subset. Three owner classes are the narrow exceptions, and each takes the alternate buffer exclusively through `AlternateScreenOwner` in `src/ui/shell_runtime.zig`: interactive permission review, the full-transcript screen, and catalog menus. Only one class may own the buffer at a time, and each must leave it and restore the main grid, composer, cursor, paste, mouse, focus, and keyboard modes when it closes. Transcript rendering, question prompts, command-output expansion, and subagent delegation remain inline. Three tools exist for reproducing and regression-proofing render bugs:
 
 ### tmux (live TTY repros)
 

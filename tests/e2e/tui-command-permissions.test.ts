@@ -357,137 +357,6 @@ function occurrenceCount(text: string, needle: string): number {
   return text.split(needle).length - 1;
 }
 
-function expectNoParentDeliveries(body: string) {
-  expect(promptText(body)).not.toContain("<subagent_deliveries");
-}
-
-function parentDeliveryEnvelope(text: string): string {
-  const start = text.indexOf("<subagent_deliveries");
-  expect(start).toBeGreaterThanOrEqual(0);
-  const end = text.indexOf("</subagent_deliveries>", start);
-  expect(end).toBeGreaterThanOrEqual(start);
-  return text.slice(start, end + "</subagent_deliveries>".length);
-}
-
-function parentDeliveryIds(body: string): string[] {
-  const text = promptText(body);
-  if (!text.includes("<subagent_deliveries")) return [];
-  return parentDeliveryEnvelope(text)
-    .split("\n")
-    .filter((line) => line.startsWith("- "))
-    .map((line) =>
-      String((JSON.parse(line.slice(2)) as { id?: unknown }).id ?? "")
-    );
-}
-
-function persistedPayloadText(payload: unknown): string {
-  if (!payload || typeof payload !== "object") return JSON.stringify(payload);
-  const message = (payload as { message?: unknown }).message;
-  if (!message || typeof message !== "object") return JSON.stringify(payload);
-  const wire = message as { encoding?: unknown; data?: unknown };
-  if (wire.encoding !== "base64" || typeof wire.data !== "string") {
-    return JSON.stringify(payload);
-  }
-  return Buffer.from(wire.data, "base64").toString("utf8");
-}
-
-function findPersistedDeliveryIds(
-  root: IsolatedRoot,
-  childId: string,
-  payload: string,
-): string[] {
-  const path = join(root.home, ".fx", "sessions", childId, "subagent", "communication.json");
-  if (!existsSync(path)) return [];
-  const record = JSON.parse(readFileSync(
-    path,
-    "utf8",
-  )) as {
-    ledger: {
-      deliveries: Array<{ id: string; payload?: unknown }>;
-    };
-  };
-  return record.ledger.deliveries
-    .filter((item) => persistedPayloadText(item.payload ?? item).includes(payload))
-    .map((item) => item.id);
-}
-
-function findPersistedDeliveryId(
-  root: IsolatedRoot,
-  childId: string,
-  payload: string,
-): string | null {
-  const matches = findPersistedDeliveryIds(root, childId, payload);
-  if (matches.length > 1) {
-    throw new Error(`Expected one persisted delivery child=${childId} payload=${payload}`);
-  }
-  return matches[0] ?? null;
-}
-
-async function waitForPersistedDeliveryId(
-  root: IsolatedRoot,
-  childId: string,
-  payload: string,
-): Promise<string> {
-  const deadline = Date.now() + TIMEOUT;
-  while (Date.now() < deadline) {
-    const id = findPersistedDeliveryId(root, childId, payload);
-    if (id) return id;
-    await Bun.sleep(20);
-  }
-  throw new Error(`Timed out waiting for persisted delivery child=${childId} payload=${payload}`);
-}
-
-async function waitForPersistedDeliveryIds(
-  root: IsolatedRoot,
-  childId: string,
-  payload: string,
-): Promise<string[]> {
-  const deadline = Date.now() + TIMEOUT;
-  while (Date.now() < deadline) {
-    const ids = findPersistedDeliveryIds(root, childId, payload);
-    if (ids.length > 0) return ids;
-    await Bun.sleep(20);
-  }
-  throw new Error(`Timed out waiting for persisted delivery child=${childId} payload=${payload}`);
-}
-
-type PendingSubagentApproval = {
-  id: string;
-  label: string;
-  rootId: string;
-  workId: string;
-};
-
-async function waitForPendingSubagentApproval(
-  root: IsolatedRoot,
-  childId: string,
-): Promise<PendingSubagentApproval> {
-  const id = await waitForPersistedDeliveryId(
-    root,
-    childId,
-    "shell.run /usr/bin/touch",
-  );
-  const communicationPath = join(
-    root.home,
-    ".fx",
-    "sessions",
-    childId,
-    "subagent",
-    "communication.json",
-  );
-  const stored = JSON.parse(readFileSync(communicationPath, "utf8")) as {
-    ledger: { approvals: Array<Record<string, unknown>> };
-  };
-  const approval = stored.ledger.approvals.find((entry) => entry.id === id);
-  if (!approval) throw new Error(`Missing approval child=${childId} id=${id}`);
-  return {
-    id,
-    label: String(approval.label ?? ""),
-    rootId: String(approval.root_id ?? ""),
-    workId: String(approval.work_id ?? ""),
-  };
-}
-
 async function waitForTraceSlice(
   tracePath: string,
   offset: number,
@@ -505,202 +374,6 @@ async function waitForTraceSlice(
     await Bun.sleep(25);
   }
   throw new Error(`Timed out waiting for ${label}.\nTrace:\n${trace}`);
-}
-
-function subagentState(root: IsolatedRoot, childId: string): string | null {
-  const path = join(root.home, ".fx", "sessions", childId, "subagent", "control.json");
-  if (!existsSync(path)) return null;
-  const record = JSON.parse(readFileSync(path, "utf8")) as { state?: string };
-  return record.state ?? null;
-}
-
-async function waitForSubagentIdle(root: IsolatedRoot, childId: string): Promise<void> {
-  const deadline = Date.now() + TIMEOUT;
-  while (Date.now() < deadline) {
-    if (subagentState(root, childId) === "idle") return;
-    await Bun.sleep(20);
-  }
-  throw new Error(`Timed out waiting for child idle child=${childId} state=${subagentState(root, childId)}`);
-}
-
-async function waitForSubagentIdleOrInterruptedAfterHostExit(
-  root: IsolatedRoot,
-  childId: string,
-): Promise<void> {
-  const deadline = Date.now() + TIMEOUT;
-  let state = subagentState(root, childId);
-  while (Date.now() < deadline) {
-    if (state === "idle" || state === "interrupted") return;
-    await Bun.sleep(20);
-    state = subagentState(root, childId);
-  }
-  throw new Error(
-    `Timed out waiting for child idle or interrupted after host exit child=${childId} state=${state}`,
-  );
-}
-
-function expectParentDelivery(
-  body: string,
-  childId: string,
-  eventId: string,
-  payload: string,
-) {
-  const text = promptText(body);
-  expect(occurrenceCount(text, "<subagent_deliveries")).toBe(1);
-  const envelope = parentDeliveryEnvelope(text);
-  expect(envelope).toContain(`"source_id":"${childId}"`);
-  expect(occurrenceCount(envelope, `"id":"${eventId}"`)).toBe(1);
-  expect(envelope).toContain(payload);
-}
-
-function expectParentDeliveries(
-  body: string,
-  childId: string,
-  eventIds: string[],
-  payload: string,
-) {
-  const text = promptText(body);
-  expect(occurrenceCount(text, "<subagent_deliveries")).toBe(1);
-  const envelope = parentDeliveryEnvelope(text);
-  expect(eventIds.length).toBeGreaterThan(0);
-  expect(envelope.split("\n").filter((line) => line.startsWith("- "))).toHaveLength(
-    eventIds.length,
-  );
-  for (const eventId of eventIds) {
-    expect(occurrenceCount(envelope, `"id":"${eventId}"`)).toBe(1);
-  }
-  expect(occurrenceCount(envelope, `"source_id":"${childId}"`)).toBe(eventIds.length);
-  expect(occurrenceCount(envelope, payload)).toBe(eventIds.length);
-}
-
-function expectParentDeliveriesOrNone(
-  body: string,
-  childId: string,
-  eventIds: string[],
-  payload: string,
-) {
-  if (eventIds.length > 0) {
-    expectParentDeliveries(body, childId, eventIds, payload);
-  } else {
-    expectNoParentDeliveries(body);
-  }
-}
-
-function expectOrderedParentDeliveries(
-  body: string,
-  childId: string,
-  expected: Array<{ eventId: string; payload: string }>,
-) {
-  const text = promptText(body);
-  expect(occurrenceCount(text, "<subagent_deliveries")).toBe(1);
-  const envelope = parentDeliveryEnvelope(text);
-  let offset = 0;
-  for (const delivery of expected) {
-    expect(occurrenceCount(envelope, `"id":"${delivery.eventId}"`)).toBe(1);
-    const index = envelope.indexOf(`"id":"${delivery.eventId}"`, offset);
-    expect(index).toBeGreaterThanOrEqual(offset);
-    const lineEnd = envelope.indexOf("\n", index);
-    expect(envelope.slice(index, lineEnd)).toContain(`"source_id":"${childId}"`);
-    expect(envelope.slice(index, lineEnd)).toContain(delivery.payload);
-    offset = lineEnd;
-  }
-}
-
-type ParentMessagePart = {
-  logical_message_id: string;
-  offset: number;
-  end_offset: number;
-  total_bytes: number;
-  more: boolean;
-  content: string;
-};
-
-function parentMessagePart(
-  body: string,
-  childId: string,
-  eventId: string,
-): ParentMessagePart {
-  const text = promptText(body);
-  expect(occurrenceCount(text, "<subagent_deliveries")).toBe(1);
-  const envelope = parentDeliveryEnvelope(text);
-  const line = envelope.split("\n").find((value) => value.startsWith("- "));
-  expect(line).toBeDefined();
-  const delivery = JSON.parse(line!.slice(2)) as {
-    id: string;
-    source_id: string;
-    payload: { message: ParentMessagePart };
-  };
-  expect(delivery.id).toBe(eventId);
-  expect(delivery.source_id).toBe(childId);
-  expect(delivery.payload.message.logical_message_id).toBe(eventId);
-  expect(Buffer.byteLength(delivery.payload.message.content, "utf8")).toBe(
-    delivery.payload.message.end_offset - delivery.payload.message.offset,
-  );
-  expect(delivery.payload.message.more).toBe(
-    delivery.payload.message.end_offset < delivery.payload.message.total_bytes,
-  );
-  return delivery.payload.message;
-}
-
-function sessionIds(root: IsolatedRoot): string[] {
-  const sessions = join(root.home, ".fx", "sessions");
-  return readdirSync(sessions)
-    .filter((id) =>
-      id !== "latest" &&
-      statSync(join(sessions, id)).isDirectory()
-    )
-    .sort();
-}
-
-function onlyParentSessionId(root: IsolatedRoot, excludedIds: string[]): string {
-  const excluded = new Set(excludedIds);
-  const parents = sessionIds(root).filter((id) => !excluded.has(id));
-  expect(parents).toHaveLength(1);
-  return parents[0]!;
-}
-
-function expectParentHistoryClean(
-  root: IsolatedRoot,
-  parentSessionId: string,
-  forbidden: string[],
-) {
-  const sessionDir = join(root.home, ".fx", "sessions", parentSessionId);
-  for (const name of ["session.json", "events.jsonl"]) {
-    const path = join(sessionDir, name);
-    if (!existsSync(path)) continue;
-    const text = readFileSync(path, "utf8");
-    expect(text).not.toContain("<subagent_deliveries");
-    for (const marker of forbidden) expect(text).not.toContain(marker);
-  }
-}
-
-function expectHumanUnreadIndependent(
-  root: IsolatedRoot,
-  childId: string,
-  eventId: string,
-) {
-  const record = JSON.parse(readFileSync(
-    join(root.home, ".fx", "sessions", childId, "subagent", "communication.json"),
-    "utf8",
-  )) as {
-    ledger: {
-      deliveries: Array<{ id: string; sequence: number }>;
-      cursors: Array<{
-        consumer_id: string;
-        target_id: string;
-        projection?: string;
-        acknowledged_sequence: number;
-      }>;
-    };
-  };
-  const delivery = record.ledger.deliveries.find((item) => item.id === eventId);
-  expect(delivery).toBeDefined();
-  const modelCursor = record.ledger.cursors.find((cursor) =>
-    cursor.consumer_id === "parent-model" && cursor.projection === "parent_turn"
-  );
-  expect(modelCursor).toBeDefined();
-  expect(modelCursor!.acknowledged_sequence).toBeGreaterThanOrEqual(delivery!.sequence);
-  expect(record.ledger.cursors.some((cursor) => cursor.consumer_id === "human")).toBe(false);
 }
 
 function finalText(text: string) {
@@ -2901,570 +2574,6 @@ describe("effect-aware command permissions", () => {
     TIMEOUT,
   );
 
-  test(
-    "fx ask condition-waits for a canonical child without shell polling",
-    async () => {
-      const root = createIsolatedRoot();
-      const childPrompt = "Return the deterministic child result.";
-      let childId = "";
-      let childCompleted = false;
-      let conditionWaitIssued = false;
-      const routeAfterCreate = (body: string): Response | Promise<Response> => {
-        if (body.includes('"toolCallId":"parent_inspect_1"')) {
-          const outcome = JSON.parse(
-            toolResultText(body, "parent_inspect_1"),
-          ) as {
-            ok: boolean;
-            status: string;
-          };
-          expect(outcome.ok).toBe(true);
-          expect(outcome.status).toBe("idle");
-          expect(childCompleted).toBe(true);
-          expect(body).toContain("deterministic child complete");
-          return finalText("parent inspected canonical child");
-        }
-        if (body.includes('"toolCallId":"parent_create_1"')) {
-          const createResult = toolResultText(body, "parent_create_1");
-          expect(createResult).toContain('"ok":true');
-          childId = JSON.parse(createResult).child_id as string;
-          expect(childId.length).toBeGreaterThan(0);
-          expect(childCompleted).toBe(false);
-          conditionWaitIssued = true;
-          return gatewayToolCall("subagent", {
-            request: {
-              action: "wait",
-              child_id: childId,
-            },
-          }, "parent_inspect_1");
-        }
-        if (body.includes('"toolCallId":"child_pwd_1"')) {
-          return (async () => {
-            await Bun.sleep(1_500);
-            childCompleted = true;
-            return finalText("deterministic child complete");
-          })();
-        }
-        if (body.includes(childPrompt)) {
-          return toolCall("pwd", {}, "child_pwd_1");
-        }
-        throw new Error(`Unexpected subagent inspection request: ${body}`);
-      };
-      const gateway = startFakeGateway([
-        subagentCreateCall("parent_create_1", childPrompt),
-        routeAfterCreate,
-        routeAfterCreate,
-        routeAfterCreate,
-        routeAfterCreate,
-      ]);
-
-      const result = await runFx(["ask", "Create and inspect one child."], {
-        cwd: root.workspace,
-        env: gatewayEnv(root, gateway, { PATH: hostilePath(root) }),
-        timeoutMs: TIMEOUT,
-      });
-
-      expect(result.code).toBe(0);
-      expect(result.stdout).toContain("parent inspected canonical child");
-      expect(gateway.requests).toHaveLength(5);
-      expect(conditionWaitIssued).toBe(true);
-      const continuation = gateway.requests.find((request) =>
-        request.body.includes("parent_inspect_1"),
-      );
-      expect(continuation).toBeDefined();
-      const parentInspectRequest = gateway.requests.find((request) =>
-        request.body.includes('"toolCallId":"parent_create_1"'),
-      );
-      expect(parentInspectRequest).toBeDefined();
-      for (const request of gateway.requests) {
-        expect(request.body).toContain('"name":"subagent"');
-        expect(request.body).not.toContain('"name":"task"');
-      }
-      const requestBodies = gateway.requests.map((request) => request.body)
-        .join("\n");
-      expect(requestBodies).not.toContain('"command":"sleep');
-      expect(requestBodies).not.toContain('"command":"while ');
-      expect(existsSync(root.profileMarker)).toBe(true);
-      expectNoHostileExecutables(root);
-      expectNoCommandArtifacts(root);
-    },
-    TIMEOUT,
-  );
-
-
-  test(
-    "fx ask runs repeated turns for a persistent canonical subagent",
-    async () => {
-      const root = createIsolatedRoot();
-      const firstPrompt = "Return the deterministic first persistent result.";
-      const secondMessage = "Return the deterministic second persistent result.";
-      let childId = "";
-      let resolveFirstRequest!: () => void;
-      let resolveSecondRequest!: () => void;
-      const firstRequest = new Promise<void>((resolve) => {
-        resolveFirstRequest = resolve;
-      });
-      const secondRequest = new Promise<void>((resolve) => {
-        resolveSecondRequest = resolve;
-      });
-      const route = (body: string): Response | Promise<Response> => {
-        if (body.includes('"toolCallId":"persistent_inspect_2"')) {
-          expect(toolResultText(body, "persistent_inspect_2")).toContain(
-            '"status":"idle"',
-          );
-          return finalText("parent observed both persistent child turns");
-        }
-        if (body.includes('"toolCallId":"persistent_send_1"')) {
-          expect(toolResultText(body, "persistent_send_1")).toContain(
-            '"status":"message_sent"',
-          );
-          return secondRequest.then(async () => {
-            await waitForSubagentIdle(root, childId);
-            return subagentInspectCall("persistent_inspect_2", childId);
-          });
-        }
-        if (body.includes('"toolCallId":"persistent_inspect_1"')) {
-          expect(toolResultText(body, "persistent_inspect_1")).toContain(
-            '"status":"idle"',
-          );
-          return gatewayToolCall("subagent", {
-            request: {
-              action: "send",
-              child_id: childId,
-              message: secondMessage,
-            },
-          }, "persistent_send_1");
-        }
-        if (body.includes('"toolCallId":"persistent_create_1"')) {
-          const created = JSON.parse(
-            toolResultText(body, "persistent_create_1"),
-          ) as { child_id: string; status: string };
-          expect(created.status.length).toBeGreaterThan(0);
-          childId = canonicalSubagentIdForStore(created.child_id);
-          return firstRequest.then(async () => {
-            await waitForSubagentIdle(root, childId);
-            return subagentInspectCall("persistent_inspect_1", childId);
-          });
-        }
-        if (body.includes(secondMessage)) {
-          resolveSecondRequest();
-          return finalText("persistent child second turn complete");
-        }
-        if (body.includes(firstPrompt)) {
-          resolveFirstRequest();
-          return finalText("persistent child first turn complete");
-        }
-        return gatewayToolCall("subagent", {
-          request: {
-            action: "run",
-            task: firstPrompt,
-          },
-        }, "persistent_create_1");
-      };
-      const gateway = startFakeGateway(Array.from({ length: 7 }, () => route));
-
-      const result = await runFx(
-        ["ask", "Create and continue one persistent child."],
-        {
-          cwd: root.workspace,
-          env: gatewayEnv(root, gateway, { PATH: hostilePath(root) }),
-          timeoutMs: TIMEOUT,
-        },
-      );
-
-      expect(result.code).toBe(0);
-      expect(result.stdout).toContain("parent observed both persistent child turns");
-      expect(gateway.requests).toHaveLength(7);
-      for (const request of gateway.requests) {
-        expect(request.body).toContain('"name":"subagent"');
-        expect(request.body).not.toContain('"name":"task"');
-      }
-      expectNoHostileExecutables(root);
-      expectNoCommandArtifacts(root);
-    },
-    TIMEOUT,
-  );
-
-
-
-
-  test(
-    "fx ask permits a child to create a nested canonical child",
-    async () => {
-      const root = createIsolatedRoot();
-      const childPrompt = "Create one nested child and report its admitted handle.";
-      const nestedPrompt = "Return the deterministic nested result.";
-      let releaseRoot!: (response: Response) => void;
-      const rootCompletion = new Promise<Response>((resolve) => {
-        releaseRoot = resolve;
-      });
-      const route = (body: string) => {
-        if (body.includes('"toolCallId":"nested_create_1"')) {
-          expect(toolResultText(body, "nested_create_1")).toContain(
-            '"child_id":',
-          );
-          return finalText("child received nested handle");
-        }
-        if (body.includes('"toolCallId":"root_create_1"')) {
-          expect(toolResultText(body, "root_create_1")).toContain(
-            '"child_id":',
-          );
-          return rootCompletion;
-        }
-        if (body.includes(nestedPrompt) && !body.includes(childPrompt)) {
-          setTimeout(() => {
-            releaseRoot(finalText("root received child handle"));
-          }, 100);
-          return finalText("nested child complete");
-        }
-        return gatewayToolCall("subagent", {
-          request: { action: "run", task: nestedPrompt },
-        }, "nested_create_1");
-      };
-      const gateway = startFakeGateway([
-        subagentCreateCall("root_create_1", childPrompt, "persistent"),
-        route,
-        route,
-        route,
-        route,
-      ]);
-
-      const result = await runFx(["ask", "Create one child that creates another child."], {
-        cwd: root.workspace,
-        env: gatewayEnv(root, gateway, { PATH: hostilePath(root) }),
-        timeoutMs: TIMEOUT,
-      });
-
-      expect(result.code).toBe(0);
-      expect(result.stdout).toContain("root received child handle");
-      expect(gateway.requests).toHaveLength(5);
-      expect(gateway.requests.some((request) =>
-        request.body.includes("nested_create_1")
-      )).toBe(true);
-      for (const request of gateway.requests) {
-        expect(request.body).toContain('"name":"subagent"');
-        expect(request.body).not.toContain('"name":"task"');
-      }
-      expectNoHostileExecutables(root);
-      expectNoCommandArtifacts(root);
-    },
-    TIMEOUT,
-  );
-
-
-
-  test.skipIf(!tmuxAvailable())(
-    "interactive fx advertises and executes the canonical subagent tool",
-    async () => {
-      const root = createIsolatedRoot();
-      const stderrPath = join(root.root, "interactive-subagent-stderr.log");
-      const childPrompt = "Return the interactive child result.";
-      const route = (body: string) => {
-        if (body.includes('"toolCallId":"interactive_create_1"')) {
-          expect(toolResultText(body, "interactive_create_1")).toContain(
-            '"child_id":',
-          );
-          return finalText("interactive parent received child handle");
-        }
-        return finalText("interactive child complete");
-      };
-      const gateway = startFakeGateway([
-        subagentCreateCall("interactive_create_1", childPrompt),
-        route,
-        route,
-      ]);
-      writeFileSync(stderrPath, "");
-
-      activeSession = await TmuxSession.create({
-        cmd: FX_BIN,
-        cwd: root.workspace,
-        env: gatewayEnv(root, gateway),
-        stderrPath,
-      });
-      await activeSession.waitForComposer(TIMEOUT);
-      await activeSession.sendText("Create one interactive child.");
-      await waitForGatewayRequestCount(gateway, 3);
-      await activeSession.waitForText("interactive parent received child handle", TIMEOUT);
-      for (const request of gateway.requests) {
-        expect(request.body).toContain('"name":"subagent"');
-        expect(request.body).not.toContain('"name":"task"');
-      }
-      await activeSession.sendText("/quit");
-      expect(await activeSession.waitForSessionEnd(5_000)).toBe(true);
-      activeSession = null;
-      expect(readFileSync(stderrPath, "utf8")).toBe("");
-    },
-    TIMEOUT,
-  );
-
-  test.skipIf(!tmuxAvailable())(
-    "interactive fx delivers a child approval to the next same-turn parent step",
-    async () => {
-      const root = createIsolatedRoot();
-      const stderrPath = join(root.root, "interactive-child-approval-stderr.log");
-      const fixturePath = join(root.workspace, "approval-fixture.txt");
-      const markerPath = join(root.workspace, "approval-must-not-exist");
-      const rootPrompt = "INTERACTIVE_CREATE_APPROVAL_CHILD";
-      const childPrompt = "INTERACTIVE_CHILD_REQUEST_APPROVAL";
-      const rootCreateCallId = "interactive_approval_create";
-      const rootProbeCallId = "interactive_approval_probe";
-      const childCommandCallId = "interactive_approval_command";
-      let childId = "";
-      let approval: PendingSubagentApproval | null = null;
-      let sameTurnChecked = false;
-      let noRedeliveryChecked = false;
-      let releaseApprovalUi!: () => void;
-      const approvalUiObserved = new Promise<void>((resolve) => {
-        releaseApprovalUi = resolve;
-      });
-      writeFileSync(fixturePath, "approval parent projection fixture\n");
-      writeFileSync(stderrPath, "");
-
-      const checkApprovalDelivery = (body: string) => {
-        expect(approval).not.toBeNull();
-        expectParentDelivery(body, childId, approval!.id, approval!.label);
-        const envelope = parentDeliveryEnvelope(promptText(body));
-        expect(envelope).toContain(`"target_id":"${approval!.rootId}"`);
-        expect(envelope).toContain(`"work_id":"${approval!.workId}"`);
-        expect(envelope).toContain('"truncated":false');
-        expect(envelope).toContain(
-          `"total_bytes":${Buffer.byteLength(approval!.label, "utf8")}`,
-        );
-        sameTurnChecked = true;
-      };
-
-      const route = async (body: string): Promise<Response> => {
-        const userText = currentUserText(body);
-        if (userText.includes("INTERACTIVE_VERIFY_APPROVAL_NOT_REPEATED")) {
-          expect(promptText(body)).not.toContain(approval!.id);
-          expect(promptText(body)).not.toContain(approval!.label);
-          noRedeliveryChecked = true;
-          return finalText("INTERACTIVE_APPROVAL_NOT_REPEATED");
-        }
-        if (body.includes(`\"toolCallId\":\"${childCommandCallId}\"`) &&
-            body.includes('"type":"tool-result"')) {
-          return finalText("INTERACTIVE_CHILD_DENIED_COMPLETE");
-        }
-        if (userText.includes(childPrompt)) {
-          return toolCall(
-            `/usr/bin/touch ${shellQuote(markerPath)}`,
-            {},
-            childCommandCallId,
-          );
-        }
-        if (body.includes(`\"toolCallId\":\"${rootProbeCallId}\"`) &&
-            body.includes('"type":"tool-result"')) {
-          const text = promptText(body);
-          if (text.includes(`"id":"${approval!.id}"`)) {
-            checkApprovalDelivery(body);
-          } else {
-            expect(sameTurnChecked).toBe(true);
-            expect(text).not.toContain(approval!.id);
-            expect(text).not.toContain(approval!.label);
-          }
-          return finalText("INTERACTIVE_PARENT_SAW_CHILD_APPROVAL");
-        }
-        if (body.includes(`\"toolCallId\":\"${rootCreateCallId}\"`) &&
-            body.includes('"type":"tool-result"')) {
-          const created = JSON.parse(
-            toolResultText(body, rootCreateCallId),
-          ) as { child_id: string; status: string };
-          expect(created.status.length).toBeGreaterThan(0);
-          childId = canonicalSubagentIdForStore(created.child_id);
-          approval = await waitForPendingSubagentApproval(root, childId);
-          expect(subagentState(root, childId)).toBe("awaiting_approval");
-          await approvalUiObserved;
-          if (promptText(body).includes(`"id":"${approval.id}"`)) {
-            checkApprovalDelivery(body);
-          }
-          return gatewayToolCall(
-            "read_file",
-            { path: "approval-fixture.txt" },
-            rootProbeCallId,
-          );
-        }
-        if (userText.includes(rootPrompt)) {
-          return gatewayToolCall("subagent", {
-            request: { action: "run", task: childPrompt },
-          }, rootCreateCallId);
-        }
-        throw new Error(`Unexpected approval projection request: ${body}`);
-      };
-      const gateway = startDynamicFakeGateway(route, {
-        classifierDecision: "caution",
-      });
-      gateways.push(gateway);
-
-      activeSession = await TmuxSession.create({
-        cmd: FX_BIN,
-        cwd: root.workspace,
-        env: gatewayEnv(root, gateway, {
-          FX_PERMISSION_MODE: "ask",
-          PATH: hostilePath(root),
-        }),
-        stderrPath,
-        width: 120,
-        height: 40,
-      });
-      await activeSession.waitForComposer(TIMEOUT);
-      await activeSession.sendText(rootPrompt);
-      const approvalPane = await activeSession.waitForText(
-        COMMAND_APPROVAL_PROMPT,
-        TIMEOUT,
-      );
-      expect(approvalPane).toContain("touch");
-      const approvalDeadline = Date.now() + TIMEOUT;
-      while (approval === null && Date.now() < approvalDeadline) {
-        await Bun.sleep(20);
-      }
-      expect(approval).not.toBeNull();
-      expect(subagentState(root, childId)).toBe("awaiting_approval");
-      expect(gateway.classifierRequests).toHaveLength(0);
-      expect(existsSync(markerPath)).toBe(false);
-      releaseApprovalUi();
-
-      const sameTurnDeadline = Date.now() + TIMEOUT;
-      while (!sameTurnChecked && Date.now() < sameTurnDeadline) {
-        await Bun.sleep(20);
-      }
-      expect(sameTurnChecked).toBe(true);
-      expect(existsSync(markerPath)).toBe(false);
-      await activeSession.sendKeys("3");
-      await activeSession.waitForText(
-        "INTERACTIVE_PARENT_SAW_CHILD_APPROVAL",
-        TIMEOUT,
-      );
-      expect(existsSync(markerPath)).toBe(false);
-      const childDeadline = Date.now() + TIMEOUT;
-      while (subagentState(root, childId) !== "idle" &&
-             Date.now() < childDeadline) {
-        await Bun.sleep(20);
-      }
-      expect(subagentState(root, childId)).toBe("idle");
-      const stored = JSON.parse(readFileSync(
-        join(root.home, ".fx", "sessions", childId, "subagent", "communication.json"),
-        "utf8",
-      )) as { ledger: { approvals: Array<Record<string, unknown>> } };
-      expect(stored.ledger.approvals.find((item) => item.id === approval!.id)?.status)
-        .toBe("denied");
-
-      await activeSession.sendText("INTERACTIVE_VERIFY_APPROVAL_NOT_REPEATED");
-      await activeSession.waitForText("INTERACTIVE_APPROVAL_NOT_REPEATED", TIMEOUT);
-      expect(noRedeliveryChecked).toBe(true);
-
-      await activeSession.sendText("/quit");
-      expect(await activeSession.waitForSessionEnd(5_000)).toBe(true);
-      activeSession = null;
-      expectHumanUnreadIndependent(root, childId, approval!.id);
-      const parentSessionId = onlyParentSessionId(root, [childId]);
-      expectParentHistoryClean(root, parentSessionId, [
-        "<subagent_deliveries",
-        approval!.label,
-      ]);
-      expect(readFileSync(stderrPath, "utf8")).toBe("");
-      expectNoHostileExecutables(root);
-      expectNoCommandArtifacts(root);
-    },
-    60_000,
-  );
-  test.skipIf(!tmuxAvailable())(
-    "interactive fx lets a child continue after repeated advisory cautions",
-    async () => {
-      const root = createIsolatedRoot();
-      const stderrPath = join(root.root, "interactive-child-auto-approval-stderr.log");
-      const markerPath = join(root.workspace, "child-auto-approved.txt");
-      const rootPrompt = "INTERACTIVE_CREATE_AUTO_APPROVAL_CHILD";
-      const childPrompt = "INTERACTIVE_AUTO_APPROVAL_CHILD";
-      const rootCreateCallId = "interactive_auto_approval_create";
-      let childId = "";
-      let childRequestCount = 0;
-      writeFileSync(stderrPath, "");
-
-      const route = (body: string): Response => {
-        const userText = currentUserText(body);
-        if (userText.includes(childPrompt)) {
-          childRequestCount += 1;
-          if (childRequestCount <= 4) {
-            if (childRequestCount > 1) expect(body).toContain("review_caution");
-            return toolCall(
-              `/usr/bin/touch ${shellQuote(markerPath)}`,
-              {},
-              `child_auto_command_${childRequestCount}`,
-            );
-          }
-          if (childRequestCount === 5) {
-            return finalText("INTERACTIVE_AUTO_CAUTION_CHILD_COMPLETE");
-          }
-          throw new Error(`Unexpected child caution request: ${body}`);
-        }
-        if (body.includes(`\"toolCallId\":\"${rootCreateCallId}\"`) &&
-            body.includes('"type":"tool-result"')) {
-          const created = JSON.parse(toolResultText(body, rootCreateCallId)) as {
-            child_id: string;
-            status: string;
-          };
-          expect(created.status.length).toBeGreaterThan(0);
-          childId = canonicalSubagentIdForStore(created.child_id);
-          return finalText("INTERACTIVE_AUTO_APPROVAL_PARENT_CREATED");
-        }
-        if (userText.includes(rootPrompt)) {
-          return gatewayToolCall("subagent", {
-            request: { action: "run", task: childPrompt },
-          }, rootCreateCallId);
-        }
-        throw new Error(`Unexpected child advisory request: ${body}`);
-      };
-      const gateway = startDynamicFakeGateway(route, {
-        classifierDecision: "caution",
-      });
-      gateways.push(gateway);
-
-      activeSession = await TmuxSession.create({
-        cmd: FX_BIN,
-        cwd: root.workspace,
-        env: gatewayEnv(root, gateway, {
-          FX_PERMISSION_MODE: "auto",
-          PATH: hostilePath(root),
-        }),
-        stderrPath,
-        width: 120,
-        height: 40,
-      });
-      await activeSession.waitForComposer(TIMEOUT);
-      await activeSession.sendText(rootPrompt);
-      await activeSession.waitForText("INTERACTIVE_AUTO_APPROVAL_PARENT_CREATED", TIMEOUT);
-      expect(childId).not.toBe("");
-
-      const deadline = Date.now() + TIMEOUT;
-      while (subagentState(root, childId) !== "idle" && Date.now() < deadline) {
-        await Bun.sleep(20);
-      }
-      expect(subagentState(root, childId)).toBe("idle");
-      expect(childRequestCount).toBe(5);
-      expect(gateway.classifierRequests).toHaveLength(1);
-      expect(existsSync(markerPath)).toBe(false);
-      const scrollback = await activeSession.captureFullScrollback();
-      expect(scrollback).not.toContain(COMMAND_APPROVAL_PROMPT);
-      expect(scrollback).not.toContain(
-        "Subagent interactive-auto-approval-child needs permission",
-      );
-      const stored = JSON.parse(readFileSync(
-        join(root.home, ".fx", "sessions", childId, "subagent", "communication.json"),
-        "utf8",
-      )) as { ledger: { approvals: Array<Record<string, unknown>> } };
-      expect(stored.ledger.approvals).toHaveLength(0);
-
-      await activeSession.sendText("/quit");
-      expect(await activeSession.waitForSessionEnd(5_000)).toBe(true);
-      activeSession = null;
-      expect(readFileSync(stderrPath, "utf8")).toBe("");
-      expectNoHostileExecutables(root);
-      expectNoCommandArtifacts(root);
-    },
-    60_000,
-  );
-
-
-
   test.skipIf(!tmuxAvailable())(
     "TUI /permissions ask preserves complete existing scrollback",
     async () => {
@@ -3576,6 +2685,87 @@ describe("effect-aware command permissions", () => {
         .toBe("ask");
       expect(gateway.requests).toHaveLength(1);
       expect(activeSession.isAlive()).toBe(true);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    60_000,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "interactive child approval uses the normal parent prompt",
+    async () => {
+      const root = createIsolatedRoot();
+      const stderrPath = join(root.root, "interactive-child-approval-stderr.log");
+      const markerPath = join(root.workspace, "child-approval-must-not-exist");
+      const rootPrompt = "DELEGATE_ONE_APPROVAL_TASK";
+      const childPrompt = "Request permission to create the delegated marker.";
+      const createId = "direct_child_create";
+      const waitId = "direct_child_wait";
+      const commandId = "direct_child_command";
+      let childId = "";
+      writeFileSync(stderrPath, "");
+
+      const gateway = startDynamicFakeGateway((body) => {
+        if (body.includes(`\"toolCallId\":\"${waitId}\"`)) {
+          expect(toolResultText(body, waitId)).toContain("CHILD_PERMISSION_DENIED");
+          return finalText("PARENT_OBSERVED_CHILD_DENIAL");
+        }
+        if (body.includes(`\"toolCallId\":\"${commandId}\"`)) {
+          return finalText("CHILD_PERMISSION_DENIED");
+        }
+        if (body.includes(`\"toolCallId\":\"${createId}\"`)) {
+          const created = JSON.parse(toolResultText(body, createId)) as {
+            child_id: string;
+            status: string;
+            result?: string;
+          };
+          childId = created.child_id;
+          if (created.status === "completed") {
+            expect(created.result).toContain("CHILD_PERMISSION_DENIED");
+            return finalText("PARENT_OBSERVED_CHILD_DENIAL");
+          }
+          expect(created.status).toBe("running");
+          return gatewayToolCall("subagent", {
+            request: { action: "wait", child_id: childId },
+          }, waitId);
+        }
+        if (currentUserText(body).includes(childPrompt)) {
+          expect(body).not.toContain('"name":"subagent"');
+          return toolCall(`/usr/bin/touch ${shellQuote(markerPath)}`, {}, commandId);
+        }
+        if (currentUserText(body).includes(rootPrompt)) {
+          return gatewayToolCall("subagent", {
+            request: { action: "run", task: childPrompt },
+          }, createId);
+        }
+        throw new Error(`Unexpected direct child approval request: ${body}`);
+      });
+      gateways.push(gateway);
+
+      activeSession = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: root.workspace,
+        env: gatewayEnv(root, gateway, {
+          FX_PERMISSION_MODE: "ask",
+        }),
+        stderrPath,
+        width: 120,
+        height: 40,
+      });
+      await activeSession.waitForComposer(TIMEOUT);
+      await activeSession.sendText(rootPrompt);
+      const approvalPane = await activeSession.waitForText(
+        COMMAND_APPROVAL_PROMPT,
+        TIMEOUT,
+      );
+      expect(approvalPane).toContain("touch");
+      expect(existsSync(markerPath)).toBe(false);
+      await activeSession.sendKeys("3");
+      await activeSession.waitForText("PARENT_OBSERVED_CHILD_DENIAL", TIMEOUT);
+      expect(childId.length).toBeGreaterThan(0);
+      expect(existsSync(markerPath)).toBe(false);
+      await activeSession.sendText("/quit");
+      expect(await activeSession.waitForSessionEnd(5_000)).toBe(true);
+      activeSession = null;
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     },
     60_000,
