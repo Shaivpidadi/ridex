@@ -5305,7 +5305,7 @@ describe("acp: model-independent", () => {
           method: "session/prompt",
           params: {
             prompt: [
-              { type: "text", text: "Before image." },
+              { type: "text", text: "User literal [Image #1]." },
               { type: "image", data: imageData, mimeType: "image/png" },
               { type: "text", text: "After image." },
             ],
@@ -5356,8 +5356,9 @@ describe("acp: model-independent", () => {
           "text",
           "image",
         ]);
-        expect(userChunks[0]?.params.update.content.text).toBe("Before image.\nAfter image.");
-        expect(JSON.stringify(userChunks)).not.toContain("[Image #");
+        expect(userChunks[0]?.params.update.content.text).toBe(
+          "User literal [Image #1].\n[Image #1]\nAfter image.",
+        );
         expect(new Set(userChunks.map((message) => message.params.update.messageId)).size).toBe(1);
         expect(imageChunk?.params.update.content).toMatchObject({
           type: "image",
@@ -5484,8 +5485,10 @@ describe("acp: model-independent", () => {
             message.params?.update?.content?.type === "text"
           )
           .map((message) => message.params.update.content.text);
-        expect(userText).toEqual(["Save this image.", "Image #1 unavailable"]);
-        expect(JSON.stringify(replay)).not.toContain("[Image #");
+        expect(userText).toEqual([
+          "Save this image.\n[Image #1]",
+          "Image #1 unavailable",
+        ]);
         expect(client.stderr).toBe("");
       } finally {
         await client?.close();

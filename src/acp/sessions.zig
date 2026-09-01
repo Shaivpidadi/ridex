@@ -1178,10 +1178,8 @@ fn sendUserHistoryTurn(
 ) !void {
     var message_id: acp_types.MessageIdBuffer = undefined;
     const stable_message_id = acp_types.generateMessageId(&message_id);
-    const replay_text = try canonicalUserHistoryText(alloc, user);
-    defer alloc.free(replay_text);
-    if (replay_text.len > 0) {
-        try sendUserHistoryChunk(state, alloc, session_id, stable_message_id, replay_text);
+    if (user.text.len > 0) {
+        try sendUserHistoryChunk(state, alloc, session_id, stable_message_id, user.text);
     }
     for (user.images) |attachment| {
         var snapshot = image_attachments.loadVerifiedSnapshot(alloc, attachment, .{}) catch |err| {
@@ -1215,32 +1213,6 @@ fn sendUserHistoryTurn(
         try out.writer.writeAll("}");
         try state.writer.writeNotification(alloc, "session/update", out.writer.buffered());
     }
-}
-
-fn canonicalUserHistoryText(alloc: Allocator, user: types.UserTurn) ![]u8 {
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(alloc);
-    var index: usize = 0;
-    while (index < user.text.len) {
-        const placeholder = if (user.text[index] == '[')
-            image_attachments.matchImagePlaceholder(user.text, index)
-        else
-            null;
-        if (placeholder) |match| {
-            if (image_attachments.findById(user.images, match.id) != null) {
-                var end = index + match.length;
-                const before_newline = out.items.len > 0 and out.items[out.items.len - 1] == '\n';
-                const after_newline = end < user.text.len and user.text[end] == '\n';
-                if (before_newline and !after_newline) _ = out.pop();
-                if (after_newline) end += 1;
-                index = end;
-                continue;
-            }
-        }
-        try out.append(alloc, user.text[index]);
-        index += 1;
-    }
-    return out.toOwnedSlice(alloc);
 }
 
 fn sendUserHistoryText(state: *server.ServerState, alloc: Allocator, session_id: []const u8, user_text: []const u8) !void {
@@ -1461,29 +1433,6 @@ fn writeModesArray(w: *std.Io.Writer, registry: mode_registry.Registry) !void {
         try w.writeAll("}");
     }
     try w.writeAll("]");
-}
-
-test "canonical ACP image replay hides owned placeholders" {
-    const alloc = std.testing.allocator;
-    const images = [_]types.ImageAttachment{.{
-        .id = 7,
-        .path = @constCast("/tmp/image.png"),
-        .media_type = @constCast("image/png"),
-    }};
-    const cases = [_]struct { text: []const u8, expected: []const u8 }{
-        .{ .text = "A\n[Image #7]\nB", .expected = "A\nB" },
-        .{ .text = "[Image #7]", .expected = "" },
-        .{ .text = "keep [Image #8] literal", .expected = "keep [Image #8] literal" },
-    };
-    for (cases) |case| {
-        const user = types.UserTurn{
-            .text = @constCast(case.text),
-            .images = @constCast(&images),
-        };
-        const replay = try canonicalUserHistoryText(alloc, user);
-        defer alloc.free(replay);
-        try std.testing.expectEqualStrings(case.expected, replay);
-    }
 }
 
 test "formatIso8601 produces valid format" {
