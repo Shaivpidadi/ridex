@@ -216,12 +216,12 @@ pub fn Runtime(comptime App: type) type {
                 startup.stored_key_status,
                 startup.credential_onboarding_skipped,
             );
-            if (comptime @hasDecl(@TypeOf(app.auth), "refreshChatGptSourceInventory")) {
-                app.auth.refreshChatGptSourceInventory(app.alloc) catch |err| {
-                    debug_trace.logf("auth", "startup ChatGPT inventory refresh failed err={s}", .{@errorName(err)});
-                };
-            } else {
+            if (comptime @hasDecl(@TypeOf(app.auth), "refreshSourceInventory")) {
                 app.auth.refreshSourceInventory(app.alloc) catch |err| {
+                    debug_trace.logf("auth", "startup source inventory refresh failed err={s}", .{@errorName(err)});
+                };
+            } else if (comptime @hasDecl(@TypeOf(app.auth), "refreshChatGptSourceInventory")) {
+                app.auth.refreshChatGptSourceInventory(app.alloc) catch |err| {
                     debug_trace.logf("auth", "startup source inventory refresh failed err={s}", .{@errorName(err)});
                 };
             }
@@ -328,13 +328,15 @@ pub fn Runtime(comptime App: type) type {
                 app.mcp_runtime = profile_mcp;
             }
 
-            const loaded = try deps.load_skills(
+            var loaded = try deps.load_skills(
                 std.heap.c_allocator,
                 app.workspace_root,
                 deps.skill_root_policy,
             );
+            errdefer loaded.deinit(std.heap.c_allocator);
             skill_runtime.traceDiagnostics("interactive_startup", loaded.diagnostics);
-            app.skills.replaceLoaded(std.heap.c_allocator, loaded.dir, loaded.skills, loaded.diagnostics);
+            try app.skills.replaceLoaded(std.heap.c_allocator, loaded.dir, loaded.skills, loaded.diagnostics);
+            loaded = .{};
 
             if (app.requested_resume == null) {
                 const welcome_message = try deps.welcome_message(app.alloc);

@@ -300,10 +300,11 @@ backend explicitly for deterministic tests and local troubleshooting.
 
 Servers are optional by default. Required startup failures block the first TUI
 or `fx ask` model request; optional failures publish a reduced, degraded
-capability set. One-shot `fx ask` starts required servers before its first model
-request and defers optional servers until the turn first performs an MCP
-operation or delegates MCP capability to a child. `/mcp list` renders a bounded,
-secret-free health snapshot.
+capability set. Terminal `fx ask` completes admitted MCP discovery before its
+first model request. JSON and other headless asks start required servers first
+and defer optional servers until the turn performs an MCP operation or delegates
+MCP capability to a child. `/mcp list` renders a bounded, secret-free health
+snapshot.
 `/mcp reload` evaluates a replacement before publication, so invalid config or
 a required-server failure leaves the prior runtime callable.
 

@@ -1722,7 +1722,64 @@ pub fn Handlers(comptime App: type) type {
             const provider = app.skillsCommandProvider();
             const command = provider.parseCommand(rest);
 
-            try app.reloadSkills();
+            if (comptime @hasDecl(App, "requestSkillsRefresh")) switch (command) {
+                .list => {
+                    const generation = try app.requestSkillsRefresh();
+                    try app.skills.queueRefreshAction(app.alloc, generation, .list);
+                    try collectSkillsRefreshFacts(app);
+                    return;
+                },
+                .show => |name| {
+                    const generation = try app.requestSkillsRefresh();
+                    try app.skills.queueRefreshAction(
+                        app.alloc,
+                        generation,
+                        .{ .show = name },
+                    );
+                    try collectSkillsRefreshFacts(app);
+                    return;
+                },
+                .install, .create, .remove, .path, .usage => {},
+            };
+            try executeSkillsCommand(app, provider, command);
+            try collectSkillsRefreshFacts(app);
+        }
+
+        pub fn collectSkillsRefreshFacts(app: *App) !void {
+            var ready = app.skills.takeReadyRefreshAction() orelse return;
+            defer ready.deinit(app.alloc);
+            if (!ready.succeeded) {
+                try app.writeDomainNotice(.{
+                    .topic = "skills",
+                    .tone = .@"error",
+                    .body = "Skills could not be refreshed. The previous catalog was not shown as current.",
+                }, true);
+                return;
+            }
+            switch (ready.action) {
+                .list => try executeSkillsCommand(
+                    app,
+                    app.skillsCommandProvider(),
+                    .list,
+                ),
+                .show => |name| try executeSkillsCommand(
+                    app,
+                    app.skillsCommandProvider(),
+                    .{ .show = name },
+                ),
+                .notice => |body| try app.writeDomainNotice(.{
+                    .topic = "skills",
+                    .tone = .neutral,
+                    .body = body,
+                }, true),
+            }
+        }
+
+        fn executeSkillsCommand(
+            app: *App,
+            provider: skill_commands.Provider,
+            command: skill_commands.Command,
+        ) !void {
             try writeSkillDiagnosticNotice(app);
 
             switch (command) {
@@ -1813,12 +1870,15 @@ pub fn Handlers(comptime App: type) type {
                     }
                 },
                 .notice => |notice| {
-                    try app.writeDomainNotice(.{
-                        .topic = "skills",
-                        .tone = .neutral,
-                        .body = notice.text,
-                    }, true);
-                    if (notice.reload) try app.reloadSkills();
+                    if (notice.reload and comptime @hasDecl(App, "requestSkillsRefresh")) {
+                        try queueSkillsNoticeAfterRefresh(app, notice.text);
+                    } else {
+                        try app.writeDomainNotice(.{
+                            .topic = "skills",
+                            .tone = .neutral,
+                            .body = notice.text,
+                        }, true);
+                    }
                 },
                 .installed => |install_result| {
                     var installed_notice: std.Io.Writer.Allocating = .init(app.alloc);
@@ -1830,14 +1890,29 @@ pub fn Handlers(comptime App: type) type {
 
                     const msg = try installed_notice.toOwnedSlice();
                     defer app.alloc.free(msg);
-                    try app.writeDomainNotice(.{
-                        .topic = "skills",
-                        .tone = .neutral,
-                        .body = std.mem.trimEnd(u8, msg, "\n"),
-                    }, true);
-                    try app.reloadSkills();
+                    if (comptime @hasDecl(App, "requestSkillsRefresh")) {
+                        try queueSkillsNoticeAfterRefresh(
+                            app,
+                            std.mem.trimEnd(u8, msg, "\n"),
+                        );
+                    } else {
+                        try app.writeDomainNotice(.{
+                            .topic = "skills",
+                            .tone = .neutral,
+                            .body = std.mem.trimEnd(u8, msg, "\n"),
+                        }, true);
+                    }
                 },
             }
+        }
+
+        fn queueSkillsNoticeAfterRefresh(app: *App, body: []const u8) !void {
+            const generation = try app.requestSkillsRefresh();
+            try app.skills.queueRefreshAction(
+                app.alloc,
+                generation,
+                .{ .notice = body },
+            );
         }
 
         fn closeModelMenuIfPresent(app: *App) void {
@@ -4105,8 +4180,10 @@ const SkillsInstallReplayApp = struct {
         self.shell.deinit(self.alloc);
     }
 
-    fn reloadSkills(self: *SkillsInstallReplayApp) !void {
+    fn requestSkillsRefresh(self: *SkillsInstallReplayApp) !u64 {
         self.reload_count += 1;
+        self.skills.fresh_through_generation = self.reload_count;
+        return self.reload_count;
     }
 
     noinline fn writeDomainNotice(self: *SkillsInstallReplayApp, notice: types.SemanticNotice, _: bool) !void {
@@ -4739,7 +4816,7 @@ test "skills install groups command notice fragments for entry replay" {
 
     try std.testing.expectEqual(@as(usize, 2), app.shell.entries.items.len);
     try std.testing.expectEqual(@as(usize, 2), app.write_count);
-    try std.testing.expectEqual(@as(usize, 2), app.reload_count);
+    try std.testing.expectEqual(@as(usize, 1), app.reload_count);
     try std.testing.expectEqual(types.NoticeTone.neutral, app.last_tone.?);
     try std.testing.expect(app.shell.entries.items[0] == .semantic_notice);
     try std.testing.expect(app.shell.entries.items[1] == .semantic_notice);
@@ -4938,7 +5015,7 @@ test "skills remove prefers a managed match after a workspace duplicate" {
     const rendered = try transcript_runtime.renderEntriesToBytes(alloc, app.shell.entries.items, 80, .{});
     defer alloc.free(rendered);
     try std.testing.expect(std.mem.find(u8, rendered, "Removed skill 'review'.") != null);
-    try std.testing.expectEqual(@as(usize, 2), app.reload_count);
+    try std.testing.expectEqual(@as(usize, 1), app.reload_count);
     try std.testing.expectError(
         error.FileNotFound,
         tmp.dir.access(io_mod.getIo(), "home/.fx/skills/review", .{}),

@@ -79,8 +79,33 @@ pub fn Runtime(comptime App: type) type {
                     try transitionScreen(app, .toggle);
                     return true;
                 },
+                .close => {
+                    if (childPresentationShell(app)) |child| {
+                        if (child.cancelPendingFullTranscriptOpen()) return true;
+                    }
+                    if (comptime @hasDecl(
+                        @TypeOf(app.shell),
+                        "cancelPendingFullTranscriptOpen",
+                    )) {
+                        if (app.shell.cancelPendingFullTranscriptOpen()) return true;
+                    }
+                    return false;
+                },
                 else => false,
             };
+        }
+
+        pub fn cancelPendingOpenForInput(app: *App) bool {
+            if (childPresentationShell(app)) |child| {
+                if (child.cancelPendingFullTranscriptOpen()) return true;
+            }
+            if (comptime @hasDecl(
+                @TypeOf(app.shell),
+                "cancelPendingFullTranscriptOpen",
+            )) {
+                return app.shell.cancelPendingFullTranscriptOpen();
+            }
+            return false;
         }
 
         fn transitionScreen(
@@ -91,6 +116,10 @@ pub fn Runtime(comptime App: type) type {
                 const from = childPresentationDepth(app);
                 const to = from.transition(event);
                 if (from == to) return;
+                if (from == .inline_mode and to == .full) {
+                    const child = childPresentationShell(app) orelse return;
+                    if (!child.requestFullTranscriptOpen()) return;
+                }
                 if (comptime @hasDecl(
                     @TypeOf(app.subagents),
                     "setChildTranscriptPresentationDepth",
@@ -118,6 +147,12 @@ pub fn Runtime(comptime App: type) type {
                 std.debug.assert(to == .full);
                 if (app.terminal.alternate_screen_owner != .none) return;
                 if (app.approval_prompt.isActive()) return;
+                if (comptime @hasDecl(
+                    @TypeOf(app.shell),
+                    "requestFullTranscriptOpen",
+                )) {
+                    if (!app.shell.requestFullTranscriptOpen()) return;
+                }
                 try app_lifecycle.openFullTranscript(
                     app.alloc,
                     &app.terminal,

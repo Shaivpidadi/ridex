@@ -314,22 +314,26 @@ pub const top_level_help_groups = [_]TopLevelHelpGroup{
         .{ .usage = "session recover <id>", .summary = "Copy a recoverable corrupt session" },
     } },
     .{ .entries = &.{
-        .{ .kind = .login, .usage = "login [vercel|codex|grok]" },
-        .{ .kind = .logout, .usage = "logout [vercel|codex|grok]" },
-        .{ .kind = .provider, .usage = "provider <gateway|codex|grok>" },
-        .{ .kind = .setup, .usage = "setup" },
-        .{ .kind = .teams, .usage = "teams" },
-        .{ .kind = .credits, .usage = "credits|balance" },
-        .{ .kind = .usage, .usage = "usage [--period <24h|7d|30d>]" },
+        .{ .kind = .login, .usage = "login [vercel|codex|grok]", .summary = "Sign in to a model provider" },
+        .{ .kind = .logout, .usage = "logout [vercel|codex|grok]", .summary = "Sign out of a model provider" },
+        .{ .kind = .provider, .usage = "provider <gateway|codex|grok>", .summary = "Choose the active model provider" },
+        .{ .kind = .models, .usage = "models" },
+    } },
+    .{ .entries = &.{
+        .{ .kind = .setup, .usage = "setup", .summary = "Configure a Vercel AI Gateway API key" },
+        .{ .kind = .teams, .usage = "teams", .summary = "Choose a Vercel AI Gateway team" },
+        .{ .kind = .credits, .usage = "credits|balance", .summary = "Show Vercel AI Gateway credits" },
+    } },
+    .{ .entries = &.{
+        .{ .kind = .usage, .usage = "usage [--period <24h|7d|30d>]", .summary = "Show locally recorded token usage and spend" },
     } },
     .{ .entries = &.{
         .{ .kind = .status, .usage = "status" },
         .{ .kind = .doctor, .usage = "doctor" },
         .{ .kind = .mcp, .usage = "mcp <command> ..." },
-        .{ .kind = .models, .usage = "models" },
         .{ .kind = .permissions, .usage = "permissions" },
         .{ .kind = .workspace, .usage = "workspace" },
-        .{ .kind = .upgrade, .usage = "upgrade" },
+        .{ .kind = .upgrade, .usage = "upgrade", .summary = "Upgrade fx on the selected release channel" },
         .{ .kind = .acp, .usage = "acp" },
         .{ .kind = .help, .usage = "help" },
     } },
@@ -374,7 +378,7 @@ pub const top_level_flags = [_]TopLevelFlag{
     },
     .{
         .usage = "-v, --version",
-        .description = "Print the 𝒇x version and exit",
+        .description = "Print the fx version and exit",
     },
 };
 
@@ -386,19 +390,19 @@ pub const top_level_examples = [_]TopLevelExample{
 };
 
 pub const top_level_notes = [_][]const u8{
-    "Run `fx <command> --help` for command-specific options and examples.",
+    "Run `fx <command> --help` for command-specific usage and options.",
     "Run `/help` inside an interactive session for slash commands.",
 };
 
 pub const top_level_resources = [_]TopLevelResource{
-    .{ .label = "Learn more about 𝒇x:", .value = "https://fx.sh/docs", .link = true },
-    .{ .label = "Report a problem:", .value = "run `/feedback` inside 𝒇x" },
+    .{ .label = "Learn more about fx:", .value = "https://fx.sh/docs", .link = true },
+    .{ .label = "Report a problem:", .value = "run `/feedback` inside fx" },
 };
 
 pub const top_level_registry = TopLevelRegistry{
     .specs = top_level_specs[0..],
     .description = "Fast, native coding agent for the terminal.",
-    .interactive_hint = "𝒇x starts an interactive session by default. Use `fx ask` to run one noninteractive request.",
+    .interactive_hint = "fx starts an interactive session by default. Use `fx ask` to run one noninteractive request.",
     .help_groups = top_level_help_groups[0..],
     .flags = top_level_flags[0..],
     .examples = top_level_examples[0..],

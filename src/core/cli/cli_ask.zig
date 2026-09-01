@@ -1672,7 +1672,11 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
             }
             try ctx.writeStderr(". Approve with fx mcp trust approve <name> before retrying.\n");
         }
-        mcp.connectRequiredForAsk(ctx.toolRegistry());
+        if (options.output_mode.isTerminal()) {
+            mcp.connectAllCancellable(ctx.toolRegistry(), ctx.cancelFlag());
+        } else {
+            mcp.connectRequiredForAsk(ctx.toolRegistry());
+        }
     }
     try ctx.checkCancellation();
     if (ctx.mcp) |mcp| {

@@ -186,6 +186,10 @@ fn entryRetainedBytes(entry: TranscriptEntry) usize {
     };
 }
 
+pub fn entrySnapshotRetainedBytes(entry: TranscriptEntry) usize {
+    return @sizeOf(TranscriptEntry) +| entryRetainedBytes(entry);
+}
+
 fn dupeSkillTokenSpans(alloc: Allocator, skill_tokens: []const SkillTokenSpan) ![]SkillTokenSpan {
     if (skill_tokens.len == 0) return &.{};
     const copy = try alloc.alloc(SkillTokenSpan, skill_tokens.len);

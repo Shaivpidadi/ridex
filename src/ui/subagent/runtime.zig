@@ -2030,6 +2030,9 @@ pub const Runtime = struct {
             );
             runtime.restoreFullTranscriptViewport(bookmark);
             self.child.presentation_transcript_depth = bookmark.presentation.depth;
+            if (bookmark.presentation.depth == .full) {
+                runtime.deferRestoredFullTranscriptOpen();
+            }
         } else if (runtime.transcriptPresentationDepth() !=
             self.child.presentation_transcript_depth)
         {

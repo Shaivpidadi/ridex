@@ -24,6 +24,7 @@ const PendingPhaseError = error{InvalidPendingPhase};
 pub const PendingSubmission = struct {
     draft: worker_runtime.QueuedPromptDraft,
     phase: PendingPhase = .awaiting_frame,
+    skill_refresh_generation: ?u64 = null,
 
     fn init(draft: worker_runtime.QueuedPromptDraft) PendingSubmission {
         std.debug.assert(draft.turn_id != 0);
@@ -55,6 +56,11 @@ pub const PendingSubmission = struct {
         self.phase = .queued;
         return true;
     }
+};
+
+pub const PendingSkillRefresh = enum {
+    pending,
+    current,
 };
 
 pub const State = struct {
@@ -183,6 +189,14 @@ pub fn SubmitRuntime(comptime App: type) type {
                 pending = &app.submission.pending.?;
             }
             if (pending.phase != .adopted) return;
+
+            if (comptime @hasDecl(App, "collectPendingSkillRefresh")) {
+                const readiness = App.collectPendingSkillRefresh(app, pending) catch |err| {
+                    finishPendingSubmissionFailure(app, err);
+                    return;
+                };
+                if (readiness == .pending) return;
+            }
 
             if (pending.draft.prompt.len > 0 and pending.draft.images.len == 0) {
                 recordAcceptedInput(app, pending.draft.prompt);
@@ -2057,6 +2071,8 @@ const PendingLifecycleFake = struct {
     finalization_count: usize = 0,
     finalization_error: bool = false,
     notice_count: usize = 0,
+    skill_refresh: enum { pending, current, failed } = .current,
+    skill_refresh_checks: usize = 0,
 
     fn deinit(self: *PendingLifecycleFake) void {
         SubmitRuntime(PendingLifecycleFake).clearPendingSubmission(self, "test_deinit");
@@ -2080,6 +2096,21 @@ const PendingLifecycleFake = struct {
         self.finalization_count += 1;
         if (self.finalization_error) return error.InjectedFinalizationFailure;
         self.worker.queued_turn_id = draft.turn_id;
+    }
+
+    pub fn collectPendingSkillRefresh(
+        self: *PendingLifecycleFake,
+        pending: *PendingSubmission,
+    ) !PendingSkillRefresh {
+        self.skill_refresh_checks += 1;
+        if (pending.skill_refresh_generation == null) {
+            pending.skill_refresh_generation = 1;
+        }
+        return switch (self.skill_refresh) {
+            .pending => .pending,
+            .current => .current,
+            .failed => error.InjectedSkillRefreshFailure,
+        };
     }
 
     pub fn writeDomainNotice(
@@ -2167,6 +2198,26 @@ test "post-commit adoption failure keeps one retryable owner and hold" {
     try Runtime.acceptPresentedPrompt(&app, 501);
     try std.testing.expect(app.submission.pending == null);
     try std.testing.expectEqual(@as(usize, 1), app.worker.release_count);
+}
+
+test "pending submission waits for its skill catalog generation before queueing" {
+    const Runtime = SubmitRuntime(PendingLifecycleFake);
+    var app = try pendingLifecycleFake(std.testing.allocator, 502);
+    defer app.deinit();
+    app.skill_refresh = .pending;
+
+    Runtime.noteCommittedFrame(&app);
+    Runtime.collectPendingSubmissionFacts(&app);
+    try std.testing.expectEqual(PendingPhase.adopted, app.submission.pending.?.phase);
+    try std.testing.expect(app.worker.held);
+    try std.testing.expectEqual(@as(usize, 0), app.finalization_count);
+    try std.testing.expectEqual(@as(?u64, 1), app.submission.pending.?.skill_refresh_generation);
+
+    app.skill_refresh = .current;
+    Runtime.collectPendingSubmissionFacts(&app);
+    try std.testing.expectEqual(PendingPhase.queued, app.submission.pending.?.phase);
+    try std.testing.expect(!app.worker.held);
+    try std.testing.expectEqual(@as(usize, 1), app.finalization_count);
 }
 
 test "post-ack finalization failure leaves notice and consumes pending owner" {

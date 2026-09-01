@@ -2707,7 +2707,7 @@ describe("gateway stream lifecycle", () => {
         session_id: string;
       };
       expect(firstJson.model).toBe(MODEL);
-      expect(firstJson.session_id.length).toBeGreaterThan(0);
+      expect(firstJson.session_id).toMatch(/^[A-Za-z0-9_-]{12}$/);
       const eventsPath = join(
         root.home,
         ".fx",

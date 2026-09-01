@@ -87,10 +87,17 @@ pub const SecretStoreWriteError = std.mem.Allocator.Error || error{
     StoredKeyWriteFailed,
 };
 
+pub const SecretStorePresence = enum {
+    present,
+    missing,
+    unavailable,
+};
+
 pub const SecretStore = struct {
     context: ?*anyopaque = null,
     backend_label: []const u8,
     is_disabled_fn: *const fn (?*anyopaque) bool,
+    presence_fn: *const fn (?*anyopaque) SecretStorePresence = unavailableSecretStorePresence,
     load_fn: *const fn (
         ?*anyopaque,
         std.mem.Allocator,
@@ -106,6 +113,12 @@ pub const SecretStore = struct {
 
     pub fn isDisabled(self: SecretStore) bool {
         return self.is_disabled_fn(self.context);
+    }
+
+    /// Reports only whether a secret exists. No secret bytes are returned or
+    /// transferred across this host boundary.
+    pub fn presence(self: SecretStore) SecretStorePresence {
+        return self.presence_fn(self.context);
     }
 
     /// Returns an owned secret, or null when none is stored. The caller must
@@ -138,6 +151,7 @@ pub const SecretStore = struct {
 pub const unavailable_secret_store: SecretStore = .{
     .backend_label = "configured credential store",
     .is_disabled_fn = unavailableSecretStoreIsDisabled,
+    .presence_fn = missingSecretStorePresence,
     .load_fn = unavailableSecretStoreLoad,
     .store_fn = unavailableSecretStoreWrite,
     .store_interactive_fn = unavailableSecretStoreInteractiveWrite,
@@ -145,6 +159,14 @@ pub const unavailable_secret_store: SecretStore = .{
 
 fn unavailableSecretStoreIsDisabled(_: ?*anyopaque) bool {
     return false;
+}
+
+fn unavailableSecretStorePresence(_: ?*anyopaque) SecretStorePresence {
+    return .unavailable;
+}
+
+fn missingSecretStorePresence(_: ?*anyopaque) SecretStorePresence {
+    return .missing;
 }
 
 fn unavailableSecretStoreLoad(

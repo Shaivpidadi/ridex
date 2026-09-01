@@ -2440,7 +2440,7 @@ test.skipIf(!tmuxAvailable())(
       await active.waitForText(streamMarker, TIMEOUT);
 
       await active.sendKeys("C-o");
-      await Bun.sleep(250);
+      await active.waitForText("┃ Full detail · ctrl o close", TIMEOUT);
       const enterAlternate = Buffer.from("\x1b[?1049h");
       const leaveAlternate = Buffer.from("\x1b[?1049l");
       const tapeBeforeCancel = readFileSync(tapePath);
@@ -4440,6 +4440,7 @@ test.skipIf(!tmuxAvailable())(
       await active.sendText("Save this conversation for the exit handoff.");
       await active.waitForText(marker, TIMEOUT);
       const sessionId = sessionIdFromHome(home);
+      expect(sessionId).toMatch(/^[A-Za-z0-9_-]{12}$/);
 
       await active.sendText("/quit");
       await waitForCondition(

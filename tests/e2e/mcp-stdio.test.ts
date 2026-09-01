@@ -356,6 +356,25 @@ async function expectProcessesExited(pids: Iterable<number>, timeoutMs = 5_000) 
   throw new Error(`MCP fixture processes did not exit: ${live.join(", ")}`);
 }
 
+async function waitForTtyAskExit(
+  session: TmuxSession,
+  expectedStatus: number | null,
+  timeoutMs = 10_000,
+) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const status = session.paneStatus();
+    if (status.dead) {
+      expect(status.status).toBe(expectedStatus);
+      return;
+    }
+    await Bun.sleep(25);
+  }
+  throw new Error(
+    `Timed out waiting for terminal fx ask to exit.\n${await session.captureFullScrollback()}`,
+  );
+}
+
 describe("modern MCP stdio compatibility", () => {
   test("direct docker run servers are cleaned through the injected cidfile", async () => {
     const root = createRoot("docker-cidfile-cleanup", MODERN_FIXTURE);
@@ -2444,6 +2463,101 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
     expect(readAttemptedPids(root.launchLogPath)).toHaveLength(0);
     expect(existsSync(root.wireLogPath)).toBe(false);
   }, 15_000);
+
+  test.skipIf(!tmuxAvailable())(
+    "terminal fx ask starts an unused optional MCP server before its model request",
+    async () => {
+      const root = createRoot("ask-terminal-eager-optional", MODERN_FIXTURE, {
+        recordLaunchAttempts: true,
+      });
+      const activeGateway = startFakeGateway([
+        fakeGatewayFinalText("Terminal MCP startup complete."),
+      ], {
+        models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+      });
+      gateway = activeGateway;
+      const binary = join(REPO_ROOT, "zig-out", "bin", "fx");
+      tui = await TmuxSession.create({
+        isolated: true,
+        cmd: `${JSON.stringify(binary)} ask --auto --no-save ${JSON.stringify("Answer without using MCP.")}`,
+        cwd: root.workspace,
+        width: 120,
+        height: 34,
+        remainOnExit: true,
+        env: fixtureEnv(root, activeGateway),
+      });
+
+      await tui.waitForText("Terminal MCP startup complete.", 20_000);
+      await waitForTtyAskExit(tui, 0);
+      expect(activeGateway.requests).toHaveLength(1);
+      const prompt = (JSON.parse(activeGateway.requests[0]!.body) as {
+        prompt: Array<{ content: unknown }>;
+      }).prompt.map((message) => contentText(message.content)).join("\n");
+      expect(prompt).toContain(
+        '<server name="fixture" state="ready" tools="1" />',
+      );
+      expect(prompt).not.toContain("available_on_demand");
+      const launch = readStartupLaunchEvidence(root);
+      expect(launch.startedPids.length).toBeGreaterThan(0);
+      expect(launch.childRecordedPids.length).toBeGreaterThan(0);
+
+      await tui.kill();
+      tui = null;
+      await expectProcessesExited(launch.allPids);
+    },
+    30_000,
+  );
+
+  test.skipIf(process.platform === "win32" || !tmuxAvailable())(
+    "terminal fx ask cancels stalled optional MCP startup before its model request",
+    async () => {
+      const root = createRoot("ask-terminal-cancel-startup", MODERN_FIXTURE, {
+        mode: "stall_startup",
+        startupTimeoutMs: 30_000,
+        restartLimit: 0,
+        recordLaunchAttempts: true,
+      });
+      const activeGateway = startFakeGateway([
+        fakeGatewayFinalText("must not be requested"),
+      ], {
+        models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+      });
+      gateway = activeGateway;
+      const binary = join(REPO_ROOT, "zig-out", "bin", "fx");
+      tui = await TmuxSession.create({
+        isolated: true,
+        cmd: `${JSON.stringify(binary)} ask --auto --no-save ${JSON.stringify("Cancel optional MCP startup.")}`,
+        cwd: root.workspace,
+        width: 120,
+        height: 34,
+        remainOnExit: true,
+        env: fixtureEnv(root, activeGateway),
+      });
+
+      const launchDeadline = Date.now() + 10_000;
+      while (
+        readAttemptedPids(root.launchLogPath).length === 0 &&
+        Date.now() < launchDeadline
+      ) {
+        await Bun.sleep(25);
+      }
+      expect(readAttemptedPids(root.launchLogPath).length).toBeGreaterThan(0);
+
+      const cancelStartedAt = Date.now();
+      await tui.sendKeys("C-c");
+      // fx restores and re-delivers SIGINT after cleanup, so tmux records a
+      // signal exit without a numeric pane status.
+      await waitForTtyAskExit(tui, null, 5_000);
+      expect(Date.now() - cancelStartedAt).toBeLessThan(5_000);
+      expect(activeGateway.requests).toHaveLength(0);
+      const launch = readStartupLaunchEvidence(root);
+
+      await tui.kill();
+      tui = null;
+      await expectProcessesExited(launch.allPids);
+    },
+    20_000,
+  );
 
   test("fx ask accepts the official legacy SDK Draft 7 tool schema", async () => {
     const root = createRoot("ask-legacy-draft7", LEGACY_FIXTURE, {

@@ -248,57 +248,59 @@ function writeLegacySession(
 
 describe("cli: help", () => {
   test(
-    "fx help exits 0 and renders the complete navigation page",
+    "top-level help aliases render the same accurate navigation page",
     async () => {
-      const r = await runFx(["help"]);
-      expect(r.code).toBe(0);
-      expect(r.stderr).toBe("");
-      expect(r.stdout).not.toContain("\x1b[");
-      expect(r.stdout).not.toContain("\x1b]2;");
-      expect(r.stdout).toStartWith(
+      const outputs: string[] = [];
+      for (const args of [["help"], ["--help"], ["-h"]]) {
+        const result = await runFx(args);
+        expect(result.code).toBe(0);
+        expect(result.stderr).toBe("");
+        outputs.push(result.stdout);
+      }
+
+      expect(outputs[1]).toBe(outputs[0]);
+      expect(outputs[2]).toBe(outputs[0]);
+      const stdout = outputs[0]!;
+      expect(stdout).not.toContain("\x1b[");
+      expect(stdout).not.toContain("\x1b]2;");
+      expect(stdout).toStartWith(
         `𝒇x v${sourceVersion()}\nFast, native coding agent for the terminal.\n`,
       );
-      expect(r.stdout).toContain("Commands:\n");
-      expect(r.stdout).toContain("Run one noninteractive request");
-      expect(r.stdout).toContain("credits|balance");
-      expect(r.stdout).toContain("Flags:\n");
-      expect(r.stdout).toContain("--context-limit <spec>");
-      expect(r.stdout).toContain("Set name=bytes|off; repeatable");
-      expect(r.stdout).toContain("--add-dir <path>");
-      expect(r.stdout).toContain("-c, --continue");
-      expect(r.stdout).toContain("-r");
-      expect(r.stdout).toContain("Open the saved-session picker");
-      expect(r.stdout).not.toContain("-c, -r, --continue");
-      expect(r.stdout).toContain("--resume [last|<id>]");
-      expect(r.stdout).toContain("--resume-last");
-      expect(r.stdout).toContain("session resume [last|id]");
-      expect(r.stdout).toContain("-v, --version");
-      expect(r.stdout).not.toContain("Must appear before the command");
-      expect(r.stdout).toContain("Examples:\n");
-      expect(r.stdout).toContain("https://fx.sh/docs");
-      expect(r.stdout).toContain("run `/feedback` inside 𝒇x");
-      expect(r.stdout).not.toContain("  Work      ");
-      expect(r.stdout).not.toContain("\n\n\nRun `fx <command> --help`");
-    },
-    TIMEOUT,
-  );
-
-  test(
-    "fx --help exits 0",
-    async () => {
-      const r = await runFx(["--help"]);
-      expect(r.code).toBe(0);
-      expect(r.stdout).toContain("ask");
-    },
-    TIMEOUT,
-  );
-
-  test(
-    "fx -h exits 0",
-    async () => {
-      const r = await runFx(["-h"]);
-      expect(r.code).toBe(0);
-      expect(r.stdout).toContain("ask");
+      expect(stdout.match(/𝒇x/g) ?? []).toHaveLength(1);
+      expect(stdout).toContain("fx starts an interactive session by default.");
+      expect(stdout).toContain("Commands:\n");
+      expect(stdout).toContain("Run one noninteractive request");
+      expect(stdout).toContain("Sign in to a model provider");
+      expect(stdout).toContain("Sign out of a model provider");
+      expect(stdout).toContain("Choose the active model provider");
+      expect(stdout).toContain("Configure a Vercel AI Gateway API key");
+      expect(stdout).toContain("Choose a Vercel AI Gateway team");
+      expect(stdout).toContain("Show Vercel AI Gateway credits");
+      expect(stdout).not.toContain("Sign in to Vercel or a selected provider");
+      expect(stdout).toContain("credits|balance");
+      expect(stdout).toContain("Flags:\n");
+      expect(stdout).toContain("--context-limit <spec>");
+      expect(stdout).toContain("Set name=bytes|off; repeatable");
+      expect(stdout).toContain("--add-dir <path>");
+      expect(stdout).toContain("-c, --continue");
+      expect(stdout).toContain("-r");
+      expect(stdout).toContain("Open the saved-session picker");
+      expect(stdout).not.toContain("-c, -r, --continue");
+      expect(stdout).toContain("--resume [last|<id>]");
+      expect(stdout).toContain("--resume-last");
+      expect(stdout).toContain("session resume [last|id]");
+      expect(stdout).toContain("-v, --version");
+      expect(stdout).toContain("Print the fx version and exit");
+      expect(stdout).not.toContain("Must appear before the command");
+      expect(stdout).toContain("Examples:\n");
+      expect(stdout).toContain("https://fx.sh/docs");
+      expect(stdout).toContain("run `/feedback` inside fx");
+      expect(stdout).toContain(
+        "Run `fx <command> --help` for command-specific usage and options.",
+      );
+      expect(stdout).not.toContain("command-specific options and examples");
+      expect(stdout).not.toContain("  Work      ");
+      expect(stdout).not.toContain("\n\n\nRun `fx <command> --help`");
     },
     TIMEOUT,
   );

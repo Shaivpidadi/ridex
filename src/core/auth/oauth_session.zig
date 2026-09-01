@@ -1,12 +1,14 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const debug_trace = @import("../shared/debug_trace.zig");
+const host_contract = @import("../hosts/host.zig");
 const host_target = @import("../hosts/target.zig");
 const native_keychain = @import("../hosts/native_keychain.zig");
 const io_mod = @import("../shared/io.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const js_host_auth = @import("js_host_auth.zig");
 const secret = @import("secret.zig");
+const session_presence = @import("session_presence.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -89,6 +91,23 @@ fn storageBackend() StorageBackend {
     // Keychain-specific tests inject their backend explicitly.
     if (comptime builtin.is_test) return .profile_file;
     return selectStorageBackend(builtin.os.tag, native_keychain.isDisabled());
+}
+
+pub fn presence() host_contract.SecretStorePresence {
+    const file_presence = session_presence.profileFile(
+        auth_file_name,
+        max_auth_file_bytes,
+    );
+    if (storageBackend() == .profile_file or file_presence == .present) {
+        return file_presence;
+    }
+    const keychain_presence = native_keychain.oauthSessionPresence() catch
+        return .unavailable;
+    if (keychain_presence == .present) return .present;
+    if (file_presence == .missing and keychain_presence == .missing) {
+        return .missing;
+    }
+    return .unavailable;
 }
 
 fn selectResolution(file: FileState, keychain: KeychainState) Resolution {

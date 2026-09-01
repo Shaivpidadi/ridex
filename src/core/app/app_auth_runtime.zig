@@ -112,9 +112,21 @@ pub fn Runtime(comptime App: type) type {
                 try beginSignIn(app, false);
                 return;
             }
-            try app.auth.refreshSourceInventory(app.alloc);
-            app.auth.openPickerForProvider(app.alloc, provider_runtime.provider(app));
-            app.shell.render_requests.request(.footer);
+            switch (app.auth.beginSourceInventoryRefresh(app.alloc, .{
+                .provider = provider_runtime.provider(app),
+            })) {
+                .started => {},
+                .busy => try writeAuthNotice(app, .{
+                    .topic = "auth",
+                    .tone = .warning,
+                    .body = "Authentication inventory refresh is already in progress.",
+                }),
+                .failed => try writeAuthNotice(app, .{
+                    .topic = "auth",
+                    .tone = .@"error",
+                    .body = "Authentication sources could not be checked. The picker remains closed.",
+                }),
+            }
         }
 
         pub fn runLogoutCommand(app: *App, target: []const u8) !void {
@@ -143,7 +155,7 @@ pub fn Runtime(comptime App: type) type {
             else
                 .gateway;
             const provider_inventory = if (comptime @hasDecl(@TypeOf(app.auth), "pickerView")) inventory: {
-                try app.auth.refreshSourceInventory(app.alloc);
+                try app.auth.refreshSourceInventoryForLogout(app.alloc);
                 break :inventory app.auth.pickerView().available_sources;
             } else @as(auth_runtime.SourceSet, .empty);
             const logout_provider = auth_transition.decideLogoutProvider(.{
@@ -223,9 +235,38 @@ pub fn Runtime(comptime App: type) type {
                 }, true);
                 return;
             }
-            try app.auth.refreshSourceInventory(app.alloc);
-            app.auth.openPickerForProvider(app.alloc, provider_runtime.provider(app));
-            app.shell.render_requests.request(.footer);
+            switch (app.auth.beginSourceInventoryRefresh(app.alloc, .{
+                .provider = provider_runtime.provider(app),
+            })) {
+                .started => {},
+                .busy => try writeAuthNotice(app, .{
+                    .topic = "auth",
+                    .tone = .warning,
+                    .body = "Authentication inventory refresh is already in progress.",
+                }),
+                .failed => try writeAuthNotice(app, .{
+                    .topic = "auth",
+                    .tone = .@"error",
+                    .body = "Authentication sources could not be checked. The picker remains closed.",
+                }),
+            }
+        }
+
+        pub fn collectSourceInventoryFacts(app: *App) !void {
+            const result = app.auth.takeSourceInventoryRefresh() orelse return;
+            switch (result) {
+                .ready => |action| {
+                    app.auth.openPickerForProvider(app.alloc, action.provider);
+                    app.shell.render_requests.request(.footer);
+                },
+                .failed => {
+                    try writeAuthNotice(app, .{
+                        .topic = "auth",
+                        .tone = .@"error",
+                        .body = "Authentication sources could not be checked. The picker was not opened with stale data.",
+                    });
+                },
+            }
         }
 
         fn applyLogoutResult(app: *App, result: login_flow.LogoutResult) !void {
@@ -1466,6 +1507,8 @@ const TestAuth = struct {
     sign_in_code_toggle_succeeds: bool = true,
     sign_in_code_submit_count: usize = 0,
     sign_in_code_submit_succeeds: bool = true,
+    inventory_refresh_action: ?auth_runtime.InventoryRefreshAction = null,
+    inventory_refresh_fails: bool = false,
 
     fn credentialSource(self: *const TestAuth) ?credentials.Source {
         return self.active_source;
@@ -1583,6 +1626,32 @@ const TestAuth = struct {
 
     fn refreshSourceInventory(self: *TestAuth, _: std.mem.Allocator) !void {
         self.source_inventory_refresh_count += 1;
+    }
+
+    fn refreshSourceInventoryForLogout(self: *TestAuth, _: std.mem.Allocator) !void {
+        self.source_inventory_refresh_count += 1;
+    }
+
+    fn beginSourceInventoryRefresh(
+        self: *TestAuth,
+        _: std.mem.Allocator,
+        action: auth_runtime.InventoryRefreshAction,
+    ) auth_runtime.InventoryRefreshStart {
+        if (self.inventory_refresh_action != null) return .busy;
+        self.source_inventory_refresh_count += 1;
+        self.inventory_refresh_action = action;
+        return .started;
+    }
+
+    fn takeSourceInventoryRefresh(
+        self: *TestAuth,
+    ) ?auth_runtime.InventoryRefreshResult {
+        const action = self.inventory_refresh_action orelse return null;
+        self.inventory_refresh_action = null;
+        return if (self.inventory_refresh_fails)
+            .{ .failed = action }
+        else
+            .{ .ready = action };
     }
 
     fn recordCredentialRefreshFailure(self: *TestAuth, source: credentials.Source) void {
@@ -1737,8 +1806,41 @@ test "setup hub projects the selected provider into the auth picker" {
 
     try Runtime(TestApp).openSetupHub(&app);
 
+    try std.testing.expect(!app.auth.picker_opened);
+    try Runtime(TestApp).collectSourceInventoryFacts(&app);
     try std.testing.expect(app.auth.picker_opened);
     try std.testing.expectEqual(model_provider.ProviderId.codex, app.auth.picker_provider);
+}
+
+test "login opens only after its asynchronous inventory refresh completes" {
+    var app: TestApp = .{ .selected_provider = .grok };
+    defer app.deinit();
+
+    try Runtime(TestApp).runLoginCommand(&app);
+
+    try std.testing.expectEqual(@as(usize, 1), app.auth.source_inventory_refresh_count);
+    try std.testing.expect(!app.auth.picker_opened);
+    try Runtime(TestApp).collectSourceInventoryFacts(&app);
+    try std.testing.expect(app.auth.picker_opened);
+    try std.testing.expectEqual(model_provider.ProviderId.grok, app.auth.picker_provider);
+    try std.testing.expect(app.shell.render_requests.footer_requested);
+}
+
+test "login inventory failure leaves the picker closed and reports one error" {
+    var app: TestApp = .{ .selected_provider = .gateway };
+    defer app.deinit();
+    app.auth.inventory_refresh_fails = true;
+
+    try Runtime(TestApp).runLoginCommand(&app);
+    try Runtime(TestApp).collectSourceInventoryFacts(&app);
+
+    try std.testing.expect(!app.auth.picker_opened);
+    try std.testing.expectEqual(@as(usize, 1), app.notice_write_count);
+    try std.testing.expect(std.mem.find(
+        u8,
+        app.transcript.items,
+        "picker was not opened with stale data",
+    ) != null);
 }
 
 test "OAuth app gating accepts native auth or JS-host auth and rejects neither" {

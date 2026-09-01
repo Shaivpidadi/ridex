@@ -1934,7 +1934,6 @@ pub fn Runtime(comptime App: type) type {
                         else
                             null;
                     full_transcript_projection = try presentation_shell.preparedFullTranscriptPageProjectionInterruptible(
-                        app.alloc,
                         full_diff_resolver,
                         full_transcript_capability,
                         checkpoint,
@@ -2203,8 +2202,12 @@ pub fn Runtime(comptime App: type) type {
                             .{ .top = area.top, .bottom = area.bottom },
                             checkpoint,
                         );
-                        owned_transcript_source = staged.source;
-                        transcript_source = &owned_transcript_source.?;
+                        if (staged.owned_source) |source| {
+                            owned_transcript_source = source;
+                            transcript_source = &owned_transcript_source.?;
+                        } else {
+                            transcript_source = staged.borrowed_source.?;
+                        }
                         prepared_transcript = staged.prepared;
                         footer_frame.paint.viewport = prepared_transcript.?.selection;
                         try validatePreparedTranscriptFitsPlan(&prepared_transcript.?, footer_frame.paint);
@@ -6580,13 +6583,13 @@ test "core.app_render_runtime lifecycle rewrite recovers normal buffer after fil
     try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "stream completed"));
 }
 
-test "core.app_render_runtime full transcript opens with a bounded loading frame" {
+test "core.app_render_runtime full transcript defers repaint until its page is ready" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var file = try tmp.dir.createFile(
         std.testing.io,
-        "full-transcript-loading-frame.log",
+        "full-transcript-deferred-frame.log",
         .{ .read = true },
     );
     defer file.close(io_mod.getIo());
@@ -6624,11 +6627,20 @@ test "core.app_render_runtime full transcript opens with a bounded loading frame
     try app_lifecycle.openFullTranscript(app.alloc, &app.terminal, &app.shell, &app.metrics);
     try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
 
-    try std.testing.expect(try coordinatorGridContains(
+    try std.testing.expect(!try coordinatorGridContains(
         app.shell.shadow_vt.?.*,
         "Preparing full detail",
     ));
-    try std.testing.expect(!try coordinatorGridContains(
+
+    for (0..100_000) |_| {
+        _ = try app.shell.pollFullTranscriptPageLoad();
+        if (app.shell.fullTranscriptPreparedForOpen()) break;
+        std.Thread.yield() catch std.atomic.spinLoopHint();
+    }
+    try std.testing.expect(app.shell.fullTranscriptPreparedForOpen());
+    app.shell.render_requests.request(.transcript);
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+    try std.testing.expect(try coordinatorGridContains(
         app.shell.shadow_vt.?.*,
         "FULL_ASYNC_SENTINEL",
     ));

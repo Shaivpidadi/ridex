@@ -40,10 +40,40 @@ const SubagentStatus = @import("../../core/subagent/domain.zig").State;
 pub const SkillsMenuProjection = struct {
     active: bool = false,
     items: []const skill_runtime.Skill = &.{},
+    actual_indices: []const u32 = &.{},
+    index_ready: bool = false,
     source_filter: skill_runtime.SkillMenuSourceFilter = .all,
     selected_index: usize = 0,
     window_start: usize = 0,
     query: []const u8 = "",
+
+    pub fn itemCount(self: SkillsMenuProjection) usize {
+        if (self.index_ready) return self.actual_indices.len;
+        return skill_runtime.skillMenuFilterQueryCount(
+            self.items,
+            self.source_filter,
+            self.query,
+        );
+    }
+
+    pub fn itemAt(
+        self: SkillsMenuProjection,
+        display_index: usize,
+    ) ?*const skill_runtime.Skill {
+        if (!self.index_ready) {
+            const actual_index = skill_runtime.skillMenuActualIndexAtQuery(
+                self.items,
+                self.source_filter,
+                self.query,
+                display_index,
+            ) orelse return null;
+            return &self.items[actual_index];
+        }
+        if (display_index >= self.actual_indices.len) return null;
+        const actual_index: usize = self.actual_indices[display_index];
+        if (actual_index >= self.items.len) return null;
+        return &self.items[actual_index];
+    }
 };
 
 pub const ModelMenuProjection = struct {
@@ -351,6 +381,8 @@ pub fn skillsMenuProjection(skills: *const skill_runtime.Runtime) SkillsMenuProj
     return .{
         .active = skills.menuVisible(),
         .items = skills.items,
+        .actual_indices = skills.menu_index.actual_indices.items,
+        .index_ready = skills.menu_index_ready,
         .source_filter = skills.menu.source_filter,
         .selected_index = skills.menu.selected_index,
         .window_start = skills.menu.window_start,

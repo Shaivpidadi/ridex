@@ -1,9 +1,11 @@
 const std = @import("std");
 const debug_trace = @import("../shared/debug_trace.zig");
 const host_target = @import("../hosts/target.zig");
+const host = @import("../hosts/host.zig");
 const io_mod = @import("../shared/io.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const secret = @import("secret.zig");
+const session_presence = @import("session_presence.zig");
 
 const Allocator = std.mem.Allocator;
 const schema_version: i64 = 1;
@@ -14,6 +16,10 @@ const mutation_lock_deadline_ms: u64 = 2000;
 const max_account_id_bytes: usize = 1024;
 
 const auth_file_name = profile_paths.grok_auth_file_name;
+
+pub fn presence() host.SecretStorePresence {
+    return session_presence.profileFile(auth_file_name, max_auth_file_bytes);
+}
 
 pub fn refreshDeadlineMs(expires_at_ms: i64) i64 {
     return @max(expires_at_ms - expiry_skew_ms, 0);

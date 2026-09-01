@@ -357,6 +357,7 @@ pub const Controller = struct {
             return error.TerminalTakeoverInputFull;
         }
         try self.input.appendSlice(alloc, bytes);
+        self.next_screen_ms = 0;
     }
 
     fn containFailure(
@@ -554,6 +555,7 @@ pub const Controller = struct {
             return self.beginReturn(App, app, completionReason(completion), true);
         };
         self.inflight_write_bytes = 0;
+        self.next_screen_ms = 0;
         if (terminalEnded(result.write.session.lifecycle)) {
             try self.beginReturn(App, app, lifecycleReason(result.write.session.lifecycle), true);
         }
@@ -658,7 +660,9 @@ pub const Controller = struct {
     }
 
     fn scheduleScreen(self: *Controller, app: anytype) !void {
-        if (self.screen_correlation != null) return;
+        if (self.screen_correlation != null or
+            self.write_correlation != null or
+            self.input.items.len != 0) return;
         const now_ms = io_mod.milliTimestamp();
         if (now_ms < self.next_screen_ms) return;
         if (takeoverFailureRequested("screen")) {
@@ -1059,12 +1063,16 @@ test "takeover prefix is raw data inside fragmented bracketed paste" {
     try std.testing.expect(!parser.in_paste);
 }
 
-test "takeover retains bounded input while lease acquisition is pending" {
-    var controller = Controller{ .phase = .acquiring };
+test "takeover retains bounded input and requests an immediate screen refresh" {
+    var controller = Controller{
+        .phase = .acquiring,
+        .next_screen_ms = 100,
+    };
     defer controller.deinit(std.testing.allocator);
 
     try controller.retainInput(std.testing.allocator, "before-acquire");
     try std.testing.expectEqualStrings("before-acquire", controller.input.items);
+    try std.testing.expectEqual(@as(i64, 0), controller.next_screen_ms);
 
     try controller.input.ensureTotalCapacity(
         std.testing.allocator,

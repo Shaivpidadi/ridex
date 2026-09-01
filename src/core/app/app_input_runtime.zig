@@ -604,6 +604,9 @@ pub fn Runtime(comptime App: type) type {
             max_prompt_history: usize,
         ) !?u8 {
             if (!ingress.has_routing_work()) return null;
+            if (terminalIngressCancelsPendingFullTranscriptOpen(ingress)) {
+                _ = full_transcript_rt.cancelPendingOpenForInput(app);
+            }
 
             const file_picker_was_active = app.input_runtime.picker.activeFilePickerQuery(&app.input_runtime.edit_state) != null;
             defer if (comptime runtime_profile.allows(App, .file_index))
@@ -731,6 +734,16 @@ pub fn Runtime(comptime App: type) type {
                 return app.subagents.managerPasteActive();
             }
             return false;
+        }
+
+        fn terminalIngressCancelsPendingFullTranscriptOpen(
+            ingress: input_action.TerminalInputIngress,
+        ) bool {
+            const event = ingress.event orelse return false;
+            return switch (event) {
+                .paste_byte, .raw => true,
+                .action => |decoded| decoded.action != .toggle_full_transcript,
+            };
         }
 
         pub fn routeActivePasteIngressByteWithLimits(
@@ -2912,8 +2925,10 @@ pub fn Runtime(comptime App: type) type {
             if (comptime !@hasField(App, "skills")) return;
             if (!app.skills.menu.active) return;
             if (!app.skills.menu.origin.isMention()) {
-                app.skills.menu.setQuery(app.input_runtime.edit_state.input.items);
-                app.skills.menu.clamp(app.skills.items);
+                app.skills.setMenuQuery(
+                    app.alloc,
+                    app.input_runtime.edit_state.input.items,
+                );
                 return;
             }
             const target = app.skills.menu.target orelse return;
@@ -2924,8 +2939,7 @@ pub fn Runtime(comptime App: type) type {
             }
             const end = skillTokenEnd(items, target.start + 1);
             app.skills.menu.target = .{ .start = target.start, .end = end };
-            app.skills.menu.setQuery(items[target.start + 1 .. end]);
-            app.skills.menu.clamp(app.skills.items);
+            app.skills.setMenuQuery(app.alloc, items[target.start + 1 .. end]);
         }
 
         fn syncModelMenu(app: *App) void {
@@ -7993,6 +8007,35 @@ test "app_input_runtime decoded kitty Escape follows the raw Escape policy" {
         try feedRoutingBytes(&app, "\x1b[27u");
         try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
         try std.testing.expect(!app.input_runtime.gestures.escapeClearArmed());
+    }
+}
+
+test "pending full transcript open cancels after complete escape input" {
+    const alloc = std.testing.allocator;
+    const sequences = [_][]const u8{
+        "\x1b[A",
+        "\x1b[B",
+        "\x1b[5~",
+        "\x1b[6~",
+    };
+
+    for (sequences) |sequence| {
+        var app = try RoutingFakeApp.init(alloc);
+        defer app.deinit();
+        _ = try app.shell.appendRawTranscriptEntryClassified(
+            alloc,
+            "pending transcript\n",
+            .unknown_raw,
+        );
+        try std.testing.expect(!app.shell.requestFullTranscriptOpen());
+
+        try feedRoutingBytes(&app, sequence);
+
+        try std.testing.expectEqualStrings(
+            "",
+            app.input_runtime.edit_state.input.items,
+        );
+        try std.testing.expect(!app.shell.cancelPendingFullTranscriptOpen());
     }
 }
 

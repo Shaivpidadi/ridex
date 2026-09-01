@@ -81,6 +81,7 @@ EXCLUDED_E2E_TESTS = (
     "tui-command-permissions.test.ts",
     "tui-direct-write-audit.test.ts",
     "tui-keybindings.test.ts",
+    "tui-performance.test.ts",
     "tui-render-lab.test.ts",
     "tui-render-live-stress.test.ts",
     "web-fetch-live.test.ts",

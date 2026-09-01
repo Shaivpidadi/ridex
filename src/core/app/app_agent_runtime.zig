@@ -910,7 +910,10 @@ pub fn Runtime(comptime App: type) type {
                 try appendClaimedContextNotice(app, &preflight_context_notices.writer, notice);
             }
 
-            var bounded_skills = try app.skills.buildRoutedSystemPromptSection(
+            var skill_catalog = app.skills.acquireCatalog();
+            var skill_catalog_owned = true;
+            defer if (skill_catalog_owned) skill_catalog.deinit();
+            var bounded_skills = try skill_catalog.buildRoutedSystemPromptSection(
                 std.heap.c_allocator,
                 job.prompt,
                 if (comptime @hasField(App, "context_limits")) app.context_limits else .{},
@@ -930,12 +933,14 @@ pub fn Runtime(comptime App: type) type {
             }
             var explicit_skills = try skill_invocation.buildExplicitPromptSection(
                 std.heap.c_allocator,
-                .{ .skills = app.skills.items, .diagnostics = app.skills.diagnostics },
+                .{ .skills = skill_catalog.items, .diagnostics = skill_catalog.diagnostics },
                 job.prompt,
                 explicit_bindings,
                 if (comptime @hasField(App, "context_limits")) app.context_limits else .{},
             );
             defer explicit_skills.deinit(std.heap.c_allocator);
+            skill_catalog.deinit();
+            skill_catalog_owned = false;
             if (explicit_skills.notice) |notice| {
                 try appendClaimedContextNotice(app, &postflight_context_notices.writer, notice);
             }
@@ -1031,7 +1036,10 @@ pub fn Runtime(comptime App: type) type {
             ) catch
                 return error.OutOfMemory;
             defer child_projection.deinit(alloc);
-            var bounded_skills = app.skills.buildRoutedSystemPromptSection(
+            var skill_catalog = app.skills.acquireCatalog();
+            var skill_catalog_owned = true;
+            defer if (skill_catalog_owned) skill_catalog.deinit();
+            var bounded_skills = skill_catalog.buildRoutedSystemPromptSection(
                 alloc,
                 message.content,
                 if (comptime @hasField(App, "context_limits")) app.context_limits else .{},
@@ -1039,12 +1047,14 @@ pub fn Runtime(comptime App: type) type {
             defer bounded_skills.deinit(alloc);
             var explicit_skills = skill_invocation.buildExplicitPromptSection(
                 alloc,
-                .{ .skills = app.skills.items, .diagnostics = app.skills.diagnostics },
+                .{ .skills = skill_catalog.items, .diagnostics = skill_catalog.diagnostics },
                 message.content,
                 &.{},
                 if (comptime @hasField(App, "context_limits")) app.context_limits else .{},
             ) catch return error.OutOfMemory;
             defer explicit_skills.deinit(alloc);
+            skill_catalog.deinit();
+            skill_catalog_owned = false;
             const prompt_policy = app.promptPolicy();
             const tool_context = childToolContext(app.subagentToolContextForAdmission(admission));
             const providers = if (comptime @hasDecl(App, "providerSet"))

@@ -44,3 +44,21 @@ jobs:
           for run in 1 2 3; do
             zig build run-bench-ui-activity -Doptimize=ReleaseSafe
           done
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Run interactive terminal performance gate
+        working-directory: tests/e2e
+        env:
+          FX_TUI_PERFORMANCE: "1"
+          FX_TUI_PERFORMANCE_REPORT: ${{ runner.temp }}/tui-performance.json
+        run: bun test tui-performance.test.ts
+
+      - name: Upload interactive terminal performance evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tui-performance
+          path: ${{ runner.temp }}/tui-performance.json
+          if-no-files-found: warn
