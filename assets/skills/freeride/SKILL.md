@@ -48,6 +48,13 @@ curl -sf -m 3 http://127.0.0.1:11343/health
 freeride doctor
 ```
 
+These read-only diagnostics are **pre-approved** — run them without
+hesitation: `freeride doctor`, `freeride keys`, `freeride providers`,
+`freeride telemetry`, `freeride --version`, `ridex doctor`, and any
+plain `curl` of `127.0.0.1:11343/health`. Run each as its OWN
+command: chaining (`&&`, `;`, pipes) or wrapping them forfeits the
+pre-approval and triggers a permission review.
+
 `/health` returns `{"ok": true, "version": ..., "providers": [...],
 "keyed_providers": [...]}`. Read it precisely:
 
