@@ -139,7 +139,15 @@ fn listActionablePageInternal(
                 .updated_at_ms = summary.updated_at_ms,
                 .id = try alloc.dupe(u8, summary.id),
             };
-            if (try child_state.isManagedChildSession(store, alloc, summary.id)) continue;
+            const managed = child_state.isManagedChildSession(
+                store,
+                alloc,
+                summary.id,
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => true,
+            };
+            if (managed) continue;
             var cloned = try session_summary_codec.cloneSessionSummary(alloc, summary);
             result.summaries.append(alloc, cloned) catch |err| {
                 cloned.deinit(alloc);
@@ -217,8 +225,17 @@ fn ensureExternalPromptAllowed(
     session_id: []const u8,
     before_writable_resume: bool,
 ) !void {
-    const managed = child_state.isManagedChildSession(store, alloc, session_id) catch |err|
-        return err;
+    const managed = child_state.isManagedChildSession(
+        store,
+        alloc,
+        session_id,
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.SessionNotFound,
+        error.SessionStoreUnavailable,
+        => if (before_writable_resume) return else return err,
+        else => return err,
+    };
     if (managed) return error.OneOffSessionNotResumable;
     if (!before_writable_resume) return;
 }

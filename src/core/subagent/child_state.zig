@@ -428,31 +428,45 @@ pub fn isManagedChildSession(
     sessions: session_store.Store,
     alloc: Allocator,
     session_id: []const u8,
-) error{OutOfMemory}!bool {
+) !bool {
     var capability = sessions.openSubagentControlCapabilityReadOnly(
         alloc,
         session_id,
         .{},
     ) catch |err| return switch (err) {
-        error.OutOfMemory => error.OutOfMemory,
         error.SessionNotFound => false,
-        else => true,
+        else => err,
     };
     defer capability.deinit();
-    for ([_][]const u8{ owner_marker_file, legacy_control_file }) |name| {
-        var file = capability.openFileReadOnly(
-            alloc,
-            .subagent_control,
-            name,
-        ) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.FileNotFound => continue,
-            else => return true,
-        };
+    var owner = capability.openFileReadOnly(
+        alloc,
+        .subagent_control,
+        owner_marker_file,
+    ) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return err,
+    };
+    if (owner) |*file| {
         file.deinit();
         return true;
     }
-    return false;
+
+    var legacy = capability.openFileReadOnly(
+        alloc,
+        .subagent_control,
+        legacy_control_file,
+    ) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    defer legacy.deinit();
+    const bytes = try legacy.readToEnd(alloc, max_state_bytes);
+    defer alloc.free(bytes);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidState;
+    const parent = parsed.value.object.get("parent_id") orelse return false;
+    return parent == .string;
 }
 
 fn renderRegistry(alloc: Allocator, registry: Registry) ![]u8 {
