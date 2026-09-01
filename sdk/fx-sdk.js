@@ -1065,11 +1065,12 @@ export async function createFxAgent(options = {}) {
       return;
     }
     if (message.method === "libfx/tool_call") {
-      const { content, isError } = await executeHostTool(
+      const { content, isError, cancelled } = await executeHostTool(
         message.params?.name,
         message.params?.input,
         message.params?.sessionId,
       );
+      if (cancelled || closing) return;
       send({ jsonrpc: "2.0", id: message.id, result: { content, isError } });
       return;
     }

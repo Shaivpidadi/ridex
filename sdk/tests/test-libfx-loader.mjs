@@ -3,7 +3,7 @@ import { strict as assert } from "node:assert";
 import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   createFxAgent,
   createFxTerminal,
@@ -18,6 +18,8 @@ assert.equal(browser.libfxApiVersion, 2);
 assert.equal(typeof browser.createFxAgent, "function");
 assert.equal(typeof browser.createFxTerminal, "function");
 
+const scriptDir = fileURLToPath(new URL(".", import.meta.url));
+const realNativeAddon = resolve(scriptDir, "../../zig-out/lib/libfx.node");
 const dir = await mkdtemp(resolve(tmpdir(), "libfx-loader-"));
 const nativePath = resolve(dir, "native.mjs");
 await writeFile(nativePath, `
@@ -57,6 +59,18 @@ try {
     createFxAgent({ nativeAddon: nativeUrl, backend: "wasm" }),
     (error) => error?.code === "LIBFX_JSPI_REQUIRED" &&
       error.message.includes("--experimental-wasm-jspi"),
+  );
+  await assert.rejects(
+    createFxAgent({ nativeAddon: realNativeAddon, instructions: "x".repeat(65_537) }),
+    (error) => error instanceof RangeError && error.message.includes("65536"),
+  );
+  await assert.rejects(
+    createFxAgent({
+      nativeAddon: realNativeAddon,
+      checkpoint: new Uint8Array([1, 2, 3]),
+      env: { AI_GATEWAY_API_KEY: "loader-checkpoint-key" },
+    }),
+    (error) => error.message.includes("Invalid or non-fresh libfx checkpoint"),
   );
 } finally {
   Object.defineProperty(WebAssembly, "Suspending", { configurable: true, value: savedSuspending });
@@ -120,4 +134,4 @@ await assert.rejects(
   "matching v2 low-level addon must reach createCore",
 );
 
-console.log("libfx loader passed: browser exports, native preference, fallback diagnostics, and strict low-level API validation");
+console.log("libfx loader passed: browser exports, native preference, fallback diagnostics, semantic errors, and strict low-level API validation");

@@ -218,7 +218,7 @@ function createNativeCoreRuntime(addon, options) {
           if (newline < 0) break;
           const line = lineBuffer.slice(0, newline);
           lineBuffer = lineBuffer.slice(newline + 1);
-          if (line) lineHandler(JSON.parse(line));
+          if (line) void Promise.resolve(lineHandler(JSON.parse(line))).catch(() => finish(1));
         }
       }
       if (addon.coreExited(core)) finish(addon.coreExitCode(core));
@@ -254,11 +254,13 @@ async function createWithFallback(surface, nativeMethod, wasmFactory, defaultWas
   }
 
   let nativeError;
+  let nativeAttempted = false;
   if (backend !== "wasm") {
     const native = await resolveNativeBackend(nativeAddon);
     nativeError = native.error;
     if (typeof native.backend?.[nativeMethod] === "function" ||
       (surface === "agent" && typeof native.backend?.createCore === "function")) {
+      nativeAttempted = true;
       try {
         if (typeof native.backend?.[nativeMethod] === "function") {
           return await native.backend[nativeMethod](runtimeOptions);
@@ -276,7 +278,10 @@ async function createWithFallback(surface, nativeMethod, wasmFactory, defaultWas
     }
   }
 
-  if (!supportsJspi()) throw jspiFallbackError(surface, nativeError);
+  if (!supportsJspi()) {
+    if (nativeAttempted) throw nativeError;
+    throw jspiFallbackError(surface, nativeError);
+  }
   return wasmFactory({
     ...runtimeOptions,
     wasm: await wasmBytes(runtimeOptions.wasm ?? defaultWasm),
