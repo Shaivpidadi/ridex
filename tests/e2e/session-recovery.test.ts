@@ -461,7 +461,7 @@ describe("session recovery", () => {
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
-  });
+  }, TIMEOUT);
 
   test(
     "process death after authority intent leaves a fenced orphan for writable resolution",
