@@ -1,0 +1,189 @@
+#!/bin/sh
+# ridex — launcher for the ridex coding agent.
+#
+# The agent binary (a fork of vercel-labs/fx) talks to the local
+# FreeRide gateway on 127.0.0.1:11343. Users never run
+# `freeride serve` themselves: this launcher keeps the daemon up.
+#
+#   ridex start|stop|restart   manage the FreeRide daemon
+#   ridex doctor               daemon + agent health report
+#   ridex <anything else>      forwarded to the agent binary,
+#                              auto-starting the daemon first
+#
+# `ridex stop` sticks: it writes a marker and later invocations refuse
+# to sneak the daemon back on. `ridex start` / `ridex restart` clear it.
+
+set -eu
+
+RIDEX_HOME="${RIDEX_HOME:-$HOME/.ridex}"
+STOP_MARKER="$RIDEX_HOME/daemon.stopped"
+PID_FILE="$RIDEX_HOME/daemon.pid"
+DAEMON_LOG="$RIDEX_HOME/daemon.log"
+GATEWAY_URL="${RIDEX_GATEWAY_URL:-http://127.0.0.1:11343}"
+AGENT_BIN="${RIDEX_AGENT_BIN:-$(dirname "$(realpath "$0")")/fx}"
+
+# How the daemon is launched. `freeride` from PATH when installed
+# (pipx/uv/pip), overridable for source checkouts:
+#   RIDEX_FREERIDE_CMD="python -m freeride" ridex ask ...
+FREERIDE_CMD="${RIDEX_FREERIDE_CMD:-freeride}"
+
+healthy() {
+    curl -sf -m 2 -o /dev/null "$GATEWAY_URL/health" 2>/dev/null
+}
+
+# During graceful shutdown the daemon stops answering /health before it
+# releases the LISTEN socket, so port drains must probe the socket itself.
+GATEWAY_HOSTPORT="${GATEWAY_URL#*://}"
+GATEWAY_HOST="${GATEWAY_HOSTPORT%%:*}"
+GATEWAY_PORT="${GATEWAY_HOSTPORT##*:}"
+
+port_bound() {
+    nc -z -G 1 -w 1 "$GATEWAY_HOST" "$GATEWAY_PORT" >/dev/null 2>&1
+}
+
+wait_port_free() {
+    _deadline=$(( $(date +%s) + ${1:-15} ))
+    while [ "$(date +%s)" -lt "$_deadline" ]; do
+        port_bound || return 0
+        sleep 0.3
+    done
+    return 1
+}
+
+spawn_daemon() {
+    mkdir -p "$RIDEX_HOME"
+    if ! command -v "${FREERIDE_CMD%% *}" >/dev/null 2>&1; then
+        echo "ridex: FreeRide gateway is not installed (command '${FREERIDE_CMD%% *}' not found)." >&2
+        echo "ridex: install it with: curl -sSL https://api.free-ride.xyz/install.sh | sh" >&2
+        exit 1
+    fi
+    # shellcheck disable=SC2086 — FREERIDE_CMD may carry args ("python -m freeride")
+    nohup $FREERIDE_CMD serve >>"$DAEMON_LOG" 2>&1 &
+    echo $! > "$PID_FILE"
+}
+
+wait_healthy() {
+    _deadline=$(( $(date +%s) + ${1:-20} ))
+    while [ "$(date +%s)" -lt "$_deadline" ]; do
+        healthy && return 0
+        sleep 0.5
+    done
+    return 1
+}
+
+# The gateway is a brick without provider keys. /health lists the
+# providers whose keys it loaded; an empty list means `freeride init`
+# has never run — prompt for keys right here (local machine, never
+# through any chat), then hot-reload the daemon.
+ensure_keys() {
+    _field=$(curl -sf -m 2 "$GATEWAY_URL/health" 2>/dev/null | grep -o '"keyed_providers":[[:space:]]*\[[^]]*\]' || true)
+    [ -z "$_field" ] && return 0  # pre-0.4.0a22 gateway without the field: don't guess
+    case "${_field#*\[}" in
+        *'"'*) return 0 ;;  # at least one provider holds a usable key
+    esac
+    echo "ridex: no provider keys are configured yet. Running key setup (keys stay on this machine)." >&2
+    $FREERIDE_CMD init || {
+        echo "ridex: key setup did not complete; get a free key at openrouter.ai/keys and re-run." >&2
+        exit 1
+    }
+    $FREERIDE_CMD reload >/dev/null 2>&1 || true
+}
+
+ensure_daemon() {
+    if healthy; then
+        ensure_keys
+        return 0
+    fi
+    if [ -e "$STOP_MARKER" ]; then
+        echo "ridex: the FreeRide daemon is stopped (you ran 'ridex stop')." >&2
+        echo "ridex: run 'ridex start' to bring it back." >&2
+        exit 1
+    fi
+    echo "ridex: starting the FreeRide daemon..." >&2
+    spawn_daemon
+    if ! wait_healthy 30; then
+        echo "ridex: the FreeRide daemon did not become healthy on $GATEWAY_URL." >&2
+        echo "ridex: check $DAEMON_LOG, or run 'ridex doctor'." >&2
+        exit 1
+    fi
+    ensure_keys
+}
+
+stop_daemon() {
+    mkdir -p "$RIDEX_HOME"
+    touch "$STOP_MARKER"
+    if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+        kill "$(cat "$PID_FILE")" 2>/dev/null || true
+    else
+        # Daemon may have been spawned by an earlier install or manually.
+        pkill -f "freeride[ .]" 2>/dev/null || pkill -f "freeride.cli.main serve" 2>/dev/null || true
+    fi
+    rm -f "$PID_FILE"
+    # Wait for the socket to actually close so an immediately-following
+    # ridex command can't race a dying-but-still-bound daemon.
+    wait_port_free 10 || true
+    echo "ridex: FreeRide daemon stopped. It stays stopped until 'ridex start'."
+}
+
+doctor() {
+    echo "ridex doctor"
+    echo "  agent binary : $AGENT_BIN $([ -x "$AGENT_BIN" ] && echo '(ok)' || echo '(MISSING)')"
+    echo "  gateway url  : $GATEWAY_URL"
+    if healthy; then
+        echo "  daemon       : healthy"
+    elif [ -e "$STOP_MARKER" ]; then
+        echo "  daemon       : stopped by user ('ridex start' to resume)"
+    else
+        echo "  daemon       : NOT RUNNING ('ridex start', or any ridex command auto-starts it)"
+    fi
+    if command -v "${FREERIDE_CMD%% *}" >/dev/null 2>&1; then
+        # Key/provider status lives with the gateway.
+        $FREERIDE_CMD doctor 2>/dev/null || true
+    else
+        echo "  freeride     : not installed — curl -sSL https://api.free-ride.xyz/install.sh | sh"
+    fi
+}
+
+case "${1:-}" in
+    start)
+        rm -f "$STOP_MARKER"
+        if healthy; then echo "ridex: FreeRide daemon already running."; exit 0; fi
+        spawn_daemon
+        wait_healthy 30 && echo "ridex: FreeRide daemon started." || {
+            echo "ridex: daemon failed to start; see $DAEMON_LOG" >&2; exit 1; }
+        ;;
+    stop)
+        stop_daemon
+        ;;
+    restart)
+        rm -f "$STOP_MARKER"
+        if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+            kill "$(cat "$PID_FILE")" 2>/dev/null || true
+        fi
+        rm -f "$PID_FILE"
+        # Wait for the old daemon to release the port before spawning,
+        # or the new one dies with "already in use".
+        wait_port_free 15 || {
+            echo "ridex: something else is holding $GATEWAY_HOST:$GATEWAY_PORT; not spawning." >&2
+            exit 1
+        }
+        spawn_daemon
+        wait_healthy 30 && echo "ridex: FreeRide daemon restarted." || {
+            echo "ridex: daemon failed to restart; see $DAEMON_LOG" >&2; exit 1; }
+        ;;
+    doctor)
+        doctor
+        ;;
+    *)
+        ensure_daemon
+        # A non-default gateway URL must reach the agent binary too; its
+        # compiled default is 127.0.0.1:11343 and it honors loopback
+        # FX_GATEWAY_* overrides.
+        if [ "$GATEWAY_URL" != "http://127.0.0.1:11343" ]; then
+            FX_GATEWAY_CHAT_URL="$GATEWAY_URL/v3/ai/language-model"
+            FX_GATEWAY_BASE_URL="$GATEWAY_URL"
+            export FX_GATEWAY_CHAT_URL FX_GATEWAY_BASE_URL
+        fi
+        exec "$AGENT_BIN" "$@"
+        ;;
+esac
