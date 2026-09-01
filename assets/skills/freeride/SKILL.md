@@ -34,6 +34,13 @@ Architecture facts that matter for diagnosis:
   `freeride/quality`, `freeride/free`, and `auto` are routing presets, not
   real models — the gateway picks a concrete free model per request.
   Concrete ids from the model list also work verbatim.
+- `freeride/coding` and `auto` carry an internal fallback LADDER: if the
+  preferred provider can't serve (rate limit, no free inference right
+  now, dead key), the gateway silently retries the same request on the
+  next provider's best tool-capable model, inside the same response. A
+  single provider being down should therefore never surface as a failed
+  turn — if the user still sees failures, EVERY ladder provider is
+  keyless/cooling (check `freeride keys`).
 - Streaming commits after the first token: a provider dying mid-stream
   truncates that one response (known limitation); just retry the turn.
 - Inbound auth is ignored — any Bearer token works against FreeRide. The
