@@ -2541,7 +2541,7 @@ fn isCurrentCompactionCheckpoint(turn: HistoryTurn) bool {
         .compacted_summary => |entry| std.mem.startsWith(
             u8,
             entry.summary,
-            "<context_handoff>",
+            core_types.context_handoff_open,
         ),
         else => false,
     };
@@ -2949,7 +2949,7 @@ fn appendHistoryMessagesImpl(
         switch (turn) {
             .compacted_summary => |entry| {
                 const summary_is_system = in_leading_summary_prefix and
-                    !std.mem.startsWith(u8, entry.summary, "<context_handoff>");
+                    !isCurrentCompactionCheckpoint(turn);
                 const text = try formatCompactedContinuationMessage(alloc, entry.summary);
                 errdefer alloc.free(text);
                 try messages.append(
@@ -3145,7 +3145,7 @@ fn appendHistoryChatMessagesImpl(
         switch (turn) {
             .compacted_summary => |entry| {
                 const summary_is_system = in_leading_summary_prefix and
-                    !std.mem.startsWith(u8, entry.summary, "<context_handoff>");
+                    !isCurrentCompactionCheckpoint(turn);
                 const text = try formatCompactedContinuationMessage(alloc, entry.summary);
                 errdefer alloc.free(text);
                 try messages.append(alloc, .{

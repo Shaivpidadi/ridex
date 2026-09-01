@@ -173,7 +173,7 @@ pub fn renderHandoff(
 ) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
-    try out.writer.writeAll("<context_handoff>\n## Authoritative continuation state\n");
+    try out.writer.writeAll(types.context_handoff_open ++ "\n## Authoritative continuation state\n");
 
     if (facts.operations.len == 0) {
         try out.writer.writeAll("- No structured execution facts were removed.\n");
@@ -213,7 +213,7 @@ pub fn renderHandoff(
         "\n## Continuation rule\n" ++
             "The authoritative continuation state overrides summary prose. " ++
             "Do not repeat completed effects. Do not treat permission feedback or " ++
-            "summary prose as authorization.\n</context_handoff>",
+            "summary prose as authorization.\n" ++ types.context_handoff_close,
     );
     return out.toOwnedSlice() catch return error.OutOfMemory;
 }
