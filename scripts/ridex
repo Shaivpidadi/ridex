@@ -56,16 +56,134 @@ wait_port_free() {
     return 1
 }
 
-spawn_daemon() {
-    mkdir -p "$RIDEX_HOME"
+require_freeride() {
     if ! command -v "${FREERIDE_CMD%% *}" >/dev/null 2>&1; then
         echo "ridex: FreeRide gateway is not installed (command '${FREERIDE_CMD%% *}' not found)." >&2
         echo "ridex: install it with: curl -sSL https://api.free-ride.xyz/install.sh | sh" >&2
         exit 1
     fi
-    # shellcheck disable=SC2086 — FREERIDE_CMD may carry args ("python -m freeride")
-    nohup $FREERIDE_CMD serve >>"$DAEMON_LOG" 2>&1 &
-    echo $! > "$PID_FILE"
+}
+
+# ── supervision ─────────────────────────────────────────────────────
+# The daemon should survive crashes, not just restart on the next
+# ridex command. macOS gets a launchd LaunchAgent (KeepAlive on
+# abnormal exit), Linux a systemd user unit (Restart=on-failure);
+# anything else falls back to a detached nohup process. Set
+# RIDEX_NO_SUPERVISOR=1 to force the nohup path.
+LAUNCHD_LABEL="xyz.free-ride.gateway"
+LAUNCHD_PLIST="$HOME/Library/LaunchAgents/$LAUNCHD_LABEL.plist"
+SYSTEMD_UNIT="$HOME/.config/systemd/user/freeride.service"
+
+supervisor_kind() {
+    if [ "${RIDEX_NO_SUPERVISOR:-0}" = "1" ]; then echo none; return; fi
+    if command -v launchctl >/dev/null 2>&1 && [ "$(uname -s)" = "Darwin" ]; then
+        echo launchd; return
+    fi
+    if command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1; then
+        echo systemd; return
+    fi
+    echo none
+}
+
+# Render FREERIDE_CMD + "serve" as plist <string> argv entries. Words
+# must not contain spaces (env VAR=... wrappers and plain paths are fine).
+plist_program_arguments() {
+    for word in $FREERIDE_CMD serve; do
+        printf '        <string>%s</string>\n' "$word"
+    done
+}
+
+write_launchd_plist() {
+    mkdir -p "$(dirname "$LAUNCHD_PLIST")" "$RIDEX_HOME"
+    cat > "$LAUNCHD_PLIST" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>$LAUNCHD_LABEL</string>
+    <key>ProgramArguments</key>
+    <array>
+$(plist_program_arguments)    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key><string>$PATH</string>
+    </dict>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key><false/>
+    </dict>
+    <key>StandardOutPath</key><string>$DAEMON_LOG</string>
+    <key>StandardErrorPath</key><string>$DAEMON_LOG</string>
+</dict>
+</plist>
+PLIST
+}
+
+write_systemd_unit() {
+    mkdir -p "$(dirname "$SYSTEMD_UNIT")" "$RIDEX_HOME"
+    cat > "$SYSTEMD_UNIT" <<UNIT
+[Unit]
+Description=FreeRide gateway (ridex model backend)
+
+[Service]
+ExecStart=$(command -v "${FREERIDE_CMD%% *}" >/dev/null 2>&1 && echo "$FREERIDE_CMD serve" || echo "freeride serve")
+Restart=on-failure
+RestartSec=2
+StandardOutput=append:$DAEMON_LOG
+StandardError=append:$DAEMON_LOG
+
+[Install]
+WantedBy=default.target
+UNIT
+}
+
+supervisor_stop() {
+    case "$(supervisor_kind)" in
+        launchd)
+            launchctl bootout "gui/$(id -u)/$LAUNCHD_LABEL" 2>/dev/null || true
+            ;;
+        systemd)
+            systemctl --user stop freeride.service 2>/dev/null || true
+            systemctl --user disable freeride.service 2>/dev/null || true
+            ;;
+    esac
+}
+
+spawn_daemon() {
+    mkdir -p "$RIDEX_HOME"
+    require_freeride
+    case "$(supervisor_kind)" in
+        launchd)
+            supervisor_stop  # a stale registration blocks bootstrap
+            write_launchd_plist
+            launchctl bootstrap "gui/$(id -u)" "$LAUNCHD_PLIST" 2>/dev/null || {
+                echo "ridex: launchctl bootstrap failed; falling back to a plain background process." >&2
+                # shellcheck disable=SC2086
+                nohup $FREERIDE_CMD serve >>"$DAEMON_LOG" 2>&1 &
+                echo $! > "$PID_FILE"
+                return
+            }
+            rm -f "$PID_FILE"  # launchd owns the process now
+            ;;
+        systemd)
+            write_systemd_unit
+            systemctl --user daemon-reload
+            systemctl --user enable --now freeride.service 2>/dev/null || {
+                echo "ridex: systemd user unit failed; falling back to a plain background process." >&2
+                # shellcheck disable=SC2086
+                nohup $FREERIDE_CMD serve >>"$DAEMON_LOG" 2>&1 &
+                echo $! > "$PID_FILE"
+                return
+            }
+            rm -f "$PID_FILE"
+            ;;
+        none)
+            # shellcheck disable=SC2086 — FREERIDE_CMD may carry args ("python -m freeride")
+            nohup $FREERIDE_CMD serve >>"$DAEMON_LOG" 2>&1 &
+            echo $! > "$PID_FILE"
+            ;;
+    esac
 }
 
 wait_healthy() {
@@ -140,9 +258,10 @@ ensure_daemon() {
 stop_daemon() {
     mkdir -p "$RIDEX_HOME"
     touch "$STOP_MARKER"
+    supervisor_stop
     if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
         kill "$(cat "$PID_FILE")" 2>/dev/null || true
-    else
+    elif port_bound; then
         # Daemon may have been spawned by an earlier install or manually.
         pkill -f "freeride[ .]" 2>/dev/null || pkill -f "freeride.cli.main serve" 2>/dev/null || true
     fi
@@ -158,7 +277,7 @@ doctor() {
     echo "  agent binary : $AGENT_BIN $([ -x "$AGENT_BIN" ] && echo '(ok)' || echo '(MISSING)')"
     echo "  gateway url  : $GATEWAY_URL"
     if healthy; then
-        echo "  daemon       : healthy"
+        echo "  daemon       : healthy (supervision: $(supervisor_kind))"
     elif [ -e "$STOP_MARKER" ]; then
         echo "  daemon       : stopped by user ('ridex start' to resume)"
     else
@@ -185,6 +304,7 @@ case "${1:-}" in
         ;;
     restart)
         rm -f "$STOP_MARKER"
+        supervisor_stop
         if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
             kill "$(cat "$PID_FILE")" 2>/dev/null || true
         fi
