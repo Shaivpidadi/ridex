@@ -326,7 +326,12 @@ fn requestedSource(
     provider: model_provider.ProviderId,
     preferred: ?credentials.Source,
 ) ?credentials.Source {
-    return if (provider == .gateway) preferred else provider_catalog.find(provider).login_source;
+    // FreeRide's credential is synthetic; like the gateway, any
+    // preferred source the user holds is acceptable.
+    return if (provider == .gateway or provider == .freeride)
+        preferred
+    else
+        provider_catalog.find(provider).login_source;
 }
 
 pub fn preparationError(failure: CredentialFailure) ?CredentialPreparationError {

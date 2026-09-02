@@ -195,6 +195,7 @@ test "provider set selects each provider's complete route" {
 
 test "provider compaction route preserves provider and credential authority" {
     const routes = Set{
+        .freeride = .{ .compaction_model = "freeride/coding" },
         .gateway = .{ .compaction_model = "openai/gpt-5.6-luna" },
         .codex = .{ .compaction_model = "gpt-5.6-luna" },
         .grok = .{ .compaction_model = "grok-4.5" },

@@ -175,6 +175,7 @@ fn freerideModelCapabilities(_: []const u8) model_capabilities.Capabilities {
 
 pub const freeride_provider_bundle = provider_set.Bundle{
     .presentation = provider_catalog.find(.freeride),
+    .compaction_model = "freeride/coding",
     .fallback_model_capabilities_fn = freerideModelCapabilities,
     .agent_stream = agent_stream_provider,
     .cli_model_catalog = cli_model_catalog_provider,
