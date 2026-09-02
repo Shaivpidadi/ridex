@@ -1,7 +1,7 @@
 //! Best-effort lifecycle reporter for the herdr agent multiplexer.
 //!
 //! Each report uses a short-lived Unix socket. Failures and reply timeouts are
-//! ignored so the integration cannot block or terminate an fx session.
+//! ignored so the integration cannot block or terminate an ridex session.
 
 const std = @import("std");
 const io_mod = @import("../../core/shared/io.zig");

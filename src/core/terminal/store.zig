@@ -7726,7 +7726,7 @@ test "human owner takeover proof is narrow and excludes agent writes" {
     );
 }
 
-test "human takeover lease is reclaimable only after its fx process owner is gone" {
+test "human takeover lease is reclaimable only after its ridex process owner is gone" {
     const Match = struct {
         var result: process_identity.TokenMatch = .matched;
 

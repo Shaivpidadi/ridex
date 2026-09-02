@@ -1127,9 +1127,9 @@ pub const StatusSnapshot = struct {
         }
         if (self.required_source == .fx_login) {
             return if (self.fx_login_status == .unavailable)
-                "The saved fx login could not be loaded. Run fx login to repair this source; no other credential was selected."
+                "The saved ridex login could not be loaded. Run ridex login to repair this source; no other credential was selected."
             else
-                "fx login is selected but unavailable. Run fx login to reconnect; no other credential was selected.";
+                "ridex login is selected but unavailable. Run ridex login to reconnect; no other credential was selected.";
         }
         if (self.required_source == .chatgpt_subscription) {
             return switch (surface) {
@@ -2902,13 +2902,13 @@ test "auth failure snapshot keeps refresh failures distinct from HTTP rejection"
 
     const message = try snapshot.renderText(std.testing.allocator);
     defer std.testing.allocator.free(message);
-    try std.testing.expectEqualStrings("fx login credential refresh failed", message);
+    try std.testing.expectEqualStrings("ridex login credential refresh failed", message);
 
     const json = try snapshot.renderJson(std.testing.allocator);
     defer std.testing.allocator.free(json);
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
     defer parsed.deinit();
-    try std.testing.expectEqualStrings("fx login", parsed.value.object.get("source").?.string);
+    try std.testing.expectEqualStrings("ridex login", parsed.value.object.get("source").?.string);
     try std.testing.expectEqualStrings("credential_refresh_failed", parsed.value.object.get("reason").?.string);
     try std.testing.expect(parsed.value.object.get("http_status") == null);
 
@@ -3073,7 +3073,7 @@ test "auth runtime exposes one current Gateway credential for prompt admission" 
     try std.testing.expectEqual(credentials.Source.fx_login, gateway_credential.source);
 }
 
-test "auth runtime never admits a teamless fx login credential" {
+test "auth runtime never admits a teamless ridex login credential" {
     const alloc = std.testing.allocator;
     var runtime: Runtime = .{};
     defer runtime.deinit(alloc);
@@ -3208,13 +3208,13 @@ test "auth status snapshot distinguishes an absent store from an unreadable one"
     try std.testing.expect(resolved.missingHelp(.cli) == null);
 }
 
-test "auth status keeps an unavailable explicit fx login distinct from automatic absence" {
+test "auth status keeps an unavailable explicit ridex login distinct from automatic absence" {
     const status = StatusSnapshot{
         .required_source = .fx_login,
         .fx_login_status = .unavailable,
     };
     const help = status.missingHelp(.cli).?;
-    try std.testing.expect(std.mem.find(u8, help, "Run fx login") != null);
+    try std.testing.expect(std.mem.find(u8, help, "Run ridex login") != null);
     try std.testing.expect(std.mem.find(u8, help, "no other credential was selected") != null);
 }
 
@@ -3225,7 +3225,7 @@ test "auth status snapshot reports an expired session without claiming it is unr
     const fresh_detail = try fresh.formatDoctorDetail(alloc);
     defer alloc.free(fresh_detail);
     try std.testing.expectEqualStrings(
-        "fx login is configured; refreshable=true; team=vercel-labs",
+        "ridex login is configured; refreshable=true; team=vercel-labs",
         fresh_detail,
     );
 
@@ -3233,7 +3233,7 @@ test "auth status snapshot reports an expired session without claiming it is unr
     const stale_detail = try stale.formatDoctorDetail(alloc);
     defer alloc.free(stale_detail);
     try std.testing.expectEqualStrings(
-        "fx login is configured; session expired; refreshable=true; team=vercel-labs",
+        "ridex login is configured; session expired; refreshable=true; team=vercel-labs",
         stale_detail,
     );
 
@@ -3573,7 +3573,7 @@ const LogoutFixture = struct {
     }
 };
 
-test "logout replaces an active fx login with the next available source" {
+test "logout replaces an active ridex login with the next available source" {
     const alloc = std.testing.allocator;
     var runtime: Runtime = .{};
     defer runtime.deinit(alloc);
@@ -3647,7 +3647,7 @@ test "logout clears the active login and re-enables auth selection when no sourc
     try std.testing.expect(!runtime.view().onboarding_skipped);
 }
 
-test "logout reconciliation adopts a newer concurrent fx login" {
+test "logout reconciliation adopts a newer concurrent ridex login" {
     const alloc = std.testing.allocator;
     var runtime: Runtime = .{};
     defer runtime.deinit(alloc);
@@ -3760,7 +3760,7 @@ test "provider picker projects the active Vercel team" {
     try std.testing.expectEqualStrings("team_1", current_team.?);
 }
 
-test "adopting fx login publishes Vercel session availability to setup" {
+test "adopting ridex login publishes Vercel session availability to setup" {
     const alloc = std.testing.allocator;
     var runtime: Runtime = .{};
     defer runtime.deinit(alloc);

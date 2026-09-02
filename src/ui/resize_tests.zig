@@ -6690,7 +6690,7 @@ test "settled resize reanchors viewport_top_row at row one" {
     try std.testing.expectEqual(@as(u16, 1), h.shell.viewport_top_row);
 }
 
-test "grow after shrink-overflow restores transcript inside fx's viewport band" {
+test "grow after shrink-overflow restores transcript inside ridex's viewport band" {
     var h = try Harness.init(std.testing.allocator, 80, 30, 4);
     defer h.deinit();
 

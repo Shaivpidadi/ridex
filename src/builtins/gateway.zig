@@ -738,7 +738,7 @@ fn fetchCredits(
     );
 }
 
-/// An fx login can reach several teams, so `/v1/credits` rejects it outright
+/// An ridex login can reach several teams, so `/v1/credits` rejects it outright
 /// unless the request names one. The endpoint reads the team from a `teamId`
 /// query value and ignores `x-vercel-ai-gateway-team`, which is the reverse of
 /// the inference endpoint. An API key carries its own team and resolves to no

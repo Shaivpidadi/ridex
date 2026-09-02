@@ -28,7 +28,7 @@ pub fn Runtime(comptime App: type) type {
                 return;
             };
             const durable_session_id = app_session_runtime.Runtime(App).activeSessionId(app) orelse {
-                try writeAdmissionFailure(app, "no durable fx session");
+                try writeAdmissionFailure(app, "no durable ridex session");
                 return;
             };
             const child_capability = app_session_runtime.Runtime(App).childCapability(app) orelse {
