@@ -58,7 +58,7 @@ try {
     ...(backend === "wasm" ? { wasm: await readFile(resolve(scriptDir, "../../zig-out/bin/fx-core.wasm")) } : {}),
     ...adapter,
     fetch,
-    env: { AI_GATEWAY_API_KEY: "skills-key", FX_GATEWAY_CHAT_URL: `http://127.0.0.1:${gateway.address().port}/chat`, FX_MODEL: "skills/model" },
+    env: { FX_DEFAULT_PROVIDER: "gateway", AI_GATEWAY_API_KEY: "skills-key", FX_GATEWAY_CHAT_URL: `http://127.0.0.1:${gateway.address().port}/chat`, FX_MODEL: "skills/model" },
   });
   const turn = agent.prompt("apply the skill");
   let text = "";

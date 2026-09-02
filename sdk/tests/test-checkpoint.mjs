@@ -54,6 +54,7 @@ const options = (backend, checkpoint) => ({
   ...(checkpoint ? { checkpoint } : {}),
   fetch,
   env: {
+    FX_DEFAULT_PROVIDER: "gateway",
     AI_GATEWAY_API_KEY: "checkpoint-key",
     FX_GATEWAY_CHAT_URL: `http://127.0.0.1:${port}/chat`,
     FX_MODEL: "checkpoint/model",

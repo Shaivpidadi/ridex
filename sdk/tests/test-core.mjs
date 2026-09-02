@@ -39,6 +39,7 @@ const agent = await createFxAgent({
   wasm: await readFile(wasmPath),
   fetch: mockFetch,
   env: {
+    FX_DEFAULT_PROVIDER: "gateway",
     AI_GATEWAY_API_KEY: "sdk-test-key",
     FX_MODEL: "sdk/core-model",
   },

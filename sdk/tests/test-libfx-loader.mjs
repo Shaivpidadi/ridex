@@ -35,7 +35,7 @@ for (const gatewayChatUrl of [
   "file:///tmp/socket",
 ]) {
   await assert.rejects(
-    createFxAgent({ nativeAddon: nativeUrl, env: { FX_GATEWAY_CHAT_URL: gatewayChatUrl } }),
+    createFxAgent({ nativeAddon: nativeUrl, env: { FX_DEFAULT_PROVIDER: "gateway", FX_GATEWAY_CHAT_URL: gatewayChatUrl } }),
     TypeError,
   );
 }
@@ -68,7 +68,7 @@ try {
     createFxAgent({
       nativeAddon: realNativeAddon,
       checkpoint: new Uint8Array([1, 2, 3]),
-      env: { AI_GATEWAY_API_KEY: "loader-checkpoint-key" },
+      env: { FX_DEFAULT_PROVIDER: "gateway", AI_GATEWAY_API_KEY: "loader-checkpoint-key" },
     }),
     (error) => error.message.includes("Invalid or non-fresh libfx checkpoint"),
   );

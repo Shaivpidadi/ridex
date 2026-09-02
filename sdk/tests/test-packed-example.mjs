@@ -32,7 +32,7 @@ const agent = await createFxAgent({
   nativeAddon: resolve(packageRoot, `libfx.${platform}.node`),
   wasm: resolve(packageRoot, "fx-core.wasm"),
   fetch,
-  env: { AI_GATEWAY_API_KEY: "packed-key", FX_GATEWAY_CHAT_URL: `http://127.0.0.1:${server.address().port}/chat`, FX_MODEL: "packed/model" },
+  env: { FX_DEFAULT_PROVIDER: "gateway", AI_GATEWAY_API_KEY: "packed-key", FX_GATEWAY_CHAT_URL: `http://127.0.0.1:${server.address().port}/chat`, FX_MODEL: "packed/model" },
 });
 try {
   assert.deepEqual(Object.keys(agent).sort(), ["checkpoint", "close", "prompt"]);

@@ -39,7 +39,7 @@ const agent = await Promise.race([
   backend: "wasm",
     wasm: await readFile(wasmPath),
     fetch: stalledFetch,
-    env: { AI_GATEWAY_API_KEY: "sdk-test-key" },
+    env: { FX_DEFAULT_PROVIDER: "gateway", AI_GATEWAY_API_KEY: "sdk-test-key" },
   }),
   timeout("fx-core initialize"),
 ]);

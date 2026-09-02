@@ -55,6 +55,7 @@ const agent = await Promise.race([
     wasm: await readFile(wasmPath),
     fetch: mockFetch,
     env: {
+      FX_DEFAULT_PROVIDER: "gateway",
       AI_GATEWAY_API_KEY: "sdk-test-key",
       HOME: "/repo",
     },

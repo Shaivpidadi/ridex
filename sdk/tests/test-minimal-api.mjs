@@ -34,6 +34,7 @@ try {
     nativeAddon: resolve(scriptDir, "../../zig-out/lib/libfx.node"),
     fetch,
     env: {
+      FX_DEFAULT_PROVIDER: "gateway",
       AI_GATEWAY_API_KEY: "minimal-key",
       FX_GATEWAY_CHAT_URL: `http://127.0.0.1:${port}/chat`,
       FX_MODEL: "minimal/model",

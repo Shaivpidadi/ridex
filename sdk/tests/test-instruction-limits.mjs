@@ -24,7 +24,7 @@ const options = {
   ...(backend === "wasm"
     ? { wasm: await readFile(resolve(scriptDir, "../../zig-out/bin/fx-core.wasm")) }
     : {}),
-  env: { AI_GATEWAY_API_KEY: "instruction-limit-test-key" },
+  env: { FX_DEFAULT_PROVIDER: "gateway", AI_GATEWAY_API_KEY: "instruction-limit-test-key" },
 };
 
 const agent = await createFxAgent({ ...options, instructions: exactInstructions });

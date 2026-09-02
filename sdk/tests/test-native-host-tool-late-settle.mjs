@@ -70,6 +70,7 @@ async function exerciseLateSettlement(closeBeforeSettle) {
         },
       }],
       env: {
+        FX_DEFAULT_PROVIDER: "gateway",
         AI_GATEWAY_API_KEY: "late-tool-key",
         FX_GATEWAY_CHAT_URL: `http://127.0.0.1:${server.address().port}/chat`,
         FX_MODEL: "late-tool/model",

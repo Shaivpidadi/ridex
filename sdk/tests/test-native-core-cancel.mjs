@@ -28,6 +28,7 @@ try {
       return fetch(input, init);
     },
     env: {
+      FX_DEFAULT_PROVIDER: "gateway",
       AI_GATEWAY_API_KEY: "native-core-cancel-key",
       FX_GATEWAY_CHAT_URL: `http://127.0.0.1:${port}/stall`,
       FX_MODEL: "native/test-model",

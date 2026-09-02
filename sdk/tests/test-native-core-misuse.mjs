@@ -208,6 +208,7 @@ try {
     cwd: process.cwd(),
     encoding: "utf8",
     env: {
+      FX_DEFAULT_PROVIDER: "gateway",
       ...process.env,
       LIBFX_AMBIENT_TRACE_CHILD: "1",
       FX_TRACE: "1",

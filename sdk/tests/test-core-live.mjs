@@ -71,7 +71,7 @@ const tracedFetch = async (url, init) => {
 };
 
 const agent = await Promise.race([
-  createFxAgent({ backend, nativeAddon, wasm: await readFile(wasmPath), fetch: tracedFetch, env: { AI_GATEWAY_API_KEY: apiKey } }),
+  createFxAgent({ backend, nativeAddon, wasm: await readFile(wasmPath), fetch: tracedFetch, env: { FX_DEFAULT_PROVIDER: "gateway", AI_GATEWAY_API_KEY: apiKey } }),
   new Promise((_, reject) => setTimeout(() => reject(new Error("timed out waiting for fx-core initialize")), 5000)),
 ]);
 

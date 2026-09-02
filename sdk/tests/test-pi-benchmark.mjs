@@ -15,7 +15,7 @@ const result = spawnSync(process.execPath, [benchmark, "--samples", "1", "--json
   cwd: repoRoot,
   encoding: "utf8",
   timeout: 20_000,
-  env: { ...process.env, LIBFX_BENCH_PI_ROOT: piRoot },
+  env: { FX_DEFAULT_PROVIDER: "gateway", ...process.env, LIBFX_BENCH_PI_ROOT: piRoot },
 });
 assert.equal(result.status, 0, `pi benchmark failed:\n${result.stderr}`);
 const report = JSON.parse(result.stdout);

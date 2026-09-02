@@ -123,7 +123,7 @@ try {
     tools: adapter.tools,
     instructions: adapter.instructions,
     fetch,
-    env: { AI_GATEWAY_API_KEY: "mcp-key", FX_GATEWAY_CHAT_URL: `http://127.0.0.1:${gateway.address().port}/chat`, FX_MODEL: "mcp/model" },
+    env: { FX_DEFAULT_PROVIDER: "gateway", AI_GATEWAY_API_KEY: "mcp-key", FX_GATEWAY_CHAT_URL: `http://127.0.0.1:${gateway.address().port}/chat`, FX_MODEL: "mcp/model" },
   });
   const turn = agent.prompt("use MCP");
   let text = "";
