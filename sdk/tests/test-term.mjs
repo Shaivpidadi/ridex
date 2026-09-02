@@ -112,7 +112,7 @@ const runtime = await createFxTerminal({
   backend: "wasm",
   wasm: await readFile(wasmPath),
   terminal,
-  env: { AI_GATEWAY_API_KEY: "term-test-key" },
+  env: { FX_DEFAULT_PROVIDER: "gateway", AI_GATEWAY_API_KEY: "term-test-key" },
   fetch: mockFetch,
   configStore: {
     get(configId) { return persistedConfig.get(configId) ?? null; },
