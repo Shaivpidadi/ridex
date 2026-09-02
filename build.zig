@@ -67,6 +67,10 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addImport("build_options", build_options.createModule());
 
     b.installArtifact(exe);
+    // Upstream's e2e/benchmark tooling resolves zig-out/bin/fx; install
+    // the same binary under the legacy name so the fork can keep running
+    // upstream CI unmodified while the product ships as `ridex`.
+    b.getInstallStep().dependOn(&b.addInstallBinFile(exe.getEmittedBin(), "fx").step);
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());

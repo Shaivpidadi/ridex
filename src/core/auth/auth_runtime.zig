@@ -236,6 +236,9 @@ fn requestedSource(
     preferred: ?credentials.Source,
 ) ?credentials.Source {
     return switch (provider) {
+        // FreeRide's credential is synthetic; any preferred source the
+        // user holds is acceptable, same as the gateway.
+        .freeride => preferred,
         .gateway => preferred,
         .codex => .chatgpt_subscription,
         .grok => .grok_subscription,
