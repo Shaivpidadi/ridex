@@ -290,7 +290,7 @@ describe("cli: help", () => {
       expect(stdout).toContain("--resume-last");
       expect(stdout).toContain("session resume [last|id]");
       expect(stdout).toContain("-v, --version");
-      expect(stdout).toContain("Print the fx version and exit");
+      expect(stdout).toContain("Print the ridex version and exit");
       expect(stdout).not.toContain("Must appear before the command");
       expect(stdout).toContain("Examples:\n");
       expect(stdout).toContain("https://github.com/Shaivpidadi/ridex/issues");
