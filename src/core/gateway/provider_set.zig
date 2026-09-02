@@ -99,7 +99,11 @@ pub const Set = struct {
 
 pub fn gateway_only(gateway: Bundle) Set {
     return .{
-        .freeride = .{},
+        // WASM/JS-host surfaces route every provider through the host's
+        // stream provider; freeride (the compiled default) must carry
+        // the same bundle or the SDK boots into
+        // AgentStreamProviderUnavailable.
+        .freeride = gateway,
         .gateway = gateway,
         .codex = .{},
         .grok = .{},

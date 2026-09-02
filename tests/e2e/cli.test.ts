@@ -37,7 +37,7 @@ const NO_GATEWAY_AUTH = {
   VERCEL_OIDC_TOKEN: undefined,
 };
 const MISSING_AUTH_MESSAGE =
-  "fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.";
+  "fx needs access to Vercel AI Gateway. Run ridex login to sign in, ridex setup to use an API key, or set AI_GATEWAY_API_KEY.";
 const MODERN_MCP_FIXTURE = join(
   import.meta.dirname,
   "fixtures",
@@ -264,9 +264,9 @@ describe("cli: help", () => {
       expect(stdout).not.toContain("\x1b[");
       expect(stdout).not.toContain("\x1b]2;");
       expect(stdout).toStartWith(
-        `𝒇x v${sourceVersion()}\nFast, native coding agent for the terminal.\n`,
+        `ridex v${sourceVersion()}\nFast, native coding agent for the terminal.\n`,
       );
-      expect(stdout.match(/𝒇x/g) ?? []).toHaveLength(1);
+      expect(stdout.match(/ridex/g) ?? []).toHaveLength(1);
       expect(stdout).toContain("fx starts an interactive session by default.");
       expect(stdout).toContain("Commands:\n");
       expect(stdout).toContain("Run one noninteractive request");
@@ -290,34 +290,34 @@ describe("cli: help", () => {
       expect(stdout).toContain("--resume-last");
       expect(stdout).toContain("session resume [last|id]");
       expect(stdout).toContain("-v, --version");
-      expect(stdout).toContain("Print the fx version and exit");
+      expect(stdout).toContain("Print the ridex version and exit");
       expect(stdout).not.toContain("Must appear before the command");
       expect(stdout).toContain("Examples:\n");
-      expect(stdout).toContain("https://fx.sh/docs");
-      expect(stdout).toContain("run `/feedback` inside fx");
+      expect(stdout).toContain("https://github.com/Shaivpidadi/ridex/issues");
+      expect(stdout).toContain("run `/feedback` inside ridex");
       expect(stdout).toContain(
-        "Run `fx <command> --help` for command-specific usage and options.",
+        "Run `ridex <command> --help` for command-specific usage and options.",
       );
       expect(stdout).not.toContain("command-specific options and examples");
       expect(stdout).not.toContain("  Work      ");
-      expect(stdout).not.toContain("\n\n\nRun `fx <command> --help`");
+      expect(stdout).not.toContain("\n\n\nRun `ridex <command> --help`");
     },
     TIMEOUT,
   );
 
   test(
-    "fx ask help renders documented options through both aliases",
+    "ridex ask help renders documented options through both aliases",
     async () => {
       const env = {
         ...NO_GATEWAY_AUTH,
         FX_DISABLE_KEYCHAIN: "1",
       };
-      const expected = `fx ask
+      const expected = `ridex ask
 
 Run one noninteractive request
 
 Usage:
-  fx ask [--auto|--yolo] [--image PATH] [--system TEXT] [--json] [--quiet] [--prompt-permissions] [--no-save] [--no-color] [--resume <last|id>|--resume-id <id>] [--continue-recovery] [--] <prompt>
+  ridex ask [--auto|--yolo] [--image PATH] [--system TEXT] [--json] [--quiet] [--prompt-permissions] [--no-save] [--no-color] [--resume <last|id>|--resume-id <id>] [--continue-recovery] [--] <prompt>
 
 Options:
   --auto                Automatically review unresolved permission requests
@@ -352,7 +352,7 @@ With --prompt-permissions, JSON and quiet requests may prompt on stderr only whe
   );
 
   test(
-    "fx session help documents inspect resume migrate and recover",
+    "ridex session help documents inspect resume migrate and recover",
     async () => {
       for (const args of [
         ["session", "--help"],
@@ -372,14 +372,14 @@ With --prompt-permissions, JSON and quiet requests may prompt on stderr only whe
   );
 
   test(
-    "fx acp help documents accepted options",
+    "ridex acp help documents accepted options",
     async () => {
       for (const alias of ["--help", "-h"]) {
         const r = await runFx(["acp", alias]);
         expect(r.code).toBe(0);
         expect(r.stderr).toBe("");
         expect(r.stdout).toContain(
-          "Usage:\n  fx acp [--model <id>] [--log-file <path>]",
+          "Usage:\n  ridex acp [--model <id>] [--log-file <path>]",
         );
         expect(r.stdout).toContain("--model <id>");
         expect(r.stdout).toContain("--log-file <path>");
@@ -389,7 +389,7 @@ With --prompt-permissions, JSON and quiet requests may prompt on stderr only whe
   );
 
   test(
-    "fx replay help describes golden output",
+    "ridex replay help describes golden output",
     async () => {
       const r = await runFx(["replay", "--help"]);
       expect(r.code).toBe(0);
@@ -402,14 +402,14 @@ With --prompt-permissions, JSON and quiet requests may prompt on stderr only whe
   );
 
   test(
-    "fx acp rejects unknown options and missing option values",
+    "ridex acp rejects unknown options and missing option values",
     async () => {
       for (const args of [["--bogus"], ["--model"], ["--log-file"]]) {
         const result = await runFx(["acp", ...args]);
         expect(result.code).toBe(1);
         expect(result.stdout).toBe("");
         expect(result.stderr).toBe(
-          "usage: fx acp [--model <id>] [--log-file <path>]\n",
+          "usage: ridex acp [--model <id>] [--log-file <path>]\n",
         );
       }
     },
@@ -453,7 +453,7 @@ With --prompt-permissions, JSON and quiet requests may prompt on stderr only whe
     async () => {
       const r = await runFx(["--record"]);
       expect(r.code).not.toBe(0);
-      expect(r.stderr).toContain("fx: unknown subcommand: --record");
+      expect(r.stderr).toContain("ridex: unknown subcommand: --record");
       expect(r.stderr).not.toContain("visual terminal capture:");
     },
     TIMEOUT,
@@ -630,7 +630,7 @@ describe("cli: status", () => {
   );
 
   test(
-    "status and doctor share fx login source, team, and refreshability",
+    "status and doctor share ridex login source, team, and refreshability",
     async () => {
       const root = mkdtempSync(join(tmpdir(), "fx-e2e-status-auth-"));
       try {
@@ -656,14 +656,14 @@ describe("cli: status", () => {
         expect(doctorText.code).toBe(0);
         expect(doctorJsonResult.code).toBe(0);
         const expectedAuth = {
-          auth: "fx login",
+          auth: "ridex login",
           auth_refreshable: true,
           team: "vercel-labs",
         };
         expect(JSON.parse(statusJsonResult.stdout.trim())).toMatchObject(expectedAuth);
         expect(JSON.parse(doctorJsonResult.stdout.trim())).toMatchObject(expectedAuth);
         for (const output of [statusText.stdout, doctorText.stdout]) {
-          expect(output).toContain("auth=fx login");
+          expect(output).toContain("auth=ridex login");
           expect(output).toContain("auth_refreshable=true");
           expect(output).toContain("team=vercel-labs");
         }
@@ -713,7 +713,7 @@ describe("cli: status", () => {
         expect(status.code).toBe(0);
         expect(doctor.code).toBe(0);
         const expectedAuth = {
-          auth: "fx login",
+          auth: "ridex login",
           auth_refreshable: true,
           team: "vercel-labs",
         };
@@ -761,7 +761,7 @@ describe("cli: status", () => {
   );
 
   test(
-    "fx status --json returns valid status JSON",
+    "ridex status --json returns valid status JSON",
     async () => {
       const r = await runFx(["status", "--json"]);
       expect(r.code).toBe(0);
@@ -780,7 +780,7 @@ describe("cli: status", () => {
   );
 
   test(
-    "fx status reports a persisted dev update channel",
+    "ridex status reports a persisted dev update channel",
     async () => {
       const root = mkdtempSync(join(tmpdir(), "fx-e2e-update-channel-"));
       try {
@@ -812,7 +812,7 @@ describe("cli: status", () => {
   );
 
   test(
-    "fx upgrade help documents release channels",
+    "ridex upgrade help documents release channels",
     async () => {
       const result = await runFx(["upgrade", "--help"]);
       expect(result.code).toBe(0);
@@ -823,7 +823,7 @@ describe("cli: status", () => {
   );
 
   test(
-    "fx status --json defaults permission mode to auto",
+    "ridex status --json defaults permission mode to auto",
     async () => {
       const root = mkdtempSync(join(tmpdir(), "fx-e2e-permission-default-"));
       try {
@@ -938,16 +938,16 @@ describe("cli: status", () => {
         expect(first.permission_mode).toBe("auto");
         expect(first.agent_step_limit).toBe(7);
         expect(status.stderr).toContain(
-          "fx: config project: ignored_project_user_only_setting; key=model",
+          "ridex: config project: ignored_project_user_only_setting; key=model",
         );
         expect(status.stderr).toContain(
-          "fx: config project: ignored_project_user_only_setting; key=permission_mode",
+          "ridex: config project: ignored_project_user_only_setting; key=permission_mode",
         );
         expect(status.stderr).toContain(
-          "fx: config project: ignored_project_user_only_setting; key=permission",
+          "ridex: config project: ignored_project_user_only_setting; key=permission",
         );
         expect(status.stderr).toContain(
-          "fx: config project: ignored_project_user_only_setting; key=statusLine",
+          "ridex: config project: ignored_project_user_only_setting; key=statusLine",
         );
         expect(status.stderr).not.toContain("danger");
 
@@ -1012,7 +1012,7 @@ describe("cli: status", () => {
         expect(Date.now() - userStartedAt).toBeLessThan(3_000);
         expect(user.code).toBe(0);
         expect(JSON.parse(user.stdout)).toMatchObject({ kind: "status" });
-        expect(user.stderr).toContain("fx: config user: durable_path_unsafe");
+        expect(user.stderr).toContain("ridex: config user: durable_path_unsafe");
 
         rmSync(join(fxDir, "settings.json"));
         expect(spawnSync("mkfifo", [join(workspace, ".fx.json")]).status).toBe(0);
@@ -1025,7 +1025,7 @@ describe("cli: status", () => {
         expect(Date.now() - projectStartedAt).toBeLessThan(3_000);
         expect(project.code).toBe(0);
         expect(JSON.parse(project.stdout)).toMatchObject({ kind: "status" });
-        expect(project.stderr).toContain("fx: config project: durable_path_unsafe");
+        expect(project.stderr).toContain("ridex: config project: durable_path_unsafe");
       } finally {
         rmSync(root, { recursive: true, force: true });
       }
@@ -1368,7 +1368,7 @@ describe("cli: usage", () => {
 
 describe("cli: permissions", () => {
   test(
-    "fx permissions --json returns valid permissions JSON",
+    "ridex permissions --json returns valid permissions JSON",
     async () => {
       const r = await runFx(["permissions", "--json"]);
       expect(r.code).toBe(0);
@@ -1388,7 +1388,7 @@ describe("cli: permissions", () => {
 
 describe("cli: doctor", () => {
   test(
-    "fx doctor --json returns valid doctor JSON",
+    "ridex doctor --json returns valid doctor JSON",
     async () => {
       const root = mkdtempSync(join(tmpdir(), "fx-e2e-doctor-json-"));
       try {
@@ -1431,7 +1431,7 @@ describe("cli: doctor", () => {
   );
 
   test(
-    "fx doctor --json leaves an empty home unchanged",
+    "ridex doctor --json leaves an empty home unchanged",
     async () => {
       const root = mkdtempSync(join(tmpdir(), "fx-e2e-doctor-no-create-"));
       try {
@@ -1460,7 +1460,7 @@ describe("cli: doctor", () => {
   );
 
   test(
-    "fx doctor --json bounds session diagnostics without summary cache",
+    "ridex doctor --json bounds session diagnostics without summary cache",
     async () => {
       const root = mkdtempSync(join(tmpdir(), "fx-e2e-doctor-bounded-"));
       try {
@@ -1530,7 +1530,7 @@ describe("cli: doctor", () => {
 
 describe("cli: logout", () => {
   test(
-    "fx logout revokes refresh and access tokens after local deletion",
+    "ridex logout revokes refresh and access tokens after local deletion",
     async () => {
       const home = mkdtempSync(join(tmpdir(), "fx-e2e-logout-revocation-"));
       const authPath = join(home, ".fx", "auth.json");
@@ -1584,7 +1584,7 @@ describe("cli: logout", () => {
   );
 
   test(
-    "fx logout warns once and sends no tokens without a revocation endpoint",
+    "ridex logout warns once and sends no tokens without a revocation endpoint",
     async () => {
       const home = mkdtempSync(join(tmpdir(), "fx-e2e-logout-no-revocation-"));
       const authPath = join(home, ".fx", "auth.json");
@@ -1618,7 +1618,7 @@ describe("cli: logout", () => {
   );
 
   test(
-    "fx logout warns once and sends no tokens to an invalid revocation endpoint",
+    "ridex logout warns once and sends no tokens to an invalid revocation endpoint",
     async () => {
       const home = mkdtempSync(join(tmpdir(), "fx-e2e-logout-invalid-revocation-"));
       const authPath = join(home, ".fx", "auth.json");
@@ -1655,7 +1655,7 @@ describe("cli: logout", () => {
   );
 
   test(
-    "fx logout removes an unsafe saved login and warns that it could not revoke it",
+    "ridex logout removes an unsafe saved login and warns that it could not revoke it",
     async () => {
       const home = mkdtempSync(join(tmpdir(), "fx-e2e-logout-rejected-login-"));
       const issuer = startLogoutIssuer([200, 200]);
@@ -1696,7 +1696,7 @@ describe("cli: logout", () => {
   );
 
   test(
-    "fx logout fails when the saved login cannot be deleted",
+    "ridex logout fails when the saved login cannot be deleted",
     async () => {
       const home = mkdtempSync(join(tmpdir(), "fx-e2e-logout-delete-failure-"));
       const issuer = startLogoutIssuer([200, 200]);
@@ -1717,10 +1717,10 @@ describe("cli: logout", () => {
         expect(logout.code).toBe(1);
         expect(logout.stdout).toBe("");
         expect(logout.stderr).toBe(
-          "fx logout: failed to durably remove saved fx login\n",
+          "ridex logout: failed to durably remove saved ridex login\n",
         );
         expect(existsSync(authPath)).toBe(true);
-        expect(JSON.parse(status.stdout).auth).toBe("fx login");
+        expect(JSON.parse(status.stdout).auth).toBe("ridex login");
         expect(issuer.requests).toEqual([]);
       } finally {
         chmodSync(fxDir, 0o700);
@@ -1732,7 +1732,7 @@ describe("cli: logout", () => {
   );
 
   test(
-    "fx logout deletes only the saved login and keeps environment credentials available",
+    "ridex logout deletes only the saved login and keeps environment credentials available",
     async () => {
       const home = mkdtempSync(join(tmpdir(), "fx-e2e-logout-env-"));
       const authPath = join(home, ".fx", "auth.json");
@@ -1816,7 +1816,7 @@ describe("cli: logout", () => {
   );
 
   test(
-    "fx logout leaves an active API key unchanged when no login exists",
+    "ridex logout leaves an active API key unchanged when no login exists",
     async () => {
       const home = mkdtempSync(join(tmpdir(), "fx-e2e-logout-no-login-"));
       const apiToken = "logout-existing-api-key";
@@ -1831,7 +1831,7 @@ describe("cli: logout", () => {
         const status = await runFx(["status", "--json"], { env });
 
         expect(logout.code).toBe(0);
-        expect(logout.stdout).toBe("No fx login session found.\n");
+        expect(logout.stdout).toBe("No ridex login session found.\n");
         expect(logout.stderr).toBe("");
         expect(JSON.parse(status.stdout)).toMatchObject({
           auth: "AI_GATEWAY_API_KEY",
@@ -1847,7 +1847,7 @@ describe("cli: logout", () => {
   );
 
   test.skipIf(platform() !== "darwin")(
-    "fx logout leaves the macOS Keychain API key untouched",
+    "ridex logout leaves the macOS Keychain API key untouched",
     async () => {
       const runId = `${process.pid}-${Date.now()}`;
       const account = `fx-e2e-logout-${runId}`;
@@ -1889,7 +1889,7 @@ describe("cli: logout", () => {
         expect(existsSync(join(home, ".fx", "auth.json"))).toBe(false);
         expect(stored.status).toBe(0);
         expect(stored.stdout.trim()).toBe(keychainToken);
-        expect(JSON.parse(status.stdout).auth).not.toBe("fx login");
+        expect(JSON.parse(status.stdout).auth).not.toBe("ridex login");
         expect(logout.stdout).not.toContain(keychainToken);
         expect(status.stdout).not.toContain(keychainToken);
       } finally {
@@ -1908,7 +1908,7 @@ describe("cli: logout", () => {
 
 describe("cli: setup", () => {
   test(
-    "fx setup is a top-level command and fails cleanly when Keychain is disabled",
+    "ridex setup is a top-level command and fails cleanly when Keychain is disabled",
     async () => {
       const r = await runFx(["setup"], {
         env: { ...NO_GATEWAY_AUTH, FX_DISABLE_KEYCHAIN: "1" },
@@ -1921,7 +1921,7 @@ describe("cli: setup", () => {
   );
 
   test(
-    "fx setup never invokes the configured Vercel CLI",
+    "ridex setup never invokes the configured Vercel CLI",
     async () => {
       const runId = `${process.pid}-${Date.now()}`;
       const fakeDir = mkdtempSync(join(tmpdir(), "fx-e2e-vercel-cli-"));
@@ -2005,7 +2005,7 @@ describe("cli: stored key file backend", () => {
 
 describe("cli: Keychain authentication", () => {
   test.skipIf(platform() !== "darwin")(
-    "fx ask reads an existing Keychain credential without onboarding",
+    "ridex ask reads an existing Keychain credential without onboarding",
     async () => {
       const runId = `${process.pid}-${Date.now()}`;
       const account = `fx-e2e-ask-${runId}`;
@@ -2294,7 +2294,7 @@ describe("cli: missing durable home", () => {
 
 describe("cli: sessions", () => {
   test(
-    "fx sessions --json returns valid sessions JSON",
+    "ridex sessions --json returns valid sessions JSON",
     async () => {
       const home = mkdtempSync(join(tmpdir(), "fx-e2e-sessions-empty-"));
       try {
@@ -2312,7 +2312,7 @@ describe("cli: sessions", () => {
   );
 
   test(
-    "fx sessions text shows named, unnamed, and renamed sessions",
+    "ridex sessions text shows named, unnamed, and renamed sessions",
     async () => {
       const root = mkdtempSync(join(tmpdir(), "fx-e2e-session-names-"));
       try {
@@ -2804,7 +2804,7 @@ describe("cli: sessions", () => {
   );
 
   test(
-    "fx sessions --json ignores malformed and oversized list caches",
+    "ridex sessions --json ignores malformed and oversized list caches",
     async () => {
       for (const cached of ["{", "x".repeat(4 * 1024 * 1024 + 1)]) {
         const root = mkdtempSync(join(tmpdir(), "fx-e2e-sessions-cache-"));
@@ -2923,7 +2923,7 @@ describe("cli: sessions", () => {
 
 describe("cli: removed task and background commands", () => {
   test(
-    "fx task, fx tasks, and fx background are unknown commands",
+    "fx task, fx tasks, and ridex background are unknown commands",
     async () => {
       for (const command of ["task", "tasks", "background"]) {
         const result = await runFx([command], { env: NO_GATEWAY_AUTH });
@@ -3001,7 +3001,7 @@ describe("cli: models", () => {
     },
   ]) {
     test(
-      `fx models renders exact text for ${scenario.name}`,
+      `ridex models renders exact text for ${scenario.name}`,
       async () => {
         const home = createIsolatedTestHome();
         const gateway = startFakeGateway([], {
@@ -3041,7 +3041,7 @@ describe("cli: models", () => {
   }
 
   test(
-    "fx models retries a rejected API key exactly once without authentication",
+    "ridex models retries a rejected API key exactly once without authentication",
     async () => {
       for (const rejectedStatus of [401, 403]) {
         const home = createIsolatedTestHome();
@@ -3099,7 +3099,7 @@ describe("cli: models", () => {
   );
 
   test(
-    "fx models preserves network and 5xx failures without anonymous retry",
+    "ridex models preserves network and 5xx failures without anonymous retry",
     async () => {
       const unavailableHome = createIsolatedTestHome();
       const gateway = startFakeGateway([], {
@@ -3176,7 +3176,7 @@ describe("cli: models", () => {
     },
   ]) {
     test(
-      `fx models preserves ${scenario.name} without anonymous retry`,
+      `ridex models preserves ${scenario.name} without anonymous retry`,
       async () => {
         const home = createIsolatedTestHome();
         const gateway = startFakeGateway([], { models: scenario.response });
@@ -3200,7 +3200,7 @@ describe("cli: models", () => {
   }
 
   test(
-    "cancelling fx models does not retry anonymously",
+    "cancelling ridex models does not retry anonymously",
     async () => {
       const home = createIsolatedTestHome();
       const gateway = startFakeGateway([], {
@@ -3240,7 +3240,7 @@ describe("cli: models", () => {
   );
 
   test(
-    "fx models rejects E2E gateway redirects without contacting the target",
+    "ridex models rejects E2E gateway redirects without contacting the target",
     async () => {
       const home = createIsolatedTestHome();
       const captureRequests: string[] = [];
@@ -3303,7 +3303,7 @@ describe("cli: models", () => {
         "requested_access=public_only credential_source=none effective_access=public_only public_only_reason=no_credential anonymous_fallback=false outcome=loaded failure_category=none http_status=none retryable=none",
     },
     {
-      name: "uses the selected fx login team catalog",
+      name: "uses the selected ridex login team catalog",
       seedFxLogin: true,
       expiredFxLogin: false,
       authEnv: {},
@@ -3314,7 +3314,7 @@ describe("cli: models", () => {
         "requested_access=authenticated credential_source=fx_login effective_access=authenticated public_only_reason=none anonymous_fallback=false outcome=loaded failure_category=none http_status=none retryable=none",
     },
     {
-      name: "refreshes an expired fx login before loading the selected team catalog",
+      name: "refreshes an expired ridex login before loading the selected team catalog",
       seedFxLogin: true,
       expiredFxLogin: true,
       authEnv: {},
@@ -3346,7 +3346,7 @@ describe("cli: models", () => {
     },
   ]) {
     test(
-      `fx models --json ${scenario.name}`,
+      `ridex models --json ${scenario.name}`,
       async () => {
         const root = mkdtempSync(join(tmpdir(), "fx-e2e-team-models-"));
         const requests: Array<{ headers: Headers; teamId: string | null }> = [];
@@ -3475,7 +3475,7 @@ describe("cli: models", () => {
   }
 
   test.skipIf(!HAS_API_KEY)(
-    "fx models --json returns valid models JSON",
+    "ridex models --json returns valid models JSON",
     async () => {
       const r = await runFx(["models", "--json"], { timeoutMs: 30_000 });
       expect(r.code).toBe(0);
@@ -3491,7 +3491,7 @@ describe("cli: models", () => {
 
 describe("cli: credits", () => {
   test(
-    "fx credits --json preserves Gateway HTTP denial details",
+    "ridex credits --json preserves Gateway HTTP denial details",
     async () => {
       const home = createIsolatedTestHome();
       const requests: Array<{
@@ -3550,7 +3550,7 @@ describe("cli: credits", () => {
   );
 
   test.skipIf(!HAS_API_KEY)(
-    "fx credits --json returns credits JSON or exits non-zero",
+    "ridex credits --json returns credits JSON or exits non-zero",
     async () => {
       const r = await runFx(["credits", "--json"], { timeoutMs: 30_000 });
       if (r.code === 0 && r.stdout.trim()) {
@@ -3566,7 +3566,7 @@ describe("cli: credits", () => {
 
 describe("cli: replay failures", () => {
   test(
-    "fx replay --json preserves structured failures for missing and malformed tapes",
+    "ridex replay --json preserves structured failures for missing and malformed tapes",
     async () => {
       const root = mkdtempSync(join(tmpdir(), "fx-e2e-replay-json-errors-"));
       try {
@@ -3596,7 +3596,7 @@ describe("cli: replay failures", () => {
 
 describe("cli: ask input validation", () => {
   test(
-    "fx ask rejects invalid UTF-8 stdin before Gateway or session effects",
+    "ridex ask rejects invalid UTF-8 stdin before Gateway or session effects",
     async () => {
       const root = mkdtempSync(join(tmpdir(), "fx-e2e-ask-invalid-utf8-"));
       const home = join(root, "home");
@@ -3646,7 +3646,7 @@ describe("cli: ask input validation", () => {
 
 describe("cli: session", () => {
   test(
-    "fx session with no id exits non-zero or shows usage",
+    "ridex session with no id exits non-zero or shows usage",
     async () => {
       const r = await runFx(["session"]);
       expect(r.code).not.toBe(0);
@@ -3655,7 +3655,7 @@ describe("cli: session", () => {
   );
 
   test(
-    "fx session exact id hides managed child detail",
+    "ridex session exact id hides managed child detail",
     async () => {
       const root = mkdtempSync(join(tmpdir(), "fx-e2e-private-child-detail-"));
       try {
@@ -3791,7 +3791,7 @@ describe("cli: issue", () => {
 
 describe("cli: ask success", () => {
   test(
-    "fx ask binds an explicitly invoked skill into the prompt",
+    "ridex ask binds an explicitly invoked skill into the prompt",
     async () => {
       const root = mkdtempSync(join(tmpdir(), "fx-e2e-ask-explicit-skill-"));
       const home = join(root, "home");
@@ -3855,7 +3855,7 @@ describe("cli: ask success", () => {
   );
 
   test(
-    "fx ask stdin prompts above the old 1 MiB limit reach Gateway byte-for-byte",
+    "ridex ask stdin prompts above the old 1 MiB limit reach Gateway byte-for-byte",
     async () => {
       const root = mkdtempSync(join(tmpdir(), "fx-e2e-ask-large-stdin-"));
       const home = join(root, "home");
@@ -3909,7 +3909,7 @@ describe("cli: ask success", () => {
   );
 
   test(
-    "fx ask stdin resource overflow has distinct text and JSON errors",
+    "ridex ask stdin resource overflow has distinct text and JSON errors",
     async () => {
       const oversized = Buffer.alloc(8 * 1024 * 1024 + 1, 0x78);
 
@@ -3921,7 +3921,7 @@ describe("cli: ask success", () => {
       expect(textResult.code).toBe(1);
       expect(textResult.stdout).toBe("");
       expect(textResult.stderr).toBe(
-        "fx ask: prompt exceeds the local input safety limit\n",
+        "ridex ask: prompt exceeds the local input safety limit\n",
       );
 
       const jsonResult = await runFx(["ask", "--json", "--auto", "--no-save"], {
@@ -3939,7 +3939,7 @@ describe("cli: ask success", () => {
   );
 
   test(
-    "fx ask sends catalog-backed portable reasoning",
+    "ridex ask sends catalog-backed portable reasoning",
     async () => {
       const root = mkdtempSync(join(tmpdir(), "fx-e2e-ask-portable-reasoning-"));
       const home = join(root, "home");
@@ -3986,7 +3986,7 @@ describe("cli: ask success", () => {
         expect(
           result.stderr
             .replace(
-              /fx ask: warning: skipped \d+ invalid or unreadable skill candidates?; relaunch with FX_TRACE=1 to write a trace log\n/g,
+              /ridex ask: warning: skipped \d+ invalid or unreadable skill candidates?; relaunch with FX_TRACE=1 to write a trace log\n/g,
               "",
             )
             .replace(
@@ -4427,7 +4427,7 @@ describe("cli: ask success", () => {
   );
 
   test.skipIf(!HAS_API_KEY)(
-    "fx ask --json --no-save --auto returns valid JSON with output",
+    "ridex ask --json --no-save --auto returns valid JSON with output",
     async () => {
       const r = await runFx(
         ["ask", "--json", "--no-save", "--auto", "Say exactly: hello world"],
@@ -4449,7 +4449,7 @@ describe("cli: ask success", () => {
 
 describe("cli: error handling", () => {
   test(
-    "fx ask rejects unknown options before a model turn and -- preserves literal prompt text",
+    "ridex ask rejects unknown options before a model turn and -- preserves literal prompt text",
     async () => {
       const root = mkdtempSync(join(tmpdir(), "fx-e2e-ask-options-"));
       const home = join(root, "home");
@@ -4476,7 +4476,7 @@ describe("cli: error handling", () => {
           timeoutMs: TIMEOUT,
         });
         expect(rejected.code).toBe(1);
-        expect(rejected.stderr).toContain("usage: fx ask");
+        expect(rejected.stderr).toContain("usage: ridex ask");
         expect(gateway.requests).toHaveLength(0);
 
         const literal = await runFx(
@@ -4511,7 +4511,7 @@ describe("cli: error handling", () => {
   );
 
   test(
-    "fx ask with no prompt exits 1",
+    "ridex ask with no prompt exits 1",
     async () => {
       const r = await runFx(["ask"]);
       expect(r.code).toBe(1);
@@ -4530,7 +4530,7 @@ describe("cli: error handling", () => {
   );
 
   test(
-    "fx ask explains no-save resume conflicts before a model turn",
+    "ridex ask explains no-save resume conflicts before a model turn",
     async () => {
       const root = mkdtempSync(join(tmpdir(), "fx-e2e-ask-resume-no-save-"));
       const home = join(root, "home");
@@ -4561,10 +4561,10 @@ describe("cli: error handling", () => {
           expect(rejected.code).toBe(1);
           expect(rejected.stdout).toBe("");
           expect(rejected.stderr).toContain(
-            "fx ask: --no-save cannot be used with --resume or --resume-id",
+            "ridex ask: --no-save cannot be used with --resume or --resume-id",
           );
           expect(rejected.stderr).toContain(
-            "usage: fx ask [--auto|--yolo] [--image PATH] [--system TEXT] [--json] [--quiet] [--prompt-permissions] [--no-save]",
+            "usage: ridex ask [--auto|--yolo] [--image PATH] [--system TEXT] [--json] [--quiet] [--prompt-permissions] [--no-save]",
           );
         }
         expect(gateway.requests).toHaveLength(0);
@@ -4590,7 +4590,7 @@ describe("cli: workspace access", () => {
         { env: enabled },
       );
       expect(help.code).toBe(0);
-      expect(help.stdout.startsWith("fx ask\n\n")).toBe(true);
+      expect(help.stdout.startsWith("ridex ask\n\n")).toBe(true);
       expect(help.stderr).toBe("");
 
       const missing = await runFx(["--add-dir"], { env: enabled });
@@ -5059,14 +5059,14 @@ describe("cli: MCP profile add", () => {
       });
       expect(help.code).toBe(0);
       for (const command of [
-        "fx mcp add NAME COMMAND [ARGS...]",
-        "fx mcp auth NAME",
-        "fx mcp list",
-        "fx mcp logout NAME",
-        "fx mcp path",
-        "fx mcp remove NAME",
-        "fx mcp trust approve|reject NAME",
-        "fx mcp trust approve-all|reset",
+        "ridex mcp add NAME COMMAND [ARGS...]",
+        "ridex mcp auth NAME",
+        "ridex mcp list",
+        "ridex mcp logout NAME",
+        "ridex mcp path",
+        "ridex mcp remove NAME",
+        "ridex mcp trust approve|reject NAME",
+        "ridex mcp trust approve-all|reset",
       ]) expect(help.stdout).toContain(command);
 
       const local = await runFx(

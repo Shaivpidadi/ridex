@@ -1971,7 +1971,7 @@ describe("MCP remote authentication lifecycle", () => {
   }
 
   test(
-    "fx ask isolates failed-server authentication from healthy tool search",
+    "ridex ask isolates failed-server authentication from healthy tool search",
     async () => {
       upstream = startModernMcpHttpFixture("json");
       auth = startAuthFixture(upstream.url);
@@ -2057,7 +2057,7 @@ describe("MCP remote authentication lifecycle", () => {
   );
 
   test(
-    "fx ask reports an actionable auth requirement without opening a browser",
+    "ridex ask reports an actionable auth requirement without opening a browser",
     async () => {
       upstream = startModernMcpHttpFixture("json");
       auth = startAuthFixture(upstream.url);
@@ -2091,7 +2091,7 @@ describe("MCP remote authentication lifecycle", () => {
       ).toHaveLength(1);
       expect(gateway.requests[1]?.body).toContain("authentication_required");
       expect(gateway.requests[1]?.body).toContain(
-        "Run /mcp auth for this server in an interactive fx session.",
+        "Run /mcp auth for this server in an interactive ridex session.",
       );
       expect(
         existsSync(join(root.home, ".fx", "mcp-credentials")),

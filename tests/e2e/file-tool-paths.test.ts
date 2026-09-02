@@ -947,7 +947,7 @@ describe("filesystem path handling", () => {
   );
 
   test(
-    "registered typed write and edit use one canonical fx ask mutation path",
+    "registered typed write and edit use one canonical ridex ask mutation path",
     async () => {
       const root = createIsolatedRoot();
       try {

@@ -296,7 +296,7 @@ function selectedSlashRow(escapes: string): string | null {
 }
 
 test("selected slash row ignores the welcome header help hint", () => {
-  const header = `${SELECTED_COMPLETION_SGR}𝒇x\x1b[0m\x1b[38;5;245m v0.3.27 · Run /help for commands`;
+  const header = `${SELECTED_COMPLETION_SGR}ridex\x1b[0m\x1b[38;5;245m v0.3.27 · Run /help for commands`;
   const command = `${SELECTED_COMPLETION_SGR}  /clear\x1b[38;5;245m start a fresh session and keep background processes`;
 
   expect(selectedSlashRow(`${header}\n${command}`)).toBe(command);
@@ -1234,7 +1234,7 @@ async function runLargeSkillResizeAttempt(attempt: number): Promise<string> {
     const restoredPane = await s.waitForPane((pane) => {
       const grid = pane.split("\n");
       return (
-        pane.includes("𝒇x") &&
+        pane.includes("ridex") &&
         !pane.includes("↑↓ Navigate") &&
         findFooter(grid) !== null
       );
@@ -1411,7 +1411,7 @@ async function runRapidSkillResizeAttempt(
     const dismissed = await s.waitForPane(
       (pane) => {
         const grid = pane.replace(/\n$/, "").split("\n");
-        return pane.includes("𝒇x") &&
+        return pane.includes("ridex") &&
           !pane.includes("↑↓ Navigate") &&
           findFooter(grid) !== null;
       },
@@ -1489,7 +1489,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
       session = await launchAt(120, 40);
 
       const grid = await session.capturePaneGrid();
-      const headerRow = grid.findIndex((line) => line.includes("𝒇x v"));
+      const headerRow = grid.findIndex((line) => line.includes("ridex v"));
       expect(headerRow).toBe(0);
     },
     TIMEOUT,
@@ -1611,7 +1611,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
         session,
         "PRE_FX_MARKER_",
       );
-      expect(scrollback.match(/𝒇x v\d+\.\d+\.\d+\b/g)).toHaveLength(1);
+      expect(scrollback.match(/ridex v\d+\.\d+\.\d+\b/g)).toHaveLength(1);
       expect(scrollback.match(/Run \/help for commands/g)).toHaveLength(1);
       expectOrderedMarkersWithoutBlankHole(scrollback, markers);
       const grid = await waitForSettledFooter(session);
@@ -1688,7 +1688,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
       await waitForLiveScrollbackText(session, finalResponse, TIMEOUT);
 
       const scrollback = await session.captureFullScrollback();
-      expect(scrollback.match(/𝒇x v\d+\.\d+\.\d+\b/g)).toHaveLength(1);
+      expect(scrollback.match(/ridex v\d+\.\d+\.\d+\b/g)).toHaveLength(1);
       expect(scrollback.match(/Run \/help for commands/g)).toHaveLength(1);
       expect(scrollback).toContain("stream the resize marker command");
       expect(scrollback).not.toContain(preFxMarker);
@@ -1980,7 +1980,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
       const afterCancelScrollback = await captureScrollback("after-cancel");
 
       const transcriptCopyCounts = (scrollback: string) => ({
-        startup: scrollback.match(/𝒇x v\d+\.\d+\.\d+\b/g)?.length ?? 0,
+        startup: scrollback.match(/ridex v\d+\.\d+\.\d+\b/g)?.length ?? 0,
         help: countOccurrences(scrollback, "Run /help for commands"),
         recording: countOccurrences(
           scrollback,
@@ -3469,7 +3469,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
         5_000,
       );
       const restored = captureScrollback();
-      expect(restored.match(/𝒇x v\d+\.\d+\.\d+\b/g)).toHaveLength(1);
+      expect(restored.match(/ridex v\d+\.\d+\.\d+\b/g)).toHaveLength(1);
       expect(restored.match(/Run \/help for commands/g)).toHaveLength(1);
       expect(restored).not.toContain("Commands 35");
       expect(findFooter(await session.capturePaneGrid())).not.toBeNull();

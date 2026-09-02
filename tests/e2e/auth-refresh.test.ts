@@ -223,7 +223,7 @@ test(
 );
 
 test(
-  "fx ask refreshes an expired login then forces one refresh and retry after 401",
+  "ridex ask refreshes an expired login then forces one refresh and retry after 401",
   async () => {
     const home = mkdtempSync(join(tmpdir(), "fx-auth-refresh-e2e-"));
     const oauth = startFakeOAuth(
@@ -329,14 +329,14 @@ test(
         `stdout: ${status.stdout}\nstderr: ${status.stderr}`,
       ).toBe(0);
       const statusJson = JSON.parse(status.stdout);
-      expect(statusJson.auth).toBe("fx login");
+      expect(statusJson.auth).toBe("ridex login");
       expect(statusJson.auth_expired).toBe(true);
       expect(statusJson.auth_refreshable).toBe(true);
 
       const doctor = await runFx(["doctor", "--json"], { env, timeoutMs: TIMEOUT });
       expect(doctor.code).toBe(0);
       const doctorJson = JSON.parse(doctor.stdout);
-      expect(doctorJson.auth).toBe("fx login");
+      expect(doctorJson.auth).toBe("ridex login");
       expect(doctorJson.auth_expired).toBe(true);
       const authCheck = doctorJson.checks.find(
         (check: { name: string }) => check.name === "auth",
@@ -358,7 +358,7 @@ test(
 );
 
 test(
-  "fx ask keeps a failed API key selected when login also exists",
+  "ridex ask keeps a failed API key selected when login also exists",
   async () => {
     const home = mkdtempSync(join(tmpdir(), "fx-auth-source-failure-e2e-"));
     const tracePath = join(home, "trace.log");
@@ -478,7 +478,7 @@ test(
       );
       expect(rejected.code).toBe(1);
       expect(rejected.stderr).toBe(
-        "fx ask: AI_GATEWAY_API_KEY authentication failed · HTTP 401\n",
+        "ridex ask: AI_GATEWAY_API_KEY authentication failed · HTTP 401\n",
       );
       const rejectedJson = JSON.parse(rejected.stdout);
       expect(rejectedJson).toMatchObject({
