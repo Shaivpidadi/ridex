@@ -688,11 +688,18 @@ const App = struct {
         if (comptime host_profile.durable_sessions) {
             SessionAppRuntime.primeSessionPicker(&app);
         }
-        const env_disabled = if (io_mod.getenv("FX_AUTO_UPGRADE")) |val|
-            std.mem.eql(u8, val, "0") or std.ascii.eqlIgnoreCase(val, "false")
-        else
-            false;
-        if (env_disabled or !auto_upgrade.shouldEnableForCurrentExecutable()) {
+        // Tri-state: "0"/"false" disables, "1"/"true" force-enables
+        // (upstream tests rely on this now that the fork's default is
+        // off — its channel would pull stock fx binaries), unset keeps
+        // the settings default.
+        if (io_mod.getenv("FX_AUTO_UPGRADE")) |val| {
+            if (std.mem.eql(u8, val, "0") or std.ascii.eqlIgnoreCase(val, "false")) {
+                app.auto_upgrade_enabled = false;
+            } else if (std.mem.eql(u8, val, "1") or std.ascii.eqlIgnoreCase(val, "true")) {
+                app.auto_upgrade_enabled = true;
+            }
+        }
+        if (!auto_upgrade.shouldEnableForCurrentExecutable()) {
             app.auto_upgrade_enabled = false;
         }
         if (comptime !host_profile.auto_upgrade) app.auto_upgrade_enabled = false;

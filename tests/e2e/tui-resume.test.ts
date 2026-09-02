@@ -3996,7 +3996,7 @@ test.skipIf(!tmuxAvailable())(
 
       expect(paneExitMatches(contender.paneStatus(), 1)).toBe(true);
       expect(readFileSync(contenderStderrPath, "utf8")).toBe(
-        "ridex: another fx process may be using this session (running or suspended); check other terminals or run jobs, then use fg or quit that process\n",
+        "ridex: another ridex process may be using this session (running or suspended); check other terminals or run jobs, then use fg or quit that process\n",
       );
       expect(owner.isPaneAlive()).toBe(true);
       const contenderScrollback = await contender.captureFullScrollback();
@@ -4465,6 +4465,7 @@ test.skipIf(!tmuxAvailable())(
     mkdirSync(workspace);
     mkdirSync(binDir);
     symlinkSync(FX_BIN, join(binDir, "fx"));
+    symlinkSync(FX_BIN, join(binDir, "ridex"));
     writeFileSync(stderrPath, "");
     writeFileSync(resumedStderrPath, "");
     const initialGateway = startFakeGateway([fakeGatewayFinalText(marker)]);
