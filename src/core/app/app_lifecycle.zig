@@ -468,7 +468,11 @@ fn loadStartupStateFromOwnedWorkspace(
     state.fast_mode_source = detailed.sources.fast_mode;
     state.slash_menu_categories = settings.slash_menu_categories orelse true;
     state.collapse_tool_calls = settings.collapse_tool_calls orelse false;
-    state.auto_upgrade = settings.auto_upgrade orelse true;
+    // ridex: default OFF. Upstream's auto-upgrade pulls fx-<platform>
+    // tarballs from the fx CDN — a shipped ridex would silently replace
+    // itself with a stock fx binary. Re-enable only once ridex runs its
+    // own update channel; users can still opt in via settings.
+    state.auto_upgrade = settings.auto_upgrade orelse false;
     state.update_channel = settings.update_channel orelse .stable;
     state.startup_scrollback = settings.startup_scrollback orelse true;
     state.effort = settings.effort orelse .auto;
