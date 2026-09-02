@@ -91,6 +91,11 @@ The launcher manages the daemon; state lives in `~/.ridex/`:
 | `ridex restart`  | stop + wait for the port to free + start |
 | `ridex doctor`   | agent binary + daemon + key report (wraps `freeride doctor`) |
 
+- The daemon is SUPERVISED where possible: a launchd LaunchAgent on
+  macOS (`xyz.free-ride.gateway`, KeepAlive on abnormal exit) or a
+  systemd user unit on Linux (`freeride.service`, Restart=on-failure) —
+  a crashed daemon restarts itself within seconds. `ridex doctor`
+  shows which supervision mode is active.
 - Daemon log: `~/.ridex/daemon.log` (falls back to
   `~/.freeride/autospawn.log` for gateways started by `freeride run`).
 - "Connection refused" while `~/.ridex/daemon.stopped` exists means the
