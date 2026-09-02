@@ -267,7 +267,7 @@ describe("cli: help", () => {
         `ridex v${sourceVersion()}\nFast, native coding agent for the terminal.\n`,
       );
       expect(stdout.match(/ridex v\d/g) ?? []).toHaveLength(1);
-      expect(stdout).toContain("fx starts an interactive session by default.");
+      expect(stdout).toContain("ridex starts an interactive session by default.");
       expect(stdout).toContain("Commands:\n");
       expect(stdout).toContain("Run one noninteractive request");
       expect(stdout).toContain("Sign in to a model provider");
