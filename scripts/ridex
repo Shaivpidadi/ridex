@@ -86,10 +86,19 @@ supervisor_kind() {
 }
 
 # Render FREERIDE_CMD + "serve" as plist <string> argv entries. Words
-# must not contain spaces (env VAR=... wrappers and plain paths are fine).
+# must not contain spaces (env VAR=... wrappers and plain paths are
+# fine). launchd requires an absolute argv[0], so the first word is
+# resolved through PATH at render time.
 plist_program_arguments() {
+    _first=1
     for word in $FREERIDE_CMD serve; do
-        printf '        <string>%s</string>\n' "$word"
+        if [ "$_first" = "1" ]; then
+            _first=0
+            _resolved="$(command -v "$word" 2>/dev/null || echo "$word")"
+            printf '        <string>%s</string>\n' "$_resolved"
+        else
+            printf '        <string>%s</string>\n' "$word"
+        fi
     done
 }
 
@@ -107,6 +116,10 @@ $(plist_program_arguments)    </array>
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key><string>$PATH</string>
+        <!-- launchd does not inherit the invoking shell's HOME; without
+             it the daemon would read root-session defaults instead of
+             this user's ~/.freeride. -->
+        <key>HOME</key><string>$HOME</string>
     </dict>
     <key>RunAtLoad</key><true/>
     <key>KeepAlive</key>
@@ -138,10 +151,24 @@ WantedBy=default.target
 UNIT
 }
 
+launchd_wait_unregistered() {
+    # bootout is asynchronous; bootstrapping again while the old
+    # registration is mid-teardown fails (and previously dropped us to
+    # the unsupervised fallback while the dying instance still held the
+    # port). Poll until the label is gone, up to ~5s.
+    _deadline=$(( $(date +%s) + 5 ))
+    while [ "$(date +%s)" -lt "$_deadline" ]; do
+        launchctl print "gui/$(id -u)/$LAUNCHD_LABEL" >/dev/null 2>&1 || return 0
+        sleep 0.3
+    done
+    return 1
+}
+
 supervisor_stop() {
     case "$(supervisor_kind)" in
         launchd)
             launchctl bootout "gui/$(id -u)/$LAUNCHD_LABEL" 2>/dev/null || true
+            launchd_wait_unregistered || true
             ;;
         systemd)
             systemctl --user stop freeride.service 2>/dev/null || true
