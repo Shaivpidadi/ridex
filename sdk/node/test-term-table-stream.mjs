@@ -35,7 +35,7 @@ const runtime = await createFxTerminal({
   backend: "wasm",
   wasm: await readFile(wasmPath),
   terminal: xtermAdapter(terminal),
-  env: { AI_GATEWAY_API_KEY: "table-stream-key" },
+  env: { FX_DEFAULT_PROVIDER: "gateway", AI_GATEWAY_API_KEY: "table-stream-key" },
   fetch,
   configStore: { get(id) { return id === "model" ? "test/table-model" : null; }, set() {} },
 });

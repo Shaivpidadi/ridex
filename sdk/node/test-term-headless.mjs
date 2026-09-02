@@ -48,7 +48,7 @@ const runtime = await createFxTerminal({
     get(id) { return config.get(id) ?? null; },
     set(id, value) { config.set(id, value); },
   },
-  env: { AI_GATEWAY_API_KEY: "term-headless-key" },
+  env: { FX_DEFAULT_PROVIDER: "gateway", AI_GATEWAY_API_KEY: "term-headless-key" },
   fetch: mockFetch,
   onEvent(event) { events.push(event); },
 });
