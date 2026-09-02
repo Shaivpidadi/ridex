@@ -21,7 +21,12 @@ PID_FILE="$RIDEX_HOME/daemon.pid"
 DAEMON_LOG="$RIDEX_HOME/daemon.log"
 GATEWAY_URL="${RIDEX_GATEWAY_URL:-http://127.0.0.1:11343}"
 SCRIPT_DIR="$(dirname "$(realpath "$0")")"
-AGENT_BIN="${RIDEX_AGENT_BIN:-$SCRIPT_DIR/fx}"
+if [ -z "${RIDEX_AGENT_BIN:-}" ]; then
+    for _cand in "$SCRIPT_DIR/ridex-agent" "$SCRIPT_DIR/../zig-out/bin/ridex" "$SCRIPT_DIR/fx"; do
+        if [ -x "$_cand" ]; then RIDEX_AGENT_BIN="$_cand"; break; fi
+    done
+fi
+AGENT_BIN="${RIDEX_AGENT_BIN:-$SCRIPT_DIR/ridex-agent}"
 
 # How the daemon is launched. `freeride` from PATH when installed
 # (pipx/uv/pip), overridable for source checkouts:
