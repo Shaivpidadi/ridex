@@ -3,7 +3,7 @@ name: CI
 on:
   workflow_dispatch:
   push:
-    branches: [main]
+    branches: [main, feat/freeride-provider]
   pull_request:
 
 concurrency:
