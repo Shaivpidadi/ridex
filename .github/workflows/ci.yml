@@ -62,6 +62,11 @@ jobs:
 
   sdk-node-wasm:
     name: SDK (Node + WASM)
+    env:
+      # Upstream's e2e/SDK suites model gateway-first flows; the fork's
+      # compiled default is freeride. Pin these suites to the upstream
+      # default instead of rewriting hundreds of fixtures.
+      FX_DEFAULT_PROVIDER: gateway
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -96,6 +101,11 @@ jobs:
 
   sdk-node-napi:
     name: SDK (Node + N-API)
+    env:
+      # Upstream's e2e/SDK suites model gateway-first flows; the fork's
+      # compiled default is freeride. Pin these suites to the upstream
+      # default instead of rewriting hundreds of fixtures.
+      FX_DEFAULT_PROVIDER: gateway
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -126,6 +136,11 @@ jobs:
 
   sdk-bun:
     name: SDK (Bun + N-API/WASM)
+    env:
+      # Upstream's e2e/SDK suites model gateway-first flows; the fork's
+      # compiled default is freeride. Pin these suites to the upstream
+      # default instead of rewriting hundreds of fixtures.
+      FX_DEFAULT_PROVIDER: gateway
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -179,6 +194,11 @@ jobs:
 
   sdk-browser-wasm:
     name: SDK (Browser + WASM)
+    env:
+      # Upstream's e2e/SDK suites model gateway-first flows; the fork's
+      # compiled default is freeride. Pin these suites to the upstream
+      # default instead of rewriting hundreds of fixtures.
+      FX_DEFAULT_PROVIDER: gateway
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -209,6 +229,11 @@ jobs:
 
   e2e_mode:
     name: E2E (deterministic, ${{ matrix.optimize }})
+    env:
+      # Upstream's e2e/SDK suites model gateway-first flows; the fork's
+      # compiled default is freeride. Pin these suites to the upstream
+      # default instead of rewriting hundreds of fixtures.
+      FX_DEFAULT_PROVIDER: gateway
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -409,6 +434,11 @@ jobs:
 
   e2e_acp_full_mode:
     name: E2E ACP (full, ${{ matrix.optimize }})
+    env:
+      # Upstream's e2e/SDK suites model gateway-first flows; the fork's
+      # compiled default is freeride. Pin these suites to the upstream
+      # default instead of rewriting hundreds of fixtures.
+      FX_DEFAULT_PROVIDER: gateway
     runs-on: ubuntu-latest
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     strategy:

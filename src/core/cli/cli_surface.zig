@@ -687,7 +687,7 @@ fn activateProviderSelection(
     );
     defer if (prepared_credential) |*credential| credential.deinit(alloc);
 
-    const already_selected = (settings.provider orelse model_provider.default_provider) == target;
+    const already_selected = (settings.provider orelse model_provider.defaultProvider()) == target;
     if (caller == .provider_command and already_selected and prepared_credential != null) {
         try writeStdout(deps, switch (target) {
             .freeride => "FreeRide is already selected.\n",

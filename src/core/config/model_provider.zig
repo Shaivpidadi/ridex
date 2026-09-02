@@ -1,4 +1,5 @@
 const std = @import("std");
+const io_mod = @import("../shared/io.zig");
 const types = @import("../shared/types.zig");
 
 pub const ProviderId = enum {
@@ -12,6 +13,16 @@ pub const ProviderId = enum {
 /// and needs no login. Vercel/Codex/Grok stay available via
 /// `ridex provider <name>`.
 pub const default_provider: ProviderId = .freeride;
+
+/// Runtime default: `FX_DEFAULT_PROVIDER` overrides the compiled
+/// default. The upstream e2e/SDK suites model gateway-first flows
+/// (Vercel login, team selection, gateway model auto-pick); CI pins
+/// them to `gateway` through this instead of rewriting hundreds of
+/// fixtures — and users get an escape hatch for free.
+pub fn defaultProvider() ProviderId {
+    const raw = io_mod.getenv("FX_DEFAULT_PROVIDER") orelse return default_provider;
+    return parse(raw) orelse default_provider;
+}
 
 /// FreeRide's smart-router preset tuned for agent tool-calling.
 pub const freeride_default_model = "freeride/coding";
@@ -66,4 +77,12 @@ test "provider parsing exposes gateway codex and grok" {
     try std.testing.expectEqual(ProviderId.grok, parse("GROK").?);
     try std.testing.expect(parse("openai-codex") == null);
     try std.testing.expect(parse("") == null);
+}
+
+test "compiled default is freeride and the env override parses provider names" {
+    // The zig suites run without FX_DEFAULT_PROVIDER (only the TS
+    // e2e/SDK CI jobs pin it to gateway), so the compiled default
+    // must hold here.
+    try std.testing.expectEqual(ProviderId.freeride, defaultProvider());
+    try std.testing.expectEqual(ProviderId.freeride, default_provider);
 }

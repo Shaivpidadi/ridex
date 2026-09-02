@@ -12,6 +12,10 @@ pub const Runtime = struct {
     model: std.ArrayList(u8) = .empty,
 
     pub fn init(alloc: Allocator) Self {
+        // Comptime-safe (main.zig uses this as a struct-field default):
+        // the compiled default only seeds the field; every real startup
+        // path adopts the env-aware defaultProvider() via
+        // loadStartupState → replaceSelection before first use.
         return .{ .alloc = alloc };
     }
 

@@ -426,6 +426,12 @@ fn loadStartupStateFromOwnedWorkspace(
 
     const configured_selection = try configuredProviderSelection(default_model, settings);
     state.provider = configured_selection.provider;
+    // Publish for transport-URL resolution too: non-interactive CLI
+    // paths (models, ask bootstrap) never reach the provider runtime's
+    // adoptOwned, so without this a settings/env provider choice would
+    // change identity but keep routing to the compiled default's
+    // endpoints.
+    model_provider.active_transport_provider = configured_selection.provider;
     state.configured_model = try alloc.dupe(u8, configured_selection.model);
     state.model_source = detailed.model_source orelse .compiled_default;
     state.selected_model = try loadInitialModel(alloc, configured_selection.model, null);
@@ -1089,7 +1095,7 @@ fn configuredProviderSelection(
     default_model: []const u8,
     settings: *const config_runtime.Settings,
 ) !model_provider.ProviderSelection {
-    const provider = settings.provider orelse model_provider.default_provider;
+    const provider = settings.provider orelse model_provider.defaultProvider();
     const model = settings.models.get(provider) orelse switch (provider) {
         .freeride => model_provider.freeride_default_model,
         .gateway => default_model,
