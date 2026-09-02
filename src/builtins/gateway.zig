@@ -2228,10 +2228,22 @@ test "built-in credits provider ignores non-string fields" {
 }
 
 test "built-in model catalog owns default and loopback target resolution" {
+    // Base resolution follows the active transport provider; pin it
+    // per assertion so other tests' startup-state loads can't leak in.
+    const prior = model_provider.active_transport_provider;
+    defer model_provider.active_transport_provider = prior;
+
+    model_provider.active_transport_provider = .gateway;
     const default_url = try modelCatalogUrl(std.testing.allocator, models_path, null);
     defer std.testing.allocator.free(default_url);
     try std.testing.expectEqualStrings("https://ai-gateway.vercel.sh/coding-agent/v1/models", default_url);
 
+    model_provider.active_transport_provider = .freeride;
+    const freeride_url = try modelCatalogUrl(std.testing.allocator, models_path, null);
+    defer std.testing.allocator.free(freeride_url);
+    try std.testing.expectEqualStrings("http://127.0.0.1:11343/coding-agent/v1/models", freeride_url);
+
+    model_provider.active_transport_provider = .gateway;
     const loopback_url = try modelCatalogUrl(std.testing.allocator, models_path, "http://127.0.0.1:43123");
     defer std.testing.allocator.free(loopback_url);
     try std.testing.expectEqualStrings("http://127.0.0.1:43123/coding-agent/v1/models", loopback_url);
