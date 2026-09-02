@@ -75,10 +75,6 @@ jobs:
 
   e2e:
     name: E2E (${{ matrix.optimize }}, ${{ matrix.platform.name }}, shard ${{ matrix.shard.label }})
-    env:
-      # See ci.yml: upstream suites run gateway-first; the fork defaults
-      # to freeride.
-      FX_DEFAULT_PROVIDER: gateway
     runs-on: ${{ matrix.platform.runner }}
     timeout-minutes: 120
     strategy:
@@ -114,6 +110,8 @@ jobs:
     env:
       AI_GATEWAY_API_KEY: ""
       VERCEL_OIDC_TOKEN: ""
+      # Upstream suites run gateway-first; the fork defaults to freeride.
+      FX_DEFAULT_PROVIDER: gateway
       FX_REQUIRE_TMUX: "1"
       SHARD_INDEX: ${{ matrix.shard.index }}
       SHARD_COUNT: ${{ matrix.shard.shard_count }}
