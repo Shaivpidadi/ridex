@@ -433,7 +433,7 @@ fn replyParseError(
     json: bool,
 ) !u8 {
     const msg = switch (err) {
-        Error.MissingTapePath => "fx replay: missing tape path\nusage: fx replay <tape> [--frames] [--json] [--golden <path>] [--frames-dir <path>]\n",
+        Error.MissingTapePath => "fx replay: missing tape path\nusage: ridex replay <tape> [--frames] [--json] [--golden <path>] [--frames-dir <path>]\n",
         Error.TooManyArgs => "fx replay: too many positional arguments\n",
         Error.UnknownFlag => "fx replay: unknown flag\n",
         Error.MissingGoldenPath => "fx replay: --golden requires a path\n",

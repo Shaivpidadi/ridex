@@ -156,7 +156,7 @@ pub const RunResult = union(enum) {
     handled_exit: u8,
 };
 
-const version_usage = "usage: fx --version\n";
+const version_usage = "usage: ridex --version\n";
 
 pub const Config = struct {
     version: []const u8 = "",
@@ -901,7 +901,7 @@ fn runIfRequestedWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Con
         } else {
             try writer.writer.print("fx: invalid global launch option: {s}\n", .{@errorName(err)});
         }
-        try writer.writer.writeAll("usage: fx [--context-limit NAME=BYTES|off] [--add-dir PATH]... [--no-additional-dirs] <command>\n");
+        try writer.writer.writeAll("usage: ridex [--context-limit NAME=BYTES|off] [--add-dir PATH]... [--no-additional-dirs] <command>\n");
         try writeStderr(deps, writer.written());
         return .handled_failure;
     };
@@ -965,7 +965,7 @@ fn runNonInteractiveWithDeps(
         },
         .acp => |rest| {
             const acp_opts = parseAcpArgs(rest) catch {
-                try writeStderr(deps, "usage: fx acp [--model <id>] [--log-file <path>]\n");
+                try writeStderr(deps, "usage: ridex acp [--model <id>] [--log-file <path>]\n");
                 return .handled_failure;
             };
             try cfg.acp_runner.run(alloc, .{
@@ -1002,7 +1002,7 @@ fn runNonInteractiveWithDeps(
         .issue => |rest| return runGithubWorkflow(alloc, rest, cfg, global_args.modifiers, deps, .issue),
         .login => |rest| {
             const maybe_login_provider = parseLoginProvider(rest) catch {
-                try writeStderr(deps, "usage: fx login [vercel|codex|grok]\n");
+                try writeStderr(deps, "usage: ridex login [vercel|codex|grok]\n");
                 return .handled_failure;
             };
             if (cfg.auth_mode == .host_managed) {
@@ -1037,7 +1037,7 @@ fn runNonInteractiveWithDeps(
         },
         .logout => |rest| {
             const maybe_login_provider = parseLoginProvider(rest) catch {
-                try writeStderr(deps, "usage: fx logout [vercel|codex|grok]\n");
+                try writeStderr(deps, "usage: ridex logout [vercel|codex|grok]\n");
                 return .handled_failure;
             };
             if (cfg.auth_mode == .host_managed) {
@@ -1130,7 +1130,7 @@ fn runNonInteractiveWithDeps(
         },
         .teams => |rest| {
             if (rest.len != 0) {
-                try writeStderr(deps, "usage: fx teams\n");
+                try writeStderr(deps, "usage: ridex teams\n");
                 return .handled_failure;
             }
             if (cfg.auth_mode == .host_managed) {
@@ -1170,7 +1170,7 @@ fn runNonInteractiveWithDeps(
         },
         .provider => |rest| {
             if (rest.len != 1) {
-                try writeStderr(deps, "usage: fx provider <freeride|gateway|codex|grok>\n");
+                try writeStderr(deps, "usage: ridex provider <freeride|gateway|codex|grok>\n");
                 return .handled_failure;
             }
             const target = model_provider.parse(rest[0]) orelse {
@@ -2182,7 +2182,7 @@ fn selfExePathDefault(_: ?*anyopaque, alloc: Allocator) ![]u8 {
 }
 
 fn writeTopLevelUsage(command_catalog: CommandCatalog, deps: RunDeps, kind: TopLevelKind) !void {
-    try writeStderr(deps, "usage: fx ");
+    try writeStderr(deps, "usage: ridex ");
     try writeStderr(deps, command_specs.topLevelUsage(command_catalog, kind));
     try writeStderr(deps, "\n");
 }
@@ -2565,7 +2565,7 @@ fn writeMcpProfileMutationSuccess(
 fn writeMcpAddUsage(deps: RunDeps) !void {
     return writeStderr(
         deps,
-        "usage: fx mcp add NAME COMMAND [ARGS...] | fx mcp add --transport http NAME URL\n",
+        "usage: ridex mcp add NAME COMMAND [ARGS...] | fx mcp add --transport http NAME URL\n",
     );
 }
 
@@ -4345,7 +4345,7 @@ test "runIfRequested help writes top-level help" {
 
     const result = try runIfRequestedWithDeps(std.testing.allocator, &.{@constCast("help")}, testConfig(), capture.deps());
     try std.testing.expectEqual(RunResult.handled_success, result);
-    try std.testing.expect(std.mem.startsWith(u8, capture.stdout.written(), "𝒇x v0.0.0\nFast, native coding agent for the terminal."));
+    try std.testing.expect(std.mem.startsWith(u8, capture.stdout.written(), "ridex v0.0.0\nFast, native coding agent for the terminal."));
     try std.testing.expect(std.mem.find(u8, capture.stdout.written(), testConfig().version) != null);
     try std.testing.expectEqualStrings("", capture.stderr.written());
 }
@@ -4489,7 +4489,7 @@ test "workspace launch modifiers preserve supported command help" {
         deps,
     );
     try std.testing.expectEqual(RunResult.handled_success, result);
-    try std.testing.expect(std.mem.startsWith(u8, capture.stdout.written(), "fx ask\n\n"));
+    try std.testing.expect(std.mem.startsWith(u8, capture.stdout.written(), "ridex ask\n\n"));
     try std.testing.expectEqualStrings("", capture.stderr.written());
 }
 
@@ -4567,7 +4567,7 @@ test "runIfRequested version flags reject extra args" {
         const result = try runIfRequestedWithDeps(std.testing.allocator, args, testConfig(), capture.deps());
         try std.testing.expectEqual(RunResult.handled_failure, result);
         try std.testing.expectEqualStrings("", capture.stdout.written());
-        try std.testing.expectEqualStrings("usage: fx --version\n", capture.stderr.written());
+        try std.testing.expectEqualStrings("usage: ridex --version\n", capture.stderr.written());
     }
 }
 
@@ -4730,7 +4730,7 @@ test "runNoConfigIfRequested handles help without config" {
         testCommandCatalog(),
         capture.deps(),
     ));
-    try std.testing.expect(std.mem.startsWith(u8, capture.stdout.written(), "𝒇x v0.0.0\nFast, native coding agent for the terminal."));
+    try std.testing.expect(std.mem.startsWith(u8, capture.stdout.written(), "ridex v0.0.0\nFast, native coding agent for the terminal."));
     try std.testing.expectEqualStrings("", capture.stderr.written());
 
     try std.testing.expect(!try runNoConfigIfRequestedWithDeps(
@@ -4799,7 +4799,7 @@ test "CLI surface uses the supplied command catalog for parsing usage and help" 
         usage_capture.deps(),
     );
     try std.testing.expectEqual(RunResult.handled_failure, result);
-    try std.testing.expectEqualStrings("usage: fx start\n", usage_capture.stderr.written());
+    try std.testing.expectEqualStrings("usage: ridex start\n", usage_capture.stderr.written());
 }
 
 test "workflow config does not carry placeholder gateway tools" {
@@ -4827,7 +4827,7 @@ test "runIfRequested invalid local flags write usage" {
     const result = try runIfRequestedWithDeps(std.testing.allocator, &.{ @constCast("status"), @constCast("--wat") }, testConfig(), capture.deps());
     try std.testing.expectEqual(RunResult.handled_failure, result);
     try std.testing.expectEqualStrings("", capture.stdout.written());
-    try std.testing.expectEqualStrings("usage: fx status [--json]\n", capture.stderr.written());
+    try std.testing.expectEqualStrings("usage: ridex status [--json]\n", capture.stderr.written());
 }
 
 test "runIfRequested invalid json local flags write json error" {
@@ -4980,7 +4980,7 @@ test "runIfRequested rejects malformed resume aliases with canonical usage" {
         );
         try std.testing.expectEqual(RunResult.handled_failure, result);
         try std.testing.expectEqualStrings(
-            "usage: fx session resume [last|<id>] | session resume --id <id> | --resume [last|<id>] | resume [last|<id>] | resume --id <id> | --resume-last | --continue | -c | -r | --resume-<id>\n",
+            "usage: ridex session resume [last|<id>] | session resume --id <id> | --resume [last|<id>] | resume [last|<id>] | resume --id <id> | --resume-last | --continue | -c | -r | --resume-<id>\n",
             capture.stderr.written(),
         );
     }
@@ -5011,7 +5011,7 @@ test "runIfRequested invalid resume writes usage" {
     const result = try runIfRequestedWithDeps(std.testing.allocator, &.{ @constCast("resume"), @constCast("a"), @constCast("b") }, testConfig(), capture.deps());
     try std.testing.expectEqual(RunResult.handled_failure, result);
     try std.testing.expectEqualStrings(
-        "usage: fx session resume [last|<id>] | session resume --id <id> | --resume [last|<id>] | resume [last|<id>] | resume --id <id> | --resume-last | --continue | -c | -r | --resume-<id>\n",
+        "usage: ridex session resume [last|<id>] | session resume --id <id> | --resume [last|<id>] | resume [last|<id>] | resume --id <id> | --resume-last | --continue | -c | -r | --resume-<id>\n",
         capture.stderr.written(),
     );
 }
@@ -5024,7 +5024,7 @@ test "runIfRequested unknown command writes header and help" {
         error.UnknownCliCommand,
         runIfRequestedWithDeps(std.testing.allocator, &.{@constCast("wat")}, testConfig(), capture.deps()),
     );
-    try std.testing.expect(std.mem.startsWith(u8, capture.stderr.written(), "fx: unknown subcommand: wat\n\n𝒇x v0.0.0\nFast, native coding agent for the terminal.\n"));
+    try std.testing.expect(std.mem.startsWith(u8, capture.stderr.written(), "fx: unknown subcommand: wat\n\nridex v0.0.0\nFast, native coding agent for the terminal.\n"));
 }
 
 test "runIfRequested bare version subcommand remains unknown" {
@@ -5035,7 +5035,7 @@ test "runIfRequested bare version subcommand remains unknown" {
         error.UnknownCliCommand,
         runIfRequestedWithDeps(std.testing.allocator, &.{@constCast("version")}, testConfig(), capture.deps()),
     );
-    try std.testing.expect(std.mem.startsWith(u8, capture.stderr.written(), "fx: unknown subcommand: version\n\n𝒇x v0.0.0\nFast, native coding agent for the terminal.\n"));
+    try std.testing.expect(std.mem.startsWith(u8, capture.stderr.written(), "fx: unknown subcommand: version\n\nridex v0.0.0\nFast, native coding agent for the terminal.\n"));
 }
 
 test "runIfRequested model fetch failure is handled" {
