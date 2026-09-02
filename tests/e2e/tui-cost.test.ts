@@ -141,7 +141,7 @@ async function waitForProfileUsage(
 }
 
 test(
-  "fx ask settles authoritative stream usage without delayed reconciliation",
+  "ridex ask settles authoritative stream usage without delayed reconciliation",
   async () => {
     root = mkdtempSync(join(tmpdir(), "fx-cost-ask-exit-"));
     const home = join(root, "home");
@@ -230,7 +230,7 @@ test(
   10_000,
 );
 
-test("fx ask gives immediate generation reconciliation a bounded drain", async () => {
+test("ridex ask gives immediate generation reconciliation a bounded drain", async () => {
   root = mkdtempSync(join(tmpdir(), "fx-cost-ask-reconcile-"));
   const home = join(root, "home");
   const workspace = join(root, "workspace");

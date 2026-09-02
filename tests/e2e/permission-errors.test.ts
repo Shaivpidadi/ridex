@@ -100,7 +100,7 @@ async function waitForPaneExit(
     await Bun.sleep(25);
   }
   throw new Error(
-    `Timed out waiting for fx ask to exit.\n${await session.captureFullScrollback()}`,
+    `Timed out waiting for ridex ask to exit.\n${await session.captureFullScrollback()}`,
   );
 }
 

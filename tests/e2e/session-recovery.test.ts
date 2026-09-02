@@ -319,7 +319,7 @@ describe("session recovery", () => {
       });
       expect(doctor.code).toBe(0);
       expect(doctor.stdout).toContain("commit_watermark_invalid");
-      expect(doctor.stdout).toContain(`fx session recover ${sessionId}`);
+      expect(doctor.stdout).toContain(`ridex session recover ${sessionId}`);
 
       const recovery = await runFx(
         ["session", "recover", sessionId, "--json"],
@@ -392,7 +392,7 @@ describe("session recovery", () => {
       expect(JSON.parse(sourceDetail.stdout)).toEqual(
         expect.objectContaining({
           code: "InvalidSessionFormat",
-          error: `session ${sessionId} is corrupt; run \`fx session recover ${sessionId}\``,
+          error: `session ${sessionId} is corrupt; run \`ridex session recover ${sessionId}\``,
         }),
       );
     } finally {

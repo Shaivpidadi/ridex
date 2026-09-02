@@ -767,7 +767,7 @@ test("volatile status rows normalize before stable-grid comparison", () => {
 });
 
 test.skipIf(!tmuxAvailable())(
-  "saved fx ask metadata appears after interactive Ctrl-O resume",
+  "saved ridex ask metadata appears after interactive Ctrl-O resume",
   async () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-ask-metadata-resume-")));
     const home = join(root, "home");
@@ -781,7 +781,7 @@ test.skipIf(!tmuxAvailable())(
     );
     writeFileSync(stderrPath, "");
 
-    const prompt = "Persist this fx ask metadata.";
+    const prompt = "Persist this ridex ask metadata.";
     const answer = "FX_ASK_METADATA_COMPLETE";
     const askGateway = startFakeGateway([fakeGatewayFinalText(answer)]);
     let active: TmuxSession | null = null;
@@ -3995,7 +3995,7 @@ test.skipIf(!tmuxAvailable())(
 
       expect(paneExitMatches(contender.paneStatus(), 1)).toBe(true);
       expect(readFileSync(contenderStderrPath, "utf8")).toBe(
-        "fx: another fx process may be using this session (running or suspended); check other terminals or run jobs, then use fg or quit that process\n",
+        "ridex: another fx process may be using this session (running or suspended); check other terminals or run jobs, then use fg or quit that process\n",
       );
       expect(owner.isPaneAlive()).toBe(true);
       const contenderScrollback = await contender.captureFullScrollback();
@@ -4501,7 +4501,7 @@ test.skipIf(!tmuxAvailable())(
       expect(paneExitMatches(active.paneStatus(), 0)).toBe(true);
       const scrollback = stripAnsi(await active.captureFullScrollback());
       const ansiScrollback = await active.captureFullScrollbackEscapes();
-      const expected = `Continue session with: fx --resume ${sessionId}`;
+      const expected = `Continue session with: ridex --resume ${sessionId}`;
       expect(scrollback).toContain(expected);
       expect(scrollback).not.toContain("To continue this session, run:");
       expect(ansiScrollback).toContain(`\x1b[38;5;245m${expected}\x1b[39m`);
@@ -4515,7 +4515,7 @@ test.skipIf(!tmuxAvailable())(
         .map((line) => line.trim())
         .find((line) => line === expected);
       const printedCommand = handoffLine?.slice("Continue session with: ".length);
-      expect(printedCommand).toBe(`fx --resume ${sessionId}`);
+      expect(printedCommand).toBe(`ridex --resume ${sessionId}`);
 
       await active.kill();
       active = await TmuxSession.create({
@@ -4605,7 +4605,7 @@ test.skipIf(!tmuxAvailable())(
         "the rapid Ctrl-C exit pane to stop",
       );
       const scrollback = stripAnsi(await active.captureFullScrollback());
-      const expected = `Continue session with: fx --resume ${sessionId}`;
+      const expected = `Continue session with: ridex --resume ${sessionId}`;
       expect(countOccurrences(scrollback, expected)).toBe(1);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
       await active.kill();
@@ -5850,7 +5850,7 @@ test.skipIf(!tmuxAvailable())(
       const currentPicker = stripAnsi(await active.capturePane());
       expect(currentPicker).toContain("Sessions 1");
       expect(currentPicker).toContain("[Current workspace]");
-      expect(currentPicker).toContain("𝒇x");
+      expect(currentPicker).toContain("ridex");
       expect(currentPicker).toContain("Save the workspace A transcript.");
       expect(currentPicker).not.toContain("Save the workspace B transcript.");
 

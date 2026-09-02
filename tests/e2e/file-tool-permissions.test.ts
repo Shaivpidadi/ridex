@@ -83,7 +83,7 @@ async function runWithFakeGateway(
 
 describe("external file permissions", () => {
   test(
-    "fx ask --yolo bypasses a configured write denial without a classifier request",
+    "ridex ask --yolo bypasses a configured write denial without a classifier request",
     async () => {
       const root = createIsolatedRoot("fx-yolo-permissions-");
       try {
@@ -148,7 +148,7 @@ describe("external file permissions", () => {
   );
 
   test(
-    "fx ask reads external paths and exercises classifier and rule-gated writes",
+    "ridex ask reads external paths and exercises classifier and rule-gated writes",
     async () => {
       const root = createIsolatedRoot("fx-file-permissions-");
       try {

@@ -220,7 +220,7 @@ keychainTest(
     try {
       const first = await runFx(["status", "--json"], { env, timeoutMs: TIMEOUT });
       expect(first.code, `stdout: ${first.stdout}\nstderr: ${first.stderr}`).toBe(0);
-      expect(JSON.parse(first.stdout).auth).toBe("fx login");
+      expect(JSON.parse(first.stdout).auth).toBe("ridex login");
       expect(
         existsSync(join(home, ".fx", "auth.json")),
         readFileSync(join(home, "oauth-keychain-trace.log"), "utf8"),
@@ -252,7 +252,7 @@ keychainTest(
       rmSync(join(home, ".fx"), { recursive: true, force: true });
       const restarted = await runFx(["status", "--json"], { env, timeoutMs: TIMEOUT });
       expect(restarted.code).toBe(0);
-      expect(JSON.parse(restarted.stdout).auth).toBe("fx login");
+      expect(JSON.parse(restarted.stdout).auth).toBe("ridex login");
       expect(existsSync(join(home, ".fx"))).toBe(false);
 
       const logout = await runFx(["logout"], { env, timeoutMs: TIMEOUT });

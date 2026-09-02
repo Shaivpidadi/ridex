@@ -1540,7 +1540,7 @@ tmuxTest(
       TIMEOUT,
     );
     expect(root).toContain("AI_GATEWAY_API_KEY");
-    expect(root).not.toContain("fx login");
+    expect(root).not.toContain("ridex login");
     expect(root).not.toContain("Vercel account");
 
     await session.sendKeys("Enter");
@@ -1583,7 +1583,7 @@ tmuxTest(
       TIMEOUT,
     );
     expect(sources).toContain("AI_GATEWAY_API_KEY");
-    expect(sources).toContain("fx login");
+    expect(sources).toContain("ridex login");
     await session.sendKeys("Escape");
     await session.sendKeys("Escape");
     await session.waitForComposer(TIMEOUT);
@@ -1808,7 +1808,7 @@ tmuxTest(
     await session.sendKeys("Enter");
     await session.waitForText("Changed Vercel team to Vercel Labs", TIMEOUT);
     await session.sendText("/status");
-    await session.waitForText("auth=fx login", TIMEOUT);
+    await session.waitForText("auth=ridex login", TIMEOUT);
     expect(savedCredentialSource(home)).toBe("fx_login");
     await session.sendText("use the direct login credential");
     await session.waitForText(DIRECT_LOGIN_RESPONSE, TIMEOUT);
@@ -1820,7 +1820,7 @@ tmuxTest(
     session = await startFx(home, stderrPath, gateway, oauth.issuerUrl);
     await session.waitForComposer(TIMEOUT);
     await session.sendText("/status");
-    await session.waitForText("auth=fx login", TIMEOUT);
+    await session.waitForText("auth=ridex login", TIMEOUT);
     await session.sendText("use the remembered direct login credential");
     await session.waitForText(RESTART_RESPONSE, TIMEOUT);
     expect(gateway.requests[1].headers.get("authorization")).toBe(
@@ -1850,7 +1850,7 @@ tmuxTest(
 );
 
 tmuxTest(
-  "Change team activates and persists fx login ahead of the environment",
+  "Change team activates and persists ridex login ahead of the environment",
   async () => {
     home = mkdtempSync(join(tmpdir(), "fx-tui-team-preference-"));
     stderrPath = join(home, "stderr.log");
@@ -1881,7 +1881,7 @@ tmuxTest(
     await session.sendKeys("Enter");
     await session.waitForText("Changed Vercel team to Vercel Labs", TIMEOUT);
     await session.sendText("/status");
-    await session.waitForText("auth=fx login", TIMEOUT);
+    await session.waitForText("auth=ridex login", TIMEOUT);
     expect(savedCredentialSource(home)).toBe("fx_login");
 
     const savedAuth = JSON.parse(readFileSync(join(home, ".fx", "auth.json"), "utf8")) as {
@@ -1895,7 +1895,7 @@ tmuxTest(
     session = await startFx(home, stderrPath, gateway, oauth.issuerUrl);
     await session.waitForComposer(TIMEOUT);
     await session.sendText("/status");
-    await session.waitForText("auth=fx login", TIMEOUT);
+    await session.waitForText("auth=ridex login", TIMEOUT);
     await session.sendText("use the selected team after restart");
     await session.waitForText(LOGIN_RESPONSE, TIMEOUT);
     expect(gateway.requests[0].headers.get("authorization")).toBe(`Bearer ${LOGIN_TOKEN}`);
@@ -1906,7 +1906,7 @@ tmuxTest(
 );
 
 tmuxTest(
-  "API key and fx login coexist through selection, restart, login, and logout",
+  "API key and ridex login coexist through selection, restart, login, and logout",
   async () => {
     home = mkdtempSync(join(tmpdir(), "fx-tui-auth-lifecycle-"));
     stderrPath = join(home, "stderr.log");
@@ -1944,7 +1944,7 @@ tmuxTest(
 
     await openSwitchCredential(session);
     const inventory = await session.waitForPane(
-      (pane) => pane.includes("AI_GATEWAY_API_KEY") && pane.includes("fx login"),
+      (pane) => pane.includes("AI_GATEWAY_API_KEY") && pane.includes("ridex login"),
       TIMEOUT,
     );
     expect(inventory).not.toContain("VERCEL_OIDC_TOKEN");
@@ -1953,7 +1953,7 @@ tmuxTest(
     await session.sendKeys("Down");
     await session.sendKeys("Enter");
     await session.sendText("/status");
-    await session.waitForText("auth=fx login", TIMEOUT);
+    await session.waitForText("auth=ridex login", TIMEOUT);
     expect(readFileSync(authPath, "utf8")).toBe(seededAuthFile);
     await session.sendText("use the selected login credential");
     await session.waitForText(LOGIN_RESPONSE, TIMEOUT);
@@ -1967,9 +1967,9 @@ tmuxTest(
     session = await startFx(home, stderrPath, gateway, oauth.issuerUrl);
     await session.waitForComposer(TIMEOUT);
     await session.sendText("/status");
-    // The switch above is remembered, so the restart keeps fx login rather than
+    // The switch above is remembered, so the restart keeps ridex login rather than
     // letting AI_GATEWAY_API_KEY reclaim it through precedence.
-    await session.waitForText("auth=fx login", TIMEOUT);
+    await session.waitForText("auth=ridex login", TIMEOUT);
     expect(readFileSync(authPath, "utf8")).toBe(seededAuthFile);
     await session.sendText("use the remembered credential after restart");
     await session.waitForText(RESTART_RESPONSE, TIMEOUT);
@@ -2010,7 +2010,7 @@ tmuxTest(
     ).toHaveLength(1);
 
     await session.sendText("/status");
-    await session.waitForText("auth=fx login", TIMEOUT);
+    await session.waitForText("auth=ridex login", TIMEOUT);
     await session.sendText("direct login prompt");
     await session.waitForText(DIRECT_LOGIN_RESPONSE, TIMEOUT);
     expect(gateway.requests).toHaveLength(4);
@@ -2197,7 +2197,7 @@ tmuxTest(
 
     await openSwitchCredential(session);
     await session.waitForPane(
-      (pane) => pane.includes("AI_GATEWAY_API_KEY") && pane.includes("fx login"),
+      (pane) => pane.includes("AI_GATEWAY_API_KEY") && pane.includes("ridex login"),
       TIMEOUT,
     );
     await session.sendKeys("Down");
@@ -2218,7 +2218,7 @@ tmuxTest(
 );
 
 test(
-  "fx login falls back once when a custom OAuth client is invalid",
+  "ridex login falls back once when a custom OAuth client is invalid",
   async () => {
     home = mkdtempSync(join(tmpdir(), "fx-tui-login-client-fallback-"));
     writeSeededFxLogin(home);
@@ -2301,7 +2301,7 @@ test(
 );
 
 test(
-  "fx teams validates Gateway before committing and persists fx login",
+  "fx teams validates Gateway before committing and persists ridex login",
   async () => {
     home = mkdtempSync(join(tmpdir(), "fx-cli-teams-validation-"));
     gateway = startFakeGateway([]);
@@ -2390,7 +2390,7 @@ test(
   60_000,
 );
 
-test("fx logout clears a remembered fx login source", async () => {
+test("ridex logout clears a remembered ridex login source", async () => {
   home = mkdtempSync(join(tmpdir(), "fx-cli-logout-preference-"));
   oauth = startFakeOAuth(ACQUIRED_LOGIN_TOKEN);
   writeSeededFxLogin(home, Date.now() + 60 * 60 * 1000, oauth.issuerUrl, "team_123");
@@ -2419,7 +2419,7 @@ test("fx logout clears a remembered fx login source", async () => {
   expect(existsSync(join(home, ".fx", "auth.json"))).toBe(false);
 });
 
-test("fx models does not retry anonymously for an explicit credential", async () => {
+test("ridex models does not retry anonymously for an explicit credential", async () => {
   home = mkdtempSync(join(tmpdir(), "fx-cli-models-explicit-auth-"));
   writeSeededFxLogin(home, Date.now() + 60 * 60 * 1000, "https://vercel.com", "team_123");
   writeFileSync(
@@ -2738,7 +2738,7 @@ test("Grok logout removes local credentials when remote revocation fails", async
       timeoutMs: TIMEOUT,
     });
     expect(ask.code).toBe(1);
-    expect(ask.stderr).toContain("fx login grok");
+    expect(ask.stderr).toContain("ridex login grok");
   } finally {
     grok.stop();
   }
@@ -3215,7 +3215,7 @@ test(
     const login = await runCodexLoginWithBrowser(env);
     expect(login.code).toBe(1);
     expect(login.stdout).not.toContain("Signed in with Codex.");
-    expect(login.stderr).toContain("fx login: could not load the target model catalog (malformed_response)");
+    expect(login.stderr).toContain("ridex login: could not load the target model catalog (malformed_response)");
     expect(existsSync(join(home, ".fx", "chatgpt-auth.json"))).toBe(true);
     const settingsPath = join(home, ".fx", "settings.json");
     expect(existsSync(settingsPath)).toBe(false);
@@ -3247,7 +3247,7 @@ test(
       const login = await runGrokLoginWithBrowser(env);
       expect(login.code).toBe(1);
       expect(login.stdout).not.toContain("Signed in with Grok.");
-      expect(login.stderr).toContain("fx login: target model catalog is empty");
+      expect(login.stderr).toContain("ridex login: target model catalog is empty");
       expect(existsSync(join(home, ".fx", "grok-auth.json"))).toBe(true);
       expect(existsSync(join(home, ".fx", "settings.json"))).toBe(false);
     } finally {
@@ -3702,7 +3702,7 @@ test(
 );
 
 test(
-  "fx login bounds invalid OAuth client fallback to two device requests",
+  "ridex login bounds invalid OAuth client fallback to two device requests",
   async () => {
     home = mkdtempSync(join(tmpdir(), "fx-tui-login-client-fallback-failure-"));
     writeSeededFxLogin(home);
@@ -3745,7 +3745,7 @@ test(
     expect(deviceRequests[1].clientId).toBeDefined();
     expect(deviceRequests[1].clientId).not.toBe("test-client");
     expect(result.stdout).toBe("");
-    expect(result.stderr).toBe("fx login: failed to sign in\n");
+    expect(result.stderr).toBe("ridex login: failed to sign in\n");
     expect(result.stderr).not.toContain(oauth.providerDetail);
     expect(readFileSync(authPath, "utf8")).toBe(seededAuthFile);
   },
@@ -3753,7 +3753,7 @@ test(
 );
 
 test(
-  "fx login does not fall back for another OAuth device error",
+  "ridex login does not fall back for another OAuth device error",
   async () => {
     home = mkdtempSync(join(tmpdir(), "fx-tui-login-client-no-fallback-"));
     writeSeededFxLogin(home);
@@ -3793,7 +3793,7 @@ test(
     expect(deviceRequests).toHaveLength(1);
     expect(deviceRequests[0].clientId).toBe("test-client");
     expect(result.stdout).toBe("");
-    expect(result.stderr).toBe("fx login: failed to sign in\n");
+    expect(result.stderr).toBe("ridex login: failed to sign in\n");
     expect(result.stderr).not.toContain(oauth.providerDetail);
     expect(readFileSync(authPath, "utf8")).toBe(seededAuthFile);
   },
@@ -3862,12 +3862,12 @@ tmuxTest(
     await session.waitForComposer(TIMEOUT);
     await openSwitchCredential(session);
     await session.waitForPane(
-      (pane) => pane.includes("AI_GATEWAY_API_KEY") && pane.includes("fx login"),
+      (pane) => pane.includes("AI_GATEWAY_API_KEY") && pane.includes("ridex login"),
       TIMEOUT,
     );
     await session.sendKeys("Down");
     await session.sendKeys("Enter");
-    await session.sendText("prove fx login is active before logout");
+    await session.sendText("prove ridex login is active before logout");
     await session.waitForText(LOGIN_RESPONSE, TIMEOUT);
     expect(gateway.requests[0].headers.get("authorization")).toBe(`Bearer ${LOGIN_TOKEN}`);
 
@@ -3891,7 +3891,7 @@ tmuxTest(
       (pane) => pane.includes("AI_GATEWAY_API_KEY") && pane.includes("Automatic"),
       TIMEOUT,
     );
-    expect(inventory).not.toMatch(/^\s+fx login\s+(?:current|available)\s*$/m);
+    expect(inventory).not.toMatch(/^\s+ridex login\s+(?:current|available)\s*$/m);
     await session.sendKeys("Escape");
 
     await session.sendText("prove environment auth remains active");
@@ -3926,7 +3926,7 @@ tmuxTest(
 );
 
 tmuxTest(
-  "logout preserves an active API key when fx login is inactive",
+  "logout preserves an active API key when ridex login is inactive",
   async () => {
     home = mkdtempSync(join(tmpdir(), "fx-tui-logout-inactive-login-"));
     stderrPath = join(home, "stderr.log");
@@ -3953,7 +3953,7 @@ tmuxTest(
 );
 
 tmuxTest(
-  "logout removes an fx login rejected for unsafe permissions",
+  "logout removes an ridex login rejected for unsafe permissions",
   async () => {
     home = mkdtempSync(join(tmpdir(), "fx-tui-logout-rejected-login-"));
     stderrPath = join(home, "stderr.log");
@@ -4006,7 +4006,7 @@ tmuxTest(
 
     await session.sendText("/logout");
     const failed = await session.waitForText(
-      "Could not confirm durable fx logout. The active source was recalculated.",
+      "Could not confirm durable ridex logout. The active source was recalculated.",
       TIMEOUT,
     );
     expect(failed).not.toContain("Signed out of fx.");
@@ -4054,7 +4054,7 @@ tmuxTest(
         pane.includes("Credential source"),
       TIMEOUT,
     );
-    expect(inventory).not.toMatch(/^\s+fx login\s+/m);
+    expect(inventory).not.toMatch(/^\s+ridex login\s+/m);
     await session.sendKeys("Escape");
     await session.waitForPane(
       (pane) => !pane.includes("Connections") && !pane.includes("Routing"),
@@ -4072,7 +4072,7 @@ tmuxTest(
         pane.includes("Esc to set up later"),
       TIMEOUT,
     );
-    expect(picker).not.toMatch(/^\s+fx login\s+/m);
+    expect(picker).not.toMatch(/^\s+ridex login\s+/m);
     expect(picker).not.toContain("Switch credential");
     expect(picker).not.toContain("Skip for now");
     expect(gateway.requests).toHaveLength(0);
@@ -4130,7 +4130,7 @@ tmuxTest(
     await session.waitForComposer(TIMEOUT);
     await openSwitchCredential(session);
     await session.waitForPane(
-      (pane) => pane.includes("AI_GATEWAY_API_KEY") && pane.includes("fx login"),
+      (pane) => pane.includes("AI_GATEWAY_API_KEY") && pane.includes("ridex login"),
       TIMEOUT,
     );
     await session.sendKeys("Down");
@@ -4146,7 +4146,7 @@ tmuxTest(
     await session.sendKeys("Enter");
     const failed = await session.waitForPane(
       (pane) =>
-        pane.includes("fx login credential refresh failed.") &&
+        pane.includes("ridex login credential refresh failed.") &&
         pane.includes("Run /login to repair this source.") &&
         !pane.includes("Setup"),
       TIMEOUT,
@@ -4314,7 +4314,7 @@ tmuxTest(
 );
 
 tmuxTest(
-  "ready team catalog downgrades after fx login expiry and refresh failure",
+  "ready team catalog downgrades after ridex login expiry and refresh failure",
   async () => {
     home = mkdtempSync(join(tmpdir(), "fx-tui-auth-ready-catalog-expiry-"));
     stderrPath = join(home, "stderr.log");
@@ -4379,7 +4379,7 @@ tmuxTest(
     await session.waitForPane(
       (pane) =>
         pane.includes(blockedPrompt) &&
-        pane.includes("fx login credential refresh failed.") &&
+        pane.includes("ridex login credential refresh failed.") &&
         pane.includes("Run /login to repair this source.") &&
         !pane.includes("Model provider"),
       TIMEOUT,
@@ -4447,7 +4447,7 @@ tmuxTest(
     const firstFailure = await session.waitForPane(
       (pane) =>
         pane.includes(firstPrompt) &&
-        pane.includes("fx login credential refresh failed.") &&
+        pane.includes("ridex login credential refresh failed.") &&
         pane.includes("Run /login to repair this source.") &&
         !pane.includes("Model provider"),
       TIMEOUT,
@@ -4478,7 +4478,7 @@ tmuxTest(
     await session.waitForPane(
       (pane) =>
         pane.includes(secondPrompt) &&
-        pane.includes("fx login credential refresh failed.") &&
+        pane.includes("ridex login credential refresh failed.") &&
         pane.includes("Run /login to repair this source.") &&
         !pane.includes("Model provider"),
       TIMEOUT,
@@ -4603,7 +4603,7 @@ tmuxTest(
     await session.sendText("/credits");
     const failed = await session.waitForPane(
       (pane) =>
-        pane.includes("fx login credential refresh failed.") &&
+        pane.includes("ridex login credential refresh failed.") &&
         pane.includes("Run /login to repair this source.") &&
         pane.includes("/credits"),
       TIMEOUT,
