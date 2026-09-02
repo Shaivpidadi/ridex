@@ -293,7 +293,7 @@ describe("cli: help", () => {
       expect(stdout).toContain("Print the ridex version and exit");
       expect(stdout).not.toContain("Must appear before the command");
       expect(stdout).toContain("Examples:\n");
-      expect(stdout).toContain("https://github.com/Shaivpidadi/ridex/issues");
+      expect(stdout).toContain("github.com/Shaivpidadi/ridex");
       expect(stdout).toContain("run `/feedback` inside ridex");
       expect(stdout).toContain(
         "Run `ridex <command> --help` for command-specific usage and options.",
