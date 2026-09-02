@@ -2691,17 +2691,17 @@ test "partially visible auth picker shows a source window without duplicates" {
     var first_source = try composeAuthPickerRow(alloc, view, 2, 4, 80);
     defer first_source.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, first_source.items, "AI_GATEWAY_API_KEY") != null);
-    try std.testing.expect(std.mem.find(u8, first_source.items, "fx login") == null);
+    try std.testing.expect(std.mem.find(u8, first_source.items, "ridex login") == null);
 
     var selected_source = try composeAuthPickerRow(alloc, view, 3, 4, 80);
     defer selected_source.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, selected_source.items, "fx login") != null);
+    try std.testing.expect(std.mem.find(u8, selected_source.items, "ridex login") != null);
 
     var scrolled_view = view;
     scrolled_view.selected_choice = .{ .source = .stored_key };
     var scrolled_first = try composeAuthPickerRow(alloc, scrolled_view, 2, 4, 80);
     defer scrolled_first.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, scrolled_first.items, "fx login") != null);
+    try std.testing.expect(std.mem.find(u8, scrolled_first.items, "ridex login") != null);
 
     var scrolled_selected = try composeAuthPickerRow(alloc, scrolled_view, 3, 4, 80);
     defer scrolled_selected.deinit(alloc);

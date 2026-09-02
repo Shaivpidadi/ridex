@@ -6464,7 +6464,7 @@ test "processQueuedPrompt non-ok gateway response records schema diagnostics" {
     try std.testing.expect(std.mem.find(u8, call.gatewayRequestShape(), "prompt.1 role=user content=array") != null);
 }
 
-test "processQueuedPrompt refreshes fx login credential before gateway request" {
+test "processQueuedPrompt refreshes ridex login credential before gateway request" {
     const alloc = std.testing.allocator;
     const completions = [_]FakeCompletion{.{ .content = "Done." }};
     var gateway = FakeGateway.init(alloc, &completions);
@@ -6484,7 +6484,7 @@ test "processQueuedPrompt refreshes fx login credential before gateway request" 
     try std.testing.expectEqual(runtime_deps.CredentialRefreshMode.if_needed, hooks.credential_refresh_modes.items[0]);
 }
 
-test "processQueuedPrompt refreshes and retries once after fx login 401" {
+test "processQueuedPrompt refreshes and retries once after ridex login 401" {
     const alloc = std.testing.allocator;
     const completions = [_]FakeCompletion{
         .{
@@ -6544,7 +6544,7 @@ test "forced auth refresh reaches later permission and tool consumers in the sam
     try std.testing.expectEqualStrings("fresh-after-401", hooks.last_execute_credential.?);
 }
 
-test "processQueuedPrompt does not retry a second fx login 401" {
+test "processQueuedPrompt does not retry a second ridex login 401" {
     const alloc = std.testing.allocator;
     const completions = [_]FakeCompletion{
         .{
@@ -6656,7 +6656,7 @@ test "Codex 401 account change makes no second provider request" {
     try std.testing.expectEqual(types.TurnPresentationOutcome.failed, hooks.finalized_outcome.?);
 }
 
-test "processQueuedPrompt keeps the selected fx login credential when forced refresh is unavailable" {
+test "processQueuedPrompt keeps the selected ridex login credential when forced refresh is unavailable" {
     const alloc = std.testing.allocator;
     const completions = [_]FakeCompletion{
         .{

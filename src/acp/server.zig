@@ -1359,7 +1359,7 @@ fn handleKernelCheckpoint(
     const active = activeLibfxSession(state, parsed.value) orelse
         return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_params,
-            .message = "Unknown libfx session",
+            .message = "Unknown libridex session",
         });
     const bytes = active.session_rt.agent.checkpoint(alloc) catch
         return state.writer.writeError(alloc, msg.id, .{
@@ -1391,7 +1391,7 @@ fn handleKernelRestore(
     const active = activeLibfxSession(state, parsed.value) orelse
         return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_params,
-            .message = "Unknown libfx session",
+            .message = "Unknown libridex session",
         });
     const checkpoint = parsed.value.object.get("checkpoint") orelse
         return state.writer.writeError(alloc, msg.id, .{

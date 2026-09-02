@@ -9071,7 +9071,7 @@ fn renderAuthenticationRequired(
         try writeEncodedJsonScalar(alloc, &out.writer, server.config.name);
         switch (mode) {
             .oauth => try out.writer.writeAll(
-                ",\"interactive\":true,\"message\":\"Run /mcp auth for this server in an interactive fx session.\"",
+                ",\"interactive\":true,\"message\":\"Run /mcp auth for this server in an interactive ridex session.\"",
             ),
             .bearer_environment => {
                 try out.writer.writeAll(

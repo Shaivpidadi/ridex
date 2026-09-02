@@ -913,13 +913,13 @@ pub const SessionListSnapshot = struct {
         }
         if (self.has_more) {
             try out.writer.print(
-                "[sessions] more saved sessions; continue with `fx sessions {s}--cursor {s}`\n",
+                "[sessions] more saved sessions; continue with `ridex sessions {s}--cursor {s}`\n",
                 .{ if (self.all_workspaces) "--all " else "", self.next_cursor orelse "" },
             );
         }
         if (self.skipped_invalid > 0) {
             try out.writer.print(
-                "[sessions] warning: skipped {d} unreadable saved session{s}; run `fx doctor` for recovery guidance\n",
+                "[sessions] warning: skipped {d} unreadable saved session{s}; run `ridex doctor` for recovery guidance\n",
                 .{ self.skipped_invalid, if (self.skipped_invalid == 1) "" else "s" },
             );
         }
@@ -1902,7 +1902,7 @@ test "command failure snapshot renders stable escaped json" {
 test "core status snapshot text and json stay stable" {
     const snapshot = StatusSnapshot{
         .model = "alpha",
-        .auth_help = "fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.",
+        .auth_help = "fx needs access to Vercel AI Gateway. Run ridex login to sign in, ridex setup to use an API key, or set AI_GATEWAY_API_KEY.",
         .permission_mode = .ask,
         .workspace_root = "/tmp/fx",
         .history_turns = 3,
@@ -1913,14 +1913,14 @@ test "core status snapshot text and json stay stable" {
     const text = try snapshot.renderText(std.testing.allocator);
     defer std.testing.allocator.free(text);
     try std.testing.expectEqualStrings(
-        "[status] model=alpha\n[status] update_channel=stable\n[status] build_channel=stable\n[status] auth=missing\n[status] auth_refreshable=false\n[status] auth_help=fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.\n[status] permission_mode=ask\n[status] workspace=/tmp/fx\n[status] history_turns=3\n[status] session_permission_grants=1\n[status] agent_step_limit=24\n",
+        "[status] model=alpha\n[status] update_channel=stable\n[status] build_channel=stable\n[status] auth=missing\n[status] auth_refreshable=false\n[status] auth_help=fx needs access to Vercel AI Gateway. Run ridex login to sign in, ridex setup to use an API key, or set AI_GATEWAY_API_KEY.\n[status] permission_mode=ask\n[status] workspace=/tmp/fx\n[status] history_turns=3\n[status] session_permission_grants=1\n[status] agent_step_limit=24\n",
         text,
     );
 
     const json = try snapshot.renderJson(std.testing.allocator);
     defer std.testing.allocator.free(json);
     try std.testing.expectEqualStrings(
-        "{\"kind\":\"status\",\"model\":\"alpha\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"missing\",\"auth_refreshable\":false,\"auth_help\":\"fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.\",\"permission_mode\":\"ask\",\"workspace\":\"/tmp/fx\",\"history_turns\":3,\"session_permission_grants\":1,\"agent_step_limit\":24}",
+        "{\"kind\":\"status\",\"model\":\"alpha\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"missing\",\"auth_refreshable\":false,\"auth_help\":\"fx needs access to Vercel AI Gateway. Run ridex login to sign in, ridex setup to use an API key, or set AI_GATEWAY_API_KEY.\",\"permission_mode\":\"ask\",\"workspace\":\"/tmp/fx\",\"history_turns\":3,\"session_permission_grants\":1,\"agent_step_limit\":24}",
         json,
     );
 }
@@ -1939,14 +1939,14 @@ test "core status snapshot includes selected team when present" {
     const text = try snapshot.renderText(std.testing.allocator);
     defer std.testing.allocator.free(text);
     try std.testing.expectEqualStrings(
-        "[status] model=alpha\n[status] update_channel=stable\n[status] build_channel=stable\n[status] auth=fx login\n[status] auth_refreshable=true\n[status] team=example-team\n[status] permission_mode=ask\n[status] workspace=/tmp/fx\n[status] history_turns=0\n[status] session_permission_grants=0\n[status] agent_step_limit=24\n",
+        "[status] model=alpha\n[status] update_channel=stable\n[status] build_channel=stable\n[status] auth=ridex login\n[status] auth_refreshable=true\n[status] team=example-team\n[status] permission_mode=ask\n[status] workspace=/tmp/fx\n[status] history_turns=0\n[status] session_permission_grants=0\n[status] agent_step_limit=24\n",
         text,
     );
 
     const json = try snapshot.renderJson(std.testing.allocator);
     defer std.testing.allocator.free(json);
     try std.testing.expectEqualStrings(
-        "{\"kind\":\"status\",\"model\":\"alpha\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"fx login\",\"auth_refreshable\":true,\"team\":\"example-team\",\"permission_mode\":\"ask\",\"workspace\":\"/tmp/fx\",\"history_turns\":0,\"session_permission_grants\":0,\"agent_step_limit\":24}",
+        "{\"kind\":\"status\",\"model\":\"alpha\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"ridex login\",\"auth_refreshable\":true,\"team\":\"example-team\",\"permission_mode\":\"ask\",\"workspace\":\"/tmp/fx\",\"history_turns\":0,\"session_permission_grants\":0,\"agent_step_limit\":24}",
         json,
     );
 }
@@ -2264,7 +2264,7 @@ test "core session list snapshot text and json stay stable" {
     defer std.testing.allocator.free(paged_text);
     try std.testing.expectEqualStrings(
         "[sessions] 1 saved\n - Session title\n   id=abc | 3 turns | Spanish | updated 1970-01-01 00:00:00.002 UTC\n" ++
-            "[sessions] more saved sessions; continue with `fx sessions --cursor v1:2:abc`\n",
+            "[sessions] more saved sessions; continue with `ridex sessions --cursor v1:2:abc`\n",
         paged_text,
     );
 

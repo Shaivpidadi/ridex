@@ -2037,7 +2037,7 @@ test "surface footer keeps the selected auth source visible at minimum height" {
     defer frame.deinit(alloc);
 
     for (frame.composed.rows.items) |row| {
-        if (std.mem.find(u8, row.text.items, "fx login") != null) return;
+        if (std.mem.find(u8, row.text.items, "ridex login") != null) return;
     }
     return error.SelectedAuthSourceNotVisible;
 }

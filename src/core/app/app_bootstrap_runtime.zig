@@ -396,7 +396,7 @@ pub fn Runtime(comptime App: type) type {
                     try app.writeDomainNotice(.{
                         .topic = "auth",
                         .tone = .warning,
-                        .body = "The saved fx login could not be loaded. No other credential was selected; run /login to repair this source.",
+                        .body = "The saved ridex login could not be loaded. No other credential was selected; run /login to repair this source.",
                     }, true);
                 }
             }
