@@ -160,6 +160,9 @@ pub fn Runtime(comptime App: type) type {
                     .topic = "auth",
                     .tone = .warning,
                     .body = switch (provider) {
+                        // Unreachable in practice: freeride resolution always
+                        // yields the synthetic credential, never .missing.
+                        .freeride => credentials.missing_interactive_credential_message,
                         .gateway => credentials.missing_interactive_credential_message,
                         .codex => credentials.missing_chatgpt_interactive_credential_message,
                         .grok => credentials.missing_grok_interactive_credential_message,

@@ -127,6 +127,10 @@ pub fn providerOptions(out: *[max_provider_options][]const u8) usize {
 
 pub fn providerMethods(id: model_provider.ProviderId) []const Method {
     return switch (id) {
+        // FreeRide needs no sign-in method: the local gateway holds the
+        // provider keys (freeride init); the agent-side credential is
+        // synthetic.
+        .freeride => &.{},
         .gateway => &.{ .oauth, .api_key },
         .codex, .grok => &.{},
     };
@@ -146,7 +150,9 @@ test "provider options expose the catalog slugs the composer accepts" {
     const count = providerOptions(&buf);
 
     try std.testing.expect(count >= 2);
-    try std.testing.expectEqualStrings("vercel", buf[0]);
+    // The fork's default provider leads the catalog; Vercel follows.
+    try std.testing.expectEqualStrings("freeride", buf[0]);
+    try std.testing.expectEqualStrings("vercel", buf[1]);
     for (buf[0..count]) |slug| {
         try std.testing.expect(provider_catalog.parse(slug) != null);
         try std.testing.expect(std.mem.indexOfScalar(u8, slug, ' ') == null);

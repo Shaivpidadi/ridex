@@ -663,8 +663,10 @@ test "provider column lists every provider and marks the active one" {
 
     const column = columnFor(&app, .provider, "");
     try std.testing.expect(column.count >= 2);
-    try std.testing.expectEqualStrings("vercel", column.labels[0]);
+    // The fork's default provider leads the catalog and is active.
+    try std.testing.expectEqualStrings("freeride", column.labels[0]);
     try std.testing.expectEqualStrings("current", column.annotations[0]);
+    try std.testing.expectEqualStrings("vercel", column.labels[1]);
     for (column.annotations[1..column.count]) |annotation| {
         try std.testing.expectEqualStrings("", annotation);
     }
@@ -685,6 +687,7 @@ test "method column marks the credential the active provider is using" {
     var app = ColumnTestApp.init(alloc);
     defer app.deinit();
     app.auth.source = .ai_gateway_api_key;
+    try app.provider_selection.replaceSelection(.gateway, "");
     try app.input_runtime.picker.beginProviderPickerFlow(alloc, "vercel", "", .method);
 
     const column = columnFor(&app, .method, "");
@@ -731,6 +734,7 @@ test "key source column offers only detected keys plus new" {
     const alloc = std.testing.allocator;
     var app = ColumnTestApp.init(alloc);
     defer app.deinit();
+    try app.provider_selection.replaceSelection(.gateway, "");
     try app.input_runtime.picker.beginProviderPickerFlow(alloc, "vercel", "api-key", .key_source);
 
     // Nothing detected: only `new` remains.

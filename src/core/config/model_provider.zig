@@ -20,9 +20,17 @@ pub const default_provider: ProviderId = .freeride;
 /// them to `gateway` through this instead of rewriting hundreds of
 /// fixtures — and users get an escape hatch for free.
 pub fn defaultProvider() ProviderId {
-    const raw = io_mod.getenv("FX_DEFAULT_PROVIDER") orelse return default_provider;
-    return parse(raw) orelse default_provider;
+    const fallback = surface_default orelse default_provider;
+    const raw = io_mod.getenv("FX_DEFAULT_PROVIDER") orelse return fallback;
+    return parse(raw) orelse fallback;
 }
+
+/// Per-surface compiled default, set by host mains before any session
+/// starts. The CLI/TUI ships freeride-first; the embeddable SDK
+/// surfaces (napi/wasm) declare `.gateway` because their public
+/// contract is gateway-shaped — `apiKey` is required and maps to
+/// AI_GATEWAY_API_KEY. `FX_DEFAULT_PROVIDER` still overrides.
+pub var surface_default: ?ProviderId = null;
 
 /// FreeRide's smart-router preset tuned for agent tool-calling.
 pub const freeride_default_model = "freeride/coding";

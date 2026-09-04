@@ -7,6 +7,7 @@ const provider_set = @import("core/gateway/provider_set.zig");
 const context_contract = @import("core/workspace/context_contract.zig");
 const host = @import("core/hosts/host.zig");
 const io_mod = @import("core/shared/io.zig");
+const model_provider = @import("core/config/model_provider.zig");
 const fetch_state = @import("napi_fetch_state.zig");
 const streamable_http = @import("core/mcp/streamable_http.zig");
 const host_stream_provider = @import("gateway/host_stream_provider.zig");
@@ -625,6 +626,7 @@ fn ensureThreadedIo() void {
         io_mod.setIo(threaded_io.?.io());
         const raw_environ: io_mod.RawEnviron = @ptrCast(std.c.environ);
         io_mod.setRawEnviron(raw_environ);
+        model_provider.surface_default = .gateway;
         threaded_io_state.store(2, .release);
         return;
     }
