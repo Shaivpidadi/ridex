@@ -31,6 +31,9 @@ pub fn main(init: std.process.Init) !void {
     io_mod.setIo(init.io);
     io_mod.setEnvironMap(init.environ_map);
     model_provider.surface_default = .gateway;
+    // Keep transport-URL resolution in step with the surface default —
+    // the wasm host agent doesn't run the CLI's provider republish.
+    model_provider.active_transport_provider = model_provider.defaultProvider();
     try acp_server.run(std.heap.c_allocator, .{
         .default_model = builtin_gateway.default_model,
         .default_agent_step_limit = 64,

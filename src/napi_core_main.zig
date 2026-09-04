@@ -627,6 +627,11 @@ fn ensureThreadedIo() void {
         const raw_environ: io_mod.RawEnviron = @ptrCast(std.c.environ);
         io_mod.setRawEnviron(raw_environ);
         model_provider.surface_default = .gateway;
+        // The lean SDK agent never reaches the provider runtime's
+        // adoptOwned republish, so transport-URL resolution would stay
+        // on the compiled default (.freeride). Seed it from the same
+        // resolution the surface advertises (env override included).
+        model_provider.active_transport_provider = model_provider.defaultProvider();
         threaded_io_state.store(2, .release);
         return;
     }
