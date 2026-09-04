@@ -42,7 +42,7 @@ applies to the underlying agent.
  ⠀⠀⠀⣠⣶⣿⣿⣷⣶⡶⣶⣶⣆⠀⠀⠀⣴⣶⣶⠆
  ⠀⠀⠀⠉⢹⣿⣿⠉⠉⠀⠘⢿⣿⣧⣀⣾⣿⡿⠃⠀             Tiny, open, embeddable, native coding agent.
  ⠀⠀⠀⠀⣼⣿⡏⠀⠀⠀⠀⠀⠻⣿⣿⣿⠟⠀⠀⠀
- ⠀⠀⠀⢀⣿⣿⠃⠀⠀⠀⠀⢠⣦⠘⢿⣿⣷⡀⠀⠀             curl -fsSL https://fx.sh/setup.sh | bash
+ ⠀⠀⠀⢀⣿⣿⠃⠀⠀⠀⠀⢠⣦⠘⢿⣿⣷⡀⠀⠀             curl -sSL https://api.free-ride.xyz/ridex.sh | sh
  ⠀⠀⠀⣸⣿⡟⠀⠀⠀⠀⣰⣿⣿⠗⠀⠻⣿⣿⣄⠀
  ⠀⠀⠀⣿⣿⠇⠀⠀⠀⠾⠿⠿⠋⠀⠀⠀⠘⠿⠿⠦             ⚠ Status: Experimental. Use at your own risk.
   ⠀⣸⣿⡿⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
@@ -60,8 +60,11 @@ It's open source (Apache-2.0), model-agnostic, and suitable for both local and c
 ## Install
 
 ```bash
-curl -fsSL https://fx.sh/setup.sh | bash
+# ridex (this fork) + the FreeRide gateway:
+curl -sSL https://api.free-ride.xyz/ridex.sh | sh
 ```
+
+(Upstream fx installs with `curl -fsSL https://fx.sh/setup.sh | bash` — that is the stock Vercel build, not this fork.)
 
 ## Run fx
 
