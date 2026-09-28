@@ -201,6 +201,22 @@ pub const Manager = struct {
         m.root_open = true;
     }
 
+    /// `ready` for calls that only find or read: a missing root is not
+    /// created, so reading on a machine that never saved a session writes
+    /// nothing. False means there is nothing to find.
+    fn readyToRead(m: *Manager) storage.IoFault!bool {
+        {
+            const io = m.env.s.io;
+            m.root_mutex.lockUncancelable(io);
+            defer m.root_mutex.unlock(io);
+            if (m.root_open) return true;
+        }
+        const present = m.env.s.rootExists(m.root_path) catch |io_err| return storage.ioFault(io_err);
+        if (!present) return false;
+        try ready(m);
+        return true;
+    }
+
     fn catalog(m: *Manager) catalog_mod.Catalog {
         return .{ .env = &m.env, .lock = &m.index_lock };
     }
@@ -234,15 +250,17 @@ pub const Manager = struct {
     pub fn openResume(m: *Manager, options: ResumeOptions) OpenError!Session {
         try checkText(options.workspace);
         if (options.parent) |p| try checkId(p);
-        try ready(m);
+        // Arguments are checked before the disk is asked anything.
+        switch (options.target) {
+            .id => |id| try checkId(id),
+            .last, .last_opened => {},
+        }
+        if (!try readyToRead(m)) return error.NotFound;
         // An id resolved from the index is owned here.
         var resolved: ?[]u8 = null;
         defer if (resolved) |r| m.gpa.free(r);
         const id: []const u8 = switch (options.target) {
-            .id => |id| blk: {
-                try checkId(id);
-                break :blk id;
-            },
+            .id => |id| id,
             .last, .last_opened => blk: {
                 const target: catalog_mod.Target = switch (options.target) {
                     .last => .last,
@@ -332,7 +350,7 @@ pub const Manager = struct {
     pub fn read(m: *Manager, gpa: std.mem.Allocator, id: []const u8, from: From, direction: Direction, limit: usize) ReadError!Page {
         try checkId(id);
         if (limit == 0) return error.InvalidArgument;
-        try ready(m);
+        if (!try readyToRead(m)) return error.NotFound;
         return session_mod.readPage(&m.env, gpa, id, from, direction, limit);
     }
 
@@ -340,13 +358,13 @@ pub const Manager = struct {
     pub fn getBlob(m: *Manager, gpa: std.mem.Allocator, id: []const u8, hash: []const u8) BlobError![]u8 {
         try checkId(id);
         if (!schema.validBlobHash(hash)) return error.InvalidArgument;
-        try ready(m);
+        if (!try readyToRead(m)) return error.NotFound;
         return session_mod.readBlob(&m.env, gpa, id, hash);
     }
 
     /// Root sessions, newest first, from the index alone.
     pub fn list(m: *Manager, gpa: std.mem.Allocator, filter: Filter, cursor: ?ListCursor, limit: usize) ListError!ListPage {
-        try ready(m);
+        if (!try readyToRead(m)) return .{ .arena = .init(gpa), .items = &.{}, .next = null };
         return m.catalog().list(gpa, filter, cursor, @max(limit, 1));
     }
 
@@ -356,7 +374,7 @@ pub const Manager = struct {
     /// the matching terminal folders (D13).
     pub fn delete(m: *Manager, id: []const u8) DeleteError!void {
         try checkId(id);
-        try ready(m);
+        if (!try readyToRead(m)) return error.NotFound;
         return m.deleteDepth(id, 0);
     }
 
@@ -380,7 +398,7 @@ pub const Manager = struct {
     /// Doctor: checks every line and snapshot of one session.
     pub fn verify(m: *Manager, id: []const u8) VerifyError!Verified {
         try checkId(id);
-        try ready(m);
+        if (!try readyToRead(m)) return error.NotFound;
         return session_mod.verifySession(&m.env, id) catch |err| switch (err) {
             error.NotFound, error.OutOfMemory => |e| e,
             error.Busy, error.ChildSession, error.Corrupt, error.UnsupportedVersion => error.Io,
@@ -807,6 +825,29 @@ const api_tests = struct {
         _ = try t.append(&.{ .turn_started, piece, .turn_committed });
         var root = try f.dir();
         root.close(io);
+    }
+
+    test "reads before any session create nothing on disk" {
+        var f: Fixture = undefined;
+        try f.init();
+        defer f.deinit();
+        // An editor listing sessions on a machine that never saved one.
+        var page = try f.manager.list(gpa, .all, null, 10);
+        try testing.expectEqual(@as(usize, 0), page.items.len);
+        page.deinit();
+        try testing.expectError(error.NotFound, f.manager.read(gpa, "AAAAAAAAAAAA", .start, .forward, 10));
+        try testing.expectError(error.NotFound, f.manager.getBlob(gpa, "AAAAAAAAAAAA", "0" ** 64));
+        try testing.expectError(error.NotFound, f.manager.openResume(.{ .target = .last, .workspace = "/w", .host = .acp }));
+        try testing.expectError(error.NotFound, f.manager.verify("AAAAAAAAAAAA"));
+        try testing.expectError(error.NotFound, f.manager.delete("AAAAAAAAAAAA"));
+        try testing.expectError(error.FileNotFound, f.dir());
+        // Once a session is saved, the same calls find it.
+        const s = try f.manager.openNew(.{ .workspace = "/w", .host = .acp });
+        _ = try s.append(&.{ .turn_started, piece, .turn_committed });
+        s.release();
+        var listed = try f.manager.list(gpa, .all, null, 10);
+        defer listed.deinit();
+        try testing.expectEqual(@as(usize, 1), listed.items.len);
     }
 
     test "a read-only session folder fails with AccessDenied, not Io (D29)" {
