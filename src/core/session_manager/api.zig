@@ -137,6 +137,23 @@ pub const ImportOptions = struct {
     created_ms: u64,
 };
 
+/// A saved session as `peek` reads it. Owns everything; free with `deinit`.
+pub const Peeked = struct {
+    role: Role,
+    /// A child's parent; null for a root.
+    parent: ?[]u8 = null,
+    workspace: []u8,
+    /// With `created_ms` and `updated_ms` set, as `Session.state` sets them.
+    state: State,
+
+    pub fn deinit(p: *Peeked, gpa: std.mem.Allocator) void {
+        if (p.parent) |value| gpa.free(value);
+        gpa.free(p.workspace);
+        p.state.deinit(gpa);
+        p.* = undefined;
+    }
+};
+
 pub const Manager = struct {
     gpa: std.mem.Allocator,
     root_path: []u8,
@@ -367,6 +384,28 @@ pub const Manager = struct {
     }
 
     /// A blob's bytes, checked against its hash. The caller frees them.
+    /// A saved session's state, folded without its lock as the catalog
+    /// reads it: line 1, the newest snapshot, then the tail (D37). A torn
+    /// tail is left as it is, and a child needs no parent to be read.
+    pub fn peek(m: *Manager, gpa: std.mem.Allocator, id: []const u8) OpenError!Peeked {
+        try checkId(id);
+        if (!try readyToRead(m)) return error.NotFound;
+        var summary = try session_mod.readSummary(&m.env, id);
+        defer summary.deinit(m.gpa);
+        var state = try summary.state.clone(gpa);
+        errdefer state.deinit(gpa);
+        state.created_ms = summary.created_ms;
+        state.updated_ms = summary.updated_ms;
+        const workspace = try gpa.dupe(u8, summary.identity.workspace);
+        errdefer gpa.free(workspace);
+        return .{
+            .role = summary.identity.role,
+            .parent = if (summary.identity.parent) |parent| try gpa.dupe(u8, parent) else null,
+            .workspace = workspace,
+            .state = state,
+        };
+    }
+
     pub fn getBlob(m: *Manager, gpa: std.mem.Allocator, id: []const u8, hash: []const u8) BlobError![]u8 {
         try checkId(id);
         if (!schema.validBlobHash(hash)) return error.InvalidArgument;
@@ -1123,6 +1162,62 @@ const api_tests = struct {
             try testing.expectEqual(b.kind, a.kind);
             try testing.expectEqual(b.ts_ms, a.ts_ms);
         }
+    }
+
+    test "peek reads a session without its lock and repairs nothing (D37)" {
+        var f: Fixture = undefined;
+        try f.init();
+        defer f.deinit();
+        const m = f.manager;
+        // Nothing saved yet: NotFound, and the root is not created.
+        try testing.expectError(error.NotFound, m.peek(gpa, "1786460757753-none"));
+        try testing.expectError(error.InvalidArgument, m.peek(gpa, "../escape"));
+
+        const p = try m.openNew(.{ .workspace = "/w", .host = .app });
+        _ = try p.append(&.{ .turn_started, piece, .turn_committed, .{ .set = .{ .key = .title, .value = "\"T\"" } } });
+        const p_id = try gpa.dupe(u8, p.id());
+        defer gpa.free(p_id);
+        // Open for writing elsewhere: peek still reads it.
+        {
+            var peeked = try m.peek(gpa, p_id);
+            defer peeked.deinit(gpa);
+            try testing.expectEqual(api.Role.root, peeked.role);
+            try testing.expectEqualStrings("/w", peeked.workspace);
+            try testing.expectEqual(@as(u64, 1), peeked.state.last_turn);
+            try testing.expectEqualStrings("\"T\"", peeked.state.title.?);
+            try testing.expect(peeked.state.created_ms > 0);
+        }
+        const c = try m.openNew(.{ .workspace = "/w", .host = .child, .role = .child, .parent = p_id, .id = "1786460757753-peek-kid" });
+        _ = try p.append(&.{.{ .child_spawned = .{ .child = c.id(), .work_id = "w" } }});
+        _ = try c.append(&.{ .turn_started, .turn_committed });
+        c.release();
+        p.release();
+
+        // A child reads without its parent.
+        {
+            var peeked = try m.peek(gpa, "1786460757753-peek-kid");
+            defer peeked.deinit(gpa);
+            try testing.expectEqual(api.Role.child, peeked.role);
+            try testing.expectEqualStrings(p_id, peeked.parent.?);
+        }
+
+        // A torn tail is read around and left in place.
+        var root = try f.dir();
+        defer root.close(io);
+        const log_path = try std.fs.path.join(gpa, &.{ p_id, "log.jsonl" });
+        defer gpa.free(log_path);
+        var torn_len: u64 = 0;
+        {
+            var log = try root.openFile(io, log_path, .{ .mode = .read_write });
+            defer log.close(io);
+            try log.writePositionalAll(io, "{\"v\":1,\"seq", try log.length(io));
+            torn_len = try log.length(io);
+        }
+        var peeked = try m.peek(gpa, p_id);
+        defer peeked.deinit(gpa);
+        try testing.expectEqual(@as(u64, 1), peeked.state.last_turn);
+        const after = try root.statFile(io, log_path, .{});
+        try testing.expectEqual(torn_len, after.size);
     }
 
     test "import keeps the v1 id and the original times" {
