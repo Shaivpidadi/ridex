@@ -756,7 +756,7 @@ const TestLog = struct {
 
     fn init(seed: u64) TestLog {
         return .{
-            .tmp = testing.tmpDir(.{}),
+            .tmp = testing.tmpDir(.{ .iterate = true }),
             .fault = if (hooks) .init(testing.allocator, testing.io, seed) else {},
         };
     }
@@ -934,7 +934,7 @@ const log_model_tests = struct {
         planted: trace.Planted = .none,
 
         fn init(seed: u64) Harness {
-            return .{ .tmp = testing.tmpDir(.{}), .fault = .init(gpa, io, seed) };
+            return .{ .tmp = testing.tmpDir(.{ .iterate = true }), .fault = .init(gpa, io, seed) };
         }
 
         fn deinit(h: *Harness) void {

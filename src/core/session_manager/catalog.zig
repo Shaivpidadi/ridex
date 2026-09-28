@@ -890,7 +890,7 @@ const catalog_model_tests = struct {
     }
 
     fn runCatalogTrace(case: []const u8, planted: trace.Planted) !void {
-        var tmp = testing.tmpDir(.{});
+        var tmp = testing.tmpDir(.{ .iterate = true });
         defer tmp.cleanup();
         const base = try tmp.dir.realPathFileAlloc(io, ".", gpa);
         defer gpa.free(base);

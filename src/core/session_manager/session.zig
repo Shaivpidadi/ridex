@@ -2605,7 +2605,7 @@ const session_model_tests = struct {
     // TurnLifecycle
 
     fn runTurnTrace(case: []const u8, planted: trace.Planted) !void {
-        var tmp = testing.tmpDir(.{});
+        var tmp = testing.tmpDir(.{ .iterate = true });
         defer tmp.cleanup();
         var fault = Fault.init(gpa, io, 1);
         defer fault.deinit();
@@ -2773,7 +2773,7 @@ const session_model_tests = struct {
     };
 
     fn runLifecycleTrace(case: []const u8, planted: trace.Planted, power_loss: bool) !void {
-        var tmp = testing.tmpDir(.{});
+        var tmp = testing.tmpDir(.{ .iterate = true });
         defer tmp.cleanup();
         var fault = Fault.init(gpa, io, 5);
         defer fault.deinit();
@@ -2891,7 +2891,7 @@ const session_model_tests = struct {
     };
 
     fn runSnapshotTrace(case: []const u8, planted: trace.Planted) !void {
-        var tmp = testing.tmpDir(.{});
+        var tmp = testing.tmpDir(.{ .iterate = true });
         defer tmp.cleanup();
         var fault = Fault.init(gpa, io, 1);
         defer fault.deinit();
@@ -3094,7 +3094,7 @@ const session_model_tests = struct {
     }
 
     fn runLockTrace(case: []const u8, planted: trace.Planted) !void {
-        var tmp = testing.tmpDir(.{});
+        var tmp = testing.tmpDir(.{ .iterate = true });
         defer tmp.cleanup();
         var fault1 = Fault.init(gpa, io, 1);
         defer fault1.deinit();
@@ -3360,7 +3360,7 @@ const session_model_tests = struct {
     };
 
     fn runForkTrace(case: []const u8, planted: trace.Planted) !void {
-        var tmp = testing.tmpDir(.{});
+        var tmp = testing.tmpDir(.{ .iterate = true });
         defer tmp.cleanup();
         var fault = Fault.init(gpa, io, 1);
         defer fault.deinit();
@@ -3586,7 +3586,7 @@ const session_model_tests = struct {
     };
 
     fn runSubagentsTrace(case: []const u8, planted: trace.Planted, finish_first: bool) !void {
-        var tmp = testing.tmpDir(.{});
+        var tmp = testing.tmpDir(.{ .iterate = true });
         defer tmp.cleanup();
         var fault = Fault.init(gpa, io, 1);
         defer fault.deinit();
@@ -3637,7 +3637,7 @@ const session_model_tests = struct {
     }
 
     test "Subagents trace: a named child fails, works again, is cancelled; a crash interrupts another" {
-        var tmp = testing.tmpDir(.{});
+        var tmp = testing.tmpDir(.{ .iterate = true });
         defer tmp.cleanup();
         var fault = Fault.init(gpa, io, 1);
         defer fault.deinit();
