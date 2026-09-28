@@ -94,6 +94,10 @@ pub const NewOptions = struct {
     role: Role = .root,
     /// Required for a child session.
     parent: ?[]const u8 = null,
+    /// A child's id, already named in its parent's `child_spawned` (D34); a
+    /// root always gets a fresh one. A taken id fails the first turn's
+    /// append and leaves the existing session as it was.
+    id: ?[]const u8 = null,
 };
 
 pub const ResumeTarget = union(enum) {
@@ -237,11 +241,16 @@ pub const Manager = struct {
     pub fn openNew(m: *Manager, options: NewOptions) OpenError!Session {
         try checkText(options.workspace);
         try checkRoleParent(options.role, options.parent);
+        if (options.id) |id| {
+            if (options.role != .child) return error.InvalidArgument;
+            try checkId(id);
+        }
         const inner = try session_mod.openNew(&m.env, .{
             .workspace = options.workspace,
             .host = options.host,
             .role = options.role,
             .parent = options.parent,
+            .id = options.id,
         });
         return .{ .manager = m, .inner = inner };
     }
@@ -1055,6 +1064,65 @@ const api_tests = struct {
         // A deleted id never comes back, not even through an import.
         try testing.expectError(error.Exists, m.openImport(.{ .id = p_id, .workspace = "/w", .host = .app, .created_ms = 1 }));
         try testing.expectError(error.NotFound, m.delete(p_id));
+    }
+
+    test "a child opens under the id its parent recorded, until its first turn creates the log (D34)" {
+        var f: Fixture = undefined;
+        try f.init();
+        defer f.deinit();
+        const m = f.manager;
+        const p = try m.openNew(.{ .workspace = "/w", .host = .app });
+        defer p.release();
+        const child_id = "1786460757753-child";
+        _ = try p.append(&.{ .turn_started, .{ .child_spawned = .{ .child = child_id, .work_id = "w1" } } });
+
+        // The first attempt never starts a turn, as when a crash loses the work:
+        // nothing reaches the disk, and the id stays free for the next attempt.
+        const lost = try m.openNew(.{ .workspace = "/w", .host = .child, .role = .child, .parent = p.id(), .id = child_id });
+        try testing.expectEqualStrings(child_id, lost.id());
+        lost.release();
+        try testing.expectError(error.NotFound, m.read(gpa, child_id, .start, .forward, 1));
+
+        const c = try m.openNew(.{ .workspace = "/w", .host = .child, .role = .child, .parent = p.id(), .id = child_id });
+        _ = try c.append(&.{ .turn_started, piece, .turn_committed });
+        c.release();
+        var page = try m.read(gpa, child_id, .start, .forward, 1);
+        defer page.deinit();
+        try testing.expectEqual(api.Kind.session_created, page.entries[0].kind.?);
+        // Resuming it needs its parent, as for any child.
+        try testing.expectError(error.ChildSession, m.openResume(.{ .target = .{ .id = child_id }, .workspace = "/w", .host = .child }));
+        const again = try m.openResume(.{ .target = .{ .id = child_id }, .workspace = "/w", .host = .child, .parent = p.id() });
+        again.release();
+    }
+
+    test "only a child takes an id, it must be valid, and a taken id never replaces a session (D34)" {
+        var f: Fixture = undefined;
+        try f.init();
+        defer f.deinit();
+        const m = f.manager;
+        try testing.expectError(error.InvalidArgument, m.openNew(.{ .workspace = "/w", .host = .app, .id = "1786460757753-root" }));
+        const p = try m.openNew(.{ .workspace = "/w", .host = .app });
+        defer p.release();
+        _ = try p.append(&.{ .turn_started, piece, .turn_committed });
+        try testing.expectError(error.InvalidArgument, m.openNew(.{ .workspace = "/w", .host = .child, .role = .child, .parent = p.id(), .id = "../escape" }));
+
+        const first = try m.openNew(.{ .workspace = "/w", .host = .child, .role = .child, .parent = p.id(), .id = "1786460757753-taken" });
+        _ = try first.append(&.{ .turn_started, piece, .turn_committed });
+        first.release();
+        var before = try m.read(gpa, "1786460757753-taken", .start, .forward, 100);
+        defer before.deinit();
+
+        const second = try m.openNew(.{ .workspace = "/w", .host = .child, .role = .child, .parent = p.id(), .id = "1786460757753-taken" });
+        defer second.release();
+        try testing.expectError(error.Io, second.append(&.{ .turn_started, piece, .turn_committed }));
+        var after = try m.read(gpa, "1786460757753-taken", .start, .forward, 100);
+        defer after.deinit();
+        try testing.expectEqual(before.entries.len, after.entries.len);
+        for (before.entries, after.entries) |b, a| {
+            try testing.expectEqual(b.seq, a.seq);
+            try testing.expectEqual(b.kind, a.kind);
+            try testing.expectEqual(b.ts_ms, a.ts_ms);
+        }
     }
 
     test "import keeps the v1 id and the original times" {
