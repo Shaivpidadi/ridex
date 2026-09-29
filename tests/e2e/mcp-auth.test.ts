@@ -889,6 +889,21 @@ async function authorizePersonalFixture(activeAuth: AuthFixture, start: URL) {
 }
 
 describe("MCP remote authentication lifecycle", () => {
+  test("generic MCP auth missing a Client ID does not recommend Slack setup", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth, false);
+    const result = await runFx(["mcp", "auth", "fixture"], {
+      cwd: root.workspace,
+      env: { ...baseEnv(root), AI_GATEWAY_API_KEY: undefined },
+    });
+    expect(result.code).not.toBe(0);
+    expect(result.stderr).toContain("ClientRegistrationUnavailable");
+    expect(result.stderr).not.toContain("/mcp add slack");
+    expect(existsSync(root.openLog)).toBe(false);
+    expect(auth.tokenExchanges).toBe(0);
+  });
+
   for (const scenario of ["fresh", "missing-client", "denied"] as const) {
     test(`Slack preset CLI connects from ${scenario} configuration`, async () => {
       upstream = startModernMcpHttpFixture("json");

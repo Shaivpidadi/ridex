@@ -1318,7 +1318,6 @@ fn slack_bridge_config(alloc: Allocator, endpoint: []const u8, client_config: Cl
 pub fn authentication_error_message(err: anyerror) []const u8 {
     return switch (err) {
         error.SlackConfigurationConflict => @import("slack_preset.zig").configuration_conflict,
-        error.ClientRegistrationUnavailable => "The server requires an OAuth Client ID. For the fx Slack app, run /mcp add slack to configure it",
         error.McpAuthorizationDenied => "Authorization was declined. Run the connection command again to retry",
         error.McpAuthorizationCallbackTimedOut => "Authorization timed out. Run the connection command again and finish authorization in your browser while fx stays open",
         error.SlackScopeConfigurationMismatch => "Your configured Slack scopes request fewer permissions than fx requires. Authorization was not started. Custom scope subsets are not supported for the fx app. Remove the local scopes override only if you want to authorize the full shared scope set",
