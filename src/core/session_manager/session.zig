@@ -407,7 +407,11 @@ pub const Session = struct {
     /// session always has a durable first line (`tla/Lifecycle.tla`).
     fn publish(session: *Session, bodies: []const schema.Body, ts: u64) AppendError!void {
         const gpa = session.env.gpa;
-        errdefer session.phase = .{ .failed = null };
+        // Nothing is visible; later calls name the cause (D40).
+        errdefer |err| {
+            session.phase = .{ .failed = null };
+            if (session.fault == null) session.fault = asIoFault(err);
+        }
 
         // Frame everything first: line 1, the held lines, then the batch.
         session.batch.clearRetainingCapacity();
@@ -843,6 +847,18 @@ fn faultCode(fault: storage.IoFault) FaultCode {
         error.AccessDenied => .access_denied,
         error.ReadOnlyFileSystem => .read_only,
         error.FileTooBig => .too_big,
+    };
+}
+
+/// The I/O fault an append failed with, if it was one.
+fn asIoFault(err: AppendError) ?storage.IoFault {
+    return switch (err) {
+        error.Io => error.Io,
+        error.NoSpaceLeft => error.NoSpaceLeft,
+        error.AccessDenied => error.AccessDenied,
+        error.ReadOnlyFileSystem => error.ReadOnlyFileSystem,
+        error.FileTooBig => error.FileTooBig,
+        else => null,
     };
 }
 
@@ -2333,6 +2349,14 @@ const session_tests = struct {
         // The close does not sync again: the failed sync's bytes stay unknown.
         try testing.expectEqual(@as(usize, 1), t.fault.closed_unsynced);
         t.fault.closed_unsynced = 0;
+
+        // A permission denial on the first turn, before the session exists.
+        const n = try newRoot(&t);
+        t.fault.fail_error = error.Refused;
+        t.fault.next_write = .{ .keep = 0, .then = .fail };
+        try testing.expectError(error.AccessDenied, n.append(&.{ .turn_started, item }));
+        try testing.expectError(error.AccessDenied, n.append(&.{.turn_started}));
+        try closeAndDestroy(n);
     }
 
     // ---------------------------------------------------------------------------
