@@ -144,6 +144,7 @@ pub const top_level_specs = [_]TopLevelSpec{
         .summary = "Manage MCP servers without opening the interactive shell",
         .details = &.{
             "Commands:",
+            "  fx mcp add slack                   Configure Slack and open authorization",
             "  fx mcp add NAME COMMAND [ARGS...]",
             "  fx mcp add --transport http NAME URL",
             "  fx " ++ command_specs.mcp_auth_usage,
