@@ -82,13 +82,15 @@ pub const Child = struct {
 };
 
 pub fn freeChildren(alloc: Allocator, children: []Child) void {
-    for (children) |child| {
-        alloc.free(child.id);
-        alloc.free(child.work_id);
-        if (child.spawn_data) |data| alloc.free(data);
-        if (child.finish_data) |data| alloc.free(data);
-    }
+    for (children) |child| freeChild(alloc, child);
     alloc.free(children);
+}
+
+fn freeChild(alloc: Allocator, child: Child) void {
+    alloc.free(child.id);
+    alloc.free(child.work_id);
+    if (child.spawn_data) |data| alloc.free(data);
+    if (child.finish_data) |data| alloc.free(data);
 }
 
 /// A line about a child, appended through its parent.
@@ -799,7 +801,10 @@ pub const Session = struct {
         const state = try self.handle.state(scratch.allocator());
         const out = try alloc.alloc(Child, state.children.items.len);
         var built: usize = 0;
-        errdefer freeChildren(alloc, out[0..built]);
+        errdefer {
+            for (out[0..built]) |child| freeChild(alloc, child);
+            alloc.free(out);
+        }
         for (state.children.items) |child| {
             const id_copy = try alloc.dupe(u8, child.id);
             errdefer alloc.free(id_copy);
@@ -1938,6 +1943,25 @@ test "the manager guards child lines, and a child without a log reopens under it
     defer child.close();
     try testing.expectEqualStrings(child_id, child.id());
     try testing.expectEqualStrings("", child.childInstructions());
+}
+
+test "a copy of a parent's children frees every part when memory runs out" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const parent = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    defer parent.close();
+    try parent.commitTurn(assistantTurn("delegate", "ok"), types.ConversationLanguage.default());
+    try parent.appendChildLines(&.{.{ .spawned = .{ .child = "1786460757753-one", .work_id = "w1", .data = "{}" } }});
+    try parent.appendChildLines(&.{.{ .finished = .{ .child = "1786460757753-one", .work_id = "w1", .outcome = .ok, .data = "{}" } }});
+    try parent.appendChildLines(&.{.{ .spawned = .{ .child = "1786460757753-two", .work_id = "w2", .data = "{}" } }});
+    const Copy = struct {
+        fn run(alloc: Allocator, session: *Session) !void {
+            freeChildren(alloc, try session.children(alloc));
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, Copy.run, .{parent});
 }
 
 fn countItems(manager: *sm.Manager, id: []const u8, item_type: []const u8) !usize {
