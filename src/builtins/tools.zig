@@ -217,7 +217,7 @@ const subagent_model_request_properties = [_]model_tool_schema.Property{.{
 const vision_description =
     "Inspect authorized images attached by the user or local image paths supplied in the conversation, and return structured factual evidence. Pass exactly one source: image_ids for attached images, or paths for local images. When to use: read visible text, UI state, objects, layout, or other visual details needed for the task. When NOT to use: inspect paths the user did not supply, infer details not visible in an image, or repeat evidence already available in the conversation.";
 const read_tool_result_description =
-    "Read a stored tool result or captured command output by opaque handle from the active session or process. Pass request.query to find a known literal line; otherwise use the optional request byte range. Turns and tool calls saved by compaction open by their ID as the handle, like M12 or T12, and request.search finds them by text. When to use: inspect more after a tool-result preview or command-output handle says retained output is available, or recover details of a compacted turn or tool call. When NOT to use: read arbitrary files, search the workspace, recover secrets, or inspect results from another session or process.";
+    "Read a stored tool result or captured command output by opaque handle from the active session or process. Pass request.query to find a known literal line; otherwise use the optional request byte range. Turns, tool calls and earlier compactions saved by compaction open by their ID as the handle, like M12, T12 or L2, and request.search finds them by text. When to use: inspect more after a tool-result preview or command-output handle says retained output is available, or recover details of a compacted turn, tool call or earlier compaction. When NOT to use: read arbitrary files, search the workspace, recover secrets, or inspect results from another session or process.";
 
 pub const glob_files = ToolSpec{
     .name = "glob_files",
@@ -775,7 +775,7 @@ pub const vision = ToolSpec{
 };
 
 const read_tool_result_range_properties = [_]model_tool_schema.Property{
-    .{ .name = "handle", .json_type = .string, .description = "Opaque handle from a prior tool-result preview or captured command output, or a saved turn or tool call ID like M12 or T12." },
+    .{ .name = "handle", .json_type = .string, .description = "Opaque handle from a prior tool-result preview or captured command output, or a saved turn, tool call or earlier compaction ID like M12, T12 or L2." },
     .{ .name = "start_byte", .json_type = .integer, .description = "Optional 1-based byte offset. Defaults to 1." },
     .{ .name = "byte_count", .json_type = .integer, .description = "Optional positive byte count. Bounded by the tool." },
 };

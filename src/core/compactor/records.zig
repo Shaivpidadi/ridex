@@ -53,11 +53,14 @@ pub const Store = struct {
 pub const Kind = enum {
     tool,
     turn,
+    /// An earlier compaction, saved whole when the next one folds it.
+    ledger,
 
     fn letter(kind: Kind) u8 {
         return switch (kind) {
             .tool => 'T',
             .turn => 'M',
+            .ledger => 'L',
         };
     }
 
@@ -66,11 +69,13 @@ pub const Kind = enum {
         return switch (kind) {
             .tool => if (one) "tool call" else "tool calls",
             .turn => if (one) "turn" else "turns",
+            .ledger => if (one) "earlier compaction" else "earlier compactions",
         };
     }
 };
 
-/// T12 is tool call 12; M12 is turn 12.
+/// T12 is tool call 12; M12 is turn 12; L2 is the second compaction, saved
+/// when the third one folded it.
 pub const Id = struct {
     kind: Kind,
     number: usize,
@@ -103,13 +108,14 @@ pub fn fileName(buffer: *[max_file_name_bytes]u8, id: Id) []const u8 {
     return buffer[0 .. end + file_suffix.len];
 }
 
-/// Parses an ID the agent types: "T12", "M12", or lowercase. Zero is not an
-/// ID.
+/// Parses an ID the agent types: "T12", "M12", "L2", or lowercase. Zero is
+/// not an ID.
 pub fn parseId(text: []const u8) ?Id {
     if (text.len < 2) return null;
     const kind: Kind = switch (text[0]) {
         'T', 't' => .tool,
         'M', 'm' => .turn,
+        'L', 'l' => .ledger,
         else => return null,
     };
     return .{ .kind = kind, .number = parseNumber(text[1..]) orelse return null };
@@ -137,8 +143,9 @@ pub fn save(alloc: Allocator, store: Store, id: Id, content: []const u8) Store.E
     return store.write(alloc, fileName(&buffer, id), content);
 }
 
-/// The highest turn and tool call numbers saved; zero when there are none.
-pub const Highest = struct { turns: usize = 0, tools: usize = 0 };
+/// The highest turn, tool call and ledger numbers saved; zero when there are
+/// none.
+pub const Highest = struct { turns: usize = 0, tools: usize = 0, ledgers: usize = 0 };
 
 pub fn highestSaved(arena: Allocator, store: Store) Store.Error!Highest {
     var highest: Highest = .{};
@@ -147,6 +154,7 @@ pub fn highestSaved(arena: Allocator, store: Store) Store.Error!Highest {
         switch (id.kind) {
             .turn => highest.turns = @max(highest.turns, id.number),
             .tool => highest.tools = @max(highest.tools, id.number),
+            .ledger => highest.ledgers = @max(highest.ledgers, id.number),
         }
     }
     return highest;
@@ -187,13 +195,21 @@ const Doc = struct {
     /// Bit `n` is set when the record holds every word of query `n`.
     complete: u32 = 0,
 
-    /// Conversation outranks tool output on equal scores, then newer first.
+    /// On equal scores the conversation outranks tool output, which outranks
+    /// a saved ledger repeating both; then newer first.
     fn better(_: void, a: Doc, b: Doc) bool {
         if (a.score != b.score) return a.score > b.score;
-        const a_conversation = a.id == null or a.id.?.kind == .turn;
-        const b_conversation = b.id == null or b.id.?.kind == .turn;
-        if (a_conversation != b_conversation) return a_conversation;
+        if (a.rank() != b.rank()) return a.rank() < b.rank();
         return (if (a.id) |id| id.number else 0) > (if (b.id) |id| id.number else 0);
+    }
+
+    fn rank(doc: Doc) u2 {
+        const id = doc.id orelse return 0;
+        return switch (id.kind) {
+            .turn => 0,
+            .tool => 1,
+            .ledger => 2,
+        };
     }
 };
 
@@ -274,7 +290,7 @@ fn writeCoverage(writer: *std.Io.Writer, query: Query, docs: []const Doc) !void 
         try writer.writeAll("Every word of ");
         try std.json.Stringify.value(text, .{}, writer);
         var parts: usize = 0;
-        for ([_]Kind{ .turn, .tool }) |kind| {
+        for ([_]Kind{ .turn, .tool, .ledger }) |kind| {
             const span = spans.get(kind);
             if (span.count == 0) continue;
             try writer.writeAll(if (parts == 0) " is in " else ", ");
@@ -517,7 +533,7 @@ fn formatResults(alloc: Allocator, arena: Allocator, queries: []const []const u8
         try writer.writeByte('\n');
     }
     try writer.writeAll("</saved_search>\n");
-    if (docs.len > 0) try writer.writeAll("Open a turn or tool call by its ID (like M12 or T12) with read_tool_result; read an archive by its handle with start_byte and byte_count.\n");
+    if (docs.len > 0) try writer.writeAll("Open a turn, tool call or earlier compaction by its ID (like M12, T12 or L2) with read_tool_result; read an archive by its handle with start_byte and byte_count.\n");
     return out.toOwnedSlice() catch error.OutOfMemory;
 }
 
@@ -675,7 +691,9 @@ test "IDs map to one file name each" {
     try testing.expectEqual(Id{ .kind = .tool, .number = 12 }, parseId("t12").?);
     try testing.expectEqual(Id{ .kind = .turn, .number = 12 }, parseId("M12").?);
     try testing.expectEqual(Id{ .kind = .turn, .number = 12 }, parseFileName("compacted-M12.txt").?);
-    for ([_][]const u8{ "T", "T0", "12", "T1x", "T-1", "../T1", "X1", "M" }) |bad| {
+    try testing.expectEqualStrings("compacted-L2.txt", fileName(&buffer, .{ .kind = .ledger, .number = 2 }));
+    try testing.expectEqual(Id{ .kind = .ledger, .number = 2 }, parseId("l2").?);
+    for ([_][]const u8{ "T", "T0", "12", "T1x", "T-1", "../T1", "X1", "M", "L0" }) |bad| {
         try testing.expect(parseId(bad) == null);
     }
     try testing.expect(parseFileName("compacted-T0.txt") == null);
@@ -818,8 +836,9 @@ test "earlier conversation archives are searched one message at a time" {
     try testing.expect(std.mem.find(u8, by_name, "matches=\"0\"") != null);
 }
 
-test "conversation outranks tool output on equal scores" {
+test "conversation outranks tool output, and both a saved ledger, on equal scores" {
     var docs = [_]Doc{
+        .{ .id = .{ .kind = .ledger, .number = 1 }, .title = "", .body = "", .offset = 0, .file_bytes = 0, .score = 1 },
         .{ .id = .{ .kind = .tool, .number = 9 }, .title = "", .body = "", .offset = 0, .file_bytes = 0, .score = 1 },
         .{ .id = .{ .kind = .turn, .number = 2 }, .title = "", .body = "", .offset = 0, .file_bytes = 0, .score = 1 },
         .{ .id = .{ .kind = .tool, .number = 10 }, .title = "", .body = "", .offset = 0, .file_bytes = 0, .score = 1 },
@@ -827,6 +846,7 @@ test "conversation outranks tool output on equal scores" {
     std.mem.sort(Doc, &docs, {}, Doc.better);
     try testing.expectEqual(Kind.turn, docs[0].id.?.kind);
     try testing.expectEqual(@as(usize, 10), docs[1].id.?.number);
+    try testing.expectEqual(Kind.ledger, docs[3].id.?.kind);
 }
 
 test "excerpts of one long line never split a UTF-8 character" {

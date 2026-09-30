@@ -124,12 +124,15 @@ pub const Used = struct {
 };
 
 pub const Payload = struct {
-    /// The session's rules, facts, decisions and status, oldest first.
+    /// The session's rules, facts, decisions and status, oldest first. After
+    /// earlier compactions' ledgers are saved away, only their rules, status
+    /// and open entries still in force stay here.
     entries: []const Entry = &.{},
     /// Skills and MCP tools used, in the order first used.
     used: []const Used = &.{},
-    /// One summary of everything before `turns`, from payloads written
-    /// before the entries.
+    /// One summary of everything before `turns`: of the ledgers saved as L1
+    /// through L<ledger_count>, or in payloads written before the entries, of
+    /// the earlier conversation.
     earlier: []const u8 = "",
     /// The compacted turns, oldest first.
     turns: []const Turn = &.{},
@@ -137,10 +140,39 @@ pub const Payload = struct {
     /// Turns and tool calls are numbered through these counts.
     turn_count: usize = 0,
     tool_count: usize = 0,
+    /// Each compaction saves the one before it whole as L1, L2, and so on.
+    ledger_count: usize = 0,
+    /// The highest number of each kind of entry, in `entry_kinds` order,
+    /// counting entries only a saved ledger still holds. New entries are
+    /// numbered above them.
+    highest: [entry_kinds.len]usize = @splat(0),
     /// False when the session is not saved, so no turn or tool call can be
     /// opened later.
     saved: bool = true,
 };
+
+/// The highest number of each kind of entry `payload` has used, in
+/// `entry_kinds` order.
+pub fn highestIds(payload: Payload) [entry_kinds.len]usize {
+    var highest = payload.highest;
+    for (payload.entries) |entry| {
+        // A saved checkpoint is read back from disk, where an ID may be malformed.
+        if (!isEntryId(entry.id)) continue;
+        const kind = std.mem.findScalar(u8, entry_kinds, entry.id[0]).?;
+        const number = std.fmt.parseUnsigned(usize, entry.id[1..], 10) catch continue;
+        highest[kind] = @max(highest[kind], number);
+    }
+    return highest;
+}
+
+/// `id` names an entry numbered no higher than the highest of its kind, so
+/// it was used, whether or not `entries` still holds it.
+pub fn wasUsed(id: []const u8, highest: [entry_kinds.len]usize) bool {
+    if (!isEntryId(id)) return false;
+    const kind = std.mem.findScalar(u8, entry_kinds, id[0]).?;
+    const number = std.fmt.parseUnsigned(usize, id[1..], 10) catch return false;
+    return number > 0 and number <= highest[kind];
+}
 
 /// Returns the checkpoint string for `payload`. Caller owns it.
 pub fn encode(alloc: Allocator, payload: Payload) Allocator.Error![]u8 {
@@ -238,7 +270,15 @@ pub fn render(alloc: Allocator, payload: Payload) Allocator.Error![]u8 {
     errdefer text.deinit(alloc);
     try text.appendSlice(alloc, "<compacted_conversation>\nThis is the earlier part of this conversation, compacted. The user's messages and the assistant's final replies shown here are exact. " ++
         "What the assistant did in between is summarized, and each tool call has a line saying what it was and what it showed.\n\n");
-    if (payload.earlier.len > 0) try text.print(alloc, "Earlier summary:\n{s}\n\n", .{payload.earlier});
+    if (payload.ledger_count > 0) {
+        try text.appendSlice(alloc, "Earlier compactions are saved whole as ");
+        try appendRange(alloc, &text, 'L', 1, payload.ledger_count);
+        try text.appendSlice(alloc, ", with their exact messages, notes and entries; open one with read_tool_result when the work needs it.");
+        if (payload.earlier.len > 0) try text.print(alloc, " In short:\n{s}", .{payload.earlier});
+        try text.appendSlice(alloc, "\n\n");
+    } else if (payload.earlier.len > 0) {
+        try text.print(alloc, "Earlier summary:\n{s}\n\n", .{payload.earlier});
+    }
     for (payload.turns) |turn| try renderTurn(alloc, &text, turn);
     if (payload.open) |open| {
         try text.appendSlice(alloc, "Turn in progress, whose first user message follows this:\n");
@@ -381,6 +421,7 @@ fn appendSavedLine(alloc: Allocator, text: *std.ArrayList(u8), payload: Payload)
     const parts = [_]Part{
         .{ .count = payload.turn_count, .one = "turn ", .many = "turns ", .letter = 'M' },
         .{ .count = payload.tool_count, .one = "tool call ", .many = "tool calls ", .letter = 'T' },
+        .{ .count = payload.ledger_count, .one = "earlier compaction ", .many = "earlier compactions ", .letter = 'L' },
     };
     var shown: usize = 0;
     for (parts) |part| shown += @intFromBool(part.count > 0);
@@ -417,6 +458,8 @@ pub fn shapeProblem(earlier: Payload, payload: Payload) ?[]const u8 {
     for (earlier.turns, payload.turns[0..earlier.turns.len]) |before, after| {
         if (!sameTurn(before, after)) return "an earlier turn changed";
     }
+    if (payload.ledger_count < earlier.ledger_count) return "a saved ledger is missing";
+    for (payload.highest, earlier.highest) |after, before| if (after < before) return "the highest entry numbers went down";
     if (payload.entries.len < earlier.entries.len) return "an earlier entry is missing";
     for (earlier.entries, payload.entries[0..earlier.entries.len]) |before, after| {
         if (!std.mem.eql(u8, before.id, after.id) or !std.mem.eql(u8, before.text, after.text)) return "an earlier entry changed";

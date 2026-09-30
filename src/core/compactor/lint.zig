@@ -40,6 +40,10 @@ pub const Sources = struct {
     tools: []const Record,
     /// Every user message a rule may quote.
     users: []const []const u8,
+    /// The highest number of each kind of entry before this compaction's,
+    /// counting entries only a saved ledger holds, so replacing one of them
+    /// is allowed.
+    highest: [checkpoint.entry_kinds.len]usize = @splat(0),
 };
 
 /// What the checks found, for the trace.
@@ -119,7 +123,7 @@ pub fn check(arena: Allocator, written: ledger.Written, earlier: []const checkpo
             try checkValues(arena, &problems, entry.text, all, counts);
         }
         for (try checkpoint.replacedIds(arena, entry.text)) |id| {
-            const exists = hasEntry(earlier, id) or hasEntry(written.entries[0..index], id);
+            const exists = hasEntry(earlier, id) or hasEntry(written.entries[0..index], id) or checkpoint.wasUsed(id, sources.highest);
             if (!exists) {
                 counts.bad_replaces += 1;
                 try problems.add(arena, "replaces {s}, which does not exist", .{id});

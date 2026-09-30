@@ -42,13 +42,18 @@ pub const Asked = struct {
     turns: []const Heading = &.{},
     /// A turn still in progress follows them; its number is not used.
     open: ?Heading = null,
-    /// The entries so far, which the request shows above the turns.
-    entries: []const checkpoint.Entry = &.{},
+    /// The highest number of each kind of entry so far, in `entry_kinds`
+    /// order; new entries are numbered above them.
+    highest: [entry_kinds.len]usize = @splat(0),
     /// Turns and tool calls can be opened later by their IDs.
     saved: bool,
     /// The request follows the conversation itself rather than the turns
     /// written out with their IDs.
     after_conversation: bool = false,
+    /// The previous compaction is saved whole as L<fold> and its turns leave
+    /// what the next assistant sees, so the model summarizes it. Zero when
+    /// there is none.
+    fold: usize = 0,
 };
 
 /// A request that follows the conversation reads like the user's next
@@ -90,23 +95,28 @@ pub fn writeRequest(alloc: Allocator, text: *std.ArrayList(u8), asked: Asked) Al
     try text.appendSlice(alloc, "Facts:\nF1, F2, ...: facts the work depends on, from these turns: names, paths, values, results, causes.\n\n" ++
         "Decisions:\nD1, D2, ...: each decision and why. When it changes an earlier entry, end with \"replaces\" and that entry's ID.\n\n" ++
         "Status:\nS1, S2, ...: where each part of the work stands now. When it updates an earlier entry, end with \"replaces\" and that entry's ID.\n\n" ++
-        "Open:\nO1, O2, ...: questions waiting on the user, and next steps the user asked for.\n\n" ++
-        "Never repeat or rewrite an entry that already exists; add a new one that replaces it. Write \"none\" under a section with nothing new.");
-    try writeHighestIds(alloc, text, asked.entries);
+        "Open:\nO1, O2, ...: questions waiting on the user, and next steps the user asked for.\n\n");
+    if (asked.fold > 0) try text.print(alloc, "Earlier:\nthree to five sentences that stand in for the earlier compacted conversation {s}, which is saved whole as L{d} and leaves what the next assistant sees: what the user wanted, what was done and found, the decisions still in force, and where the work stood. Its rules, status and open entries stay as they are, so do not repeat them.\n\n", .{
+        if (asked.after_conversation) "at the start of the conversation above" else "shown above",
+        asked.fold,
+    });
+    try text.appendSlice(alloc, "Never repeat or rewrite an entry that already exists; add a new one that replaces it. Write \"none\" under a section with nothing new.");
+    try writeHighestIds(alloc, text, asked.highest);
     try text.appendSlice(alloc, " Be exact: say what was verified, and mark anything only planned, assumed or not checked. Write only these notes.");
 }
 
 const entry_kinds = checkpoint.entry_kinds;
 
 /// Appends the request for the complete turns, `missing`, that a first
-/// reply left out. `entries` are every entry so far, the first reply's too.
-pub fn writeFollowUp(alloc: Allocator, text: *std.ArrayList(u8), missing: []const Heading, entries: []const checkpoint.Entry, after_conversation: bool) Allocator.Error!void {
+/// reply left out. `highest` counts every entry so far, the first reply's
+/// too.
+pub fn writeFollowUp(alloc: Allocator, text: *std.ArrayList(u8), missing: []const Heading, highest: [entry_kinds.len]usize, after_conversation: bool) Allocator.Error!void {
     try text.appendSlice(alloc, "Your notes on the turns above left some out. Write the notes for only these turns now, each heading followed by its notes:\n\n");
     try writeHeadings(alloc, text, missing, null);
     if (after_conversation) try text.appendSlice(alloc, "\nUnder each heading above are the turn's tool calls, so you can find them; do not copy those lines. Answer with text only and call no tools." ++ from_fx ++ "\n");
     try text.appendSlice(alloc, "\nUnder each heading, " ++ in_between_label ++ " with what the assistant did before its final reply, then a line for every tool call, starting with its ID, on why it was used and what it showed.\n\n" ++
         "Then any new entries from those turns under the same sections, each starting with its ID and the turn or tool call it comes from.");
-    try writeHighestIds(alloc, text, entries);
+    try writeHighestIds(alloc, text, highest);
     try text.appendSlice(alloc, " Write only these notes.");
 }
 
@@ -138,15 +148,7 @@ fn writeHeadingRest(alloc: Allocator, text: *std.ArrayList(u8), turn: Heading) A
 
 /// Asks for new entries numbered after the highest of each kind, so no ID
 /// ever names two entries.
-fn writeHighestIds(alloc: Allocator, text: *std.ArrayList(u8), entries: []const checkpoint.Entry) Allocator.Error!void {
-    var highest = [_]usize{0} ** entry_kinds.len;
-    for (entries) |entry| {
-        // A saved checkpoint is read back from disk, where an ID may be empty.
-        if (entry.id.len == 0) continue;
-        const kind = std.mem.findScalar(u8, entry_kinds, entry.id[0]) orelse continue;
-        const number = std.fmt.parseInt(usize, entry.id[1..], 10) catch continue;
-        highest[kind] = @max(highest[kind], number);
-    }
+fn writeHighestIds(alloc: Allocator, text: *std.ArrayList(u8), highest: [entry_kinds.len]usize) Allocator.Error!void {
     var written: usize = 0;
     for (entry_kinds, highest) |kind, number| {
         if (number == 0) continue;
@@ -348,8 +350,12 @@ pub const Written = struct {
     /// The complete turns the reply wrote an in-between line for, even
     /// `none`.
     noted: []const usize = &.{},
-    /// Entries left out because their ID was already taken.
+    /// The summary of the earlier compacted conversation, when asked for.
+    earlier: []const u8 = "",
+    /// Entries left out because they repeat an existing entry word for word.
     repeated: usize = 0,
+    /// Entries kept under the next free ID because theirs was taken.
+    renumbered: usize = 0,
     /// Notes left out because this request has no such turn or tool call.
     unknown: usize = 0,
 
@@ -371,21 +377,27 @@ fn noteFor(notes: []const Note, number: usize) []const u8 {
 /// asked for far less.
 const max_work_bytes = 1200;
 const max_tool_note_bytes = 300;
+/// The summary of earlier compactions replaces the one before it, so this
+/// bounds it however many there are.
+const max_earlier_bytes = 2400;
 /// A reply in none of the asked form may say more, for every turn at once.
 const max_unread_bytes = 8 * 1024;
 
 /// Reads the model's notes. Notes for turns and tool calls that `known`
-/// does not have are left out, like entries whose ID `earlier` or an earlier
-/// entry of the reply already has. A reply in none of the asked form becomes
-/// the notes of the newest turn. `arena` owns the result.
-pub fn read(arena: Allocator, reply: []const u8, known: Known, earlier: []const checkpoint.Entry) Allocator.Error!Written {
+/// does not have are left out, like entries repeating one of `earlier` word
+/// for word. An entry whose ID is taken, by `highest` or by an earlier entry
+/// of the reply, is kept under the next free ID. A reply in none of the asked
+/// form becomes the notes of the newest turn. `arena` owns the result.
+pub fn read(arena: Allocator, reply: []const u8, known: Known, earlier: []const checkpoint.Entry, highest: [entry_kinds.len]usize) Allocator.Error!Written {
     const Building = struct { number: usize, text: std.ArrayList(u8) = .empty, limit: usize };
     var works: std.ArrayList(Building) = .empty;
     var tool_notes: std.ArrayList(Building) = .empty;
     var sections: std.ArrayList(u8) = .empty;
+    var earlier_summary: std.ArrayList(u8) = .empty;
     var current: ?*Building = null;
     var turn: ?usize = null;
     var in_sections = false;
+    var in_earlier = false;
     var unknown: usize = 0;
     var noted: std.ArrayList(usize) = .empty;
 
@@ -396,14 +408,28 @@ pub fn read(arena: Allocator, reply: []const u8, known: Known, earlier: []const 
         if (turnNumber(plain)) |number| {
             turn = number;
             in_sections = false;
+            in_earlier = false;
             current = null;
+            continue;
+        }
+        if (earlierRest(plain)) |rest| {
+            in_earlier = true;
+            in_sections = false;
+            turn = null;
+            current = null;
+            if (rest.len > 0) try earlier_summary.print(arena, "{s}\n", .{rest});
             continue;
         }
         if (sectionRest(plain)) |rest| {
             in_sections = true;
+            in_earlier = false;
             turn = null;
             current = null;
             try sections.print(arena, "{s}\n", .{rest});
+            continue;
+        }
+        if (in_earlier) {
+            try earlier_summary.print(arena, "{s}\n", .{line});
             continue;
         }
         if (in_sections) {
@@ -445,7 +471,7 @@ pub fn read(arena: Allocator, reply: []const u8, known: Known, earlier: []const 
 
     // A reply in none of the asked form is kept whole as the notes of the
     // newest turn it covers rather than lost.
-    if (works.items.len == 0 and tool_notes.items.len == 0 and sections.items.len == 0 and unknown == 0) {
+    if (works.items.len == 0 and tool_notes.items.len == 0 and sections.items.len == 0 and earlier_summary.items.len == 0 and unknown == 0) {
         const newest: ?usize = if (known.open) 0 else if (known.turns.len > 0) known.turns[known.turns.len - 1] else null;
         if (newest) |number| {
             try works.append(arena, .{ .number = number, .limit = max_unread_bytes });
@@ -466,19 +492,56 @@ pub fn read(arena: Allocator, reply: []const u8, known: Known, earlier: []const 
         out.* = notes.items;
     }
 
-    var entries: std.ArrayList(checkpoint.Entry) = .empty;
-    for (try items(arena, sections.items)) |item| {
-        const taken = for (earlier) |entry| {
-            if (std.mem.eql(u8, entry.id, item.id)) break true;
-        } else for (entries.items) |entry| {
-            if (std.mem.eql(u8, entry.id, item.id)) break true;
+    const summary = std.mem.trim(u8, earlier_summary.items, " \t\r\n");
+    if (!isNone(summary)) {
+        const cut = text_utils.utf8BackwardBoundary(summary, @min(summary.len, max_earlier_bytes));
+        if (cut < summary.len) trace.log(false, "the summary of earlier compactions was cut to {d} bytes bytes={d}", .{ cut, summary.len });
+        written.earlier = summary[0..cut];
+    }
+
+    // New IDs are kept first, so a taken one never pushes a later entry off
+    // the ID the model gave it; taken ones then get the next free IDs.
+    const Fate = union(enum) { repeat, keep: []const u8, renumber };
+    const found = try items(arena, sections.items);
+    const fates = try arena.alloc(Fate, found.len);
+    const before = checkpoint.highestIds(.{ .entries = earlier, .highest = highest });
+    var next = before;
+    for (found, fates, 0..) |item, *fate, index| {
+        const repeats = for (earlier) |entry| {
+            if (std.mem.eql(u8, entry.id, item.id) and std.mem.eql(u8, entry.text[entry.id.len..], entryRest(item))) break true;
         } else false;
-        if (taken) {
+        if (repeats) {
+            fate.* = .repeat;
             written.repeated += 1;
             continue;
         }
-        try entries.append(arena, .{ .id = item.id, .text = try entryText(arena, item) });
+        const kind = std.mem.findScalar(u8, entry_kinds, item.id[0]).?;
+        const number = std.fmt.parseUnsigned(usize, item.id[1..], 10) catch 0;
+        const reused = for (found[0..index], fates[0..index]) |other, other_fate| {
+            if (other_fate == .keep and std.mem.eql(u8, other.id, item.id)) break true;
+        } else false;
+        if (number <= before[kind] or reused) {
+            fate.* = .renumber;
+            continue;
+        }
+        fate.* = .{ .keep = item.id };
+        next[kind] = @max(next[kind], number);
     }
+    var entries: std.ArrayList(checkpoint.Entry) = .empty;
+    for (found, fates) |item, fate| {
+        const id = switch (fate) {
+            .repeat => continue,
+            .keep => |id| id,
+            .renumber => renumbered: {
+                const kind = std.mem.findScalar(u8, entry_kinds, item.id[0]).?;
+                next[kind] += 1;
+                written.renumbered += 1;
+                break :renumbered try std.fmt.allocPrint(arena, "{c}{d}", .{ entry_kinds[kind], next[kind] });
+            },
+        };
+        try entries.append(arena, .{ .id = id, .text = try std.mem.concat(arena, u8, &.{ id, entryRest(item) }) });
+    }
+    if (written.renumbered > 0) trace.log(false, "compaction entries renumbered because their IDs were taken count={d}", .{written.renumbered});
     written.entries = entries.items;
     return written;
 }
@@ -535,6 +598,18 @@ fn endsHeading(rest: []const u8) bool {
 fn inBetweenRest(plain: []const u8) ?[]const u8 {
     for ([_][]const u8{ in_between_label, "In-between:" }) |label| {
         if (startsWithIgnoreCase(plain, label)) return std.mem.trim(u8, plain[label.len..], " ");
+    }
+    return null;
+}
+
+/// What follows the `Earlier:` heading of the summary of earlier compactions
+/// on its line, or null when `plain` is not it.
+fn earlierRest(plain: []const u8) ?[]const u8 {
+    for ([_][]const u8{ "Earlier summary", "Earlier" }) |heading| {
+        if (!startsWithIgnoreCase(plain, heading)) continue;
+        const after = plain[heading.len..];
+        if (after.len == 0) return after;
+        if (after[0] == ':') return std.mem.trim(u8, after[1..], " ");
     }
     return null;
 }
@@ -602,14 +677,14 @@ fn isToolsLabel(plain: []const u8) bool {
     return startsWithIgnoreCase(plain, "T:") or startsWithIgnoreCase(plain, "Tools:");
 }
 
-/// An entry's text from its ID on, without the bullet, check box or bold
-/// mark around the ID, like `- [x] **F1** (T3): ...` saved as `F1 (T3): ...`.
-fn entryText(arena: Allocator, item: Item) Allocator.Error![]const u8 {
+/// An entry's text after its ID, without the bullet, check box or bold mark
+/// around the ID: ` (T3): ...` of `- [x] **F1** (T3): ...`, saved after the
+/// ID as `F1 (T3): ...`.
+fn entryRest(item: Item) []const u8 {
     // Nothing that may come before an ID contains one.
     const at = std.mem.find(u8, item.text, item.id).?;
-    var rest = item.text[at + item.id.len ..];
-    if (std.mem.startsWith(u8, rest, "**")) rest = rest[2..];
-    return std.mem.concat(arena, u8, &.{ item.id, rest });
+    const rest = item.text[at + item.id.len ..];
+    return if (std.mem.startsWith(u8, rest, "**")) rest[2..] else rest;
 }
 
 const Item = struct {
@@ -740,7 +815,7 @@ const testing = std.testing;
 test "a saved entry with an empty ID is skipped when new IDs are numbered" {
     var text: std.ArrayList(u8) = .empty;
     defer text.deinit(testing.allocator);
-    try writeHighestIds(testing.allocator, &text, &.{ .{ .id = "", .text = "" }, .{ .id = "F4", .text = "F4 (T1): x" } });
+    try writeHighestIds(testing.allocator, &text, checkpoint.highestIds(.{ .entries = &.{ .{ .id = "", .text = "" }, .{ .id = "F4", .text = "F4 (T1): x" } } }));
     try testing.expectEqualStrings(" The highest IDs so far: F4. Number new entries after them.", text.items);
 }
 
@@ -787,7 +862,7 @@ test "notes are read per turn and tool call, and entries only ever add" {
         \\none
     ;
     const earlier = [_]checkpoint.Entry{.{ .id = "D1", .text = "D1 (M2): cache in a pickle file" }};
-    const written = try read(arena, reply, .{ .turns = &.{ 3, 4 }, .tools = &.{ 8, 9 }, .open = true }, &earlier);
+    const written = try read(arena, reply, .{ .turns = &.{ 3, 4 }, .tools = &.{ 8, 9 }, .open = true }, &earlier, @splat(0));
 
     try testing.expectEqualStrings("Read the loader and found dates kept as text, then fixed the parser.", written.work(3));
     try testing.expectEqualStrings("", written.work(4));
@@ -796,16 +871,26 @@ test "notes are read per turn and tool call, and entries only ever add" {
     try testing.expectEqualStrings("ran the tests; 1 of 6 failed", written.tool(9));
     try testing.expectEqual(@as(usize, 1), written.unknown);
 
-    // The rewrite of D1 is left out; entries keep their text as written.
-    try testing.expectEqual(@as(usize, 1), written.repeated);
-    try testing.expectEqual(@as(usize, 4), written.entries.len);
+    // The rewrite of D1 is kept under the next free ID, after the D2 the
+    // model numbered right; entries keep their text as written.
+    try testing.expectEqual(@as(usize, 0), written.repeated);
+    try testing.expectEqual(@as(usize, 1), written.renumbered);
+    try testing.expectEqual(@as(usize, 5), written.entries.len);
     try testing.expectEqualStrings("R2 (M3): \"Store every price as integer cents.\"", written.entries[0].text);
     try testing.expectEqualStrings("R3 (M4): \"keep it short\"", written.entries[1].text);
     try testing.expectEqualStrings("F4", written.entries[2].id);
-    try testing.expectEqualStrings("D2 (M4): no cache; replaces D1", written.entries[3].text);
+    try testing.expectEqualStrings("D3 (M3): a rewrite of an entry that already exists", written.entries[3].text);
+    try testing.expectEqualStrings("D2 (M4): no cache; replaces D1", written.entries[4].text);
+
+    // An entry repeated word for word is left out, and one whose ID only a
+    // saved ledger still holds is renumbered above it.
+    const again = try read(arena, "Decisions:\n- D1 (M2): cache in a pickle file\n- D4 (M5): keep the pickle cache", .{ .turns = &.{5}, .tools = &.{} }, &earlier, .{ 0, 0, 6, 0, 0 });
+    try testing.expectEqual(@as(usize, 1), again.repeated);
+    try testing.expectEqual(@as(usize, 1), again.entries.len);
+    try testing.expectEqualStrings("D7 (M5): keep the pickle cache", again.entries[0].text);
 
     // Without a turn in progress, its notes are left out.
-    const closed = try read(arena, reply, .{ .turns = &.{3}, .tools = &.{8} }, &.{});
+    const closed = try read(arena, reply, .{ .turns = &.{3}, .tools = &.{8} }, &.{}, @splat(0));
     try testing.expectEqualStrings("", closed.work(0));
     try testing.expectEqualStrings("", closed.work(4));
 }
@@ -828,7 +913,7 @@ test "a run of tool calls may share a note, kept on its first call" {
         \\T: none.
     ;
     const known: Known = .{ .turns = &.{ 2, 3 }, .tools = &.{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 } };
-    const written = try read(arena, reply, known, &.{});
+    const written = try read(arena, reply, known, &.{}, @splat(0));
     try testing.expectEqualStrings("T1–T4: located the loader and its callers", written.tool(1));
     try testing.expectEqualStrings("", written.tool(2));
     try testing.expectEqualStrings("T5–T6: ran the tests", written.tool(5));
@@ -844,14 +929,14 @@ test "a reply in none of the asked form becomes the newest turn's notes" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const prose = "The reads completed.\nKeep SENTINEL_42 in mind.";
-    const complete = try read(arena, prose, .{ .turns = &.{ 3, 4 }, .tools = &.{7} }, &.{});
+    const complete = try read(arena, prose, .{ .turns = &.{ 3, 4 }, .tools = &.{7} }, &.{}, @splat(0));
     try testing.expectEqual(@as(usize, 1), complete.works.len);
     try testing.expectEqualStrings(prose, complete.work(4));
     try testing.expectEqualStrings("", complete.work(3));
-    const running = try read(arena, prose, .{ .turns = &.{3}, .tools = &.{}, .open = true }, &.{});
+    const running = try read(arena, prose, .{ .turns = &.{3}, .tools = &.{}, .open = true }, &.{}, @splat(0));
     try testing.expectEqualStrings(prose, running.work(0));
     // A reply in the asked form for other turns is not taken as prose.
-    const misplaced = try read(arena, "Turn 9\nIn between: elsewhere", .{ .turns = &.{3}, .tools = &.{} }, &.{});
+    const misplaced = try read(arena, "Turn 9\nIn between: elsewhere", .{ .turns = &.{3}, .tools = &.{} }, &.{}, @splat(0));
     try testing.expectEqual(@as(usize, 0), misplaced.works.len);
     try testing.expectEqual(@as(usize, 1), misplaced.unknown);
 }
@@ -931,7 +1016,7 @@ test "the request asks only for the new turns and numbers entries after the high
         .{ .id = "S1", .text = "S1 (M2): z" },
     };
     const turns = [_]Heading{ .{ .number = 4, .first_tool = 10, .last_tool = 19 }, .{ .number = 5 }, .{ .number = 9, .first_tool = 20, .last_tool = 20 } };
-    try writeRequest(testing.allocator, &text, .{ .turns = &turns, .open = .{ .number = 0, .first_tool = 21, .last_tool = 23 }, .entries = &entries, .saved = true });
+    try writeRequest(testing.allocator, &text, .{ .turns = &turns, .open = .{ .number = 0, .first_tool = 21, .last_tool = 23 }, .highest = checkpoint.highestIds(.{ .entries = &entries }), .saved = true });
     const headings = "without skipping any, each followed by its notes:\n\nTurn 4 (T10\u{2013}T19)\nTurn 5 (no tool calls)\nTurn 9 (T20)\nTurn in progress (T21\u{2013}T23)\n\nUnder each heading:\nIn between:";
     for ([_][]const u8{ headings, "`T<number>:`", "For the turn in progress", "\nRules:\n", "\nFacts:\n", "\nDecisions:\n", "\nStatus:\n", "\nOpen:\n", "like M<number>", "which ones are worth opening" }) |part| {
         try testing.expect(std.mem.find(u8, text.items, part) != null);

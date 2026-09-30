@@ -6559,13 +6559,14 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         };
         expect(secondCompactRequest.tools).toEqual([]);
         const secondCompactText = JSON.stringify(secondCompactRequest.prompt);
-        // The model writes notes only for the turns after the first
-        // compaction; what that compaction kept stays as it is.
-        expect(secondCompactText).not.toContain("FIRST_PROMPT_COMPACTION_SENTINEL");
         expect(secondCompactText).toContain("SECOND_PROMPT_COMPACTION_SENTINEL");
         expect(secondCompactText).toContain("Write the compaction notes for the new turns above");
-        expect(secondCompactText).not.toContain("Continue the compacted session.");
-        expect(secondCompactText).not.toContain("compacted_conversation");
+        // The first compaction is shown whole so the model can summarize it,
+        // since it is saved as L1 and leaves what the agent sees.
+        expect(secondCompactText).toContain("[The earlier compacted conversation, to summarize; it is saved whole as L1]");
+        expect(secondCompactText).toContain("FIRST_PROMPT_COMPACTION_SENTINEL");
+        expect(secondCompactText).toContain("Continue the compacted session.");
+        expect(secondCompactText).toContain("\\nEarlier:\\nthree to five sentences");
         expect(readFileSync(resumedStderrPath, "utf8")).toBe("");
 
         const afterSecondCompact = await runFx(
@@ -6578,10 +6579,13 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         };
         const secondSummary = secondCanonical.history.at(-1)?.summary ?? "";
         expect(secondSummary).toContain("Second compaction preserved the restored session.");
-        expect(secondSummary).toContain("FIRST_PROMPT_COMPACTION_SENTINEL");
         expect(secondSummary).not.toContain("operation sequence");
-        // The first compaction's notes stay unchanged in the second.
-        expect(secondSummary).toContain("Continue the compacted session.");
+        expect(secondSummary).toContain("\"ledger_count\":1");
+        // The first compaction, its notes included, is saved whole as L1.
+        expect(secondSummary).not.toContain("FIRST_PROMPT_COMPACTION_SENTINEL");
+        const firstLedger = readFileSync(join(root.home, ".fx", "sessions", sessionId, "tool-results", "compacted-L1.txt"), "utf8");
+        expect(firstLedger).toContain("FIRST_PROMPT_COMPACTION_SENTINEL");
+        expect(firstLedger).toContain("Continue the compacted session.");
       } finally {
         if (tui) await tui.kill();
         gateway.stop();

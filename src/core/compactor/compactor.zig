@@ -226,11 +226,11 @@ fn earlierFrom(arena: Allocator, store: ?Store, earlier: ?[]const u8) !?summariz
     const saved = earlier orelse return null;
     if (try checkpoint.parse(arena, saved)) |payload| return payload;
     if (try legacyEarlier(arena, store, saved)) |legacy| return legacy;
-    // An unreadable checkpoint may have saved turns and tool calls already;
-    // numbering after them keeps the new ones from replacing them.
+    // An unreadable checkpoint may have saved turns, tool calls and ledgers
+    // already; numbering after them keeps the new ones from replacing them.
     const highest: records.Highest = if (store) |kept| try records.highestSaved(arena, kept) else .{};
-    if (highest.turns > 0 or highest.tools > 0) trace.log(false, "earlier checkpoint unreadable; new turns and tool calls are numbered after the saved ones turns={d} tools={d}", .{ highest.turns, highest.tools });
-    return .{ .earlier = saved, .turn_count = highest.turns, .tool_count = highest.tools };
+    if (highest.turns > 0 or highest.tools > 0 or highest.ledgers > 0) trace.log(false, "earlier checkpoint unreadable; new records are numbered after the saved ones turns={d} tools={d} ledgers={d}", .{ highest.turns, highest.tools, highest.ledgers });
+    return .{ .earlier = saved, .turn_count = highest.turns, .tool_count = highest.tools, .ledger_count = highest.ledgers };
 }
 
 /// The first user message starts each turn; later ones are messages the user
