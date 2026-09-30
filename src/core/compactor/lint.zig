@@ -603,6 +603,13 @@ test "an entry may replace one written before it in the same reply" {
     const result = try checked(arena, .{ .entries = &entries }, &.{}, &counts);
     try testing.expectEqualStrings(entries[1].text, result.entries[1].text);
     try testing.expect(std.mem.endsWith(u8, result.entries[2].text, "[check: replaces S4, which does not exist]"));
+
+    // S4 may be saved only in the ledger of a folded compaction, which the
+    // highest numbers so far count.
+    var folded = test_sources;
+    folded.highest = .{ 0, 0, 0, 4, 0 };
+    const again = try check(arena, .{ .entries = entries[2..] }, &.{}, folded, &counts);
+    try testing.expectEqualStrings(entries[2].text, again.entries[0].text);
 }
 
 test "tool notes are checked against their call, and a failed call is not a success" {

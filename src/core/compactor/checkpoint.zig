@@ -1,14 +1,14 @@
 //! The saved form of a context compaction checkpoint.
 //!
 //! A checkpoint's `summary` string holds `marker` followed by the JSON of a
-//! `Payload`: every compacted turn with its user messages and final reply
-//! exact, a summary of what the assistant did in between and a line for each
-//! tool call; the session's rules, facts, decisions and status as entries
-//! that are only ever added; the skills and MCP tools it used; and how many
-//! turns and tool calls are saved word for word (M1 through M<turn_count>, T1
-//! through T<tool_count>). Payloads written earlier may hold one summary of
-//! the earlier conversation, and keep being shown. Every session codec keeps
-//! treating the string as opaque text. Checkpoints written before this format
+//! `Payload`: every turn since the last fold with its user messages and final
+//! reply exact, a summary of what the assistant did in between and a line for
+//! each tool call; the session's rules, facts, decisions and status as
+//! entries that are only ever added; the skills and MCP tools it used; one
+//! summary standing in for the earlier compactions saved whole as L1 through
+//! L<ledger_count>; and how many turns and tool calls are saved word for word
+//! (M1 through M<turn_count>, T1 through T<tool_count>). Every session codec
+//! keeps treating the string as opaque text. Checkpoints written before this format
 //! hold model-visible text directly and keep working.
 //!
 //! This file is the one place that tells the formats apart and renders what
@@ -95,7 +95,8 @@ pub fn replacedIds(arena: Allocator, text: []const u8) Allocator.Error![]const [
     return out.items;
 }
 
-fn isEntryId(word: []const u8) bool {
+/// Whether `word` is an entry ID, such as R3.
+pub fn isEntryId(word: []const u8) bool {
     if (word.len < 2 or std.mem.findScalar(u8, entry_kinds, word[0]) == null) return false;
     for (word[1..]) |byte| if (!std.ascii.isDigit(byte)) return false;
     return true;
@@ -356,7 +357,7 @@ fn appendEntries(alloc: Allocator, text: *std.ArrayList(u8), entries: []const En
             if (entry.id.len == 0 or std.mem.findScalar(u8, section.kinds, entry.id[0]) == null) continue;
             if (written == 0) try text.print(alloc, "{s}\n", .{section.heading});
             try text.appendSlice(alloc, entry.text);
-            if (replacer) |id| try text.print(alloc, " (replaced by {s})", .{id});
+            if (replacer) |id| try text.print(alloc, replaced_mark ++ "{s})", .{id});
             try text.append(alloc, '\n');
             written += 1;
         }
@@ -366,6 +367,9 @@ fn appendEntries(alloc: Allocator, text: *std.ArrayList(u8), entries: []const En
 
 /// What a note or entry that failed a check ends with.
 pub const check_mark = " [check: ";
+
+/// What follows an entry a later one replaces, before the later one's ID.
+pub const replaced_mark = " (replaced by ";
 
 /// Says what check marks mean, when the payload has one.
 fn appendCheckNote(alloc: Allocator, text: *std.ArrayList(u8), payload: Payload) Allocator.Error!void {
@@ -447,7 +451,8 @@ fn appendSavedLine(alloc: Allocator, text: *std.ArrayList(u8), payload: Payload)
 /// The first way `payload` breaks the checkpoint's shape in what it keeps of
 /// `earlier` and what it adds, or null. Code, not the model, writes the
 /// shape, so a problem here is a bug and the checkpoint must not be saved:
-/// - what `earlier` kept is unchanged, turn by turn and entry by entry;
+/// - what `earlier` kept is unchanged, turn by turn and entry by entry, and
+///   no saved ledger or entry number it counted goes missing;
 /// - the new turns are numbered on from `earlier` through `turn_count`, each
 ///   with its user message;
 /// - every new tool call has one line, in order within its turn, and they
@@ -700,6 +705,21 @@ test "the shape check passes what compaction builds and names what breaks it" {
     bad = good;
     bad.entries = &.{ earlier.entries[0], .{ .id = "S1", .text = "tests pass" } };
     try testing.expectEqualStrings("an entry does not start with its ID", shapeProblem(earlier, bad).?);
+
+    // A folded compaction keeps its ledgers and the numbers used so far.
+    var folded = earlier;
+    folded.ledger_count = 2;
+    folded.highest = .{ 0, 4, 0, 0, 0 };
+    var kept = good;
+    kept.ledger_count = 2;
+    kept.highest = folded.highest;
+    try testing.expect(shapeProblem(folded, kept) == null);
+    bad = kept;
+    bad.ledger_count = 1;
+    try testing.expectEqualStrings("a saved ledger is missing", shapeProblem(folded, bad).?);
+    bad = kept;
+    bad.highest = .{ 0, 3, 0, 0, 0 };
+    try testing.expectEqualStrings("the highest entry numbers went down", shapeProblem(folded, bad).?);
 }
 
 test "the saved line names only what can be opened" {

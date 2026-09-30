@@ -71,7 +71,7 @@ pub const Store = records.Store;
 pub const max_search_phrases = records.max_search_phrases;
 pub const RecordFileBuffer = [records.max_file_name_bytes]u8;
 
-/// The saved file of a record ID the agent typed ("T12", "M12"), or null
+/// The saved file of a record ID the agent typed ("T12", "M12", "L2"), or null
 /// when `text` is not one.
 pub fn recordFile(buffer: *RecordFileBuffer, text: []const u8) ?[]const u8 {
     return records.fileName(buffer, records.parseId(text) orelse return null);
@@ -109,8 +109,9 @@ pub const Request = struct {
     size: Size,
     /// Reaches the conversation's model, which writes the summary.
     caller: ModelCaller,
-    /// Where M and T records are saved. Without one (a session that is not
-    /// saved), everything goes into the summary.
+    /// Where M, T and L records are saved. Without one (a session that is
+    /// not saved), everything goes into the summary and earlier compactions
+    /// are never folded away.
     records: ?Store,
     cancel_flag: *std.atomic.Value(bool),
     trace_ctx: debug_trace.TraceContext,
@@ -313,7 +314,7 @@ test "a clipped result keeps the handle of its saved whole output" {
     try std.testing.expectEqualStrings("", savedOutputHandle(null, "no memory"));
 }
 
-test "an unreadable checkpoint numbers new turns and tool calls after the saved ones" {
+test "an unreadable checkpoint numbers new turns, tool calls and ledgers after the saved ones" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -323,6 +324,7 @@ test "an unreadable checkpoint numbers new turns and tool calls after the saved 
     try records.save(arena, store, .{ .kind = .turn, .number = 3 }, "turn three");
     try records.save(arena, store, .{ .kind = .tool, .number = 7 }, "tool seven");
     try records.save(arena, store, .{ .kind = .tool, .number = 2 }, "tool two");
+    try records.save(arena, store, .{ .kind = .ledger, .number = 2 }, "ledger two");
     try store.write(arena, "result-shell-1.txt", "not a record");
 
     const broken = "fx-compactor-v1\n{\"turns\": [";
@@ -330,6 +332,7 @@ test "an unreadable checkpoint numbers new turns and tool calls after the saved 
     try std.testing.expectEqualStrings(broken, earlier.earlier);
     try std.testing.expectEqual(@as(usize, 3), earlier.turn_count);
     try std.testing.expectEqual(@as(usize, 7), earlier.tool_count);
+    try std.testing.expectEqual(@as(usize, 2), earlier.ledger_count);
     // Without a store nothing was saved, so numbering starts at one.
     try std.testing.expectEqual(@as(usize, 0), (try earlierFrom(arena, null, broken)).?.turn_count);
 }

@@ -2,10 +2,14 @@
 //! assistant's final replies, which stay word for word: what the assistant
 //! did in between, a line for every tool call, and the session's rules,
 //! facts, decisions and status. The conversation's model writes them for the
-//! new turns only; nothing it wrote before is ever changed or removed. This
-//! file says what the model is asked for and reads what it wrote:
+//! new turns only; nothing it wrote before is ever changed. When a later
+//! compaction folds the previous one away, the model also writes the summary
+//! that stands in for it, saved whole as its L record. This file says what
+//! the model is asked for and reads what it wrote:
 //! - a note counts only for a turn or tool call of this compaction;
-//! - entries are only added: one whose ID is already taken is left out.
+//! - entries are only added: one repeated word for word is left out, and one
+//!   whose ID is taken is kept under the next free ID, replacing the entry
+//!   it rewrites.
 //! lint.zig then checks what the notes and entries say.
 //! It also lists, from the tool calls alone, the skills and MCP tools used,
 //! and finds the sentences of the user's messages that may set rules, so the
@@ -96,28 +100,47 @@ pub fn writeRequest(alloc: Allocator, text: *std.ArrayList(u8), asked: Asked) Al
         "Decisions:\nD1, D2, ...: each decision and why. When it changes an earlier entry, end with \"replaces\" and that entry's ID.\n\n" ++
         "Status:\nS1, S2, ...: where each part of the work stands now. When it updates an earlier entry, end with \"replaces\" and that entry's ID.\n\n" ++
         "Open:\nO1, O2, ...: questions waiting on the user, and next steps the user asked for.\n\n");
-    if (asked.fold > 0) try text.print(alloc, "Earlier:\nthree to five sentences that stand in for the earlier compacted conversation {s}, which is saved whole as L{d} and leaves what the next assistant sees: what the user wanted, what was done and found, the decisions still in force, and where the work stood. Its rules, status and open entries stay as they are, so do not repeat them.\n\n", .{
-        if (asked.after_conversation) "at the start of the conversation above" else "shown above",
-        asked.fold,
-    });
+    if (asked.fold > 0) try writeEarlierSection(alloc, text, asked.fold, asked.after_conversation);
     try text.appendSlice(alloc, "Never repeat or rewrite an entry that already exists; add a new one that replaces it. Write \"none\" under a section with nothing new.");
     try writeHighestIds(alloc, text, asked.highest);
     try text.appendSlice(alloc, " Be exact: say what was verified, and mark anything only planned, assumed or not checked. Write only these notes.");
 }
 
+/// The section for the summary that stands in for the previous compaction,
+/// saved whole as L<fold>.
+fn writeEarlierSection(alloc: Allocator, text: *std.ArrayList(u8), fold: usize, after_conversation: bool) Allocator.Error!void {
+    try text.print(alloc, "Earlier:\nthree to five sentences that stand in for the earlier compacted conversation {s}, which is saved whole as L{d} and leaves what the next assistant sees: what the user wanted, what was done and found, the decisions still in force, and where the work stood. Its rules, status and open entries stay as they are, so do not repeat them.\n\n", .{
+        if (after_conversation) "at the start of the conversation above" else "shown above",
+        fold,
+    });
+}
+
 const entry_kinds = checkpoint.entry_kinds;
 
-/// Appends the request for the complete turns, `missing`, that a first
-/// reply left out. `highest` counts every entry so far, the first reply's
-/// too.
-pub fn writeFollowUp(alloc: Allocator, text: *std.ArrayList(u8), missing: []const Heading, highest: [entry_kinds.len]usize, after_conversation: bool) Allocator.Error!void {
+/// Appends the request for what a first reply left out: the complete turns
+/// `missing`, and with a nonzero `fold` the summary of the previous
+/// compaction, saved whole as L<fold>. `highest` counts every entry so far,
+/// the first reply's too.
+pub fn writeFollowUp(alloc: Allocator, text: *std.ArrayList(u8), missing: []const Heading, highest: [entry_kinds.len]usize, after_conversation: bool, fold: usize) Allocator.Error!void {
+    if (missing.len == 0) {
+        try text.appendSlice(alloc, "Your notes left out the summary of the earlier compacted conversation. Write only that now, under this heading:\n\n");
+        try writeEarlierSection(alloc, text, fold, after_conversation);
+        if (after_conversation) try text.appendSlice(alloc, "Answer with text only and call no tools." ++ from_fx);
+        return;
+    }
     try text.appendSlice(alloc, "Your notes on the turns above left some out. Write the notes for only these turns now, each heading followed by its notes:\n\n");
     try writeHeadings(alloc, text, missing, null);
     if (after_conversation) try text.appendSlice(alloc, "\nUnder each heading above are the turn's tool calls, so you can find them; do not copy those lines. Answer with text only and call no tools." ++ from_fx ++ "\n");
     try text.appendSlice(alloc, "\nUnder each heading, " ++ in_between_label ++ " with what the assistant did before its final reply, then a line for every tool call, starting with its ID, on why it was used and what it showed.\n\n" ++
         "Then any new entries from those turns under the same sections, each starting with its ID and the turn or tool call it comes from.");
     try writeHighestIds(alloc, text, highest);
-    try text.appendSlice(alloc, " Write only these notes.");
+    if (fold > 0) {
+        try text.appendSlice(alloc, " Your notes also left out the summary of the earlier compacted conversation; after the entries, write it under this heading:\n\n");
+        try writeEarlierSection(alloc, text, fold, after_conversation);
+        try text.appendSlice(alloc, "Write only these notes.");
+    } else {
+        try text.appendSlice(alloc, " Write only these notes.");
+    }
 }
 
 /// One line per turn, like `Turn 3 (T10–T19)`, then `Turn in progress`,
@@ -174,9 +197,11 @@ const max_candidate_line_bytes = 400;
 /// first and without repeats: ones with words like "never", "only" or
 /// "not a". A short one keeps up to two sentences before it, so "Don't build
 /// it." keeps what "it" was. Questions, code blocks and lines that look like
-/// pasted output are skipped. They are recall only: the model decides which
-/// still apply. `arena` owns the result.
-pub fn candidates(arena: Allocator, messages: []const Message) Allocator.Error![]const Candidate {
+/// pasted output are skipped, and so are sentences a rule in `filed` already
+/// quotes, so a turn still in progress at each compaction is not filed
+/// again. They are recall only: the model decides which still apply. `arena`
+/// owns the result.
+pub fn candidates(arena: Allocator, messages: []const Message, filed: []const checkpoint.Entry) Allocator.Error![]const Candidate {
     var out: std.ArrayList(Candidate) = .empty;
     var bytes: usize = 0;
     for (messages) |message| {
@@ -206,7 +231,10 @@ pub fn candidates(arena: Allocator, messages: []const Message) Allocator.Error![
                 const seen = for (out.items) |item| {
                     if (std.mem.eql(u8, item.text, text)) break true;
                 } else false;
-                if (seen) continue;
+                const quoted = for (filed) |entry| {
+                    if (entry.id[0] == 'R' and std.mem.find(u8, entry.text, sentence) != null) break true;
+                } else false;
+                if (seen or quoted) continue;
                 if (bytes + text.len > max_candidate_bytes) {
                     trace.log(false, "rule candidates over their room; the newest are left out candidates={d} bytes={d}", .{ out.items.len, bytes });
                     return out.items;
@@ -380,6 +408,8 @@ const max_tool_note_bytes = 300;
 /// The summary of earlier compactions replaces the one before it, so this
 /// bounds it however many there are.
 const max_earlier_bytes = 2400;
+/// An entry numbered this far above the highest of its kind is renumbered.
+const max_id_gap = 1000;
 /// A reply in none of the asked form may say more, for every turn at once.
 const max_unread_bytes = 8 * 1024;
 
@@ -500,17 +530,20 @@ pub fn read(arena: Allocator, reply: []const u8, known: Known, earlier: []const 
     }
 
     // New IDs are kept first, so a taken one never pushes a later entry off
-    // the ID the model gave it; taken ones then get the next free IDs.
-    const Fate = union(enum) { repeat, keep: []const u8, renumber };
+    // the ID the model gave it; taken ones then get the next free IDs. An
+    // entry written under the ID of one that exists is a rewrite of it, so it
+    // replaces it.
+    const Fate = union(enum) { repeat, keep: []const u8, renumber: struct { replaces: bool } };
     const found = try items(arena, sections.items);
     const fates = try arena.alloc(Fate, found.len);
     const before = checkpoint.highestIds(.{ .entries = earlier, .highest = highest });
     var next = before;
     for (found, fates, 0..) |item, *fate, index| {
+        const rest = entryRest(item);
         const repeats = for (earlier) |entry| {
-            if (std.mem.eql(u8, entry.id, item.id) and std.mem.eql(u8, entry.text[entry.id.len..], entryRest(item))) break true;
+            if (std.mem.eql(u8, entry.id, item.id) and std.mem.eql(u8, entry.text[entry.id.len..], rest)) break true;
         } else false;
-        if (repeats) {
+        if (repeats or copiesReplaced(rest)) {
             fate.* = .repeat;
             written.repeated += 1;
             continue;
@@ -520,8 +553,14 @@ pub fn read(arena: Allocator, reply: []const u8, known: Known, earlier: []const 
         const reused = for (found[0..index], fates[0..index]) |other, other_fate| {
             if (other_fate == .keep and std.mem.eql(u8, other.id, item.id)) break true;
         } else false;
-        if (number <= before[kind] or reused) {
-            fate.* = .renumber;
+        if (number == 0 or number <= before[kind] or reused) {
+            fate.* = .{ .renumber = .{ .replaces = number > 0 and number <= before[kind] and !reused } };
+            continue;
+        }
+        // Far above the highest is a slip, not a real number; renumbered, the
+        // numbers stay small and never run out.
+        if (number - before[kind] > max_id_gap) {
+            fate.* = .{ .renumber = .{ .replaces = false } };
             continue;
         }
         fate.* = .{ .keep = item.id };
@@ -529,17 +568,21 @@ pub fn read(arena: Allocator, reply: []const u8, known: Known, earlier: []const 
     }
     var entries: std.ArrayList(checkpoint.Entry) = .empty;
     for (found, fates) |item, fate| {
-        const id = switch (fate) {
+        const id, const replaces = switch (fate) {
             .repeat => continue,
-            .keep => |id| id,
-            .renumber => renumbered: {
+            .keep => |id| .{ id, false },
+            .renumber => |renumber| renumbered: {
                 const kind = std.mem.findScalar(u8, entry_kinds, item.id[0]).?;
-                next[kind] += 1;
+                next[kind] +|= 1;
                 written.renumbered += 1;
-                break :renumbered try std.fmt.allocPrint(arena, "{c}{d}", .{ entry_kinds[kind], next[kind] });
+                break :renumbered .{ try std.fmt.allocPrint(arena, "{c}{d}", .{ entry_kinds[kind], next[kind] }), renumber.replaces };
             },
         };
-        try entries.append(arena, .{ .id = id, .text = try std.mem.concat(arena, u8, &.{ id, entryRest(item) }) });
+        const text = if (replaces)
+            try std.mem.concat(arena, u8, &.{ id, entryRest(item), "; replaces ", item.id })
+        else
+            try std.mem.concat(arena, u8, &.{ id, entryRest(item) });
+        try entries.append(arena, .{ .id = id, .text = text });
     }
     if (written.renumbered > 0) trace.log(false, "compaction entries renumbered because their IDs were taken count={d}", .{written.renumbered});
     written.entries = entries.items;
@@ -675,6 +718,15 @@ fn toolNumber(text: *[]const u8) ?usize {
 /// A line like `T: none` or `Tools: none`, which names no call.
 fn isToolsLabel(plain: []const u8) bool {
     return startsWithIgnoreCase(plain, "T:") or startsWithIgnoreCase(plain, "Tools:");
+}
+
+/// A line copied from the compacted conversation, where an entry a later one
+/// replaced ends like ` (replaced by S2)`.
+fn copiesReplaced(rest: []const u8) bool {
+    const line = std.mem.trimEnd(u8, rest, " ");
+    const at = std.mem.findLast(u8, line, checkpoint.replaced_mark) orelse return false;
+    const tail = line[at + checkpoint.replaced_mark.len ..];
+    return tail.len > 1 and tail[tail.len - 1] == ')' and checkpoint.isEntryId(tail[0 .. tail.len - 1]);
 }
 
 /// An entry's text after its ID, without the bullet, check box or bold mark
@@ -872,22 +924,37 @@ test "notes are read per turn and tool call, and entries only ever add" {
     try testing.expectEqual(@as(usize, 1), written.unknown);
 
     // The rewrite of D1 is kept under the next free ID, after the D2 the
-    // model numbered right; entries keep their text as written.
+    // model numbered right, and replaces D1; entries keep their text as
+    // written.
     try testing.expectEqual(@as(usize, 0), written.repeated);
     try testing.expectEqual(@as(usize, 1), written.renumbered);
     try testing.expectEqual(@as(usize, 5), written.entries.len);
     try testing.expectEqualStrings("R2 (M3): \"Store every price as integer cents.\"", written.entries[0].text);
     try testing.expectEqualStrings("R3 (M4): \"keep it short\"", written.entries[1].text);
     try testing.expectEqualStrings("F4", written.entries[2].id);
-    try testing.expectEqualStrings("D3 (M3): a rewrite of an entry that already exists", written.entries[3].text);
+    try testing.expectEqualStrings("D3 (M3): a rewrite of an entry that already exists; replaces D1", written.entries[3].text);
     try testing.expectEqualStrings("D2 (M4): no cache; replaces D1", written.entries[4].text);
 
-    // An entry repeated word for word is left out, and one whose ID only a
-    // saved ledger still holds is renumbered above it.
-    const again = try read(arena, "Decisions:\n- D1 (M2): cache in a pickle file\n- D4 (M5): keep the pickle cache", .{ .turns = &.{5}, .tools = &.{} }, &earlier, .{ 0, 0, 6, 0, 0 });
-    try testing.expectEqual(@as(usize, 1), again.repeated);
-    try testing.expectEqual(@as(usize, 1), again.entries.len);
-    try testing.expectEqualStrings("D7 (M5): keep the pickle cache", again.entries[0].text);
+    // An entry repeated word for word is left out, and so is a line copied
+    // with the mark of an entry another replaced. One whose ID only a saved
+    // ledger still holds is a rewrite of that one, renumbered above it.
+    const again = try read(arena,
+        \\Decisions:
+        \\- D1 (M2): cache in a pickle file
+        \\- D1 (M2): cache in a file (replaced by D2)
+        \\- D8 (M5): the old loader (replaced by a new one) stays for tests
+        \\- D4 (M5): keep the pickle cache
+    , .{ .turns = &.{5}, .tools = &.{} }, &earlier, .{ 0, 0, 6, 0, 0 });
+    try testing.expectEqual(@as(usize, 2), again.repeated);
+    try testing.expectEqual(@as(usize, 2), again.entries.len);
+    try testing.expectEqualStrings("D8 (M5): the old loader (replaced by a new one) stays for tests", again.entries[0].text);
+    try testing.expectEqualStrings("D9 (M5): keep the pickle cache; replaces D4", again.entries[1].text);
+
+    // An ID far above the highest is renumbered, so numbers never run out.
+    const far = try read(arena, "Facts:\n- F18446744073709551615 (T8): the parser is slow\n- F1000 (T8): the loader is fast", .{ .turns = &.{3}, .tools = &.{8} }, &.{}, @splat(0));
+    try testing.expectEqual(@as(usize, 1), far.renumbered);
+    try testing.expectEqualStrings("F1001 (T8): the parser is slow", far.entries[0].text);
+    try testing.expectEqualStrings("F1000 (T8): the loader is fast", far.entries[1].text);
 
     // Without a turn in progress, its notes are left out.
     const closed = try read(arena, reply, .{ .turns = &.{3}, .tools = &.{8} }, &.{}, @splat(0));
@@ -982,7 +1049,7 @@ test "sentences that may set rules are found in the user's messages, with what a
         .{ .turn = 24, .text = "Never modify anything under src/, the tool only reads it." },
         .{ .turn = 0, .text = "Keep going, but don't touch the tests.", .in_progress = true },
     };
-    const found = try candidates(arena, &messages);
+    const found = try candidates(arena, &messages, &.{});
     const expected = [_]Candidate{
         .{ .turn = 2, .text = "Before you start, some rules for this whole task: use only the Python standard library, no third-party packages." },
         .{ .turn = 2, .text = "Never modify anything under src/, the tool only reads it." },
@@ -1005,6 +1072,17 @@ test "sentences that may set rules are found in the user's messages, with what a
     try testing.expect(std.mem.find(u8, text.items, "File each one that still applies under Rules") != null);
     try testing.expect(std.mem.find(u8, text.items, "- M2: \"Never modify anything under src/, the tool only reads it.\"\n") != null);
     try testing.expect(std.mem.find(u8, text.items, "- turn in progress: \"Keep going, but don't touch the tests.\"\n") != null);
+
+    // A sentence a rule already quotes is not offered again; only rules
+    // count, not a fact that happens to quote it.
+    const filed = [_]checkpoint.Entry{
+        .{ .id = "R1", .text = "R1 (turn in progress): \u{201C}Keep going, but don't touch the tests.\u{201D}" },
+        .{ .id = "F2", .text = "F2 (M5): the user said \"Never use eval() or exec() for this.\"" },
+    };
+    const later = [_]Message{ messages[1], messages[6] };
+    const unfiled = try candidates(arena, &later, &filed);
+    try testing.expectEqual(@as(usize, 1), unfiled.len);
+    try testing.expectEqualStrings("Never use eval() or exec() for this.", unfiled[0].text);
 }
 
 test "the request asks only for the new turns and numbers entries after the highest" {

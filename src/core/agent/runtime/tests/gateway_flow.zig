@@ -3017,7 +3017,7 @@ test "compaction writes the summary with the least reasoning each model accepts"
         .{ .assistant = .{ .user = .{ .text = @constCast("recent request") }, .assistant = @constCast("recent answer") } },
     };
     const effort = types.ReasoningEffort.literal;
-    // Like Opus 5.5: reasoning cannot be turned off, so low is the least.
+    // This model cannot turn reasoning off, so low is the least it takes.
     const primary_efforts = [_]types.ReasoningEffort{ effort("low"), effort("medium"), effort("high"), effort("xhigh"), effort("max") };
     const fallback_efforts = [_]types.ReasoningEffort{ effort("none"), effort("low"), effort("high"), effort("xhigh") };
     const model = "anthropic/claude-opus-5.5";

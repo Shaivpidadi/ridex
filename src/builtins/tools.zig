@@ -790,7 +790,7 @@ const read_tool_result_search_properties = [_]model_tool_schema.Property{.{
     .json_type = .array,
     .bounds = &.{ .min_items = 1, .max_items = compactor.max_search_phrases },
     .shape = &.{ .array_values = .{ .json_type = .string } },
-    .description = "One to three searches over turns and tool calls saved by compaction. Words match in any order; rarer words and exact phrases rank higher.",
+    .description = "One to three searches over turns, tool calls and earlier compactions saved by compaction. Words match in any order; rarer words and exact phrases rank higher.",
 }};
 
 const read_tool_result_input_schemas = [_]model_tool_schema.ObjectSchema{

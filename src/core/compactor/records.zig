@@ -1,8 +1,10 @@
-//! Turns and tool calls saved by context compaction, and search over them.
+//! Turns, tool calls and earlier compactions saved by context compaction, and
+//! search over them.
 //!
 //! Each is one file in the session's tool-results store: tool call T12 with
-//! its input and output unchanged in `compacted-T12.txt`, and turn 12 word for
-//! word in `compacted-M12.txt`. The first line of every file is an index line
+//! its input and output unchanged in `compacted-T12.txt`, turn 12 word for
+//! word in `compacted-M12.txt`, and the first compaction a later one folded
+//! away, whole, in `compacted-L1.txt`. The first line of every file is an index line
 //! that says what it is, so a match there counts more. Conversation archives
 //! written by the previous compactor are searched too, one message or tool
 //! result at a time.
