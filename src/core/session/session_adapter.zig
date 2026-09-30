@@ -681,7 +681,10 @@ pub const Session = struct {
             const cursor: sm.Cursor = .{ .offset = offset, .seq = state.last_compaction_seq.? };
             var page = try self.handle.read(sa, .{ .at = cursor }, .forward, 1);
             defer page.deinit();
-            const data = page.entries[0].body.?.compacted.data;
+            const data = compactedData(&page) orelse {
+                debug_trace.logf("session", "event=sessions_v2_compaction_unreadable session={s} offset={d}", .{ self.id(), offset });
+                return error.InvalidSessionFormat;
+            };
             const compacted = try std.json.parseFromSliceLeaky(CompactedData, sa, data, .{});
             try history.append(alloc, .{ .compacted_summary = .{
                 .summary = try alloc.dupe(u8, compacted.summary),
@@ -963,6 +966,19 @@ const CompactedData = struct {
     /// The first turn the compaction kept, read back to on resume.
     keep_from_turn: ?u64 = null,
 };
+
+/// The compaction line a page read at its cursor starts with, or null when
+/// that line is damaged. Open reads only line 1, the newest snapshot and the
+/// tail, and every compaction is followed by a snapshot, so damage to its
+/// line shows only here.
+fn compactedData(page: *const sm.Page) ?[]const u8 {
+    if (page.entries.len == 0) return null;
+    const body = page.entries[0].body orelse return null;
+    return switch (body) {
+        .compacted => |line| line.data,
+        else => null,
+    };
+}
 
 // ---------------------------------------------------------------------------
 // Encodings (pure)
@@ -1371,6 +1387,37 @@ test "resume after a compaction starts with its summary and keeps the retained t
     try testing.expectEqualStrings("turns one and two", restored.history[0].compacted_summary.summary);
     try testing.expectEqualStrings("three", restored.history[1].assistant.user.text);
     try testing.expectEqualStrings("four", restored.history[2].assistant.user.text);
+}
+
+test "resume refuses a session whose compaction line is damaged" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    try s.commitTurn(assistantTurn("one", "1"), types.ConversationLanguage.default());
+    try s.commitTurn(assistantTurn("two", "2"), types.ConversationLanguage.default());
+    var summary = "turns one and two".*;
+    try s.commitCompaction(.{ .summary = &summary, .removed_turn_count = 2, .compaction_count = 1 }, false, null);
+    try s.commitTurn(assistantTurn("three", "3"), types.ConversationLanguage.default());
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    s.close();
+
+    // One byte of the summary changes, so its line fails its check. Open
+    // reads past it: a snapshot follows every compaction.
+    const io = io_mod.getIo();
+    const log_path = try std.fs.path.join(testing.allocator, &.{ ".fx", "sessions", "v2", id, "log.jsonl" });
+    defer testing.allocator.free(log_path);
+    const bytes = try t.tmp.dir.readFileAlloc(io, log_path, testing.allocator, .limited(1 << 20));
+    defer testing.allocator.free(bytes);
+    const at = std.mem.find(u8, bytes, "turns one and two") orelse return error.TestUnexpectedResult;
+    bytes[at] = 'T';
+    try t.tmp.dir.writeFile(io, .{ .sub_path = log_path, .data = bytes });
+
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .ask);
+    defer r.close();
+    try testing.expectError(error.InvalidSessionFormat, r.restore(testing.allocator));
 }
 
 test "a piece above the inline limit goes to a blob and comes back whole" {
