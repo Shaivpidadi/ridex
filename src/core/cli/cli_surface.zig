@@ -3099,9 +3099,14 @@ fn runSessionRecoveryV2(alloc: Allocator, deps: RunDeps, recovery: SessionRecove
         return .handled_failure;
     };
     defer recovered.deinit(alloc);
+    const source_id = try alloc.dupe(u8, recovery.session_id);
+    const recovered_id = alloc.dupe(u8, recovered.id) catch |err| {
+        alloc.free(source_id);
+        return err;
+    };
     var result: session_store.SessionRecoveryResult = .{
-        .source_session_id = try alloc.dupe(u8, recovery.session_id),
-        .recovered_session_id = try alloc.dupe(u8, recovered.id),
+        .source_session_id = source_id,
+        .recovered_session_id = recovered_id,
         .history_len = recovered.history_len,
         .status = if (recovered.files_complete) .recovered else .recovered_with_unverified_artifacts,
     };

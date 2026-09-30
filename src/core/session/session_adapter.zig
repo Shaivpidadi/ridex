@@ -143,8 +143,6 @@ pub const Store = struct {
         store.* = undefined;
     }
 
-    /// A child's whole history, read without its lock: every turn, oldest
-    /// first. Free with `types.freeHistoryTurnSlice`.
     /// `~/.fx/session-files`, or null when nothing has used it yet.
     fn openFilesRoot(store: *Store) !?io_mod.VerifiedDir {
         var home = try openHome(store.home);
@@ -216,6 +214,8 @@ pub const Store = struct {
         }
     }
 
+    /// A child's whole history, read without its lock: every turn, oldest
+    /// first. Free with `types.freeHistoryTurnSlice`.
     pub fn childHistory(store: *Store, alloc: Allocator, child_id: []const u8) ![]types.HistoryTurn {
         var history: std.ArrayList(types.HistoryTurn) = .empty;
         errdefer {
@@ -261,10 +261,6 @@ fn traceDiagnostic(_: ?*anyopaque, event: sm.Diagnostic) void {
     });
 }
 
-// ---------------------------------------------------------------------------
-// Session: one per open session
-
-/// Settings a new session starts with; held in memory until its first turn.
 // ---------------------------------------------------------------------------
 // Commands: `fx session {id}`, `fx session recover`, doctor
 
@@ -459,6 +455,10 @@ pub fn doctor(store: *Store, alloc: Allocator, limit: usize, now_ms: i64) !Docto
     return report;
 }
 
+// ---------------------------------------------------------------------------
+// Session: one per open session
+
+/// Settings a new session starts with; held in memory until its first turn.
 pub const Seed = struct {
     preferences: session_codec.DurableSessionPreferences,
     language: types.ConversationLanguage,
@@ -1265,7 +1265,6 @@ pub const Session = struct {
         return restored;
     }
 
-    /// Keeps each turn for resume, with the number of the turn that holds it.
     /// Hands `visitor.append` every turn in the log, oldest first, as v1's
     /// conversation reader does: a compaction hides no turn from the
     /// transcript. Each turn is freed after its call, and pages are freed as
