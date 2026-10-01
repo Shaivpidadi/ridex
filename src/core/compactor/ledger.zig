@@ -108,7 +108,7 @@ pub fn writeRequest(alloc: Allocator, text: *std.ArrayList(u8), asked: Asked) Al
 /// The section for the summary that stands in for the previous compaction,
 /// saved whole as L<fold>.
 fn writeEarlierSection(alloc: Allocator, text: *std.ArrayList(u8), fold: usize, after_conversation: bool) Allocator.Error!void {
-    try text.print(alloc, "Earlier:\nthree to five sentences that stand in for the earlier compacted conversation {s}, which is saved whole as L{d} and leaves what the next assistant sees: what the user wanted, what was done and found, the decisions still in force, and where the work stood. Its rules, status and open entries stay as they are, so do not repeat them.\n\n", .{
+    try text.print(alloc, "Earlier:\nthree to five sentences that stand in for the earlier compacted conversation {s}, which is saved whole as L{d} and leaves what the next assistant sees: what the user wanted, what was done and found, the decisions still in force, and where the work stood when it ended. Cover only that conversation; the turns after it and any turn in progress stay in view with the user's messages word for word, so leave them out. Its rules, status and open entries stay as they are, so do not repeat them.\n\n", .{
         if (after_conversation) "at the start of the conversation above" else "shown above",
         fold,
     });

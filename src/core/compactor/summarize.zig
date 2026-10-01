@@ -301,7 +301,7 @@ fn userMessages(alloc: Allocator, request: Request) Allocator.Error![]const []co
 /// label and the request for its summary. A test checks both cover the
 /// longest request.
 const request_overhead_tokens = 592;
-const fold_overhead_tokens = 80;
+const fold_overhead_tokens = 120;
 const item_label_tokens = 8;
 
 /// Where the part starting at `start` ends: as many turns as fit one request
@@ -1715,6 +1715,8 @@ test "compacting again saves the previous compaction whole and shows its summary
     try testing.expect(std.mem.find(u8, seen, "\n\n[Turn 3]\n[User]\nnow run the tests\n") != null);
     try testing.expect(std.mem.find(u8, seen, "each followed by its notes:\n\nTurn 3 (T2)\n\n") != null);
     try testing.expect(std.mem.find(u8, seen, "\nEarlier:\nthree to five sentences that stand in for the earlier compacted conversation shown above, which is saved whole as L1 ") != null);
+    // The summary covers only the folded compaction; later turns stay in view.
+    try testing.expect(std.mem.find(u8, seen, " Cover only that conversation; the turns after it and any turn in progress stay in view with the user's messages word for word, so leave them out.") != null);
     try testing.expect(std.mem.find(u8, seen, " The highest IDs so far: F1. Number new entries after them.") != null);
 
     const compacted = second.compacted;
