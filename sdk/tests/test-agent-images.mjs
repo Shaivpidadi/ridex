@@ -345,6 +345,36 @@ for (const resizeImage of [undefined, (image) => image]) {
   await assert.rejects(queued, /cannot checkpoint while a prompt is active/);
   for await (const _ of turn) {}
   assert.equal((await turn.result).stopReason, "end_turn");
+  // The rejected call released its place, so the next call is idle again.
+  const afterRejected = agent.checkpoint();
+  const third = agent.prompt("third");
+  assert.ok((await afterRejected).byteLength > 0);
+  for await (const _ of third) {}
+  await agent.close();
+}
+
+// A checkpoint requested from an event handler while another checkpoint's
+// request is being sent waits for it instead of running beside it.
+{
+  const gateway = mockGateway();
+  const nested = [];
+  let agent;
+  agent = await createAgent(gateway, {
+    model: "sdk/vision-model",
+    onEvent(event) {
+      if (event.type === "acp.send" && event.message.method === "libfx/checkpoint" && nested.length < 8) {
+        nested.push(agent.checkpoint());
+      }
+    },
+  });
+  await runPrompt(agent, "first");
+  const expected = Buffer.from(await agent.checkpoint());
+  for (let settled = -1; settled !== nested.length;) {
+    settled = nested.length;
+    await Promise.all(nested);
+  }
+  assert.equal(nested.length, 8);
+  for (const bytes of await Promise.all(nested)) assert.deepEqual(Buffer.from(bytes), expected);
   await agent.close();
 }
 

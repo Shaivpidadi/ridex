@@ -1907,13 +1907,17 @@ export async function createFxAgent(options = {}) {
     checkpoint() {
       // One checkpoint runs at a time: each holds an outbound attachment until
       // it is taken, and the native table holds only a few. An idle call still
-      // sends its request before returning, ahead of a later prompt(). The
-      // count drops before the caller's own reaction to `run`, so a call made
-      // right after awaiting the previous one is idle.
-      const run = pendingCheckpoints > 0 ? checkpointTail.then(takeCheckpoint) : takeCheckpoint();
+      // sends its request before returning, ahead of a later prompt(). The slot
+      // is claimed before that send, so a call from an event handler during it
+      // still waits. The count drops before the caller's own reaction to `run`,
+      // so a call made right after awaiting the previous one is idle.
+      const previous = pendingCheckpoints > 0 ? checkpointTail : null;
       pendingCheckpoints++;
-      const settle = () => { pendingCheckpoints--; };
-      checkpointTail = run.then(settle, settle);
+      let release;
+      checkpointTail = new Promise((resolve) => { release = resolve; });
+      const run = previous ? previous.then(takeCheckpoint) : takeCheckpoint();
+      const settle = () => { pendingCheckpoints--; release(); };
+      run.then(settle, settle);
       return run;
     },
     async close() {
