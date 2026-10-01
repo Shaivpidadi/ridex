@@ -263,7 +263,7 @@ class PgsoPipelineTests(unittest.TestCase):
         self.assertEqual(
             (
                 "-passes=internalize,constmerge,globaldce,mergefunc,verify",
-                "-internalize-public-api-list=main,_mh_execute_header",
+                "-internalize-public-api-list=main,_mh_execute_header,memset",
             ),
             OUTLINE_CLEANUP_FLAGS,
         )

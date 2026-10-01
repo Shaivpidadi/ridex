@@ -2,13 +2,17 @@
 //!
 //! Zig 0.16's compiler_rt memset stores one byte per loop iteration, and the
 //! executable links it instead of the C library's. Safe builds call memset to
-//! fill every `undefined` buffer: a 4 KiB path buffer for each file system
+//! fill every `undefined` buffer: a `PATH_MAX` buffer for each file system
 //! call and the new memory of each allocation. That loop executed about two
 //! thirds of the instructions in `fx status --json` and `fx sessions --json`.
+//! Upstream tracks this as https://codeberg.org/ziglang/zig/issues/32091.
+//! Delete this file once the pinned Zig's memset stores more than one byte per
+//! iteration.
 //!
 //! This memset stores 32 bytes at a time. Only native Linux and macOS
 //! executables export it, so the WASM surfaces and the Node-API addon keep the
-//! toolchain's memset.
+//! toolchain's memset. The PGSO pipeline keeps it in its public symbol list,
+//! because its cleanup pass would otherwise delete it.
 
 const std = @import("std");
 const builtin = @import("builtin");
