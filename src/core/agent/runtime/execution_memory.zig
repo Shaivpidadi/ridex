@@ -710,10 +710,16 @@ pub fn withholdRequestToolImages(arena: Allocator, messages: []const ChatMessage
             const dimensions = image_data.encodedImageDimensions(image.data);
             if (dimensions) |size| {
                 try notice.writer.print("[Image not sent: {s} is {d}x{d} pixels; this request permits at most {d} per side and 5 MiB encoded per image. ", .{ image.mime_type, size.width, size.height, max_dimension });
+            } else if (image.source_ref != null and image.data.len == 0) {
+                try notice.writer.print("[Image not sent: only a host source reference was supplied; this request permits at most {d} per side and 5 MiB encoded per image. ", .{max_dimension});
             } else {
                 try notice.writer.writeAll("[Image not sent: its dimensions could not be verified. ");
             }
-            try notice.writer.writeAll("If this tool result names a local file, use an available image tool to save a smaller copy, then read_file the copy. If no tool or path is available, ask the user; ask before installing software.]\n");
+            if (image.source_ref) |source_ref| {
+                try image_data.writeHostImageRecoveryNotice(&notice.writer, source_ref, max_dimension);
+            } else {
+                try notice.writer.writeAll("If this tool result names a local file, use an available image tool to save a smaller copy, then read_file the copy. If no tool or path is available, ask the user; ask before installing software.]\n");
+            }
         }
         if (kept.items.len == memory.tool_images.len) continue;
         const output = projected orelse try arena.dupe(ChatMessage, messages);

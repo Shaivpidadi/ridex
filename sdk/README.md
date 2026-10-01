@@ -120,36 +120,89 @@ that threshold when the queue is empty; an individual encoded ACP message is
 limited to 64 MiB on both backends. These are transport bounds, not a total
 answer-size limit or a bound on retained conversation history.
 
-Image blocks accept a `Blob` or `File` with a non-empty `type`, or the
-existing canonical base64 (no line wrapping) and explicit `mimeType` of a PNG,
-JPEG, GIF, or WebP payload:
+Image blocks accept a `Blob` or `File` with a non-empty `type`, or canonical
+base64 (no line wrapping) and an explicit `mimeType` for PNG, JPEG, GIF, or WebP.
+The MIME type is required; for a Blob it is inferred from `Blob.type`, and a
+conflicting explicit `mimeType` rejects the input.
 
 ```js
 const turn = agent.prompt([
   { type: "text", text: "What does this screenshot show?" },
-  { type: "image", data: file }, // File or Blob, with file.type
+  { type: "image", data: file, sourceRef: "uploads:screenshot-1" },
   // Or: { type: "image", data: base64Png, mimeType: "image/png" }
 ]);
 ```
 
-A prompt may contain up to 8 images, each with up to 5 MiB of base64 data,
-with at most 8 MiB of image data per prompt. The SDK checks Blob size before
-reading it, encodes it for the same ACP wire format, and rejects larger input
-with typed `RangeError`s. The total frame size is checked before reading a
-Blob, and the actual byte count is checked before encoding it. Blob reads are
-asynchronous: `prompt()` returns a turn, and read failures reject
-`turn.result`. Cancelling or closing while a Blob is being read settles the
-turn without sending its prompt. For base64 input, size errors still throw
-synchronously from `prompt()`.
+An optional `sourceRef` identifies a host-owned original. It must be a non-empty
+UTF-8 string of at most 512 bytes, without ASCII control characters (0–31 or
+DEL). With a reference, you may omit `data` entirely:
 
-The kernel sniffs decoded bytes and compares them with the claimed MIME type
-for both input forms; a mismatch fails the turn with
+```js
+agent.prompt([
+  { type: "image", mimeType: "image/png", sourceRef: "uploads:screenshot-1" },
+]);
+```
+
+A prompt may contain up to 8 images, including reference-only blocks, each with
+up to 5 MiB of base64 data and at most 8 MiB of image data per prompt. The full
+ACP frame must also fit within 8 MiB. These limits do not increase when you add a
+reference. If referenced image data would exceed a per-image or aggregate frame
+limit, the SDK sends its MIME type and reference without image data. It checks
+Blob size before reading, so oversized referenced Blobs stay unread and
+host-owned. Without a reference, the existing typed size errors still apply.
+
+Blob reads are asynchronous: `prompt()` returns a turn, and read failures reject
+`turn.result`. The actual byte count is checked before encoding. Cancelling or
+closing during a Blob read settles the turn without sending its prompt.
+Base64 input size errors throw synchronously from `prompt()`.
+
+Eligible images reach the model unchanged. The kernel validates decoded bytes
+against the claimed MIME type; a mismatch fails the turn with
 `Invalid image prompt block`. Images are routed only to models that advertise
 image input; for any other model the turn fails with
 `Image prompts are unavailable for the selected model` and no image bytes
-leave the process. Prompt images are retained in checkpoints within the
-existing 4 MiB checkpoint bound, so a restored agent can refer to earlier
-images on either backend.
+leave the process. Images outside the request's pixel or encoded-size limits,
+and reference-only originals, are withheld with model-visible recovery feedback
+that includes their `sourceRef` when supplied.
+
+A source reference is metadata, not an access grant or an automatic fetch.
+Your host owns the original's lifetime, reference resolution, and authorization.
+Expose preparation or retrieval through your existing tools' `execute()`
+callbacks if the agent needs a smaller copy. libfx has no built-in image resizer,
+shell, global converter, or source store. If a tool is absent or fails, the
+original remains withheld rather than being sent anyway.
+
+For example, a tool can delegate to your app's authorized image store:
+
+```js
+const prepareImage = {
+  name: "prepare_image",
+  description: "Return a new smaller copy of a host-owned image. Use the request limit for maxSide.",
+  inputSchema: {
+    type: "object",
+    properties: { sourceRef: { type: "string" }, maxSide: { type: "integer" } },
+    required: ["sourceRef", "maxSide"],
+  },
+  async execute({ sourceRef, maxSide }, { signal }) {
+    const copy = await imageStore.prepareCopy(sourceRef, { maxSide, signal });
+    return {
+      type: "libfx.tool-result",
+      text: "Prepared a new copy; original unchanged.",
+      images: [{ type: "image", data: copy.base64, mimeType: copy.mimeType, sourceRef }],
+    };
+  },
+};
+// Supply prepareImage in createFxAgent({ tools: [prepareImage], ... }).
+```
+
+`imageStore` is application code, not a libfx API. It must authorize references,
+validate the requested dimensions, and stop conversion when `signal` aborts.
+The returned copy is checked again by the kernel before model submission.
+
+Prompt images and source refs are retained within the existing 4 MiB checkpoint
+bound on both backends. A checkpoint does not store host-owned originals for
+reference-only blocks. On restoration, resupply your tools and restore the
+sources those refs identify.
 
 Only one top-level prompt may run at a time. While it runs,
 `await turn.steer(text)` appends guidance at the next safe model boundary
@@ -259,6 +312,27 @@ A host tool may use any name, including the kernel's builtin names such as
 `write_file` and `edit_file`: the kernel routes by the registered executor, so
 a host-defined `write_file` calls the host's `execute()` rather than the
 builtin file mutation.
+
+Ordinary objects returned by tools are JSON text. To return rich image content,
+use the typed result:
+
+```js
+return {
+  type: "libfx.tool-result",
+  text: "Original is available through the host image tools.",
+  images: [
+    { type: "image", mimeType: "image/png", sourceRef: "uploads:screenshot-1" },
+    // A prepared copy may also include data: base64Png.
+  ],
+};
+```
+
+Tool images require `mimeType` and accept base64 `data`, or a `sourceRef` with no
+`data`. References use the same validation, ownership, recovery feedback, and
+checkpoint rules as prompt images. The existing eight-image, 5 MiB per-image,
+and 8 MiB result/frame bounds still apply. Referenced data is omitted if those
+bounds would overflow; an unreferenced oversized result remains a tool error.
+
 Instructions are limited to 64 KiB of UTF-8 text, including text assembled by
 the MCP and skills adapters. They are the complete host-owned system context:
 libfx adds no hidden base prompt, and omitting `instructions` sends no system

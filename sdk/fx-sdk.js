@@ -1299,17 +1299,41 @@ function blobByteLength(value) {
   }
 }
 
+function normalizeImageSourceRef(value, name) {
+  boundedString(value, `${name} sourceRef`, 512, false);
+  if (value !== undefined && /[\x00-\x1f\x7f\uD800-\uDFFF]/u.test(value)) {
+    throw new TypeError(`${name} sourceRef must be valid UTF-8 without ASCII controls`);
+  }
+  return value;
+}
+
+function omitReferencedImageData(blocks) {
+  return blocks.map((block) => {
+    if (block.type !== "image" || block.sourceRef === undefined) return block;
+    const { data, ...reference } = block;
+    return reference;
+  });
+}
+
+function promptImageDataBytes(prompt) {
+  return prompt.reduce((total, block) => {
+    if (block.type !== "image" || block.data === undefined) return total;
+    return total + (typeof block.data === "string" ? block.data.length : Math.ceil(blobByteLength(block.data) / 3) * 4);
+  }, 0);
+}
+
 function normalizePromptInput(input) {
   if (typeof input === "string") return [{ type: "text", text: input }];
   if (!Array.isArray(input)) throw new TypeError("prompt input must be a string or an array of prompt blocks");
   let imageCount = 0;
-  let imageBytes = 0;
-  return input.map((block, index) => {
+  let prompt = input.map((block, index) => {
     if (!block || typeof block !== "object") throw new TypeError(`prompt block ${index} must be an object`);
     if (block.type === "image") {
+      const sourceRef = normalizeImageSourceRef(block.sourceRef, `image prompt block ${index}`);
       const size = blobByteLength(block.data);
       const blob = size !== null;
-      if (!blob && (typeof block.data !== "string" || block.data.length === 0)) {
+      const referenceOnly = block.data === undefined && sourceRef !== undefined;
+      if (!referenceOnly && !blob && (typeof block.data !== "string" || block.data.length === 0)) {
         throw new TypeError(`image prompt block ${index} requires base64 data or a Blob`);
       }
       const mimeType = blob ? block.data.type : block.mimeType;
@@ -1322,19 +1346,20 @@ function normalizePromptInput(input) {
       if (blob && (!Number.isSafeInteger(size) || size <= 0)) {
         throw new TypeError(`image prompt block ${index} requires a non-empty Blob with a valid size`);
       }
-      const encodedLength = blob ? Math.ceil(size / 3) * 4 : block.data.length;
-      if (encodedLength > maxPromptImageDataBytes) {
+      const encodedLength = referenceOnly ? 0 : blob ? Math.ceil(size / 3) * 4 : block.data.length;
+      if (encodedLength > maxPromptImageDataBytes && sourceRef === undefined) {
         throw new RangeError(`image prompt block ${index} exceeds the ${maxPromptImageDataBytes} byte per-image libfx limit`);
       }
       imageCount += 1;
       if (imageCount > maxPromptImages) {
         throw new RangeError(`prompt cannot contain more than ${maxPromptImages} images`);
       }
-      imageBytes += encodedLength;
-      if (imageBytes > maxPromptImagesBytes) {
-        throw new RangeError(`prompt images exceed the ${maxPromptImagesBytes} byte libfx frame limit`);
-      }
-      return { type: "image", data: block.data, mimeType };
+      return {
+        type: "image",
+        ...(!referenceOnly && encodedLength <= maxPromptImageDataBytes ? { data: block.data } : {}),
+        mimeType,
+        ...(sourceRef === undefined ? {} : { sourceRef }),
+      };
     }
     if (block.type === "text") {
       if (typeof block.text !== "string") throw new TypeError(`text prompt block ${index} requires text`);
@@ -1348,34 +1373,31 @@ function normalizePromptInput(input) {
     }
     throw new TypeError(`unsupported prompt block type: ${String(block.type)}`);
   });
+  if (promptImageDataBytes(prompt) > maxPromptImagesBytes) prompt = omitReferencedImageData(prompt);
+  if (promptImageDataBytes(prompt) > maxPromptImagesBytes) {
+    throw new RangeError(`prompt images exceed the ${maxPromptImagesBytes} byte libfx frame limit`);
+  }
+  if (promptFrameSize(prompt) > maxPromptFrameBytes) prompt = omitReferencedImageData(prompt);
+  return prompt;
 }
 
 function promptFrameSize(prompt) {
   let blobDataBytes = 0;
   const projected = prompt.map((block) => {
-    if (block.type !== "image" || typeof block.data === "string") return block;
+    if (block.type !== "image" || block.data === undefined || typeof block.data === "string") return block;
     const size = blobByteLength(block.data);
     if (!Number.isSafeInteger(size)) throw new TypeError("image prompt requires a valid Blob size");
     blobDataBytes += Math.ceil(size / 3) * 4;
-    return { type: "image", data: "", mimeType: block.mimeType };
+    return { ...block, data: "" };
   });
   return encoder.encode(JSON.stringify({ sessionId: "", prompt: projected })).length + blobDataBytes + promptFrameEnvelopeBytes;
 }
 
 async function materializePromptBlobs(blocks, isCancelled) {
   const encoded = [];
-  let imageBytes = 0;
   for (const [index, block] of blocks.entries()) {
     if (isCancelled()) return null;
-    if (block.type !== "image") {
-      encoded.push(block);
-      continue;
-    }
-    if (typeof block.data === "string") {
-      imageBytes += block.data.length;
-      if (imageBytes > maxPromptImagesBytes) {
-        throw new RangeError(`prompt images exceed the ${maxPromptImagesBytes} byte libfx frame limit`);
-      }
+    if (block.type !== "image" || block.data === undefined || typeof block.data === "string") {
       encoded.push(block);
       continue;
     }
@@ -1383,13 +1405,13 @@ async function materializePromptBlobs(blocks, isCancelled) {
     if (isCancelled()) return null;
     const encodedLength = Math.ceil(bytes.length / 3) * 4;
     if (encodedLength > maxPromptImageDataBytes) {
+      if (block.sourceRef !== undefined) {
+        encoded.push(...omitReferencedImageData([block]));
+        continue;
+      }
       throw new RangeError(`image prompt block ${index} exceeds the ${maxPromptImageDataBytes} byte per-image libfx limit`);
     }
-    imageBytes += encodedLength;
-    if (imageBytes > maxPromptImagesBytes) {
-      throw new RangeError(`prompt images exceed the ${maxPromptImagesBytes} byte libfx frame limit`);
-    }
-    encoded.push({ type: "image", data: bytesToBase64(bytes), mimeType: block.mimeType });
+    encoded.push({ ...block, data: bytesToBase64(bytes) });
   }
   return normalizePromptInput(encoded);
 }
@@ -1466,17 +1488,28 @@ function hostToolContent(value) {
     if (typeof value.text !== "string" || !Array.isArray(value.images) || value.images.length > 8) {
       throw new TypeError("invalid typed tool result");
     }
-    let imageBytes = 0;
-    const images = value.images.map((image) => {
-      if (image?.type !== "image" || typeof image.data !== "string" || typeof image.mimeType !== "string" || image.mimeType.length > 128 || image.data.length > 5 * 1024 * 1024) {
+    let images = value.images.map((image) => {
+      if (image?.type !== "image") throw new TypeError("invalid tool image");
+      const sourceRef = normalizeImageSourceRef(image.sourceRef, "tool image");
+      const referenceOnly = image.data === undefined && sourceRef !== undefined;
+      if ((!referenceOnly && typeof image.data !== "string") || typeof image.mimeType !== "string" || image.mimeType.length === 0 || image.mimeType.length > 128 || (image.data?.length > maxPromptImageDataBytes && sourceRef === undefined)) {
         throw new TypeError("invalid tool image");
       }
-      imageBytes += image.data.length;
-      if (imageBytes > 8 * 1024 * 1024) throw new RangeError("tool images exceed the result limit");
-      return { type: "image", data: image.data, mimeType: image.mimeType };
+      return {
+        type: "image",
+        ...(!referenceOnly && image.data.length <= maxPromptImageDataBytes ? { data: image.data } : {}),
+        mimeType: image.mimeType,
+        ...(sourceRef === undefined ? {} : { sourceRef }),
+      };
     });
-    const content = JSON.stringify({ text: value.text, images });
-    if (new TextEncoder().encode(content).length > 8 * 1024 * 1024) throw new RangeError("typed tool result exceeds the result limit");
+    if (promptImageDataBytes(images) > maxPromptImagesBytes) images = omitReferencedImageData(images);
+    if (promptImageDataBytes(images) > maxPromptImagesBytes) throw new RangeError("tool images exceed the result limit");
+    let content = JSON.stringify({ text: value.text, images });
+    if (encoder.encode(content).length > maxPromptImagesBytes) {
+      images = omitReferencedImageData(images);
+      content = JSON.stringify({ text: value.text, images });
+    }
+    if (encoder.encode(content).length > maxPromptImagesBytes) throw new RangeError("typed tool result exceeds the result limit");
     return { content, rich: true, isError: value.isError === true };
   }
   if (typeof value === "string") return { content: value, rich: false };
@@ -1698,6 +1731,10 @@ export async function createFxAgent(options = {}) {
       );
       if (cancelled || closing) return;
       const response = { jsonrpc: "2.0", id: message.id, result: { content, isError, ...(rich ? { contentType: "rich" } : {}) } };
+      if (rich && encoder.encode(JSON.stringify(response)).length + 1 > maxPromptFrameBytes) {
+        const result = JSON.parse(content);
+        response.result.content = JSON.stringify({ ...result, images: omitReferencedImageData(result.images) });
+      }
       if (encoder.encode(JSON.stringify(response)).length + 1 > 8 * 1024 * 1024) {
         response.result = { content: "Host tool result exceeded the response frame limit", isError: true };
       }
@@ -1847,7 +1884,7 @@ export async function createFxAgent(options = {}) {
 
   function startTurn(input, promptOptions) {
     const prompt = normalizePromptInput(input);
-    const hasBlobs = prompt.some((block) => block.type === "image" && typeof block.data !== "string");
+    const hasBlobs = prompt.some((block) => block.type === "image" && block.data !== undefined && typeof block.data !== "string");
     if (promptFrameSize(prompt) > maxPromptFrameBytes) {
       throw new RangeError(`prompt exceeds the ${maxPromptFrameBytes} byte libfx frame limit`);
     }

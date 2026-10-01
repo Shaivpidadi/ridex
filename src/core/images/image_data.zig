@@ -5,7 +5,38 @@ const Allocator = std.mem.Allocator;
 pub const max_encoded_image_bytes: usize = 5 * 1024 * 1024;
 pub const max_result_frame_bytes: usize = 8 * 1024 * 1024;
 pub const max_tool_images: usize = 8;
+pub const max_source_ref_bytes: usize = 512;
 pub const Error = Allocator.Error || error{ InvalidImage, ImageLimitExceeded, UnsupportedImageType };
+
+pub fn validSourceRef(source_ref: []const u8) bool {
+    if (source_ref.len == 0 or source_ref.len > max_source_ref_bytes or !std.unicode.utf8ValidateSlice(source_ref)) return false;
+    for (source_ref) |byte| if (byte < 0x20 or byte == 0x7f) return false;
+    return true;
+}
+
+test "source references are bounded opaque UTF-8 without control bytes" {
+    try std.testing.expect(validSourceRef("host:screenshot-1"));
+    try std.testing.expect(validSourceRef("é" ** 256));
+    for ([_][]const u8{ "", "a" ** 513, "bad\nref", "bad\x7fref", "\xff" }) |value| {
+        try std.testing.expect(!validSourceRef(value));
+    }
+}
+
+test "tool source references support deferred images without weakening validation" {
+    const alloc = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, "[{\"type\":\"image\",\"mimeType\":\"image/png\",\"sourceRef\":\"host:original\"}]", .{});
+    defer parsed.deinit();
+    const images = try parseToolImages(alloc, parsed.value.array.items);
+    defer types.freeToolImages(alloc, images);
+    try std.testing.expectEqual(@as(usize, 1), images.len);
+    try std.testing.expectEqualStrings("", images[0].data);
+    try std.testing.expectEqualStrings("host:original", images[0].source_ref.?);
+
+    var list = ImageList{ .alloc = alloc };
+    defer list.deinit();
+    try std.testing.expectError(error.ImageLimitExceeded, list.append("", "image/png"));
+    try std.testing.expectError(error.InvalidImage, list.appendWithSourceRef("", "image/png", "bad\nref"));
+}
 
 /// Owns validated images until take transfers them to the result owner.
 pub const ImageList = struct {
@@ -17,18 +48,29 @@ pub const ImageList = struct {
         for (self.items.items) |item| {
             self.alloc.free(item.data);
             self.alloc.free(item.mime_type);
+            if (item.source_ref) |source_ref| self.alloc.free(source_ref);
         }
         self.items.deinit(self.alloc);
     }
 
     pub fn append(self: *ImageList, data: []const u8, mime_type: []const u8) Error!void {
+        return self.appendWithSourceRef(data, mime_type, null);
+    }
+
+    fn appendWithSourceRef(self: *ImageList, data: []const u8, mime_type: []const u8, source_ref: ?[]const u8) Error!void {
         if (self.items.items.len >= max_tool_images or data.len > max_result_frame_bytes -| self.encoded_bytes) return error.ImageLimitExceeded;
-        try validateImage(self.alloc, data, mime_type);
+        if (source_ref) |value| if (!validSourceRef(value)) return error.InvalidImage;
+        if (data.len == 0) {
+            if (source_ref == null) return error.ImageLimitExceeded;
+            if (!supportedMediaType(mime_type)) return error.UnsupportedImageType;
+        } else try validateImage(self.alloc, data, mime_type);
         const owned_data = try self.alloc.dupe(u8, data);
         errdefer self.alloc.free(owned_data);
         const owned_type = try self.alloc.dupe(u8, mime_type);
         errdefer self.alloc.free(owned_type);
-        try self.items.append(self.alloc, .{ .data = owned_data, .mime_type = owned_type });
+        const owned_ref = if (source_ref) |value| try self.alloc.dupe(u8, value) else null;
+        errdefer if (owned_ref) |value| self.alloc.free(value);
+        try self.items.append(self.alloc, .{ .data = owned_data, .mime_type = owned_type, .source_ref = owned_ref });
         self.encoded_bytes += data.len;
     }
 
@@ -50,9 +92,18 @@ pub fn parseToolImages(alloc: Allocator, content: []const std.json.Value) Error!
         if (!embedded and !std.mem.eql(u8, kind.string, "image")) continue;
         const block = if (embedded) item.object.get("resource") orelse continue else item;
         if (block != .object) continue;
+        const source_ref: ?[]const u8 = if (!embedded and block.object.get("sourceRef") != null) ref: {
+            const value = block.object.get("sourceRef").?;
+            if (value != .string or !validSourceRef(value.string)) return error.InvalidImage;
+            break :ref value.string;
+        } else null;
         const data = block.object.get(if (embedded) "blob" else "data") orelse {
             if (embedded) continue;
-            return error.InvalidImage;
+            if (source_ref == null) return error.InvalidImage;
+            const mime_type = block.object.get("mimeType") orelse return error.InvalidImage;
+            if (mime_type != .string or !supportedMediaType(mime_type.string)) return error.InvalidImage;
+            try images.appendWithSourceRef("", mime_type.string, source_ref);
+            continue;
         };
         const mime_type = block.object.get("mimeType") orelse {
             if (embedded) continue;
@@ -60,7 +111,7 @@ pub fn parseToolImages(alloc: Allocator, content: []const std.json.Value) Error!
         };
         if (data != .string or mime_type != .string) return error.InvalidImage;
         if (!supportedMediaType(mime_type.string)) continue;
-        try images.append(data.string, mime_type.string);
+        try images.appendWithSourceRef(data.string, mime_type.string, source_ref);
     }
     return images.take();
 }
@@ -106,6 +157,12 @@ fn detectFormat(bytes: []const u8) ?ImageFormat {
 pub const max_image_dimension: u32 = 2000;
 pub const max_single_image_dimension: u32 = 8000;
 pub const strict_image_count: usize = 20;
+
+pub fn writeHostImageRecoveryNotice(writer: *std.Io.Writer, source_ref: []const u8, max_dimension: u32) std.Io.Writer.Error!void {
+    try writer.writeAll("Host source reference: ");
+    try std.json.Stringify.value(source_ref, .{}, writer);
+    try writer.print(". Use an available host-provided tool that accepts this reference to make a new copy at most {d} pixels per side and 5 MiB encoded, then return the copy as image data. If no suitable host tool or source is available, ask the user for a smaller image.]\n", .{max_dimension});
+}
 
 pub fn requestMaxDimension(image_count: usize) u32 {
     return if (image_count > strict_image_count) max_image_dimension else max_single_image_dimension;

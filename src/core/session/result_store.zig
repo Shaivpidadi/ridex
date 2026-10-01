@@ -5,6 +5,7 @@ const text_utils = @import("../shared/text_utils.zig");
 const types = @import("../shared/types.zig");
 const artifact_digest = @import("artifact_digest.zig");
 const session_child_store = @import("session_child_store.zig");
+const session_codec = @import("session_codec.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -258,16 +259,7 @@ fn storeLargeResultAtHandle(
 pub fn storeToolImages(alloc: Allocator, capability: *session_child_store.SessionChildCapability, call_id: []const u8, tool_name: []const u8, images: []const types.ToolImage) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-    try out.writer.writeByte('[');
-    for (images, 0..) |image, index| {
-        if (index > 0) try out.writer.writeByte(',');
-        try out.writer.writeAll("{\"type\":\"image\",\"mimeType\":");
-        try std.json.Stringify.value(image.mime_type, .{}, &out.writer);
-        try out.writer.writeAll(",\"data\":");
-        try std.json.Stringify.value(image.data, .{}, &out.writer);
-        try out.writer.writeByte('}');
-    }
-    try out.writer.writeByte(']');
+    try session_codec.writePersistedToolImages(&out.writer, images);
     if (out.written().len > image_data.max_result_frame_bytes) return error.ResultTooLarge;
     const base = try makeHandle(alloc, call_id, tool_name, out.written());
     defer alloc.free(base);
@@ -294,7 +286,7 @@ pub fn loadToolImages(alloc: Allocator, capability: *session_child_store.Session
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
     defer parsed.deinit();
     if (parsed.value != .array) return error.InvalidImageArtifact;
-    const images = try image_data.parseToolImages(alloc, parsed.value.array.items);
+    const images = try session_codec.parsePersistedToolImages(alloc, parsed.value.array.items);
     errdefer types.freeToolImages(alloc, images);
     if (images.len != parsed.value.array.items.len) return error.InvalidImageArtifact;
     return images;
@@ -1395,6 +1387,40 @@ test "managed result handles authenticate stored content" {
         "result-run_command-legacy.txt",
         digest,
     ));
+}
+
+test "stored tool image source refs round trip without reading the host source" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "images");
+    const path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "images");
+    defer alloc.free(path);
+    var capability = try session_child_store.SessionChildCapability.initLegacyRoute(alloc, path, .tool_results, .writable);
+    defer capability.deinit();
+    const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jP0cAAAAASUVORK5CYII=";
+    const originals = [_]types.ToolImage{
+        .{ .data = @constCast(png), .mime_type = @constCast("image/png"), .source_ref = @constCast("host:original") },
+        .{ .data = @constCast(""), .mime_type = @constCast("image/jpeg"), .source_ref = @constCast("/unavailable/host/source") },
+    };
+    const handle = try storeToolImages(alloc, &capability, "recover", "host_image", &originals);
+    defer alloc.free(handle);
+    const loaded = try loadToolImages(alloc, &capability, handle);
+    defer types.freeToolImages(alloc, loaded);
+    try std.testing.expectEqual(@as(usize, 2), loaded.len);
+    try std.testing.expectEqualStrings(png, loaded[0].data);
+    try std.testing.expectEqualStrings("host:original", loaded[0].source_ref.?);
+    try std.testing.expectEqualStrings("", loaded[1].data);
+    try std.testing.expectEqualStrings("/unavailable/host/source", loaded[1].source_ref.?);
+    try std.testing.expectError(error.InvalidSourceRef, storeToolImages(alloc, &capability, "bad", "host_image", &.{.{
+        .data = @constCast(""),
+        .mime_type = @constCast("image/png"),
+        .source_ref = @constCast("bad\nref"),
+    }}));
+    try std.testing.expectError(error.InvalidImage, storeToolImages(alloc, &capability, "empty", "host_image", &.{.{
+        .data = @constCast(""),
+        .mime_type = @constCast("image/png"),
+    }}));
 }
 
 test "stored tool images round trip and reject changed artifacts" {

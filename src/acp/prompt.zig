@@ -18,6 +18,7 @@ else
     struct {};
 const io_mod = @import("../core/shared/io.zig");
 const image_attachments = @import("../core/images/image_attachments.zig");
+const image_data = @import("../core/images/image_data.zig");
 const jsonrpc = @import("jsonrpc.zig");
 const acp_types = @import("types.zig");
 const server = @import("server.zig");
@@ -1116,14 +1117,30 @@ fn buildAgentConfig(
     };
 }
 
+test "libfx inline prompt source references survive capture without a filesystem" {
+    const alloc = std.testing.allocator;
+    var parsed = try parsePromptInput(alloc, "{\"prompt\":[{\"type\":\"image\",\"mimeType\":\"image/png\",\"sourceRef\":\"host:original\"}]}");
+    defer parsed.deinit(alloc);
+    try parsed.captureImagesInline(alloc);
+    try std.testing.expectEqual(@as(usize, 1), parsed.images.len);
+    try std.testing.expectEqualStrings("host:original", parsed.images[0].source_ref.?);
+    try std.testing.expect(parsed.images[0].inline_data == null);
+    try std.testing.expect(parsed.images[0].snapshot_path == null);
+    try std.testing.expectEqualStrings("[Image #1]", parsed.text);
+
+    try std.testing.expectError(error.InvalidPromptImage, parsePromptInput(alloc, "{\"prompt\":[{\"type\":\"image\",\"mimeType\":\"image/png\",\"sourceRef\":\"bad\\nref\"}]}"));
+}
+
 const PendingPromptImage = struct {
     id: usize,
     bytes: []u8,
     media_type: []u8,
+    source_ref: ?[]u8 = null,
 
     fn deinit(self: *PendingPromptImage, alloc: Allocator) void {
         alloc.free(self.bytes);
         alloc.free(self.media_type);
+        if (self.source_ref) |value| alloc.free(value);
         self.* = undefined;
     }
 };
@@ -1157,6 +1174,7 @@ const ParsedPromptInput = struct {
                 snapshot_dir,
             );
             captured += 1;
+            if (pending.source_ref) |value| images[index].source_ref = try alloc.dupe(u8, value);
         }
         self.images = images;
     }
@@ -1175,12 +1193,24 @@ const ParsedPromptInput = struct {
             alloc.free(images);
         }
         for (self.pending_images, 0..) |pending, index| {
-            images[index] = try image_attachments.captureInlineImageBytesInMemory(
+            var attachment = if (pending.bytes.len == 0) ref: {
+                if (pending.source_ref == null or !image_data.supportedMediaType(pending.media_type)) return error.InvalidPromptImage;
+                const path = try std.fmt.allocPrint(alloc, image_attachments.inline_image_path_prefix ++ "{d}", .{pending.id});
+                errdefer alloc.free(path);
+                break :ref types.ImageAttachment{
+                    .id = pending.id,
+                    .path = path,
+                    .media_type = try alloc.dupe(u8, pending.media_type),
+                };
+            } else try image_attachments.captureInlineImageBytesInMemory(
                 alloc,
                 pending.id,
                 pending.media_type,
                 pending.bytes,
             );
+            errdefer types.freeImageAttachment(alloc, attachment);
+            if (pending.source_ref) |value| attachment.source_ref = try alloc.dupe(u8, value);
+            images[index] = attachment;
             captured += 1;
         }
         self.images = images;
@@ -1270,27 +1300,33 @@ fn parsePromptInputWithFirstImageId(
                 }
             }
         } else if (std.mem.eql(u8, block_type.string, "image")) {
-            const data_value = block.object.get("data") orelse return error.InvalidPromptImage;
             const media_type_value = block.object.get("mimeType") orelse return error.InvalidPromptImage;
-            if (data_value != .string or media_type_value != .string or media_type_value.string.len == 0) {
-                return error.InvalidPromptImage;
-            }
-            const decoded_len = std.base64.standard.Decoder.calcSizeForSlice(data_value.string) catch
-                return error.InvalidPromptImage;
-            if (decoded_len == 0) return error.InvalidPromptImage;
-            if (decoded_len > image_attachments.max_image_bytes) {
-                return error.ImageTooLarge;
-            }
-            const decoded = try alloc.alloc(u8, decoded_len);
+            if (media_type_value != .string or media_type_value.string.len == 0) return error.InvalidPromptImage;
+            const source_ref_value: ?[]const u8 = if (block.object.get("sourceRef")) |value| ref: {
+                if (value != .string or !image_data.validSourceRef(value.string)) return error.InvalidPromptImage;
+                break :ref value.string;
+            } else null;
+            const decoded = if (block.object.get("data")) |data_value| bytes: {
+                if (data_value != .string) return error.InvalidPromptImage;
+                const decoded_len = std.base64.standard.Decoder.calcSizeForSlice(data_value.string) catch
+                    return error.InvalidPromptImage;
+                if (decoded_len == 0) return error.InvalidPromptImage;
+                if (decoded_len > image_attachments.max_image_bytes) return error.ImageTooLarge;
+                const result = try alloc.alloc(u8, decoded_len);
+                errdefer alloc.free(result);
+                std.base64.standard.Decoder.decode(result, data_value.string) catch return error.InvalidPromptImage;
+                const canonical_len = std.base64.standard.Encoder.calcSize(result.len);
+                if (canonical_len != data_value.string.len) return error.InvalidPromptImage;
+                const canonical = try alloc.alloc(u8, canonical_len);
+                defer alloc.free(canonical);
+                const encoded = std.base64.standard.Encoder.encode(canonical, result);
+                if (!std.mem.eql(u8, encoded, data_value.string)) return error.InvalidPromptImage;
+                break :bytes result;
+            } else bytes: {
+                if (source_ref_value == null or !image_data.supportedMediaType(media_type_value.string)) return error.InvalidPromptImage;
+                break :bytes try alloc.alloc(u8, 0);
+            };
             errdefer alloc.free(decoded);
-            std.base64.standard.Decoder.decode(decoded, data_value.string) catch
-                return error.InvalidPromptImage;
-            const canonical_len = std.base64.standard.Encoder.calcSize(decoded.len);
-            if (canonical_len != data_value.string.len) return error.InvalidPromptImage;
-            const canonical = try alloc.alloc(u8, canonical_len);
-            defer alloc.free(canonical);
-            const encoded = std.base64.standard.Encoder.encode(canonical, decoded);
-            if (!std.mem.eql(u8, encoded, data_value.string)) return error.InvalidPromptImage;
 
             const image_id = std.math.add(usize, first_image_id, pending_images.items.len) catch
                 return error.ImageIdOverflow;
@@ -1302,10 +1338,13 @@ fn parsePromptInputWithFirstImageId(
 
             const media_type = try alloc.dupe(u8, media_type_value.string);
             errdefer alloc.free(media_type);
+            const source_ref = if (source_ref_value) |value| try alloc.dupe(u8, value) else null;
+            errdefer if (source_ref) |value| alloc.free(value);
             try pending_images.append(alloc, .{
                 .id = image_id,
                 .bytes = decoded,
                 .media_type = media_type,
+                .source_ref = source_ref,
             });
         } else if (std.mem.eql(u8, block_type.string, "resource")) {
             if (block.object.get("resource")) |resource| {

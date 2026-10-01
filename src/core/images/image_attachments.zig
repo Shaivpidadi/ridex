@@ -624,18 +624,9 @@ pub fn captureInlineImageBytesInMemory(
     const detected = detectMediaTypeFromBytes(bytes) orelse return error.UnsupportedImageType;
     if (!std.mem.eql(u8, detected, declared_media_type)) return error.ImageSnapshotMediaTypeMismatch;
 
-    // Without a snapshot directory there is no platform resizer, so only
-    // PNGs shrink here; other oversized images are withheld with a note when
-    // requests are built.
-    const owned_bytes = owned: {
-        if (try png_downscale.downscaleOversized(alloc, detected, bytes)) |smaller| {
-            if (image_data.fitsEncodedImageLimit(smaller.png.len)) break :owned smaller.png;
-            alloc.free(smaller.png);
-        }
-        break :owned try alloc.dupe(u8, bytes);
-    };
+    if (!image_data.fitsEncodedImageLimit(bytes.len)) return error.ImageTooLarge;
+    const owned_bytes = try alloc.dupe(u8, bytes);
     errdefer alloc.free(owned_bytes);
-    if (!image_data.fitsEncodedImageLimit(owned_bytes.len)) return error.ImageTooLarge;
     const owned_path = try std.fmt.allocPrint(alloc, inline_image_path_prefix ++ "{d}", .{image_id});
     errdefer alloc.free(owned_path);
     const owned_media_type = try alloc.dupe(u8, declared_media_type);
@@ -856,8 +847,14 @@ fn writeWithheldAttachmentNotice(
 ) std.Io.Writer.Error!void {
     if (dimensions) |size| {
         try writer.print("[Image #{d} not sent: {s} is {d}x{d} pixels. This request permits at most {d} per side and 5 MiB encoded per image. ", .{ attachment.id, attachment.media_type, size.width, size.height, max_dimension });
+    } else if (attachment.source_ref != null and attachment.inline_data == null and attachment.snapshot_path == null) {
+        try writer.print("[Image #{d} not sent: only a host source reference was supplied. This request permits at most {d} per side and 5 MiB encoded per image. ", .{ attachment.id, max_dimension });
     } else {
         try writer.print("[Image #{d} not sent: its dimensions could not be verified. ", .{attachment.id});
+    }
+    if (attachment.source_ref) |source_ref| {
+        try image_data.writeHostImageRecoveryNotice(writer, source_ref, max_dimension);
+        return;
     }
     if (attachment.inline_data == null) {
         if (attachment.snapshot_path) |path| {
@@ -3146,6 +3143,28 @@ test "requests keep verified attachments within the pixel limit unchanged" {
     try std.testing.expectEqual(@as([*]const types.ChatMessage, &messages), projection.messages.ptr);
 }
 
+test "reference-only attachments get host recovery guidance without attempting file access" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const images = [_]types.ImageAttachment{.{
+        .id = 1,
+        .path = @constCast("inline://image-1"),
+        .media_type = @constCast("image/png"),
+        .source_ref = @constCast("host:original"),
+    }};
+    const messages = [_]types.ChatMessage{.{ .role = .user, .images = &images }};
+    var cache: AttachmentDimensionCache = .empty;
+    const projection = try withholdOversizedAttachments(arena, arena, &cache, &messages, 8000);
+    try std.testing.expectEqual(@as(usize, 0), projection.messages[0].images.len);
+    const notice = projection.messages[0].content.?;
+    try std.testing.expect(std.mem.find(u8, notice, "only a host source reference was supplied") != null);
+    try std.testing.expect(std.mem.find(u8, notice, "host:original") != null);
+    try std.testing.expect(std.mem.find(u8, notice, "host-provided tool") != null);
+    try std.testing.expect(std.mem.find(u8, notice, "read_file") == null);
+    try std.testing.expectEqual(@as(usize, 1), messages[0].images.len);
+}
+
 test "requests withhold snapshots whose dimensions cannot be verified" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -3281,18 +3300,16 @@ test "requests find a JPEG frame header behind large metadata" {
     try std.testing.expect(std.mem.startsWith(u8, projection.messages[0].content.?, "[Image #1 not sent: image/jpeg is 4032x3024 pixels"));
 }
 
-test "in-memory capture downscales an oversized PNG and keeps other formats" {
+test "in-memory capture preserves PNG and JPEG originals without resizing" {
     const alloc = std.testing.allocator;
     const png = try png_downscale.testSolidGrayPng(alloc, 2400, 8, 128);
     defer alloc.free(png);
-    const shrunk = try captureInlineImageBytesInMemory(alloc, 1, "image/png", png);
-    defer types.freeImageAttachment(alloc, shrunk);
-    try std.testing.expectEqual(
-        @as(?image_data.Dimensions, .{ .width = 2000, .height = 7 }),
-        image_data.imageDimensions(shrunk.inline_data.?),
-    );
-    var verified = try loadVerifiedSnapshot(alloc, shrunk, .{});
-    verified.deinit(alloc);
+    const original = try captureInlineImageBytesInMemory(alloc, 1, "image/png", png);
+    defer types.freeImageAttachment(alloc, original);
+    try std.testing.expectEqualSlices(u8, png, original.inline_data.?);
+    var verified = try loadVerifiedSnapshot(alloc, original, .{});
+    defer verified.deinit(alloc);
+    try std.testing.expectEqualSlices(u8, png, verified.bytes);
 
     const jpeg = image_data.testJpeg(3420, 2224);
     const kept = try captureInlineImageBytesInMemory(alloc, 2, "image/jpeg", &jpeg);
