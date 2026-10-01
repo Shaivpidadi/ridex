@@ -23,6 +23,7 @@ const acp_types = @import("types.zig");
 const server = @import("server.zig");
 const sessions = @import("sessions.zig");
 const client_instructions = @import("client_instructions.zig");
+const tool_call_identities = @import("tool_call_identities.zig");
 const agent_runtime = @import("../core/agent/agent_runtime.zig");
 const agent_execution_memory = @import("../core/agent/execution_memory.zig");
 const diff_mod = @import("../core/output/diff.zig");
@@ -240,19 +241,16 @@ const AcpContext = struct {
     /// before its server reconnects. A failure costs only replay detail.
     fn rememberToolIdentity(self: *AcpContext, name: []const u8, identity: mcp_runtime.McpRuntime.ToolIdentity) void {
         const session = if (self.state.active_session) |*active| active else return;
-        const capability: ?*session_child_store.SessionChildCapability = blk: {
-            const found = if (session.writable) |*writable|
-                writable.childCapability()
-            else if (session.v2) |v2|
-                v2.childCapability()
-            else
-                break :blk null;
-            break :blk found catch |err| {
+        // A v2 session keeps the record as a setting (D46).
+        const target: tool_call_identities.Target = if (session.v2) |v2| .{ .v2 = v2 } else blk: {
+            const writable = if (session.writable) |*value| value else break :blk .none;
+            const capability = writable.childCapability() catch |err| {
                 debug_trace.logf("acp", "tool identity kept in memory only tool={s} err={s}", .{ name, @errorName(err) });
-                break :blk null;
+                break :blk .none;
             };
+            break :blk .{ .capability = capability };
         };
-        session.tool_identities.remember(self.state.alloc, capability, name, identity) catch |err| {
+        session.tool_identities.remember(self.state.alloc, target, name, identity) catch |err| {
             debug_trace.logf("acp", "tool identity not recorded for replay tool={s} err={s}", .{ name, @errorName(err) });
         };
     }
@@ -739,15 +737,18 @@ pub fn handlePrompt(
             if (comptime host_target.is_wasm) return promptInputFailure(error.UnsupportedPromptImage);
             var temporary_snapshot_dir: ?[]u8 = null;
             defer if (temporary_snapshot_dir) |path| alloc.free(path);
-            // A v2 session keeps them in its side folder, like v1's.
+            // A v2 session captures into a temporary folder, then keeps the
+            // bytes inside the turn (D44).
             const snapshot_dir = try session_store.imageSnapshotStorageDir(
                 alloc,
-                if (session.v2) |v2| std.fs.path.dirname(try v2.ensureFilesPath()) else if (session.store) |store| store.sessions_dir else null,
-                if (session.store != null or session.v2 != null) session.session_id else null,
+                if (session.v2 != null) null else if (session.store) |store| store.sessions_dir else null,
+                if (session.v2 == null and session.store != null) session.session_id else null,
                 &temporary_snapshot_dir,
             );
             defer alloc.free(snapshot_dir);
             prompt_input.captureImages(alloc, snapshot_dir) catch |err|
+                return promptInputFailure(err);
+            if (session.v2 != null) image_attachments.inlineCapturedSnapshots(alloc, prompt_input.images) catch |err|
                 return promptInputFailure(err);
         }
     }

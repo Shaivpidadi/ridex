@@ -1444,17 +1444,20 @@ pub fn Runtime(comptime App: type) type {
                 attachment,
                 snapshot_dir,
             );
+            // A v2 session keeps the image inside the turn (D44).
+            if (app.session_persistence.v2 != null) try image_attachments.inlineCapturedSnapshot(app.alloc, attachment);
         }
 
         fn imageSnapshotStorageDir(app: *App) ![]u8 {
-            // A v2 session keeps its images with its side files.
-            const sessions_dir = if (app.session_persistence.v2) |v2|
-                std.fs.path.dirname(try v2.ensureFilesPath())
+            // A v2 session captures into the process's temporary folder,
+            // then keeps the bytes inside the turn (D44).
+            const sessions_dir = if (app.session_persistence.v2 != null)
+                null
             else if (app.session_persistence.store) |*store|
                 store.sessions_dir
             else
                 null;
-            const session_id = activeSessionId(app);
+            const session_id = if (app.session_persistence.v2 != null) null else activeSessionId(app);
             return session_store.imageSnapshotStorageDir(
                 app.alloc,
                 sessions_dir,
@@ -1541,8 +1544,14 @@ pub fn Runtime(comptime App: type) type {
         pub fn enableSessionStores(app: *App) void {
             if (comptime !runtime_profile.allows(App, .durable_sessions)) return;
             if (app.session_persistence.v2) |v2| {
-                if (comptime @hasDecl(@TypeOf(app.session), "configureWebFetchArtifacts")) {
-                    app.session.configureWebFetchArtifacts(app.alloc, v2.filesPath());
+                if (comptime @hasDecl(@TypeOf(app.session), "configureWebFetchArtifactBlobs")) {
+                    // A v2 session's downloads are its blobs (D44, D49).
+                    if (v2.childCapability()) |capability| {
+                        app.session.configureWebFetchArtifactBlobs(app.alloc, capability, v2.id());
+                    } else |err| {
+                        debug_trace.logf("session", "event=sessions_v2_web_fetch_store_unavailable session={s} err={s}", .{ v2.id(), @errorName(err) });
+                        app.session.clearWebFetchArtifacts();
+                    }
                 }
                 enableSubagentHostV2(app, v2);
                 return;

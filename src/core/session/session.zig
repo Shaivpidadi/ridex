@@ -12,6 +12,7 @@ const image_attachments = @import("../images/image_attachments.zig");
 const generation_usage_provider = @import("generation_usage_provider.zig");
 const web_fetch_artifacts = @import("web_fetch_artifacts.zig");
 const command_replay_store = @import("command_replay_store.zig");
+const session_child_store = @import("session_child_store.zig");
 pub const session_usage = @import("session_usage.zig");
 pub const profile_usage_runtime = @import("profile_usage_runtime.zig");
 const command_contract = @import("../execution/command_contract.zig");
@@ -1868,6 +1869,22 @@ pub const SessionRuntime = struct {
     pub fn configureWebFetchArtifacts(self: *SessionRuntime, alloc: Allocator, session_dir: []const u8) void {
         self.clearWebFetchArtifacts();
         const store = web_fetch_artifacts.Store.init(alloc, session_dir) catch |err| {
+            self.web_fetch_artifacts = .{ .unavailable = err };
+            return;
+        };
+        self.web_fetch_artifacts = .{ .store = store };
+    }
+
+    /// As `configureWebFetchArtifacts`, for a v2 session, whose downloads
+    /// are its blobs (D44, D49).
+    pub fn configureWebFetchArtifactBlobs(
+        self: *SessionRuntime,
+        alloc: Allocator,
+        capability: *const session_child_store.SessionChildCapability,
+        session_id: []const u8,
+    ) void {
+        self.clearWebFetchArtifacts();
+        const store = web_fetch_artifacts.Store.initBlobs(alloc, capability, session_id) catch |err| {
             self.web_fetch_artifacts = .{ .unavailable = err };
             return;
         };

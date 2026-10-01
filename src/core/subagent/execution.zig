@@ -341,6 +341,16 @@ pub const TurnContext = struct {
         return try checkpoint.dupe(alloc);
     }
 
+    /// Opens a v2 child's turn on disk as its work starts, so a body its
+    /// tools store is a blob of a session on disk (D44). A v1 child keeps
+    /// side files and has nothing to open.
+    pub fn beginTurn(self: *TurnContext) !void {
+        switch (self.loaded) {
+            .v1 => {},
+            .v2 => |child| try child.beginTurn(),
+        }
+    }
+
     pub fn childCapability(
         self: *TurnContext,
     ) !*session_child_store.SessionChildCapability {

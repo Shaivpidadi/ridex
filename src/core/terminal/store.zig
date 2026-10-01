@@ -474,10 +474,12 @@ pub const ProfileStore = struct {
     process_provider: process_provider_mod.Provider,
     sessions_dir: io_mod.VerifiedDir,
     display_sessions_path: []u8,
-    /// `~/.fx`, kept open to reach the side folders of v2 sessions, which
-    /// hold their terminal state in v1's layout (D27).
+    /// `~/.fx`, kept open to reach the folders v2 sessions keep terminal
+    /// state in, in v1's layout: `~/.fx/terminal/{id}` (D45), or the side
+    /// folder of a session not moved yet (D27, D47).
     fx_dir: io_mod.VerifiedDir,
-    display_files_path: []u8,
+    /// `~/.fx/terminal` and `~/.fx/session-files`, as `outside_roots`.
+    display_outside_paths: [outside_roots.len][]u8,
     options: Options,
     mutex: std.Io.Mutex = .init,
     residents: std.ArrayList(*DurableSession) = .empty,
@@ -516,14 +518,20 @@ pub const ProfileStore = struct {
         errdefer sessions_dir.close();
         const display_sessions_path = try profile_paths.sessionsDir(alloc, home);
         errdefer alloc.free(display_sessions_path);
-        const display_files_path = try std.fs.path.join(alloc, &.{ home, profile_paths.root_dir_name, profile_paths.session_files_dir_name });
+        var display_outside_paths: [outside_roots.len][]u8 = undefined;
+        var joined: usize = 0;
+        errdefer for (display_outside_paths[0..joined]) |path| alloc.free(path);
+        for (outside_roots, &display_outside_paths) |root_name, *path| {
+            path.* = try std.fs.path.join(alloc, &.{ home, profile_paths.root_dir_name, root_name });
+            joined += 1;
+        }
         return .{
             .alloc = alloc,
             .process_provider = process_provider,
             .sessions_dir = sessions_dir,
             .display_sessions_path = display_sessions_path,
             .fx_dir = fx_dir,
-            .display_files_path = display_files_path,
+            .display_outside_paths = display_outside_paths,
             .options = options,
         };
     }
@@ -532,7 +540,7 @@ pub const ProfileStore = struct {
         std.debug.assert(self.residents.items.len == 0);
         self.residents.deinit(self.alloc);
         self.alloc.free(self.display_sessions_path);
-        self.alloc.free(self.display_files_path);
+        for (self.display_outside_paths) |path| self.alloc.free(path);
         self.sessions_dir.close();
         self.fx_dir.close();
         self.* = undefined;
@@ -591,13 +599,17 @@ pub const ProfileStore = struct {
         return null;
     }
 
+    /// A capability over an owner's terminal state or proofs. Only a new
+    /// terminal makes a v2 owner's folder (`create_owner`); every other use
+    /// finds it or fails with FileNotFound.
     fn open_capability(
         self: *ProfileStore,
         owner_session_id: []const u8,
         comptime proof_route: bool,
+        create_owner: bool,
     ) !session_child_store.SessionChildCapability {
         try session_layout.validateSessionId(owner_session_id);
-        var owner = try self.open_owner(owner_session_id);
+        var owner = try self.open_owner(owner_session_id, create_owner);
         defer owner.deinit(self.alloc);
         const owner_dir = owner.dir;
         const display_path = owner.display_path;
@@ -629,9 +641,15 @@ pub const ProfileStore = struct {
         }
     };
 
+    /// Where v2 sessions keep terminal state outside the session manager,
+    /// in order: `~/.fx/terminal` (D45), then side folders not moved yet
+    /// (D27, D47). A new owner folder is made only in the first.
+    const outside_roots = [_][]const u8{ profile_paths.terminal_dir_name, profile_paths.session_files_dir_name };
+
     /// The folder an owner keeps its terminal state in: its v1 session
-    /// folder, or the side folder of a v2 session (D27).
-    fn open_owner(self: *ProfileStore, owner_session_id: []const u8) !OwnerFolder {
+    /// folder, or a v2 session's folder outside the manager. `create` makes
+    /// `~/.fx/terminal/{id}` (`0700`) when the owner has none.
+    fn open_owner(self: *ProfileStore, owner_session_id: []const u8, create: bool) !OwnerFolder {
         const zio = io_mod.getIo();
         const options: std.Io.Dir.OpenOptions = .{ .iterate = true, .follow_symlinks = false };
         if (self.sessions_dir.dir.openDir(zio, owner_session_id, options)) |found| {
@@ -643,47 +661,75 @@ pub const ProfileStore = struct {
             error.NotDir, error.SymLinkLoop => return error.SessionPathUnsafe,
             else => return err,
         }
-        var files = (try self.open_files_root()) orelse return error.FileNotFound;
-        defer files.close();
-        var dir = files.dir.openDir(zio, owner_session_id, options) catch |err| switch (err) {
-            error.NotDir, error.SymLinkLoop => return error.SessionPathUnsafe,
-            else => return err,
-        };
-        errdefer dir.close(zio);
-        return .{ .dir = dir, .display_path = try session_layout.sessionDirPath(self.alloc, self.display_files_path, owner_session_id) };
+        for (outside_roots, 0..) |root_name, index| {
+            var root = (try self.open_outside_root(root_name, false)) orelse continue;
+            defer root.close();
+            var dir = root.dir.openDir(zio, owner_session_id, options) catch |err| switch (err) {
+                error.FileNotFound => continue,
+                error.NotDir, error.SymLinkLoop => return error.SessionPathUnsafe,
+                else => return err,
+            };
+            errdefer dir.close(zio);
+            return .{ .dir = dir, .display_path = try session_layout.sessionDirPath(self.alloc, self.display_outside_paths[index], owner_session_id) };
+        }
+        if (!create) return error.FileNotFound;
+        var root = (try self.open_outside_root(outside_roots[0], true)).?;
+        defer root.close();
+        var made = try io_mod.openOrCreateVerifiedPrivateDir(&root, owner_session_id);
+        errdefer made.close();
+        return .{ .dir = made.dir, .display_path = try session_layout.sessionDirPath(self.alloc, self.display_outside_paths[0], owner_session_id) };
     }
 
-    /// `~/.fx/session-files`, once a v2 session has made it. Opened for each
-    /// use: it can appear after this store opened.
-    fn open_files_root(self: *ProfileStore) !?io_mod.VerifiedDir {
-        return io_mod.openVerifiedPrivateDirIfPresent(&self.fx_dir, profile_paths.session_files_dir_name);
+    /// `~/.fx/{root_name}`, or null when nothing has made it yet. Opened
+    /// for each use: it can appear after this store opened.
+    fn open_outside_root(self: *ProfileStore, root_name: []const u8, create: bool) !?io_mod.VerifiedDir {
+        if (create) return try io_mod.openOrCreateVerifiedPrivateDir(&self.fx_dir, root_name);
+        return io_mod.openVerifiedPrivateDirIfPresent(&self.fx_dir, root_name);
     }
 
-    /// Every owner folder: v1 session folders, then the side folders of v2
-    /// sessions whose id has no v1 folder. A name lasts until the next call.
+    /// Every owner folder: v1 session folders, then the v2 folders of each
+    /// outside root whose id no earlier root has. A name lasts until the
+    /// next call.
     const OwnerIterator = struct {
         store: *ProfileStore,
         sessions: std.Io.Dir.Iterator,
-        files: ?io_mod.VerifiedDir,
-        files_iter: ?std.Io.Dir.Iterator = null,
+        roots: [outside_roots.len]?io_mod.VerifiedDir,
+        root_index: usize = 0,
+        root_iter: ?std.Io.Dir.Iterator = null,
 
         fn next(it: *OwnerIterator) !?[]const u8 {
             const zio = io_mod.getIo();
             while (try it.sessions.next(zio)) |entry| {
                 if (isOwner(entry)) return entry.name;
             }
-            const files = if (it.files) |*value| value else return null;
-            if (it.files_iter == null) it.files_iter = files.dir.iterate();
-            while (try it.files_iter.?.next(zio)) |entry| {
-                if (!isOwner(entry)) continue;
-                if (it.store.sessions_dir.dir.statFile(zio, entry.name, .{ .follow_symlinks = false })) |_| continue else |_| {}
-                return entry.name;
+            while (it.root_index < it.roots.len) : ({
+                it.root_index += 1;
+                it.root_iter = null;
+            }) {
+                const root = if (it.roots[it.root_index]) |*value| value else continue;
+                if (it.root_iter == null) it.root_iter = root.dir.iterate();
+                while (try it.root_iter.?.next(zio)) |entry| {
+                    if (!isOwner(entry) or it.seenEarlier(entry.name)) continue;
+                    return entry.name;
+                }
             }
             return null;
         }
 
+        /// An id with a folder in an earlier root is that owner, seen once.
+        fn seenEarlier(it: *OwnerIterator, name: []const u8) bool {
+            const zio = io_mod.getIo();
+            const options: std.Io.Dir.StatFileOptions = .{ .follow_symlinks = false };
+            if (it.store.sessions_dir.dir.statFile(zio, name, options)) |_| return true else |_| {}
+            for (it.roots[0..it.root_index]) |*maybe| {
+                const root = if (maybe.*) |*value| value else continue;
+                if (root.dir.statFile(zio, name, options)) |_| return true else |_| {}
+            }
+            return false;
+        }
+
         fn deinit(it: *OwnerIterator) void {
-            if (it.files) |*value| value.close();
+            for (&it.roots) |*maybe| if (maybe.*) |*value| value.close();
         }
 
         fn isOwner(entry: anytype) bool {
@@ -693,7 +739,10 @@ pub const ProfileStore = struct {
     };
 
     fn owner_iterator(self: *ProfileStore) !OwnerIterator {
-        return .{ .store = self, .sessions = self.sessions_dir.dir.iterate(), .files = try self.open_files_root() };
+        var roots: [outside_roots.len]?io_mod.VerifiedDir = .{null} ** outside_roots.len;
+        errdefer for (&roots) |*maybe| if (maybe.*) |*value| value.close();
+        for (outside_roots, &roots) |root_name, *root| root.* = try self.open_outside_root(root_name, false);
+        return .{ .store = self, .sessions = self.sessions_dir.dir.iterate(), .roots = roots };
     }
 
     fn open_existing(
@@ -701,7 +750,7 @@ pub const ProfileStore = struct {
         owner_session_id: []const u8,
         terminal_session_id: []const u8,
     ) !DurableSession {
-        var state = try self.open_capability(owner_session_id, false);
+        var state = try self.open_capability(owner_session_id, false, false);
         errdefer state.deinit();
         var record = try load_record(self.alloc, &state, terminal_session_id);
         errdefer record.deinit(self.alloc);
@@ -732,7 +781,7 @@ pub const ProfileStore = struct {
         var owners = try self.owner_iterator();
         defer owners.deinit();
         while (try owners.next()) |owner_id| {
-            var capability = self.open_capability(owner_id, false) catch continue;
+            var capability = self.open_capability(owner_id, false, false) catch continue;
             defer capability.deinit();
             const name = try record_name(self.alloc, terminal_session_id);
             defer self.alloc.free(name);
@@ -774,6 +823,7 @@ pub const ProfileStore = struct {
         errdefer result.deinit();
         var capability = try self.open_capability(
             claim.principal.durable_session_id,
+            false,
             false,
         );
         defer capability.deinit();
@@ -874,7 +924,7 @@ pub const ProfileStore = struct {
         var owners = try self.owner_iterator();
         defer owners.deinit();
         while (try owners.next()) |owner_id| {
-            var capability = self.open_capability(owner_id, false) catch continue;
+            var capability = self.open_capability(owner_id, false, false) catch continue;
             defer capability.deinit();
             var names = capability.iterate(self.alloc, .terminal_state) catch continue;
             defer names.deinit();
@@ -899,7 +949,7 @@ pub const ProfileStore = struct {
         var owners = try self.owner_iterator();
         defer owners.deinit();
         while (try owners.next()) |owner_id| {
-            var capability = self.open_capability(owner_id, false) catch continue;
+            var capability = self.open_capability(owner_id, false, false) catch continue;
             defer capability.deinit();
             var names = capability.iterate(self.alloc, .terminal_state) catch continue;
             defer names.deinit();
@@ -971,7 +1021,7 @@ pub const ProfileStore = struct {
         var owners = try self.owner_iterator();
         defer owners.deinit();
         while (try owners.next()) |owner_id| {
-            var capability = self.open_capability(owner_id, false) catch continue;
+            var capability = self.open_capability(owner_id, false, false) catch continue;
             defer capability.deinit();
             var names = capability.iterate(self.alloc, .terminal_state) catch continue;
             defer names.deinit();
@@ -981,7 +1031,7 @@ pub const ProfileStore = struct {
                 terminal_ids.deinit(self.alloc);
             }
             try collect_artifact_ids(self.alloc, &terminal_ids, names.names);
-            var proof_capability = self.open_capability(owner_id, true) catch null;
+            var proof_capability = self.open_capability(owner_id, true, false) catch null;
             defer if (proof_capability) |*proofs| proofs.deinit();
             if (proof_capability) |*proofs| {
                 var proof_names = proofs.iterate(
@@ -2023,6 +2073,7 @@ fn verify_owner_catalog_claim(
     var capability = try profile.open_capability(
         claim.principal.durable_session_id,
         false,
+        false,
     );
     defer capability.deinit();
     const key = owner_catalog_key(claim.principal, claim.actor);
@@ -2447,13 +2498,16 @@ pub const DurableSession = struct {
         defer profile.mutex.unlock(zio);
         try contracts.validate_session_id(input.session_id);
         try input.dimensions.validate();
+        // A new terminal makes a v2 owner's folder (D45).
         var state = try profile.open_capability(
             input.persistence.grant.principal.durable_session_id,
             false,
+            true,
         );
         errdefer state.deinit();
         var proofs = try profile.open_capability(
             input.persistence.grant.principal.durable_session_id,
+            true,
             true,
         );
         defer proofs.deinit();
@@ -2616,6 +2670,7 @@ pub const DurableSession = struct {
         var proofs = try self.profile.open_capability(
             self.record.owner_session_id,
             true,
+            false,
         );
         defer proofs.deinit();
         var proof = try read_proof(
@@ -2659,6 +2714,7 @@ pub const DurableSession = struct {
         var proofs = try self.profile.open_capability(
             self.record.owner_session_id,
             true,
+            false,
         );
         defer proofs.deinit();
         cleanup_partial_start(
@@ -2675,6 +2731,7 @@ pub const DurableSession = struct {
         if (self.state == null) {
             self.state = try self.profile.open_capability(
                 self.record.owner_session_id,
+                false,
                 false,
             );
         }
@@ -5841,12 +5898,13 @@ fn testSignalProcess(
     return error.Unsupported;
 }
 
-test "a v2 session's side folder owns terminal state, and every scan sees both roots" {
+test "a v2 session's terminal folder owns its terminal state, an unmoved side folder still counts, and every scan sees each owner once (D45)" {
     var fixture = try TestStoreFixture.init(std.testing.allocator, .{});
     defer fixture.deinit();
-    // Made after the store opened, as a v2 session makes it (D27).
     var root = io_mod.VerifiedDir{ .dir = try fixture.tmp.dir.openDir(std.testing.io, ".fx", .{ .iterate = true, .follow_symlinks = false }) };
     defer root.close();
+    // Made after the store opened: an older session's side folder (D27),
+    // and one that also has a v1 folder.
     var files = try io_mod.openOrCreateVerifiedPrivateDir(&root, profile_paths.session_files_dir_name);
     defer files.close();
     for ([_][]const u8{ "v2-side-owner", "terminal-store-owner" }) |name| {
@@ -5854,11 +5912,24 @@ test "a v2 session's side folder owns terminal state, and every scan sees both r
         owner.close();
     }
 
-    var capability = try fixture.profile.open_capability("v2-side-owner", false);
-    capability.deinit();
-    try std.testing.expectError(error.FileNotFound, fixture.profile.open_capability("absent-owner", false));
+    // Only a new terminal makes a v2 owner's folder, in ~/.fx/terminal.
+    try std.testing.expectError(error.FileNotFound, fixture.profile.open_capability("v2-new-owner", false, false));
+    try std.testing.expectError(error.FileNotFound, root.dir.statFile(std.testing.io, profile_paths.terminal_dir_name, .{}));
+    var made = try fixture.profile.open_capability("v2-new-owner", false, true);
+    made.deinit();
+    var terminal_root = io_mod.VerifiedDir{ .dir = try root.dir.openDir(std.testing.io, profile_paths.terminal_dir_name, .{ .iterate = true, .follow_symlinks = false }) };
+    defer terminal_root.close();
+    const made_stat = try terminal_root.dir.statFile(std.testing.io, "v2-new-owner", .{ .follow_symlinks = false });
+    try std.testing.expectEqual(@as(u32, 0o700), made_stat.permissions.toMode() & 0o777);
+    var found = try fixture.profile.open_capability("v2-new-owner", false, false);
+    found.deinit();
+    var side = try fixture.profile.open_capability("v2-side-owner", false, false);
+    side.deinit();
+    try std.testing.expectError(error.FileNotFound, fixture.profile.open_capability("absent-owner", false, false));
 
-    // A v1 folder and a v2 folder of the same id are one owner, seen once.
+    // A folder in an earlier root makes the same id one owner, seen once.
+    var both = try io_mod.openOrCreateVerifiedPrivateDir(&terminal_root, "v2-side-owner");
+    both.close();
     var names: std.ArrayList([]u8) = .empty;
     defer {
         for (names.items) |name| std.testing.allocator.free(name);
@@ -5872,9 +5943,10 @@ test "a v2 session's side folder owns terminal state, and every scan sees both r
             return std.mem.order(u8, a, b) == .lt;
         }
     }.less);
-    try std.testing.expectEqual(@as(usize, 2), names.items.len);
+    try std.testing.expectEqual(@as(usize, 3), names.items.len);
     try std.testing.expectEqualStrings("terminal-store-owner", names.items[0]);
-    try std.testing.expectEqualStrings("v2-side-owner", names.items[1]);
+    try std.testing.expectEqualStrings("v2-new-owner", names.items[1]);
+    try std.testing.expectEqualStrings("v2-side-owner", names.items[2]);
 }
 
 const TestStoreFixture = struct {
@@ -8272,6 +8344,7 @@ test "durable failure boundaries do not report success" {
         );
         var state = try fixture.profile.open_capability(
             "terminal-store-owner",
+            false,
             false,
         );
         defer state.deinit();
