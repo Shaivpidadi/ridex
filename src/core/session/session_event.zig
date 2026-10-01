@@ -1898,10 +1898,6 @@ fn parsePayload(alloc: Allocator, kind: Kind, value: std.json.Value) !Event {
             const bytes = try alloc.alloc(u8, decoded_len);
             errdefer alloc.free(bytes);
             std.base64.standard.Decoder.decode(bytes, encoded) catch return error.InvalidEventFrame;
-            const canonical = try alloc.alloc(u8, std.base64.standard.Encoder.calcSize(bytes.len));
-            defer alloc.free(canonical);
-            const rendered = std.base64.standard.Encoder.encode(canonical, bytes);
-            if (!std.mem.eql(u8, rendered, encoded)) return error.InvalidEventFrame;
             break :blk .{ .state_replacement_chunk = .{
                 .replacement_id = try parseIdentifier(try requireString(object, "replacement_id")),
                 .chunk_index = try requireU64(object, "chunk_index"),
@@ -1925,6 +1921,18 @@ fn parsePayload(alloc: Allocator, kind: Kind, value: std.json.Value) !Event {
             } };
         },
     };
+}
+
+test "replacement chunk decoding uses only decoded storage" {
+    const json = "{\"replacement_id\":\"" ++ "ab" ** 16 ++ "\",\"chunk_index\":0,\"raw_bytes\":1,\"chunk_sha256\":\"" ++ "00" ** 32 ++ "\",\"base64\":\"/w==\"}";
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+    defer parsed.deinit();
+    var storage: [1]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&storage);
+    const alloc = fixed.allocator();
+    var event = try parsePayload(alloc, .state_replacement_chunk, parsed.value);
+    defer event.deinit(alloc);
+    try std.testing.expectEqualSlices(u8, "\xff", event.state_replacement_chunk.bytes);
 }
 
 fn readFrameLine(alloc: Allocator, source: *std.Io.Reader) ![]u8 {
