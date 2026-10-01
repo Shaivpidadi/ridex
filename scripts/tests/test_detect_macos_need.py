@@ -184,6 +184,11 @@ class DetectMacosNeedTests(unittest.TestCase):
         self.assertIn("tests/e2e/helper.ts", self.assert_needed())
         self.base = self.git("rev-parse", "HEAD")
 
+        self.write("tests/e2e/os-helper.ts", 'const linux = platform() === "linux";\n')
+        self.commit("node:os helper")
+        self.assertIn("tests/e2e/os-helper.ts", self.assert_needed())
+        self.base = self.git("rev-parse", "HEAD")
+
         self.write("tests/e2e/plain.ts", "export const value = 1;\n")
         self.commit("plain helper")
         self.assert_not_needed()

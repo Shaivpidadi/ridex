@@ -6,7 +6,8 @@
 # macOS runs only when a change touches behavior that can differ on macOS: a
 # Zig file with a macOS, BSD, or Linux code path before or after the change,
 # build.zig, the macOS signing script, the native SDK addon, an E2E file listed
-# in tests/e2e/macos-platform-tests.json, or the macOS checks themselves. A Linux
+# in tests/e2e/macos-platform-tests.json, a shared E2E helper that reads the
+# platform before or after the change, or the macOS checks themselves. A Linux
 # branch counts because macOS takes its other path. A Windows-only branch does
 # not, because macOS and Linux share its other path. Set MACOS_REQUESTED to a
 # reason to force the checks, and SDK_NATIVE_REQUESTED=true to force the native
@@ -49,7 +50,7 @@ has_platform_code() {
 }
 
 zig_platform_code='\.linux([^A-Za-z0-9_]|$)|isBSD|\.macos|isDarwin|[Dd]arwin'
-ts_platform_code='process\.platform'
+ts_platform_code='process\.platform|platform\(\)'
 
 if ! jq -e 'type == "array"' "$platform_list" >/dev/null 2>&1; then
   printf 'error: %s is missing or not a JSON array; the macOS check cannot decide\n' "$platform_list" >&2
