@@ -101,7 +101,13 @@ pub const Reason = enum { cancel, failed, closed, crash };
 pub const Outcome = enum { ok, failed, cancelled, interrupted, lost };
 /// `language` is the conversation language fx keeps per session, a JSON
 /// string such as `"es"` or `"und-Latn"` (D18); the index lists it.
-pub const SetKey = enum { prefs, title, permissions, usage, workspace, language };
+/// `client_prompt` (a JSON string) and `tool_identities` are an ACP
+/// client's settings (D46). `moved_files` records a session moved off fx's
+/// side folder: its value names the blob that maps old handles to blobs,
+/// and its line lists every moved blob (D47). `compaction_records` names
+/// the blob that maps fx's compactor record names to blobs, and its line
+/// lists the map and the records it adds (D50).
+pub const SetKey = enum { prefs, title, permissions, usage, workspace, language, client_prompt, tool_identities, moved_files, compaction_records };
 
 pub const ForkOrigin = struct { id: []const u8, seq: u64 };
 
@@ -140,7 +146,22 @@ pub const Body = union(Kind) {
     };
     pub const Compacted = struct { turn: ?u64, data: []const u8 };
     pub const Interrupted = struct { turn: u64, reason: Reason };
-    pub const Setting = struct { key: SetKey, value: []const u8 };
+    pub const Setting = struct {
+        key: SetKey,
+        value: []const u8,
+        /// Hashes of the blobs this setting refers to, under the item's
+        /// rule; allowed outside a turn (D47).
+        blobs: []const []const u8 = &.{},
+    };
+
+    /// The blobs a line refers to: an item's or a setting's, else none.
+    pub fn blobRefs(body: Body) []const []const u8 {
+        return switch (body) {
+            .item => |piece| piece.blobs,
+            .set => |s| s.blobs,
+            else => &.{},
+        };
+    }
     /// `data` is fx's raw JSON about the child or the work (D22).
     pub const WorkItem = struct { child: []const u8, work_id: []const u8, data: ?[]const u8 = null };
     pub const Finished = struct { child: []const u8, work_id: []const u8, outcome: Outcome, data: ?[]const u8 = null };
@@ -170,15 +191,7 @@ pub fn appendBody(gpa: std.mem.Allocator, out: *std.ArrayList(u8), body: Body) e
             try w.number("turn", p.turn);
             try w.string("type", p.type);
             try w.raw("data", p.data);
-            if (p.blobs.len > 0) {
-                try w.key("blobs");
-                try out.append(gpa, '[');
-                for (p.blobs, 0..) |hash, i| {
-                    if (i > 0) try out.append(gpa, ',');
-                    try appendJsonString(gpa, out, hash);
-                }
-                try out.append(gpa, ']');
-            }
+            try w.blobList(p.blobs);
         },
         .compacted => |c| {
             if (c.turn) |turn| try w.number("turn", turn);
@@ -191,6 +204,7 @@ pub fn appendBody(gpa: std.mem.Allocator, out: *std.ArrayList(u8), body: Body) e
         .set => |s| {
             try w.string("key", @tagName(s.key));
             try w.raw("value", s.value);
+            try w.blobList(s.blobs);
         },
         .child_spawned => |c| {
             try w.string("child", c.child);
@@ -251,7 +265,11 @@ fn bodyOf(kind: Kind, f: Fields) BodyError!Body {
             .turn = try f.req(u64, "turn"),
             .reason = try f.req(Reason, "reason"),
         } },
-        .set => .{ .set = .{ .key = try f.req(SetKey, "key"), .value = try f.rawReq("value") } },
+        .set => .{ .set = .{
+            .key = try f.req(SetKey, "key"),
+            .value = try f.rawReq("value"),
+            .blobs = try f.opt([]const []const u8, "blobs") orelse &.{},
+        } },
         .child_spawned => .{ .child_spawned = .{
             .child = try f.req([]const u8, "child"),
             .work_id = try f.req([]const u8, "work_id"),
@@ -500,6 +518,18 @@ const FieldWriter = struct {
         try w.out.print(w.gpa, "{d}", .{value});
     }
 
+    /// `"blobs":[...]`, written only when there is at least one.
+    fn blobList(w: FieldWriter, hashes: []const []const u8) error{OutOfMemory}!void {
+        if (hashes.len == 0) return;
+        try w.key("blobs");
+        try w.out.append(w.gpa, '[');
+        for (hashes, 0..) |hash, i| {
+            if (i > 0) try w.out.append(w.gpa, ',');
+            try appendJsonString(w.gpa, w.out, hash);
+        }
+        try w.out.append(w.gpa, ']');
+    }
+
     fn raw(w: FieldWriter, name: []const u8, value: []const u8) error{OutOfMemory}!void {
         try w.key(name);
         try w.out.appendSlice(w.gpa, value);
@@ -698,6 +728,13 @@ test "every kind's fields round trip, raw values byte for byte" {
     const set = (try roundTrip(arena, .{ .set = .{ .key = .title, .value = "\"hello\"" } })).set;
     try testing.expectEqual(SetKey.title, set.key);
     try testing.expectEqualStrings("\"hello\"", set.value);
+    try testing.expectEqual(@as(usize, 0), set.blobs.len);
+    const moved = (try roundTrip(arena, .{ .set = .{ .key = .moved_files, .value = "{}", .blobs = &.{&hash} } })).set;
+    try testing.expectEqual(SetKey.moved_files, moved.key);
+    try testing.expectEqualStrings(&hash, moved.blobs[0]);
+    const records = (try roundTrip(arena, .{ .set = .{ .key = .compaction_records, .value = "{}", .blobs = &.{&hash} } })).set;
+    try testing.expectEqual(SetKey.compaction_records, records.key);
+    try testing.expectEqualStrings(&hash, records.blobs[0]);
 
     const compacted = (try roundTrip(arena, .{ .compacted = .{ .turn = null, .data = "{}" } })).compacted;
     try testing.expectEqual(@as(?u64, null), compacted.turn);

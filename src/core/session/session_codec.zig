@@ -503,15 +503,21 @@ pub fn parseDurableBytes(alloc: Allocator, value: std.json.Value) ![]u8 {
                 return error.InvalidDurableBytes;
             if (std.unicode.utf8ValidateSlice(decoded)) return error.InvalidDurableBytes;
 
-            const canonical_len = std.base64.standard.Encoder.calcSize(decoded.len);
-            const canonical = try alloc.alloc(u8, canonical_len);
-            defer alloc.free(canonical);
-            const written = std.base64.standard.Encoder.encode(canonical, decoded);
-            if (!std.mem.eql(u8, written, encoded)) return error.InvalidDurableBytes;
             return decoded;
         },
         else => return error.InvalidDurableBytes,
     }
+}
+
+test "durable binary decoding uses only decoded storage" {
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"encoding\":\"base64\",\"data\":\"/w==\"}", .{});
+    defer parsed.deinit();
+    var storage: [1]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&storage);
+    const alloc = fixed.allocator();
+    const decoded = try parseDurableBytes(alloc, parsed.value);
+    defer alloc.free(decoded);
+    try std.testing.expectEqualSlices(u8, "\xff", decoded);
 }
 
 pub fn encodeState(state: DurableSessionState, writer: *std.Io.Writer) !EncodeSummary {

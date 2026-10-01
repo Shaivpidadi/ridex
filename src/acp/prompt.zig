@@ -24,6 +24,7 @@ const acp_types = @import("types.zig");
 const server = @import("server.zig");
 const sessions = @import("sessions.zig");
 const client_instructions = @import("client_instructions.zig");
+const tool_call_identities = @import("tool_call_identities.zig");
 const agent_runtime = @import("../core/agent/agent_runtime.zig");
 const agent_execution_memory = @import("../core/agent/execution_memory.zig");
 const diff_mod = @import("../core/output/diff.zig");
@@ -278,19 +279,16 @@ const AcpContext = struct {
     /// before its server reconnects. A failure costs only replay detail.
     fn rememberToolIdentity(self: *AcpContext, name: []const u8, identity: mcp_runtime.McpRuntime.ToolIdentity) void {
         const session = if (self.state.active_session) |*active| active else return;
-        const capability: ?*session_child_store.SessionChildCapability = blk: {
-            const found = if (session.writable) |*writable|
-                writable.childCapability()
-            else if (session.v2) |v2|
-                v2.childCapability()
-            else
-                break :blk null;
-            break :blk found catch |err| {
+        // A v2 session keeps the record as a setting (D46).
+        const target: tool_call_identities.Target = if (session.v2) |v2| .{ .v2 = v2 } else blk: {
+            const writable = if (session.writable) |*value| value else break :blk .none;
+            const capability = writable.childCapability() catch |err| {
                 debug_trace.logf("acp", "tool identity kept in memory only tool={s} err={s}", .{ name, @errorName(err) });
-                break :blk null;
+                break :blk .none;
             };
+            break :blk .{ .capability = capability };
         };
-        session.tool_identities.remember(self.state.alloc, capability, name, identity) catch |err| {
+        session.tool_identities.remember(self.state.alloc, target, name, identity) catch |err| {
             debug_trace.logf("acp", "tool identity not recorded for replay tool={s} err={s}", .{ name, @errorName(err) });
         };
     }
@@ -789,15 +787,18 @@ pub fn handlePrompt(
             if (comptime host_target.is_wasm) return promptInputFailure(error.UnsupportedPromptImage);
             var temporary_snapshot_dir: ?[]u8 = null;
             defer if (temporary_snapshot_dir) |path| alloc.free(path);
-            // A v2 session keeps them in its side folder, like v1's.
+            // A v2 session captures into a temporary folder, then keeps the
+            // bytes inside the turn (D44).
             const snapshot_dir = try session_store.imageSnapshotStorageDir(
                 alloc,
-                if (session.v2) |v2| std.fs.path.dirname(try v2.ensureFilesPath()) else if (session.store) |store| store.sessions_dir else null,
-                if (session.store != null or session.v2 != null) session.session_id else null,
+                if (session.v2 != null) null else if (session.store) |store| store.sessions_dir else null,
+                if (session.v2 == null and session.store != null) session.session_id else null,
                 &temporary_snapshot_dir,
             );
             defer alloc.free(snapshot_dir);
             prompt_input.captureImages(alloc, snapshot_dir) catch |err|
+                return promptInputFailure(err);
+            if (session.v2 != null) image_attachments.inlineCapturedSnapshots(alloc, prompt_input.images) catch |err|
                 return promptInputFailure(err);
         }
     }
@@ -1375,12 +1376,6 @@ fn decodePromptImageData(alloc: Allocator, data_value: std.json.Value) ![]u8 {
     errdefer alloc.free(decoded);
     std.base64.standard.Decoder.decode(decoded, data_value.string) catch
         return error.InvalidPromptImage;
-    const canonical_len = std.base64.standard.Encoder.calcSize(decoded.len);
-    if (canonical_len != data_value.string.len) return error.InvalidPromptImage;
-    const canonical = try alloc.alloc(u8, canonical_len);
-    defer alloc.free(canonical);
-    const encoded = std.base64.standard.Encoder.encode(canonical, decoded);
-    if (!std.mem.eql(u8, encoded, data_value.string)) return error.InvalidPromptImage;
     return decoded;
 }
 
@@ -3579,6 +3574,34 @@ test "captureImagesInline rejects a declared media type that contradicts the byt
     defer parsed.deinit(alloc);
     try std.testing.expectError(error.ImageSnapshotMediaTypeMismatch, parsed.captureImagesInline(alloc));
     try std.testing.expectEqual(@as(usize, 0), parsed.images.len);
+}
+
+test "prompt image decoding uses only decoded storage" {
+    var storage: [5]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&storage);
+    const alloc = fixed.allocator();
+    const decoded = try decodePromptImageData(alloc, .{ .string = "aGVsbG8=" });
+    defer alloc.free(decoded);
+    try std.testing.expectEqualStrings("hello", decoded);
+}
+
+test "prompt image decoding requires canonical standard base64" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { encoded: []const u8, bytes: []const u8 }{
+        .{ .encoded = "Zg==", .bytes = "f" },
+        .{ .encoded = "Zm8=", .bytes = "fo" },
+        .{ .encoded = "Zm9v", .bytes = "foo" },
+        .{ .encoded = "/w==", .bytes = "\xff" },
+        .{ .encoded = "//8=", .bytes = "\xff\xff" },
+    };
+    for (cases) |case| {
+        const decoded = try decodePromptImageData(alloc, .{ .string = case.encoded });
+        defer alloc.free(decoded);
+        try std.testing.expectEqualSlices(u8, case.bytes, decoded);
+    }
+    for ([_][]const u8{ "", "Zh==", "Zm9=", "///=", "Zg", "Zg=", "Zg===", "Zm9v=", "Zg==\n", "Zg== ", " Zg==", "Z g=", "AA=A", "__8=" }) |encoded| {
+        try std.testing.expectError(error.InvalidPromptImage, decodePromptImageData(alloc, .{ .string = encoded }));
+    }
 }
 
 test "parsePromptInput rejects malformed base64 image data" {

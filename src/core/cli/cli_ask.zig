@@ -899,10 +899,10 @@ const AskContext = struct {
     }
 
     fn imageSnapshotStorageDir(self: *AskContext) ![]u8 {
-        const sessions_dir = if (self.v2) |v2|
-            std.fs.path.dirname(try v2.ensureFilesPath())
-        else if (self.store) |*store| store.sessions_dir else null;
-        const session_id = self.activeSessionId();
+        // A v2 session captures into the process's temporary folder, then
+        // keeps the bytes inside the turn (D44).
+        const sessions_dir = if (self.v2 != null) null else if (self.store) |*store| store.sessions_dir else null;
+        const session_id = if (self.v2 != null) null else self.activeSessionId();
         return session_store.imageSnapshotStorageDir(
             self.alloc,
             sessions_dir,
@@ -920,6 +920,7 @@ const AskContext = struct {
             snapshot_dir,
             .{ .cancel_flag = self.cancelFlag() },
         );
+        if (self.v2 != null) try image_attachments.inlineCapturedSnapshot(self.alloc, attachment);
     }
 
     fn captureImageAttachments(self: *AskContext, attachments: []ImageAttachment) !void {
@@ -931,6 +932,7 @@ const AskContext = struct {
             snapshot_dir,
             .{ .cancel_flag = self.cancelFlag() },
         );
+        if (self.v2 != null) try image_attachments.inlineCapturedSnapshots(self.alloc, attachments);
     }
 
     /// Record whether restored history references shell execution handles this
@@ -1141,7 +1143,7 @@ const AskContext = struct {
                 self.ultrafast_mode = preferences.ultrafast_mode;
             }
         }
-        self.session.configureWebFetchArtifacts(self.alloc, v2.filesPath());
+        self.session.configureWebFetchArtifactBlobs(self.alloc, try v2.childCapability(), v2.id());
         self.v2 = v2;
         try self.startV2SubagentHost(v2);
     }
