@@ -977,9 +977,11 @@ fn needsSync(bodies: []const schema.Body) bool {
         // Usage is durable before fx clears its usage-recovery marker
         // (`tla/Wiring.tla` UsageNeverSilent).
         // fx removes the side folder only once the move is durable (D47).
+        // Compactor records need no sync of their own: the compaction line
+        // that cites them comes later in the log, which keeps a prefix (D50).
         .set => |s| switch (s.key) {
             .permissions, .usage, .moved_files => return true,
-            .prefs, .title, .workspace, .language, .client_prompt, .tool_identities => {},
+            .prefs, .title, .workspace, .language, .client_prompt, .tool_identities, .compaction_records => {},
         },
         else => {},
     };

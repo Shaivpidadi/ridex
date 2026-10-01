@@ -363,24 +363,21 @@ test("fx ask keeps the conversation language when a resumed turn has no language
   }
 }, TIMEOUT * 2);
 
-/// The path of a file named `name` anywhere under `dir`.
-function findFile(dir: string, name: string): string | undefined {
-  for (const entry of readdirSync(dir, { withFileTypes: true })) {
-    const path = join(dir, entry.name);
-    if (entry.isDirectory()) {
-      const found = findFile(path, name);
-      if (found) return found;
-    } else if (entry.name === name) {
-      return path;
-    }
-  }
-  return undefined;
+/// The blob of the compactor record `name` (D50): the newest
+/// `compaction_records` line names the blob mapping record names to blobs.
+function compactionRecordPath(fixture: Fixture, id: string, name: string): string | undefined {
+  const line = (logLines(fixture, id) as any[]).filter((l) => l.kind === "set" && l.key === "compaction_records").at(-1);
+  if (!line) return undefined;
+  expect(line.blobs).toContain(line.value.map);
+  const blobs = join(v2Root(fixture), id, "blobs");
+  const hash = JSON.parse(readFileSync(join(blobs, line.value.map), "utf8"))[name];
+  return hash ? join(blobs, hash) : undefined;
 }
 
 const sha256 = (bytes: Buffer) => createHash("sha256").update(bytes).digest("hex");
 
 for (const userHeavy of [false, true]) {
-  test(`fx ask compacts on its own, keeps what it summarized as side files, and resumes from the summary, userHeavy=${userHeavy}`, async () => {
+  test(`fx ask compacts on its own, keeps what it summarized as blobs, and resumes from the summary, userHeavy=${userHeavy}`, async () => {
     const fixture = createFixture("fx-v2-compaction-");
     const model = "fixture/compaction";
     const originalUser = "Keep café and the original constraint unchanged." +
@@ -388,7 +385,7 @@ for (const userHeavy of [false, true]) {
     const assistant = "VERIFIED_VALUE=73\n" +
       Array.from({ length: 14_000 }, (_, n) => `Assistant reference ${n}: group ${n % 19}, historical data, not new completed work.\n`).join("") +
       "PENDING_CHECK=transport-resume\n";
-    let phase: "seed" | "continue" = "seed";
+    let phase: "seed" | "continue" | "read" = "seed";
     // fx-compactor's notes request. A turn with nothing between its message
     // and its final reply has nothing to note, so it may need none.
     let notesCalls = 0;
@@ -398,6 +395,10 @@ for (const userHeavy of [false, true]) {
       if (body.includes("Write the compaction notes")) {
         notesCalls += 1;
         return fakeGatewayFinalText("none");
+      }
+      if (phase === "read") {
+        if (body.includes("compaction-read-1")) return fakeGatewayFinalText("READ_SAVED_TURN_DONE");
+        return fakeGatewayToolCall("compaction-read-1", "read_tool_result", { request: { handle: "M1", query: "Assistant reference 7000:" } });
       }
       return fakeGatewayFinalText(phase === "seed" ? assistant : "CONTINUED_FROM_COMMITTED_MEMORY");
     }, { models: [{ id: model, type: "language", tags: ["tool-use"], context_window: userHeavy ? 256_000 : 128_000, max_tokens: 8192 }] });
@@ -420,12 +421,13 @@ for (const userHeavy of [false, true]) {
       expect(JSON.parse(continued.stdout).output).toBe("CONTINUED_FROM_COMMITTED_MEMORY");
 
       // One compaction line holding the compacted conversation, and the
-      // turn it compacted saved whole as a side file.
+      // turn it compacted saved whole as a compactor record, a blob of the
+      // session (D50).
       const compactions = (logLines(fixture, id) as any[]).filter((line) => line.kind === "compacted");
       expect(compactions).toHaveLength(1);
       const data = typeof compactions[0].data === "string" ? JSON.parse(compactions[0].data) : compactions[0].data;
       expect(data.summary.startsWith("fx-compactor-v1\n")).toBe(true);
-      const turnPath = findFile(join(fixture.home, ".fx", "session-files", id), "compacted-M1.txt");
+      const turnPath = compactionRecordPath(fixture, id, "compacted-M1.txt");
       expect(turnPath).toBeDefined();
       const savedTurn = readFileSync(turnPath!, "utf8");
       expect(savedTurn).toContain(originalUser);
@@ -465,6 +467,16 @@ for (const userHeavy of [false, true]) {
       expect(notesCalls).toBe(notesCallsBeforeReopen);
       expect((logLines(fixture, id) as any[]).filter((line) => line.kind === "compacted")).toHaveLength(1);
       expect(readFileSync(logPath).subarray(0, before.length).equals(before)).toBe(true);
+
+      // Another fresh process reads the saved turn by its ID, through the
+      // records the session keeps as blobs (D50).
+      phase = "read";
+      const read = await run(["--resume-id", id, "Read the saved turn."]);
+      expect(read.code).toBe(0);
+      // Tool progress goes to stderr.
+      expect(read.stderr).not.toContain("panic");
+      expect(JSON.parse(read.stdout).output).toBe("READ_SAVED_TURN_DONE");
+      expect(bodies.findLast((body) => body.includes("compaction-read-1"))).toContain("Assistant reference 7000: group 8");
       expectWholeLog(fixture, id);
       expectNoV1Sessions(fixture);
     } finally {

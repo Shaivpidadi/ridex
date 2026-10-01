@@ -601,12 +601,24 @@ const BlobHost = struct {
     /// A moved session's old side-file names, as `{folder}/{name}`, to their
     /// blobs (D47). Set while the session opens; read-only after.
     moved: std.StringHashMapUnmanaged(Hash) = .empty,
+    /// The compactor's records by name (D50), loaded on open and kept
+    /// since; `mutex` guards them.
+    records: std.StringArrayHashMapUnmanaged(Hash) = .empty,
+    /// Records kept since the last `compaction_records` line, which the
+    /// next one lists.
+    records_added: std.ArrayList(Hash) = .empty,
+    /// Counts record changes, so a line written while another record
+    /// arrives leaves the map due again.
+    records_generation: u64 = 0,
+    records_written: u64 = 0,
 
     const Hash = session_child_store.Blobs.Hash;
 
     const vtable: session_child_store.Blobs.VTable = .{
         .put = put,
         .put_file = putFile,
+        .put_record = putRecord,
+        .record_names = recordNames,
         .resolve = resolve,
         .get = get,
         .path = path,
@@ -640,6 +652,7 @@ const BlobHost = struct {
         host.mutex.lockUncancelable(io);
         defer host.mutex.unlock(io);
         if (host.pending.items.len > 0) debug_trace.logf("session", "event=sessions_v2_blobs_unlisted session={s} count={d}", .{ host.id, host.pending.items.len });
+        if (host.records_generation != host.records_written) debug_trace.logf("session", "event=sessions_v2_records_unlisted session={s} count={d}", .{ host.id, host.records_added.items.len });
     }
 
     fn put(ctx: *anyopaque, bytes: []const u8) session_child_store.BlobError!Hash {
@@ -663,6 +676,76 @@ const BlobHost = struct {
         try host.remember(hash);
         return hash;
     }
+
+    fn putRecord(ctx: *anyopaque, name: []const u8, bytes: []const u8) session_child_store.BlobError!void {
+        const host = from(ctx);
+        const io = io_mod.getIo();
+        host.life.lockUncancelable(io);
+        defer host.life.unlock(io);
+        const handle = host.session orelse return error.BlobStoreClosed;
+        const hash = handle.putBlob(bytes) catch |err| return host.storeFailed(err);
+        host.mutex.lockUncancelable(io);
+        defer host.mutex.unlock(io);
+        try host.records_added.ensureUnusedCapacity(host.alloc, 1);
+        if (host.records.getPtr(name)) |known| {
+            known.* = hash;
+        } else {
+            const key = try host.alloc.dupe(u8, name);
+            errdefer host.alloc.free(key);
+            try host.records.put(host.alloc, key, hash);
+        }
+        host.records_added.appendAssumeCapacity(hash);
+        host.records_generation += 1;
+    }
+
+    /// Every record's name, then a moved session's old tool-results names
+    /// that no record replaced (D47, D50).
+    fn recordNames(ctx: *anyopaque, arena: Allocator) session_child_store.BlobError![]const []const u8 {
+        const host = from(ctx);
+        const io = io_mod.getIo();
+        host.mutex.lockUncancelable(io);
+        defer host.mutex.unlock(io);
+        var names: std.ArrayList([]const u8) = .empty;
+        try names.ensureTotalCapacity(arena, host.records.count() + host.moved.count());
+        for (host.records.keys()) |name| names.appendAssumeCapacity(try arena.dupe(u8, name));
+        // `movedFolder(.tool_results)`'s names.
+        const prefix = "tool-results/";
+        var moved = host.moved.keyIterator();
+        while (moved.next()) |key| {
+            if (!std.mem.startsWith(u8, key.*, prefix)) continue;
+            const name = key.*[prefix.len..];
+            if (host.records.contains(name)) continue;
+            names.appendAssumeCapacity(try arena.dupe(u8, name));
+        }
+        return names.items;
+    }
+
+    /// The records map as JSON and the records it adds, when it changed
+    /// since the last line that recorded it (D50); in `a`.
+    fn recordsDue(host: *BlobHost, a: Allocator) error{OutOfMemory}!?RecordsDue {
+        const io = io_mod.getIo();
+        host.mutex.lockUncancelable(io);
+        defer host.mutex.unlock(io);
+        if (host.records_generation == host.records_written) return null;
+        var map: std.StringArrayHashMapUnmanaged([]const u8) = .empty;
+        try map.ensureTotalCapacity(a, host.records.count());
+        for (host.records.keys(), host.records.values()) |name, *hash| map.putAssumeCapacity(name, try a.dupe(u8, hash));
+        var json: std.Io.Writer.Allocating = .init(a);
+        std.json.Stringify.value(std.json.ArrayHashMap([]const u8){ .map = map }, .{}, &json.writer) catch return error.OutOfMemory;
+        return .{ .map_json = json.written(), .added = try a.dupe(Hash, host.records_added.items), .generation = host.records_generation };
+    }
+
+    /// A durable line now records `due`: its records are listed, and the map
+    /// is current unless a record arrived since.
+    fn recordsWritten(host: *BlobHost, due: RecordsDue) void {
+        const io = io_mod.getIo();
+        host.mutex.lockUncancelable(io);
+        defer host.mutex.unlock(io);
+        host.records_added.replaceRangeAssumeCapacity(0, due.added.len, &.{});
+        host.records_written = due.generation;
+    }
+
+    const RecordsDue = struct { map_json: []const u8, added: []const Hash, generation: u64 };
 
     fn storeFailed(host: *BlobHost, err: sm.AppendError) session_child_store.BlobError {
         // A body is stored only while the session is on disk (D44).
@@ -712,6 +795,12 @@ const BlobHost = struct {
     fn resolve(ctx: *anyopaque, kind: session_child_store.ManagedChildKind, name: []const u8) session_child_store.BlobError!Hash {
         const host = from(ctx);
         if (artifact_digest.blobHash(name)) |hash| return hash[0..artifact_digest.blob_hex_bytes].*;
+        if (kind == .tool_results) {
+            const io = io_mod.getIo();
+            host.mutex.lockUncancelable(io);
+            defer host.mutex.unlock(io);
+            if (host.records.get(name)) |hash| return hash;
+        }
         const folder = movedFolder(kind) orelse return error.BlobNotFound;
         var key_buffer: [movedKeyMax]u8 = undefined;
         const key = std.fmt.bufPrint(&key_buffer, "{s}/{s}", .{ folder, name }) catch return error.BlobNotFound;
@@ -765,6 +854,9 @@ const BlobHost = struct {
         var keys = host.moved.keyIterator();
         while (keys.next()) |key| host.alloc.free(key.*);
         host.moved.deinit(host.alloc);
+        for (host.records.keys()) |name| host.alloc.free(name);
+        host.records.deinit(host.alloc);
+        host.records_added.deinit(host.alloc);
         host.pending.deinit(host.alloc);
         host.alloc.free(host.id);
         host.alloc.destroy(host);
@@ -967,14 +1059,20 @@ pub const Session = struct {
     /// Appends through the manager; a host session also traces the turn and
     /// child lines `Wiring.tla` models. The first item lists every blob the
     /// stores kept since the last such line, so verify and recover see a
-    /// lost one as damage (D39, D44).
+    /// lost one as damage (D39, D44). Compactor records kept since the last
+    /// `compaction_records` line get a new one first, so the line that
+    /// cites them never lands without them (D50).
     fn write(self: *Session, events: []const sm.Event) sm.AppendError!u64 {
         var scratch = std.heap.ArenaAllocator.init(self.alloc);
         defer scratch.deinit();
-        const pending = try self.host.pendingCopy(scratch.allocator());
-        const batch = try listPending(scratch.allocator(), events, pending);
+        const a = scratch.allocator();
+        const due = try self.host.recordsDue(a);
+        const with_records = if (due) |records| try std.mem.concat(a, sm.Event, &.{ try self.recordLines(a, records), events }) else events;
+        const pending = try self.host.pendingCopy(a);
+        const batch = try listPending(a, with_records, pending);
         const seq = try self.handle.append(batch.events);
         if (batch.listed) self.host.listed(pending);
+        if (due) |records| self.host.recordsWritten(records);
         if (self.root) for (events) |event| switch (event) {
             .turn_started => traceWiring("BeginTurn", self.id(), "", self.store.pid),
             .turn_committed => traceWiring("EndTurn", self.id(), " end=commit", self.store.pid),
@@ -984,6 +1082,25 @@ pub const Session = struct {
             else => {},
         };
         return seq;
+    }
+
+    /// The `compaction_records` lines for `due`: its map as one more blob,
+    /// listed with the records it adds, in chunks as the move's are (D50).
+    fn recordLines(self: *Session, a: Allocator, due: BlobHost.RecordsDue) sm.AppendError![]const sm.Event {
+        const map_hash = try a.dupe(u8, &(try self.handle.putBlob(due.map_json)));
+        const value = try std.fmt.allocPrint(a, "{{\"map\":\"{s}\"}}", .{map_hash});
+        var refs: std.ArrayList([]const u8) = .empty;
+        try refs.ensureTotalCapacity(a, due.added.len + 1);
+        for (due.added) |*hash| refs.appendAssumeCapacity(hash);
+        refs.appendAssumeCapacity(map_hash);
+        var lines: std.ArrayList(sm.Event) = .empty;
+        var rest = refs.items;
+        while (rest.len > 0) {
+            const take = @min(rest.len, moved_refs_per_line);
+            try lines.append(a, .{ .set = .{ .key = .compaction_records, .value = value, .blobs = rest[0..take] } });
+            rest = rest[take..];
+        }
+        return lines.items;
     }
 
     /// The session is on disk: it has a turn, ended or open.
@@ -1707,6 +1824,7 @@ pub const Session = struct {
     fn openMoved(self: *Session) !void {
         try self.moveSideFiles();
         try self.loadMovedMap();
+        try self.loadRecords();
     }
 
     fn moveSideFiles(self: *Session) !void {
@@ -1844,6 +1962,37 @@ pub const Session = struct {
             if (key.len > movedKeyMax or hash.len != artifact_digest.blob_hex_bytes) return error.InvalidSessionFormat;
             if (host.moved.contains(key)) continue;
             host.moved.putAssumeCapacity(try host.alloc.dupe(u8, key), hash[0..artifact_digest.blob_hex_bytes].*);
+        }
+    }
+
+    /// Reads the compactor's records map (D50), once, as `loadMovedMap` reads
+    /// the move's.
+    fn loadRecords(self: *Session) !void {
+        var scratch = std.heap.ArenaAllocator.init(self.alloc);
+        defer scratch.deinit();
+        const sa = scratch.allocator();
+        const raw = (try self.handle.state(sa)).compaction_records orelse return;
+        const Value = struct { map: []const u8 };
+        const value = std.json.parseFromSliceLeaky(Value, sa, raw, .{ .ignore_unknown_fields = true }) catch return error.InvalidSessionFormat;
+        const bytes = self.store.manager.getBlob(sa, self.id(), value.map) catch |err| switch (err) {
+            // A lost or damaged map damages the session, as a lost blob
+            // does (D39); its records read as gone.
+            error.NotFound, error.Corrupt, error.InvalidArgument => {
+                debug_trace.logf("session", "event=sessions_v2_records_map_unreadable session={s} err={s}", .{ self.id(), @errorName(err) });
+                return;
+            },
+            else => |e| return e,
+        };
+        const map = std.json.parseFromSliceLeaky(std.json.ArrayHashMap([]const u8), sa, bytes, .{}) catch return error.InvalidSessionFormat;
+        const host = self.host;
+        host.mutex.lockUncancelable(io_mod.getIo());
+        defer host.mutex.unlock(io_mod.getIo());
+        try host.records.ensureUnusedCapacity(host.alloc, map.map.count());
+        for (map.map.keys(), map.map.values()) |name, hash| {
+            session_child_store.SessionChildCapability.validateManagedName(name) catch return error.InvalidSessionFormat;
+            if (hash.len != artifact_digest.blob_hex_bytes) return error.InvalidSessionFormat;
+            if (host.records.contains(name)) continue;
+            host.records.putAssumeCapacity(try host.alloc.dupe(u8, name), hash[0..artifact_digest.blob_hex_bytes].*);
         }
     }
 };
@@ -3997,6 +4146,7 @@ const OldSideFolder = struct {
         defer side.close();
         try side.dir.createDirPath(io, "tool-results");
         try side.dir.writeFile(io, .{ .sub_path = "tool-results/" ++ result_handle, .data = "an old result body" });
+        try side.dir.writeFile(io, .{ .sub_path = "tool-results/compacted-T9.txt", .data = "T9 kept by the compactor before the move" });
         try side.dir.createDirPath(io, "logs/commands");
         try side.dir.writeFile(io, .{ .sub_path = "logs/commands/" ++ replay_handle, .data = "FXRPLY01" });
         try side.dir.createDirPath(io, "images");
@@ -4064,6 +4214,24 @@ test "an older session moves off its side folder on its first writable open, and
     var replay_file = try capability.openBlobFile(testing.allocator, .command_artifacts, OldSideFolder.replay_handle);
     replay_file.close(io_mod.getIo());
     try testing.expectError(error.BlobNotFound, capability.readBlob(testing.allocator, .tool_results, "result-shell-0-0.txt", 1024));
+    // The compactor still lists and reads its old record, until a newer one
+    // of the same name replaces it (D50).
+    {
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const records = result_store.compactorStore(capability);
+        const names = try records.list(arena);
+        var listed = false;
+        for (names) |name| listed = listed or std.mem.eql(u8, name, "compacted-T9.txt");
+        try testing.expect(listed);
+        try testing.expectEqualStrings("T9 kept by the compactor before the move", try records.read(arena, "compacted-T9.txt", 1024));
+        try records.write(testing.allocator, "compacted-T9.txt", "T9 kept again");
+        try testing.expectEqualStrings("T9 kept again", try records.read(arena, "compacted-T9.txt", 1024));
+        var count: usize = 0;
+        for (try records.list(arena)) |name| count += @intFromBool(std.mem.eql(u8, name, "compacted-T9.txt"));
+        try testing.expectEqual(@as(usize, 1), count);
+    }
     // The image is inside the turn now, and the client's settings are settings.
     var restored = try r.restore(testing.allocator);
     defer restored.deinit(testing.allocator);
@@ -4087,6 +4255,62 @@ test "an older session moves off its side folder on its first writable open, and
     const lost = without.history[0].assistant.user.images[0];
     try testing.expectEqual(@as(?[]u8, null), lost.inline_data);
     try testing.expect(std.mem.endsWith(u8, lost.snapshot_path.?, "images/" ++ OldSideFolder.image_name));
+}
+
+test "compactor records on v2 are recorded by one setting with the next write, and come back on resume and in a fork (D50)" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    try s.beginTurn();
+    // Mid-turn, as auto compaction keeps them; a name kept twice is replaced.
+    const records = result_store.compactorStore(try s.childCapability());
+    try records.write(testing.allocator, "compacted-T1.txt", "T1 shell: ls\nResult:\nfirst\n");
+    try records.write(testing.allocator, "compacted-M1.txt", "M1 the first turn\n");
+    try records.write(testing.allocator, "compacted-T1.txt", "T1 shell: ls\nResult:\nreplaced\n");
+    try testing.expectEqual(@as(usize, 0), try countSettings(t.store.manager, s.id(), .compaction_records));
+    try testing.expectEqualStrings("T1 shell: ls\nResult:\nreplaced\n", try records.read(arena, "compacted-T1.txt", 1024));
+    // The turn's next write records them, once.
+    try s.commitTurn(assistantTurn("compact it", "done"), types.ConversationLanguage.default());
+    try testing.expectEqual(@as(usize, 1), try countSettings(t.store.manager, s.id(), .compaction_records));
+    try s.beginTurn();
+    try s.commitTurn(assistantTurn("again", "done again"), types.ConversationLanguage.default());
+    try testing.expectEqual(@as(usize, 1), try countSettings(t.store.manager, s.id(), .compaction_records));
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    s.close();
+    try testing.expect(!pathExists(&t, &.{ ".fx", files_dir_name }));
+    try testing.expectEqual(@as(u64, 0), (try t.store.manager.verify(id)).bad_blobs);
+
+    // A new process reads them back by name, and lists them.
+    {
+        const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .ask);
+        defer r.close();
+        const again = result_store.compactorStore(try r.childCapability());
+        const names = try again.list(arena);
+        try testing.expectEqual(@as(usize, 2), names.len);
+        try testing.expectEqualStrings("T1 shell: ls\nResult:\nreplaced\n", try again.read(arena, "compacted-T1.txt", 1024));
+        try testing.expectEqualStrings("M1 the first turn\n", try again.read(arena, "compacted-M1.txt", 1024));
+        // read_tool_result opens a record by its ID.
+        const page = try result_store.readByRangeManaged(testing.allocator, try r.childCapability(), "compacted-M1.txt", 1, 64);
+        defer testing.allocator.free(page);
+        try testing.expect(std.mem.find(u8, page, "the first turn") != null);
+    }
+
+    // A fork carries the records with the turns that kept them.
+    const fork = try t.store.manager.openFork(.{ .source = id, .at = .{ .turn = 1 }, .workspace = "/w", .host = .ask });
+    const fork_id = try testing.allocator.dupe(u8, fork.id());
+    defer testing.allocator.free(fork_id);
+    fork.release();
+    {
+        const f = try Session.resumeSession(testing.allocator, &t.store, .{ .id = fork_id }, "/w", .ask);
+        defer f.close();
+        try testing.expectEqualStrings("M1 the first turn\n", try result_store.compactorStore(try f.childCapability()).read(arena, "compacted-M1.txt", 1024));
+    }
 }
 
 test "a web-fetch download on v2 is a read-only blob the model opens by its path (D49)" {
@@ -4131,7 +4355,8 @@ test "a move cut short is redone on the next open, and old names still resolve (
         defer files_root.close();
         var side = (try io_mod.openVerifiedPrivateDirIfPresent(&files_root, id)).?;
         defer side.close();
-        try testing.expectEqual(@as(usize, 3), try s.moveOut(&side));
+        // A tool result, a compactor record, a replay and an image.
+        try testing.expectEqual(@as(usize, 4), try s.moveOut(&side));
     }
     s.close();
     try testing.expect(pathExists(&t, &.{ ".fx", files_dir_name, id }));

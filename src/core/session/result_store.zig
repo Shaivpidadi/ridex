@@ -761,6 +761,13 @@ pub fn isStoredTextHandle(handle: []const u8) bool {
         std.mem.endsWith(u8, handle, ".txt");
 }
 
+/// A compactor record's name, such as `compacted-M12.txt`, which
+/// `read_tool_result` opens by its ID (D50).
+fn isRecordHandle(handle: []const u8) bool {
+    return std.mem.startsWith(u8, handle, "compacted-") and
+        std.mem.endsWith(u8, handle, ".txt");
+}
+
 pub fn handleMatchesContentDigest(
     handle: []const u8,
     digest: [32]u8,
@@ -793,9 +800,10 @@ fn readStoredTextManaged(
 ) ![]u8 {
     if (capability.holdsBlobs()) {
         // Every store's blobs share the session, found by hash alone, so
-        // only this store's own handles are its results: a command
-        // replay's is read by its own store (D44).
-        if (!isStoredTextHandle(handle) and !isImageHandle(handle)) return error.ResultHandleNotFound;
+        // only this store's own handles are its results, its compactor
+        // records among them: a command replay's is read by its own store
+        // (D44, D50).
+        if (!isStoredTextHandle(handle) and !isImageHandle(handle) and !isRecordHandle(handle)) return error.ResultHandleNotFound;
         return capability.readBlob(alloc, .tool_results, handle, stored_text_max_bytes) catch |err| switch (err) {
             error.BlobNotFound => error.ResultHandleNotFound,
             error.BlobTooLarge => error.StreamTooLong,
@@ -814,8 +822,8 @@ fn readStoredTextManaged(
     return file.readToEnd(alloc, stored_text_max_bytes);
 }
 
-/// This session's tool-results folder as fx-compactor's record store. The
-/// store borrows `capability`.
+/// This session's tool-results folder as fx-compactor's record store, or on
+/// v2 its records kept as blobs (D50). The store borrows `capability`.
 pub fn compactorStore(capability: *session_child_store.SessionChildCapability) compactor.Store {
     return .{ .context = capability, .vtable = &.{
         .write = writeCompactorFile,
@@ -826,22 +834,44 @@ pub fn compactorStore(capability: *session_child_store.SessionChildCapability) c
 
 fn writeCompactorFile(context: *anyopaque, alloc: Allocator, name: []const u8, content: []const u8) compactor.Store.Error!void {
     const capability: *session_child_store.SessionChildCapability = @ptrCast(@alignCast(context));
+    if (capability.holdsBlobs()) {
+        session_child_store.SessionChildCapability.validateManagedName(name) catch |err| return compactorStoreError("write", name, err);
+        return capability.putRecord(name, content) catch |err| compactorStoreError("write", name, err);
+    }
     var entry = capability.atomicReplace(alloc, .tool_results, name, content) catch |err| return compactorStoreError("write", name, err);
     entry.deinit(alloc);
 }
 
 fn listCompactorFiles(context: *anyopaque, arena: Allocator) compactor.Store.Error![]const []const u8 {
     const capability: *session_child_store.SessionChildCapability = @ptrCast(@alignCast(context));
+    if (capability.holdsBlobs()) return capability.recordNames(arena) catch |err| compactorStoreError("list", "", err);
     const entries = capability.iterate(arena, .tool_results) catch |err| return compactorStoreError("list", "", err);
     return entries.names;
 }
 
 fn readCompactorFile(context: *anyopaque, arena: Allocator, name: []const u8, max_bytes: usize) compactor.Store.Error![]const u8 {
     const capability: *session_child_store.SessionChildCapability = @ptrCast(@alignCast(context));
+    if (capability.holdsBlobs()) return readRecordBlob(capability, arena, name, max_bytes);
     var file = capability.openFileReadOnly(arena, .tool_results, name) catch |err| return compactorStoreError("open", name, err);
     defer file.deinit();
     const size = (file.stat() catch |err| return compactorStoreError("stat", name, err)).size;
     return file.readRange(arena, 0, @intCast(@min(size, max_bytes))) catch |err| compactorStoreError("read", name, err);
+}
+
+/// Up to `max_bytes` from the start of a v2 record's read-only blob file,
+/// which may be far larger than what the compactor searches (D50).
+fn readRecordBlob(capability: *session_child_store.SessionChildCapability, arena: Allocator, name: []const u8, max_bytes: usize) compactor.Store.Error![]const u8 {
+    session_child_store.SessionChildCapability.validateManagedName(name) catch |err| return compactorStoreError("read", name, err);
+    const io = io_mod.getIo();
+    var file = capability.openBlobFile(arena, .tool_results, name) catch |err| return compactorStoreError("open", name, switch (err) {
+        error.BlobNotFound => error.FileNotFound,
+        else => err,
+    });
+    defer file.close(io);
+    const size = (file.stat(io) catch |err| return compactorStoreError("stat", name, err)).size;
+    const bytes = try arena.alloc(u8, std.math.cast(usize, @min(size, max_bytes)) orelse return error.OutOfMemory);
+    const got = file.readPositionalAll(io, bytes, 0) catch |err| return compactorStoreError("read", name, err);
+    return bytes[0..got];
 }
 
 fn compactorStoreError(operation: []const u8, name: []const u8, err: anyerror) compactor.Store.Error {
@@ -992,6 +1022,43 @@ test "the tool-results folder serves as the compactor's record store" {
     try std.testing.expectEqualStrings("T1 shell", try store.read(arena, "compacted-T1.txt", 8));
     try std.testing.expectError(error.FileNotFound, store.read(arena, "compacted-T2.txt", 1024));
     try std.testing.expectError(error.StoreFailed, store.write(alloc, "../escape.txt", "no"));
+}
+
+test "a v2 session's compactor records are blobs, replaced and listed by name (D50)" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const blob_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(blob_dir);
+    var memory = session_child_store.MemoryBlobsForTesting.initWithFiles(alloc, blob_dir);
+    defer memory.deinit();
+    var capability = try session_child_store.SessionChildCapability.initBlobs(alloc, memory.blobs(), "", .writable);
+    defer capability.deinit();
+    const store = compactorStore(&capability);
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    try store.write(alloc, "compacted-T1.txt", "T1 shell: ls\nResult:\nfirst\n");
+    try store.write(alloc, "compacted-T1.txt", "T1 shell: ls\nResult:\nreplaced\n");
+    const names = try store.list(arena);
+    try std.testing.expectEqual(@as(usize, 1), names.len);
+    try std.testing.expectEqualStrings("compacted-T1.txt", names[0]);
+    try std.testing.expectEqualStrings("T1 shell: ls\nResult:\nreplaced\n", try store.read(arena, "compacted-T1.txt", 1024));
+    try std.testing.expectEqualStrings("T1 shell", try store.read(arena, "compacted-T1.txt", 8));
+    try std.testing.expectError(error.FileNotFound, store.read(arena, "compacted-T2.txt", 1024));
+    try std.testing.expectError(error.StoreFailed, store.write(alloc, "../escape.txt", "no"));
+
+    // read_tool_result opens a record by its ID through the ordinary reader.
+    const page = try readByRangeManaged(alloc, &capability, "compacted-T1.txt", 1, 64);
+    defer alloc.free(page);
+    try std.testing.expect(std.mem.find(u8, page, "replaced") != null);
+
+    // A read-only copy reads records but cannot keep one.
+    var read_only = try capability.cloneReadOnly(alloc);
+    defer read_only.deinit();
+    try std.testing.expectEqualStrings("T1 shell", try compactorStore(&read_only).read(arena, "compacted-T1.txt", 8));
+    try std.testing.expectError(error.StoreFailed, compactorStore(&read_only).write(alloc, "compacted-T2.txt", "x"));
 }
 
 test "diff content packs round trip, bound, and reject tampering" {

@@ -670,7 +670,7 @@ fn checkEvents(gpa: std.mem.Allocator, events: []const Event, import: bool) Appe
             switch (s.key) {
                 .title, .workspace, .client_prompt => try checkJsonString(gpa, s.value),
                 .language => try checkLanguage(gpa, s.value),
-                .prefs, .permissions, .usage, .tool_identities, .moved_files => try checkJson(gpa, s.value),
+                .prefs, .permissions, .usage, .tool_identities, .moved_files, .compaction_records => try checkJson(gpa, s.value),
             }
             for (s.blobs) |hash| if (!schema.validBlobHash(hash)) return error.InvalidArgument;
         },
@@ -1769,6 +1769,51 @@ const api_tests = struct {
         try testing.expectEqual(@as(u64, 1), copied.last_turn);
         try testing.expectEqual(@as(?[]u8, null), copied.moved_files);
         copy.release();
+    }
+
+    test "compactor records are a setting that lists blobs inside a turn, and the newest wins on resume and in a fork (D50)" {
+        var f: Fixture = undefined;
+        try f.init();
+        defer f.deinit();
+        const m = f.manager;
+        const s = try m.openNew(.{ .workspace = "/w", .host = .app });
+        _ = try s.append(&.{ .turn_started, piece });
+        // Mid-turn, as auto compaction runs: the records and their map.
+        const record = try s.putBlob("T1 shell: ls\nResult:\nfirst\n");
+        const first_map = try s.putBlob("{\"compacted-T1.txt\":\"r\"}");
+        const first = try std.fmt.allocPrint(gpa, "{{\"map\":\"{s}\"}}", .{&first_map});
+        defer gpa.free(first);
+        _ = try s.append(&.{.{ .set = .{ .key = .compaction_records, .value = first, .blobs = &.{ &record, &first_map } } }});
+        _ = try s.append(&.{ piece, .turn_committed });
+        // A later compaction rewrites the map; the newest value wins.
+        _ = try s.append(&.{.turn_started});
+        const second_map = try s.putBlob("{\"compacted-T1.txt\":\"r\",\"compacted-M1.txt\":\"m\"}");
+        const second = try std.fmt.allocPrint(gpa, "{{\"map\":\"{s}\"}}", .{&second_map});
+        defer gpa.free(second);
+        _ = try s.append(&.{.{ .set = .{ .key = .compaction_records, .value = second, .blobs = &.{&second_map} } }});
+        _ = try s.append(&.{ piece, .turn_committed });
+        const id = try gpa.dupe(u8, s.id());
+        defer gpa.free(id);
+        s.release();
+
+        const r = try m.openResume(.{ .target = .{ .id = id }, .workspace = "/w", .host = .app });
+        var st = try r.state(gpa);
+        defer st.deinit(gpa);
+        try testing.expectEqualStrings(second, st.compaction_records.?);
+        r.release();
+        try testing.expectEqual(@as(u64, 0), (try m.verify(id)).bad_blobs);
+
+        // A fork at turn 1 keeps the first map and links its records.
+        const fork = try m.openFork(.{ .source = id, .at = .{ .turn = 1 }, .workspace = "/w", .host = .app });
+        const fork_id = try gpa.dupe(u8, fork.id());
+        defer gpa.free(fork_id);
+        var forked = try fork.state(gpa);
+        defer forked.deinit(gpa);
+        try testing.expectEqualStrings(first, forked.compaction_records.?);
+        fork.release();
+        const body = try m.getBlob(gpa, fork_id, &record);
+        defer gpa.free(body);
+        try testing.expectEqualStrings("T1 shell: ls\nResult:\nfirst\n", body);
     }
 
     test "a blob is read-only and its path opens to its bytes, in the session and in a fork (D49)" {

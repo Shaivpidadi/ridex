@@ -90,9 +90,15 @@ pub const Blobs = struct {
         put: *const fn (ctx: *anyopaque, bytes: []const u8) BlobError!Hash,
         /// The first `len` bytes of an open file outside the session.
         put_file: *const fn (ctx: *anyopaque, file: std.Io.File, len: u64) BlobError!Hash,
-        /// The blob a handle of `kind` refers to: the one it names, or in a
-        /// session moved off the side folder, the one its old name maps to
-        /// (D47).
+        /// Keeps `bytes` as the compactor record `name`, replacing any record
+        /// of that name (D50).
+        put_record: *const fn (ctx: *anyopaque, name: []const u8, bytes: []const u8) BlobError!void,
+        /// Every compactor record's name, with a moved session's old
+        /// tool-results names (D50). `arena` owns the list.
+        record_names: *const fn (ctx: *anyopaque, arena: Allocator) BlobError![]const []const u8,
+        /// The blob a handle of `kind` refers to: the one it names, a
+        /// compactor record's (D50), or in a session moved off the side
+        /// folder, the one its old name maps to (D47).
         resolve: *const fn (ctx: *anyopaque, kind: ManagedChildKind, name: []const u8) BlobError!Hash,
         /// A blob's bytes, at most `max_bytes`, checked against its name.
         /// Caller owns.
@@ -611,13 +617,15 @@ const CapabilityImpl = struct {
 };
 
 /// Blobs held in memory, for the stores' tests: bodies by hash, with the
-/// adapter's rules for names and limits, and no moved map. Given a folder,
-/// each body is also written there read-only, so `path` has a file.
+/// adapter's rules for names and limits, compactor records by name, and no
+/// moved map. Given a folder, each body is also written there read-only, so
+/// `path` has a file.
 pub const MemoryBlobsForTesting = struct {
     alloc: Allocator,
     dir: ?[]const u8 = null,
     mutex: std.Io.Mutex = .init,
     bodies: std.StringHashMapUnmanaged([]u8) = .empty,
+    records: std.StringArrayHashMapUnmanaged(Blobs.Hash) = .empty,
     refs: usize = 0,
     closed: bool = false,
     puts: usize = 0,
@@ -625,6 +633,8 @@ pub const MemoryBlobsForTesting = struct {
     const vtable: Blobs.VTable = .{
         .put = put,
         .put_file = putFile,
+        .put_record = putRecord,
+        .record_names = recordNames,
         .resolve = resolve,
         .get = get,
         .path = path,
@@ -649,6 +659,8 @@ pub const MemoryBlobsForTesting = struct {
             self.alloc.free(entry.value_ptr.*);
         }
         self.bodies.deinit(self.alloc);
+        for (self.records.keys()) |name| self.alloc.free(name);
+        self.records.deinit(self.alloc);
         self.* = undefined;
     }
 
@@ -703,11 +715,36 @@ pub const MemoryBlobsForTesting = struct {
         return put(ctx, bytes);
     }
 
+    fn putRecord(ctx: *anyopaque, name: []const u8, bytes: []const u8) BlobError!void {
+        const self = from(ctx);
+        const hash = try put(ctx, bytes);
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        if (self.records.getPtr(name)) |known| {
+            known.* = hash;
+            return;
+        }
+        const key = try self.alloc.dupe(u8, name);
+        errdefer self.alloc.free(key);
+        try self.records.put(self.alloc, key, hash);
+    }
+
+    fn recordNames(ctx: *anyopaque, arena: Allocator) BlobError![]const []const u8 {
+        const self = from(ctx);
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        const names = try arena.alloc([]const u8, self.records.count());
+        for (self.records.keys(), names) |name, *out| out.* = try arena.dupe(u8, name);
+        return names;
+    }
+
     fn resolve(ctx: *anyopaque, kind: ManagedChildKind, name: []const u8) BlobError!Blobs.Hash {
-        _ = ctx;
-        _ = kind;
-        const hash = artifact_digest.blobHash(name) orelse return error.BlobNotFound;
-        return hash[0..artifact_digest.blob_hex_bytes].*;
+        const self = from(ctx);
+        if (artifact_digest.blobHash(name)) |hash| return hash[0..artifact_digest.blob_hex_bytes].*;
+        if (kind != .tool_results) return error.BlobNotFound;
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        return self.records.get(name) orelse error.BlobNotFound;
     }
 
     fn get(ctx: *anyopaque, alloc: Allocator, hash: []const u8, max_bytes: usize) BlobError![]u8 {
@@ -797,6 +834,21 @@ pub const SessionChildCapability = struct {
     pub fn putBlobFile(self: *SessionChildCapability, file: std.Io.File, len: u64) BlobError!Blobs.Hash {
         const blobs = try self.writableBlobs();
         return blobs.vtable.put_file(blobs.ctx, file, len);
+    }
+
+    /// Keeps `bytes` as the compactor record `name`, replacing any of that
+    /// name; `holdsBlobs` only (D50). `readBlob` and `openBlobFile` read it
+    /// back under `.tool_results`.
+    pub fn putRecord(self: *SessionChildCapability, name: []const u8, bytes: []const u8) BlobError!void {
+        const blobs = try self.writableBlobs();
+        return blobs.vtable.put_record(blobs.ctx, name, bytes);
+    }
+
+    /// Every compactor record's name; `holdsBlobs` only (D50). `arena` owns
+    /// the list.
+    pub fn recordNames(self: *SessionChildCapability, arena: Allocator) BlobError![]const []const u8 {
+        const blobs = self.impl.blobs orelse return error.BlobStoreFailed;
+        return blobs.vtable.record_names(blobs.ctx, arena);
     }
 
     /// The body a handle of `kind` refers to, at most `max_bytes` and

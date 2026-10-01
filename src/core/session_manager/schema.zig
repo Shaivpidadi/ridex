@@ -104,8 +104,10 @@ pub const Outcome = enum { ok, failed, cancelled, interrupted, lost };
 /// `client_prompt` (a JSON string) and `tool_identities` are an ACP
 /// client's settings (D46). `moved_files` records a session moved off fx's
 /// side folder: its value names the blob that maps old handles to blobs,
-/// and its line lists every moved blob (D47).
-pub const SetKey = enum { prefs, title, permissions, usage, workspace, language, client_prompt, tool_identities, moved_files };
+/// and its line lists every moved blob (D47). `compaction_records` names
+/// the blob that maps fx's compactor record names to blobs, and its line
+/// lists the map and the records it adds (D50).
+pub const SetKey = enum { prefs, title, permissions, usage, workspace, language, client_prompt, tool_identities, moved_files, compaction_records };
 
 pub const ForkOrigin = struct { id: []const u8, seq: u64 };
 
@@ -730,6 +732,9 @@ test "every kind's fields round trip, raw values byte for byte" {
     const moved = (try roundTrip(arena, .{ .set = .{ .key = .moved_files, .value = "{}", .blobs = &.{&hash} } })).set;
     try testing.expectEqual(SetKey.moved_files, moved.key);
     try testing.expectEqualStrings(&hash, moved.blobs[0]);
+    const records = (try roundTrip(arena, .{ .set = .{ .key = .compaction_records, .value = "{}", .blobs = &.{&hash} } })).set;
+    try testing.expectEqual(SetKey.compaction_records, records.key);
+    try testing.expectEqualStrings(&hash, records.blobs[0]);
 
     const compacted = (try roundTrip(arena, .{ .compacted = .{ .turn = null, .data = "{}" } })).compacted;
     try testing.expectEqual(@as(?u64, null), compacted.turn);
