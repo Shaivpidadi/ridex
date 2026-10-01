@@ -427,7 +427,7 @@ fn startV2Session(
     defer if (session_rt_owned) session_rt.deinit(alloc);
     _ = try session_rt.initializeProfileUsage(alloc, io_mod.getenv("HOME"));
     session_rt.usage.restoreLegacyWallDuration(io_mod.milliTimestamp());
-    session_rt.configureWebFetchArtifacts(alloc, v2.filesPath());
+    session_rt.configureWebFetchArtifactBlobs(alloc, try v2.childCapability(), v2.id());
     server.cancelAndReapActivePrompt(state);
     activateSession(state, null, .{
         .session_id = session_id,
@@ -872,11 +872,9 @@ fn handleRestoreSession(
             durable.created_at_ms,
         );
     }
-    const session_dir = if (v2) |value|
-        try alloc.dupe(u8, value.filesPath())
-    else
-        try session_store.sessionDirPath(alloc, store.?.sessions_dir, session_id);
-    defer alloc.free(session_dir);
+    // A v2 session's downloads are its blobs (D44); v1 keeps them in its folder.
+    const session_dir: ?[]u8 = if (v2 != null) null else try session_store.sessionDirPath(alloc, store.?.sessions_dir, session_id);
+    defer if (session_dir) |path| alloc.free(path);
 
     // Read before the active session is released, so an unreadable prompt
     // fails this restore without replacing a different active session. A
@@ -891,7 +889,10 @@ fn handleRestoreSession(
     };
     defer if (client_system_prompt) |text| state.alloc.free(text);
     if (writable) |*value| value.releaseHydrationHistory(alloc);
-    session_rt.configureWebFetchArtifacts(alloc, session_dir);
+    if (v2) |value|
+        session_rt.configureWebFetchArtifactBlobs(alloc, try value.childCapability(), value.id())
+    else
+        session_rt.configureWebFetchArtifacts(alloc, session_dir.?);
     server.cancelAndReapActivePrompt(state);
     activateSession(state, store, .{
         .session_id = sid_copy,
@@ -1202,8 +1203,9 @@ const SessionActivation = struct {
     workspace: ?*workspace_binding.Binding = null,
 };
 
-/// The session whose side files hold its client prompt and tool identities,
-/// on either backend. Borrowed for the call.
+/// The session that keeps its client prompt and tool identities, on either
+/// backend: a v1 session's side files, or a v2 session's settings (D46).
+/// Borrowed for the call.
 const SavedFiles = union(enum) {
     v1: *session_store.LoadedWritableSession,
     v2: *session_adapter.Session,
@@ -1214,24 +1216,6 @@ const SavedFiles = union(enum) {
             .v2 => |session| session.id(),
         };
     }
-
-    /// Borrowed from the session. On v2 the side folder is made on first use.
-    fn capability(self: SavedFiles) !*session_child_store.SessionChildCapability {
-        return switch (self) {
-            .v1 => |writable| writable.childCapability(),
-            .v2 => |session| session.childCapability(),
-        };
-    }
-
-    /// False for a v2 session that has not reached the disk: it has nothing
-    /// to restore, and asking for its capability would make an empty side
-    /// folder (D24).
-    fn restorable(self: SavedFiles) bool {
-        return switch (self) {
-            .v1 => true,
-            .v2 => |session| session.saved(),
-        };
-    }
 };
 
 fn persistClientSystemPrompt(
@@ -1239,7 +1223,10 @@ fn persistClientSystemPrompt(
     files: SavedFiles,
     text: []const u8,
 ) !void {
-    try client_instructions.persist(alloc, try files.capability(), text);
+    switch (files) {
+        .v1 => |writable| try client_instructions.persist(alloc, try writable.childCapability(), text),
+        .v2 => |session| try session.setClientPrompt(text),
+    }
 }
 
 /// Returns the owned persisted client prompt of a restored session, or an
@@ -1250,15 +1237,20 @@ fn restoredClientSystemPrompt(
     alloc: Allocator,
     files: SavedFiles,
 ) error{ OutOfMemory, ClientSystemPromptUnreadable }![]u8 {
-    const capability = files.capability() catch |err| {
-        debug_trace.logf(
-            "acp",
-            "no client system prompt to restore session={s} err={s}",
-            .{ files.id(), @errorName(err) },
-        );
-        return &.{};
-    };
-    const text = client_instructions.load(alloc, capability) catch |err| switch (err) {
+    const text = switch (files) {
+        .v1 => |writable| blk: {
+            const capability = writable.childCapability() catch |err| {
+                debug_trace.logf(
+                    "acp",
+                    "no client system prompt to restore session={s} err={s}",
+                    .{ files.id(), @errorName(err) },
+                );
+                return &.{};
+            };
+            break :blk client_instructions.load(alloc, capability);
+        },
+        .v2 => |session| session.clientPrompt(alloc),
+    } catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => {
             debug_trace.logf(
@@ -1278,16 +1270,26 @@ fn restoredToolIdentities(
     alloc: Allocator,
     files: SavedFiles,
 ) Allocator.Error!tool_call_identities.Record {
-    if (!files.restorable()) return .{};
-    const capability = files.capability() catch |err| {
-        debug_trace.logf(
-            "acp",
-            "no tool identity record to restore session={s} err={s}",
-            .{ files.id(), @errorName(err) },
-        );
-        return .{};
+    const record = switch (files) {
+        .v1 => |writable| blk: {
+            const capability = writable.childCapability() catch |err| {
+                debug_trace.logf(
+                    "acp",
+                    "no tool identity record to restore session={s} err={s}",
+                    .{ files.id(), @errorName(err) },
+                );
+                return .{};
+            };
+            break :blk tool_call_identities.load(alloc, capability);
+        },
+        .v2 => |session| blk: {
+            const stored = session.toolIdentities(alloc) catch |err| break :blk err;
+            const bytes = stored orelse return .{};
+            defer alloc.free(bytes);
+            break :blk tool_call_identities.parse(alloc, bytes);
+        },
     };
-    return tool_call_identities.load(alloc, capability) catch |err| switch (err) {
+    return record catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => {
             debug_trace.logf(

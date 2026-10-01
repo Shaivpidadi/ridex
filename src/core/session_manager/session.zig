@@ -523,7 +523,25 @@ pub const Session = struct {
     /// again costs one stat.
     pub fn putBlob(session: *Session, bytes: []const u8) AppendError![schema.blob_hash_len]u8 {
         if (bytes.len > max_blob_bytes) return error.TooLarge;
-        const hash = schema.blobHash(bytes);
+        return session.storeBlob(.{ .bytes = bytes });
+    }
+
+    /// As `putBlob`, for the first `len` bytes of `file`, an open file
+    /// outside the session such as a command's output spool. They are
+    /// copied in chunks, so the body is never whole in memory (D44).
+    pub fn putBlobFile(session: *Session, file: std.Io.File, len: u64) AppendError![schema.blob_hash_len]u8 {
+        if (len > max_blob_bytes) return error.TooLarge;
+        return session.storeBlob(.{ .file = .{ .file = file, .len = len } });
+    }
+
+    const BlobSource = union(enum) {
+        bytes: []const u8,
+        file: struct { file: std.Io.File, len: u64 },
+    };
+
+    const blob_copy_chunk_bytes = 256 * 1024;
+
+    fn storeBlob(session: *Session, source: BlobSource) AppendError![schema.blob_hash_len]u8 {
         const env = session.env;
         const s = env.s;
         const io = s.io;
@@ -539,37 +557,49 @@ pub const Session = struct {
             }
         };
         defer s.closeDir(dir);
-        if (s.stat(dir, &hash)) |_| return hash else |_| {}
-        var tmp_name: [1 + schema.blob_hash_len + 1 + 16 + 4]u8 = undefined;
+        // Bytes in hand name themselves before any write; a file is named
+        // once copied.
+        const known: ?[schema.blob_hash_len]u8 = switch (source) {
+            .bytes => |bytes| schema.blobHash(bytes),
+            .file => null,
+        };
+        if (known) |hash| if (s.stat(dir, &hash)) |_| return hash else |_| {};
+        var tmp_name: [1 + 7 + 1 + 16 + 4]u8 = undefined;
         var suffix: [8]u8 = undefined;
         io.random(&suffix);
-        const name = std.fmt.bufPrint(&tmp_name, ".{s}.{x}.tmp", .{ &hash, &suffix }) catch unreachable;
-        const file = s.createFile(dir, name) catch |io_err| return storage.ioFault(io_err);
+        const name = std.fmt.bufPrint(&tmp_name, ".pending.{x}.tmp", .{&suffix}) catch unreachable;
+        const file = s.createReadOnlyFile(dir, name) catch |io_err| return storage.ioFault(io_err);
         var file_open = true;
         defer if (file_open) s.closeFile(file);
-        errdefer s.deleteFile(dir, name) catch {};
-        s.writeAt(file, bytes, 0) catch |io_err| return storage.ioFault(io_err);
+        var renamed = false;
+        defer if (!renamed) s.deleteFile(dir, name) catch {};
+        const hash = switch (source) {
+            .bytes => |bytes| blk: {
+                s.writeAt(file, bytes, 0) catch |io_err| return storage.ioFault(io_err);
+                break :blk known.?;
+            },
+            .file => |from| try copyBlobFrom(env, file, from.file, from.len),
+        };
         s.sync(file) catch |io_err| return storage.ioFault(io_err);
         s.closeFile(file);
         file_open = false;
+        if (known == null) if (s.stat(dir, &hash)) |_| return hash else |_| {};
         s.rename(dir, name, dir, &hash) catch |io_err| return storage.ioFault(io_err);
+        renamed = true;
         s.syncDir(dir) catch |io_err| return storage.ioFault(io_err);
         return hash;
     }
 
-    /// Every blob an item refers to must already exist in this session
-    /// (`tla/Fork.tla` `RefsExist`).
+    /// Every blob an item or a setting refers to must already exist in this
+    /// session (`tla/Fork.tla` `RefsExist`).
     fn checkBlobRefs(session: *Session, live: *Live, bodies: []const schema.Body) AppendError!void {
         if (!hasBlobRefs(bodies)) return;
         const s = session.env.s;
         const dir = s.openDir(live.dir, "blobs") catch |io_err| return storage.ioFault(io_err);
         defer s.closeDir(dir);
-        for (bodies) |body| switch (body) {
-            .item => |piece| for (piece.blobs) |hash| {
-                if (!schema.validBlobHash(hash)) return error.InvalidTransition;
-                _ = s.stat(dir, hash) catch return error.InvalidTransition;
-            },
-            else => {},
+        for (bodies) |body| for (body.blobRefs()) |hash| {
+            if (!schema.validBlobHash(hash)) return error.InvalidTransition;
+            _ = s.stat(dir, hash) catch return error.InvalidTransition;
         };
     }
 
@@ -880,11 +910,31 @@ test "a fault code round trips every I/O fault, and none is no fault" {
 }
 
 fn hasBlobRefs(bodies: []const schema.Body) bool {
-    for (bodies) |body| switch (body) {
-        .item => |piece| if (piece.blobs.len > 0) return true,
-        else => {},
-    };
+    for (bodies) |body| {
+        if (body.blobRefs().len > 0) return true;
+    }
     return false;
+}
+
+/// Copies the first `len` bytes of `from` into `to` in chunks and returns
+/// their blob name. A source shorter than `len` is an I/O failure.
+fn copyBlobFrom(env: *const Env, to: storage.File, from: std.Io.File, len: u64) AppendError![schema.blob_hash_len]u8 {
+    const s = env.s;
+    const buffer = try env.gpa.alloc(u8, @intCast(@min(len, Session.blob_copy_chunk_bytes)));
+    defer env.gpa.free(buffer);
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    var offset: u64 = 0;
+    while (offset < len) {
+        const want: usize = @intCast(@min(len - offset, buffer.len));
+        const got = from.readPositional(s.io, &.{buffer[0..want]}, offset) catch return error.Io;
+        if (got == 0) return error.Io;
+        hasher.update(buffer[0..got]);
+        s.writeAt(to, buffer[0..got], offset) catch |io_err| return storage.ioFault(io_err);
+        offset += got;
+    }
+    var digest: [32]u8 = undefined;
+    hasher.final(&digest);
+    return std.fmt.bytesToHex(digest, .lower);
 }
 
 /// The copy fallback when a hard link is refused: the copy is synced
@@ -899,7 +949,7 @@ fn copyBlob(env: *const Env, source: storage.Dir, target: storage.Dir, name: []c
     const bytes = try gpa.alloc(u8, @intCast(len));
     defer gpa.free(bytes);
     if ((s.readAt(from, bytes, 0) catch |io_err| return storage.ioFault(io_err)) != bytes.len) return error.Io;
-    const to = s.createFile(target, name) catch |io_err| return storage.ioFault(io_err);
+    const to = s.createReadOnlyFile(target, name) catch |io_err| return storage.ioFault(io_err);
     defer s.closeFile(to);
     s.writeAt(to, bytes, 0) catch |io_err| return storage.ioFault(io_err);
     s.sync(to) catch |io_err| return storage.ioFault(io_err);
@@ -926,9 +976,12 @@ fn needsSync(bodies: []const schema.Body) bool {
         .turn_committed, .turn_interrupted, .child_spawned, .child_finished => return true,
         // Usage is durable before fx clears its usage-recovery marker
         // (`tla/Wiring.tla` UsageNeverSilent).
+        // fx removes the side folder only once the move is durable (D47).
+        // Compactor records need no sync of their own: the compaction line
+        // that cites them comes later in the log, which keeps a prefix (D50).
         .set => |s| switch (s.key) {
-            .permissions, .usage => return true,
-            .prefs, .title, .workspace, .language => {},
+            .permissions, .usage, .moved_files => return true,
+            .prefs, .title, .workspace, .language, .client_prompt, .tool_identities, .compaction_records => {},
         },
         else => {},
     };
@@ -1485,6 +1538,19 @@ pub fn readBlob(env: *const Env, gpa: std.mem.Allocator, id_: []const u8, hash: 
     return bytes;
 }
 
+/// Whether session `id_` holds a regular blob file named `hash`; its bytes
+/// are not read (D49).
+pub fn blobExists(env: *const Env, id_: []const u8, hash: []const u8) (error{NotFound} || storage.IoFault)!void {
+    const s = env.s;
+    if (!schema.validId(id_) or !schema.validBlobHash(hash)) return error.NotFound;
+    const dir = s.openDir(env.root, id_) catch |err| return notFoundOr(err);
+    defer s.closeDir(dir);
+    const blobs = s.openDir(dir, "blobs") catch |err| return notFoundOr(err);
+    defer s.closeDir(blobs);
+    const st = s.stat(blobs, hash) catch |err| return notFoundOr(err);
+    if (st.kind != .file) return error.NotFound;
+}
+
 fn notFoundOr(err: storage.Error) (error{NotFound} || storage.IoFault) {
     return if (err == error.NotFound) error.NotFound else error.Io;
 }
@@ -1608,11 +1674,11 @@ fn findForkPoint(env: *const Env, source: []const u8, src: storage.File, end: u6
         const kind = line.header.kind orelse continue;
         switch (kind) {
             .turn_started => turn_seen = true,
-            .item => {
+            .item, .set => {
                 _ = arena.reset(.retain_capacity);
                 const body = schema.parseBody(arena.allocator(), kind, line.body()) catch return error.Corrupt;
                 var whole = true;
-                for (body.item.blobs) |hash| {
+                for (body.blobRefs()) |hash| {
                     if (!try blobIsWhole(env, source, hash)) whole = false;
                 }
                 if (!whole) break;
@@ -1826,11 +1892,11 @@ pub fn verifySession(env: *const Env, id_: []const u8) OpenError!Verified {
             result.damaged_at = line.offset;
             break;
         };
+        for (body.blobRefs()) |hash| {
+            if (!try blobIsWhole(env, id_, hash)) result.bad_blobs += 1;
+        }
         switch (body) {
             .session_created => |c| fork_seq = if (c.forked_from) |o| o.seq else 0,
-            .item => |piece| for (piece.blobs) |hash| {
-                if (!try blobIsWhole(env, id_, hash)) result.bad_blobs += 1;
-            },
             .snapshot => |snap| {
                 var decoded = fold.decodeState(gpa, arena.allocator(), snap.state) catch {
                     result.bad_snapshots += 1;

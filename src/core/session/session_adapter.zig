@@ -13,8 +13,12 @@
 //!   `interruption` item and `turn_interrupted` (`cancel` or `failed`);
 //! - preferences, permissions, conversation language, title and usage are
 //!   `set` values in v1's encodings;
-//! - side files (tool results, images, command logs, artifacts) live in
-//!   `~/.fx/session-files/{id}/` until the default flips.
+//! - large bodies (tool results, tool images, command replay, web-fetch
+//!   downloads) are blobs of the session, each named by its hash (D44); an
+//!   ACP client's prompt and tool identities are settings (D46); hosted
+//!   terminal state lives in `~/.fx/terminal/{id}/` (D45). An older session
+//!   with a `~/.fx/session-files/{id}/` side folder moves on its first
+//!   writable open (D47, `tla/MoveSideFiles.tla`).
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -33,6 +37,7 @@ const session_child_store = @import("session_child_store.zig");
 const session_display_metadata = @import("session_display_metadata.zig");
 const session_store = @import("session_store.zig");
 const session_summary_codec = @import("session_summary_codec.zig");
+const artifact_digest = @import("artifact_digest.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
 const model_provider = @import("../config/model_provider.zig");
 
@@ -40,8 +45,11 @@ const Allocator = std.mem.Allocator;
 const Event = session_event.ConversationEvent;
 const PieceKind = std.meta.Tag(Event);
 
-/// Folder of the side files of v2 sessions, under `~/.fx`.
+/// Folder of the side files older v2 sessions kept, under `~/.fx`; a
+/// session moves out of it on its first writable open (D47).
 pub const files_dir_name = profile_paths.session_files_dir_name;
+/// Folder of v2 sessions' hosted terminal state, under `~/.fx` (D45).
+pub const terminal_dir_name = profile_paths.terminal_dir_name;
 /// Folder of the usage-recovery markers of v2 sessions, under `~/.fx`;
 /// v1's readers load only v1 sessions, so v2 markers live apart.
 pub const usage_markers_dir_name = "usage-recovery-v2";
@@ -165,45 +173,82 @@ pub const Store = struct {
         store.* = undefined;
     }
 
-    /// `~/.fx/session-files`, or null when nothing has used it yet.
-    fn openFilesRoot(store: *Store) !?io_mod.VerifiedDir {
+    /// `~/.fx/{name}`, or null when nothing has made it yet.
+    fn openProfileFolder(store: *Store, name: []const u8) !?io_mod.VerifiedDir {
         var home = try openHome(store.home);
         defer home.close();
         var fx = try io_mod.openVerifiedPrivateDirIfPresent(&home, profile_paths.root_dir_name) orelse return null;
         defer fx.close();
-        return io_mod.openVerifiedPrivateDirIfPresent(&fx, files_dir_name);
+        return io_mod.openVerifiedPrivateDirIfPresent(&fx, name);
     }
 
-    /// Removes `~/.fx/session-files/{id}`; `why` names the caller in the trace.
+    /// `~/.fx/{name}`, made `0700` when missing.
+    fn makeProfileFolder(store: *Store, name: []const u8) !io_mod.VerifiedDir {
+        var home = try openHome(store.home);
+        defer home.close();
+        var fx = try io_mod.openOrCreateVerifiedPrivateDir(&home, profile_paths.root_dir_name);
+        defer fx.close();
+        return io_mod.openOrCreateVerifiedPrivateDir(&fx, name);
+    }
+
+    /// The folders of `id` outside the manager: its terminal state (D45)
+    /// and a side folder not yet moved (D47).
+    const outside_folders = [_][]const u8{ terminal_dir_name, files_dir_name };
+
+    /// Removes the folders of `id` outside the manager; `why` names the
+    /// caller in the trace.
     fn removeFiles(store: *Store, id: []const u8, why: []const u8) void {
-        var files = (store.openFilesRoot() catch |err| {
-            debug_trace.logf("session", "event=sessions_v2_files_kept session={s} why={s} err={s}", .{ id, why, @errorName(err) });
-            return;
-        }) orelse return;
-        defer files.close();
-        files.dir.deleteTree(io_mod.getIo(), id) catch |err| {
-            debug_trace.logf("session", "event=sessions_v2_files_kept session={s} why={s} err={s}", .{ id, why, @errorName(err) });
-            return;
-        };
-        debug_trace.logf("session", "event=sessions_v2_files_removed session={s} why={s}", .{ id, why });
+        for (outside_folders) |root_name| {
+            var root = (store.openProfileFolder(root_name) catch |err| {
+                debug_trace.logf("session", "event=sessions_v2_files_kept session={s} root={s} why={s} err={s}", .{ id, root_name, why, @errorName(err) });
+                continue;
+            }) orelse continue;
+            defer root.close();
+            if (root.dir.statFile(io_mod.getIo(), id, .{ .follow_symlinks = false })) |_| {} else |_| continue;
+            root.dir.deleteTree(io_mod.getIo(), id) catch |err| {
+                debug_trace.logf("session", "event=sessions_v2_files_kept session={s} root={s} why={s} err={s}", .{ id, root_name, why, @errorName(err) });
+                continue;
+            };
+            debug_trace.logf("session", "event=sessions_v2_files_removed session={s} root={s} why={s}", .{ id, root_name, why });
+        }
     }
 
-    /// Copies `session-files/{from}` to `session-files/{to}`: plain files and
-    /// folders only, never through a link. False when anything was left out;
-    /// a source with no side files has nothing to copy.
+    /// Copies the folders of `from` outside the manager to `to`, root by
+    /// root: plain files and folders only, never through a link. False when
+    /// anything was left out; a source with none has nothing to copy. A
+    /// side folder not yet moved is copied as it is, and the copy moves on
+    /// its own first open.
     fn copyFiles(store: *Store, from: []const u8, to: []const u8) bool {
-        var files = (store.openFilesRoot() catch |err| return copyFailed(from, err)) orelse return true;
-        defer files.close();
-        var source = (io_mod.openVerifiedPrivateDirIfPresent(&files, from) catch |err| return copyFailed(from, err)) orelse return true;
-        defer source.close();
-        var target = io_mod.openOrCreateVerifiedPrivateDir(&files, to) catch |err| return copyFailed(from, err);
-        defer target.close();
-        return copyTree(&source, &target, 0);
+        var complete = true;
+        for (outside_folders) |root_name| {
+            var root = (store.openProfileFolder(root_name) catch |err| {
+                complete = copyFailed(from, err);
+                continue;
+            }) orelse continue;
+            defer root.close();
+            var source = (io_mod.openVerifiedPrivateDirIfPresent(&root, from) catch |err| {
+                complete = copyFailed(from, err);
+                continue;
+            }) orelse continue;
+            defer source.close();
+            var target = io_mod.openOrCreateVerifiedPrivateDir(&root, to) catch |err| {
+                complete = copyFailed(from, err);
+                continue;
+            };
+            defer target.close();
+            if (!copyTree(&source, &target, 0)) complete = false;
+        }
+        return complete;
     }
 
-    /// Removes side folders whose session is gone, except young ones (D36).
+    /// Removes folders outside the manager whose session is gone, except
+    /// young ones (D36, D45), in both roots.
     fn sweepFiles(store: *Store, alloc: Allocator, report: *Doctor, now_ms: i64) !void {
-        var files = try store.openFilesRoot() orelse return;
+        for (outside_folders) |root_name| try store.sweepRoot(alloc, root_name, report, now_ms);
+    }
+
+    fn sweepRoot(store: *Store, alloc: Allocator, root_name: []const u8, report: *Doctor, now_ms: i64) !void {
+        var files = try store.openProfileFolder(root_name) orelse return;
         defer files.close();
         var it = files.dir.iterate();
         while (try it.next(io_mod.getIo())) |entry| {
@@ -223,15 +268,15 @@ pub const Store = struct {
             };
             const changed_ms: i64 = @intCast(@divFloor(stat.mtime.toNanoseconds(), std.time.ns_per_ms));
             if (now_ms - changed_ms < orphan_min_age_ms) {
-                debug_trace.logf("session", "event=sessions_v2_orphan_files_young session={s}", .{entry.name});
+                debug_trace.logf("session", "event=sessions_v2_orphan_files_young session={s} root={s}", .{ entry.name, root_name });
                 continue;
             }
             files.dir.deleteTree(io_mod.getIo(), entry.name) catch |err| {
-                debug_trace.logf("session", "event=sessions_v2_files_kept session={s} why=orphan err={s}", .{ entry.name, @errorName(err) });
+                debug_trace.logf("session", "event=sessions_v2_files_kept session={s} root={s} why=orphan err={s}", .{ entry.name, root_name, @errorName(err) });
                 report.kept += 1;
                 continue;
             };
-            debug_trace.logf("session", "event=sessions_v2_files_removed session={s} why=orphan", .{entry.name});
+            debug_trace.logf("session", "event=sessions_v2_files_removed session={s} root={s} why=orphan", .{ entry.name, root_name });
             report.removed += 1;
         }
     }
@@ -532,13 +577,315 @@ pub const Resumed = struct {
     }
 };
 
+/// A session's blobs as fx's stores reach them (D44), shared by every
+/// capability over the session, including the copies a background reader or
+/// a running command keeps. It lives until the last holder releases it.
+/// Once the session closes it stores nothing more; reads go to the
+/// process's manager, which outlives every session.
+///
+/// Locks: `life` is held through each store, so a close waits for one in
+/// flight; `mutex` guards only the counts and lists. Neither is taken while
+/// the other is wanted, and no store takes the session's own lock.
+const BlobHost = struct {
+    alloc: Allocator,
+    store: *Store,
+    /// The session's id, owned.
+    id: []u8,
+    life: std.Io.Mutex = .init,
+    /// The open session; null once it closed.
+    session: ?sm.Session,
+    mutex: std.Io.Mutex = .init,
+    refs: usize = 1,
+    /// Blobs stored since the last item that lists them (D44).
+    pending: std.ArrayList(Hash) = .empty,
+    /// A moved session's old side-file names, as `{folder}/{name}`, to their
+    /// blobs (D47). Set while the session opens; read-only after.
+    moved: std.StringHashMapUnmanaged(Hash) = .empty,
+    /// The compactor's records by name (D50), loaded on open and kept
+    /// since; `mutex` guards them.
+    records: std.StringArrayHashMapUnmanaged(Hash) = .empty,
+    /// Records kept since the last `compaction_records` line, which the
+    /// next one lists.
+    records_added: std.ArrayList(Hash) = .empty,
+    /// Counts record changes, so a line written while another record
+    /// arrives leaves the map due again.
+    records_generation: u64 = 0,
+    records_written: u64 = 0,
+
+    const Hash = session_child_store.Blobs.Hash;
+
+    const vtable: session_child_store.Blobs.VTable = .{
+        .put = put,
+        .put_file = putFile,
+        .put_record = putRecord,
+        .record_names = recordNames,
+        .resolve = resolve,
+        .get = get,
+        .path = path,
+        .retain = retain,
+        .release = release,
+    };
+
+    fn create(alloc: Allocator, store: *Store, handle: sm.Session) !*BlobHost {
+        const host = try alloc.create(BlobHost);
+        errdefer alloc.destroy(host);
+        host.* = .{ .alloc = alloc, .store = store, .id = try alloc.dupe(u8, handle.id()), .session = handle };
+        return host;
+    }
+
+    fn blobs(host: *BlobHost) session_child_store.Blobs {
+        return .{ .ctx = host, .vtable = &vtable };
+    }
+
+    fn from(ctx: *anyopaque) *BlobHost {
+        return @ptrCast(@alignCast(ctx));
+    }
+
+    /// The session is closing: waits for a store in flight, then refuses
+    /// new ones. Blobs stored but never listed stay unreachable from a fork,
+    /// so the trace counts them.
+    fn detach(host: *BlobHost) void {
+        const io = io_mod.getIo();
+        host.life.lockUncancelable(io);
+        host.session = null;
+        host.life.unlock(io);
+        host.mutex.lockUncancelable(io);
+        defer host.mutex.unlock(io);
+        if (host.pending.items.len > 0) debug_trace.logf("session", "event=sessions_v2_blobs_unlisted session={s} count={d}", .{ host.id, host.pending.items.len });
+        if (host.records_generation != host.records_written) debug_trace.logf("session", "event=sessions_v2_records_unlisted session={s} count={d}", .{ host.id, host.records_added.items.len });
+    }
+
+    fn put(ctx: *anyopaque, bytes: []const u8) session_child_store.BlobError!Hash {
+        const host = from(ctx);
+        const io = io_mod.getIo();
+        host.life.lockUncancelable(io);
+        defer host.life.unlock(io);
+        const handle = host.session orelse return error.BlobStoreClosed;
+        const hash = handle.putBlob(bytes) catch |err| return host.storeFailed(err);
+        try host.remember(hash);
+        return hash;
+    }
+
+    fn putFile(ctx: *anyopaque, file: std.Io.File, len: u64) session_child_store.BlobError!Hash {
+        const host = from(ctx);
+        const io = io_mod.getIo();
+        host.life.lockUncancelable(io);
+        defer host.life.unlock(io);
+        const handle = host.session orelse return error.BlobStoreClosed;
+        const hash = handle.putBlobFile(file, len) catch |err| return host.storeFailed(err);
+        try host.remember(hash);
+        return hash;
+    }
+
+    fn putRecord(ctx: *anyopaque, name: []const u8, bytes: []const u8) session_child_store.BlobError!void {
+        const host = from(ctx);
+        const io = io_mod.getIo();
+        host.life.lockUncancelable(io);
+        defer host.life.unlock(io);
+        const handle = host.session orelse return error.BlobStoreClosed;
+        const hash = handle.putBlob(bytes) catch |err| return host.storeFailed(err);
+        host.mutex.lockUncancelable(io);
+        defer host.mutex.unlock(io);
+        try host.records_added.ensureUnusedCapacity(host.alloc, 1);
+        if (host.records.getPtr(name)) |known| {
+            known.* = hash;
+        } else {
+            const key = try host.alloc.dupe(u8, name);
+            errdefer host.alloc.free(key);
+            try host.records.put(host.alloc, key, hash);
+        }
+        host.records_added.appendAssumeCapacity(hash);
+        host.records_generation += 1;
+    }
+
+    /// Every record's name, then a moved session's old tool-results names
+    /// that no record replaced (D47, D50).
+    fn recordNames(ctx: *anyopaque, arena: Allocator) session_child_store.BlobError![]const []const u8 {
+        const host = from(ctx);
+        const io = io_mod.getIo();
+        host.mutex.lockUncancelable(io);
+        defer host.mutex.unlock(io);
+        var names: std.ArrayList([]const u8) = .empty;
+        try names.ensureTotalCapacity(arena, host.records.count() + host.moved.count());
+        for (host.records.keys()) |name| names.appendAssumeCapacity(try arena.dupe(u8, name));
+        // `movedFolder(.tool_results)`'s names.
+        const prefix = "tool-results/";
+        var moved = host.moved.keyIterator();
+        while (moved.next()) |key| {
+            if (!std.mem.startsWith(u8, key.*, prefix)) continue;
+            const name = key.*[prefix.len..];
+            if (host.records.contains(name)) continue;
+            names.appendAssumeCapacity(try arena.dupe(u8, name));
+        }
+        return names.items;
+    }
+
+    /// The records map as JSON and the records it adds, when it changed
+    /// since the last line that recorded it (D50); in `a`.
+    fn recordsDue(host: *BlobHost, a: Allocator) error{OutOfMemory}!?RecordsDue {
+        const io = io_mod.getIo();
+        host.mutex.lockUncancelable(io);
+        defer host.mutex.unlock(io);
+        if (host.records_generation == host.records_written) return null;
+        var map: std.StringArrayHashMapUnmanaged([]const u8) = .empty;
+        try map.ensureTotalCapacity(a, host.records.count());
+        for (host.records.keys(), host.records.values()) |name, *hash| map.putAssumeCapacity(name, try a.dupe(u8, hash));
+        var json: std.Io.Writer.Allocating = .init(a);
+        std.json.Stringify.value(std.json.ArrayHashMap([]const u8){ .map = map }, .{}, &json.writer) catch return error.OutOfMemory;
+        return .{ .map_json = json.written(), .added = try a.dupe(Hash, host.records_added.items), .generation = host.records_generation };
+    }
+
+    /// A durable line now records `due`: its records are listed, and the map
+    /// is current unless a record arrived since.
+    fn recordsWritten(host: *BlobHost, due: RecordsDue) void {
+        const io = io_mod.getIo();
+        host.mutex.lockUncancelable(io);
+        defer host.mutex.unlock(io);
+        host.records_added.replaceRangeAssumeCapacity(0, due.added.len, &.{});
+        host.records_written = due.generation;
+    }
+
+    const RecordsDue = struct { map_json: []const u8, added: []const Hash, generation: u64 };
+
+    fn storeFailed(host: *BlobHost, err: sm.AppendError) session_child_store.BlobError {
+        // A body is stored only while the session is on disk (D44).
+        if (err == error.InvalidTransition) debug_trace.logf("session", "event=sessions_v2_body_before_turn session={s}", .{host.id});
+        return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.TooLarge => error.BlobTooLarge,
+            error.SessionClosed => error.BlobStoreClosed,
+            error.NoSpaceLeft => error.NoSpaceLeft,
+            error.AccessDenied => error.AccessDenied,
+            error.ReadOnlyFileSystem => error.ReadOnlyFileSystem,
+            error.FileTooBig => error.FileTooBig,
+            error.InvalidArgument, error.InvalidTransition, error.Io => error.BlobStoreFailed,
+        };
+    }
+
+    fn remember(host: *BlobHost, hash: Hash) error{OutOfMemory}!void {
+        const io = io_mod.getIo();
+        host.mutex.lockUncancelable(io);
+        defer host.mutex.unlock(io);
+        for (host.pending.items) |*known| if (std.mem.eql(u8, known, &hash)) return;
+        try host.pending.append(host.alloc, hash);
+    }
+
+    /// The pending blobs, in `a`.
+    fn pendingCopy(host: *BlobHost, a: Allocator) error{OutOfMemory}![]Hash {
+        const io = io_mod.getIo();
+        host.mutex.lockUncancelable(io);
+        defer host.mutex.unlock(io);
+        return a.dupe(Hash, host.pending.items);
+    }
+
+    /// Forgets pending blobs a durable line now lists.
+    fn listed(host: *BlobHost, hashes: []const Hash) void {
+        const io = io_mod.getIo();
+        host.mutex.lockUncancelable(io);
+        defer host.mutex.unlock(io);
+        for (hashes) |*hash| {
+            for (host.pending.items, 0..) |*known, index| {
+                if (!std.mem.eql(u8, known, hash)) continue;
+                _ = host.pending.orderedRemove(index);
+                break;
+            }
+        }
+    }
+
+    fn resolve(ctx: *anyopaque, kind: session_child_store.ManagedChildKind, name: []const u8) session_child_store.BlobError!Hash {
+        const host = from(ctx);
+        if (artifact_digest.blobHash(name)) |hash| return hash[0..artifact_digest.blob_hex_bytes].*;
+        if (kind == .tool_results) {
+            const io = io_mod.getIo();
+            host.mutex.lockUncancelable(io);
+            defer host.mutex.unlock(io);
+            if (host.records.get(name)) |hash| return hash;
+        }
+        const folder = movedFolder(kind) orelse return error.BlobNotFound;
+        var key_buffer: [movedKeyMax]u8 = undefined;
+        const key = std.fmt.bufPrint(&key_buffer, "{s}/{s}", .{ folder, name }) catch return error.BlobNotFound;
+        return host.moved.get(key) orelse error.BlobNotFound;
+    }
+
+    fn get(ctx: *anyopaque, alloc: Allocator, hash: []const u8, max_bytes: usize) session_child_store.BlobError![]u8 {
+        const host = from(ctx);
+        const bytes = host.store.manager.getBlob(alloc, host.id, hash) catch |err| return blobReadFailed(err);
+        if (bytes.len > max_bytes) {
+            alloc.free(bytes);
+            return error.BlobTooLarge;
+        }
+        return bytes;
+    }
+
+    fn path(ctx: *anyopaque, alloc: Allocator, hash: []const u8) session_child_store.BlobError![]u8 {
+        const host = from(ctx);
+        return host.store.manager.blobPath(alloc, host.id, hash) catch |err| blobReadFailed(err);
+    }
+
+    fn blobReadFailed(err: sm.BlobError) session_child_store.BlobError {
+        return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.InvalidArgument, error.NotFound => error.BlobNotFound,
+            error.Corrupt => error.BlobDamaged,
+            error.NoSpaceLeft => error.NoSpaceLeft,
+            error.AccessDenied => error.AccessDenied,
+            error.ReadOnlyFileSystem => error.ReadOnlyFileSystem,
+            error.FileTooBig => error.FileTooBig,
+            error.Io => error.BlobStoreFailed,
+        };
+    }
+
+    fn retain(ctx: *anyopaque) void {
+        const host = from(ctx);
+        const io = io_mod.getIo();
+        host.mutex.lockUncancelable(io);
+        defer host.mutex.unlock(io);
+        host.refs += 1;
+    }
+
+    fn release(ctx: *anyopaque) void {
+        const host = from(ctx);
+        const io = io_mod.getIo();
+        host.mutex.lockUncancelable(io);
+        host.refs -= 1;
+        const last = host.refs == 0;
+        host.mutex.unlock(io);
+        if (!last) return;
+        var keys = host.moved.keyIterator();
+        while (keys.next()) |key| host.alloc.free(key.*);
+        host.moved.deinit(host.alloc);
+        for (host.records.keys()) |name| host.alloc.free(name);
+        host.records.deinit(host.alloc);
+        host.records_added.deinit(host.alloc);
+        host.pending.deinit(host.alloc);
+        host.alloc.free(host.id);
+        host.alloc.destroy(host);
+    }
+};
+
+/// The side-folder layout an older session kept each kind of body in, as
+/// `session_child_store` routes it; the key prefix of its moved names (D47).
+fn movedFolder(kind: session_child_store.ManagedChildKind) ?[]const u8 {
+    return switch (kind) {
+        .tool_results => "tool-results",
+        .command_artifacts => "logs/commands",
+        .browser_artifacts => "artifacts/web-fetch",
+        else => null,
+    };
+}
+
+/// A moved name's key: a folder of a few bytes and a handle of at most 160.
+const movedKeyMax = 256;
+
 pub const Session = struct {
     alloc: Allocator,
     store: *Store,
     handle: sm.Session,
-    /// `~/.fx/session-files/{id}`, owned.
+    /// `~/.fx/session-files/{id}`, owned: where an older session kept its
+    /// side files, read once by the move (D47).
     files_path: []u8,
-    files_dir: ?io_mod.VerifiedDir = null,
+    /// The session's blobs, shared with every capability over it (D44).
+    host: *BlobHost,
     capability: ?session_child_store.SessionChildCapability = null,
     /// Serializes this adapter's own state; the manager's Session is
     /// thread-safe on its own.
@@ -610,6 +957,7 @@ pub const Session = struct {
             const self = try init(alloc, store, handle, false);
             errdefer self.destroyInner();
             self.root = false;
+            try self.openMoved();
             var scratch = std.heap.ArenaAllocator.init(alloc);
             defer scratch.deinit();
             const state = try handle.state(scratch.allocator());
@@ -686,6 +1034,7 @@ pub const Session = struct {
         errdefer handle.release();
         const self = try init(alloc, store, handle, false);
         errdefer self.destroyInner();
+        try self.openMoved();
         var state = try handle.state(alloc);
         defer state.deinit(alloc);
         self.last_turn = state.last_turn;
@@ -696,8 +1045,10 @@ pub const Session = struct {
     fn init(alloc: Allocator, store: *Store, handle: sm.Session, fresh: bool) !*Session {
         const files_path = try std.fs.path.join(alloc, &.{ store.home, profile_paths.root_dir_name, files_dir_name, handle.id() });
         errdefer alloc.free(files_path);
+        const host = try BlobHost.create(alloc, store, handle);
+        errdefer BlobHost.release(host);
         const self = try alloc.create(Session);
-        self.* = .{ .alloc = alloc, .store = store, .handle = handle, .files_path = files_path, .fresh = fresh };
+        self.* = .{ .alloc = alloc, .store = store, .handle = handle, .files_path = files_path, .host = host, .fresh = fresh };
         return self;
     }
 
@@ -706,9 +1057,22 @@ pub const Session = struct {
     }
 
     /// Appends through the manager; a host session also traces the turn and
-    /// child lines `Wiring.tla` models.
+    /// child lines `Wiring.tla` models. The first item lists every blob the
+    /// stores kept since the last such line, so verify and recover see a
+    /// lost one as damage (D39, D44). Compactor records kept since the last
+    /// `compaction_records` line get a new one first, so the line that
+    /// cites them never lands without them (D50).
     fn write(self: *Session, events: []const sm.Event) sm.AppendError!u64 {
-        const seq = try self.handle.append(events);
+        var scratch = std.heap.ArenaAllocator.init(self.alloc);
+        defer scratch.deinit();
+        const a = scratch.allocator();
+        const due = try self.host.recordsDue(a);
+        const with_records = if (due) |records| try std.mem.concat(a, sm.Event, &.{ try self.recordLines(a, records), events }) else events;
+        const pending = try self.host.pendingCopy(a);
+        const batch = try listPending(a, with_records, pending);
+        const seq = try self.handle.append(batch.events);
+        if (batch.listed) self.host.listed(pending);
+        if (due) |records| self.host.recordsWritten(records);
         if (self.root) for (events) |event| switch (event) {
             .turn_started => traceWiring("BeginTurn", self.id(), "", self.store.pid),
             .turn_committed => traceWiring("EndTurn", self.id(), " end=commit", self.store.pid),
@@ -718,6 +1082,25 @@ pub const Session = struct {
             else => {},
         };
         return seq;
+    }
+
+    /// The `compaction_records` lines for `due`: its map as one more blob,
+    /// listed with the records it adds, in chunks as the move's are (D50).
+    fn recordLines(self: *Session, a: Allocator, due: BlobHost.RecordsDue) sm.AppendError![]const sm.Event {
+        const map_hash = try a.dupe(u8, &(try self.handle.putBlob(due.map_json)));
+        const value = try std.fmt.allocPrint(a, "{{\"map\":\"{s}\"}}", .{map_hash});
+        var refs: std.ArrayList([]const u8) = .empty;
+        try refs.ensureTotalCapacity(a, due.added.len + 1);
+        for (due.added) |*hash| refs.appendAssumeCapacity(hash);
+        refs.appendAssumeCapacity(map_hash);
+        var lines: std.ArrayList(sm.Event) = .empty;
+        var rest = refs.items;
+        while (rest.len > 0) {
+            const take = @min(rest.len, moved_refs_per_line);
+            try lines.append(a, .{ .set = .{ .key = .compaction_records, .value = value, .blobs = rest[0..take] } });
+            rest = rest[take..];
+        }
+        return lines.items;
     }
 
     /// The session is on disk: it has a turn, ended or open.
@@ -736,27 +1119,24 @@ pub const Session = struct {
         });
     }
 
-    /// `~/.fx/session-files/{id}`: borrowed until `close`.
-    pub fn filesPath(self: *const Session) []const u8 {
-        return self.files_path;
-    }
-
     /// Closes the session and frees the adapter. Every child thread of this
     /// session must have joined (`tla/Wiring.tla` ParentOutlivesChildren).
+    /// A copy of its capability that a background reader still holds keeps
+    /// reading, and stores nothing more (D44).
     pub fn close(self: *Session) void {
+        self.host.detach();
         self.handle.close() catch |err| debug_trace.logf("session", "event=sessions_v2_close_failed session={s} err={s}", .{ self.id(), @errorName(err) });
         if (self.root) traceWiring("Close", self.id(), "", self.store.pid);
         if (self.turn_open) debug_trace.logf("session", "event=sessions_v2_turn_closed_open session={s} streamed={d}", .{ self.id(), self.streamed.items.len });
         // Before `release`: the id lives in the handle.
-        if (self.files_dir != null and !self.saved()) self.removeUnsavedFiles();
+        if (!self.saved()) self.removeUnsavedFiles();
         self.handle.release();
         self.destroyInner();
     }
 
-    /// A session that never reached the disk takes its side folder with it,
-    /// as v1 removes a pristine session's folder. Asks the manager first: a
-    /// first write that failed may still have landed, and its turn points
-    /// into this folder.
+    /// A session that never reached the disk takes its terminal folder with
+    /// it, as v1 removes a pristine session's folder. Asks the manager
+    /// first: a first write that failed may still have landed.
     fn removeUnsavedFiles(self: *Session) void {
         var probe = self.store.manager.read(self.alloc, self.id(), .start, .forward, 1) catch |err| switch (err) {
             error.NotFound => null,
@@ -769,18 +1149,13 @@ pub const Session = struct {
             page.deinit();
             return;
         }
-        // The capability borrows the folder.
-        if (self.capability) |*capability| capability.deinit();
-        self.capability = null;
-        if (self.files_dir) |*dir| dir.close();
-        self.files_dir = null;
         self.store.removeFiles(self.id(), "unsaved");
     }
 
     fn destroyInner(self: *Session) void {
         const alloc = self.alloc;
         if (self.capability) |*capability| capability.deinit();
-        if (self.files_dir) |*dir| dir.close();
+        BlobHost.release(self.host);
         self.clearStreamed();
         self.streamed.deinit(alloc);
         self.stored_results.deinit(alloc);
@@ -806,10 +1181,11 @@ pub const Session = struct {
         self.running.clearRetainingCapacity();
     }
 
-    // -- side files ----------------------------------------------------------
+    // -- bodies --------------------------------------------------------------
 
-    /// The side-file capability over `~/.fx/session-files/{id}`, created
-    /// `0700` on first use. Borrowed until `close`.
+    /// The capability over this session's blobs (D44): it stores and reads
+    /// large bodies, routes terminal state to `~/.fx/terminal/{id}` (D45),
+    /// and has no side folder. Borrowed until `close`.
     pub fn childCapability(self: *Session) !*session_child_store.SessionChildCapability {
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
@@ -818,40 +1194,45 @@ pub const Session = struct {
 
     fn capabilityLocked(self: *Session) !*session_child_store.SessionChildCapability {
         if (self.capability) |*capability| return capability;
-        const dir = try self.openFilesDir();
-        self.capability = try session_child_store.SessionChildCapability.init(self.alloc, dir.dir, self.files_path, .writable);
+        const terminal_path = try std.fs.path.join(self.alloc, &.{ self.store.home, profile_paths.root_dir_name, terminal_dir_name, self.id() });
+        defer self.alloc.free(terminal_path);
+        self.capability = try session_child_store.SessionChildCapability.initBlobs(self.alloc, self.host.blobs(), terminal_path, .writable);
         return &self.capability.?;
-    }
-
-    /// Creates the side folder (`0700`) if it is missing, for writers that
-    /// use it before any capability does, such as a prompt's images, and
-    /// returns `filesPath()`.
-    pub fn ensureFilesPath(self: *Session) ![]const u8 {
-        self.mutex.lockUncancelable(io_mod.getIo());
-        defer self.mutex.unlock(io_mod.getIo());
-        _ = try self.openFilesDir();
-        return self.files_path;
-    }
-
-    fn openFilesDir(self: *Session) !*io_mod.VerifiedDir {
-        if (self.files_dir) |*dir| return dir;
-        var home = try openHome(self.store.home);
-        defer home.close();
-        var fx = try io_mod.openOrCreateVerifiedPrivateDir(&home, profile_paths.root_dir_name);
-        defer fx.close();
-        var files = try io_mod.openOrCreateVerifiedPrivateDir(&fx, files_dir_name);
-        defer files.close();
-        self.files_dir = try io_mod.openOrCreateVerifiedPrivateDir(&files, self.id());
-        return &self.files_dir.?;
     }
 
     // -- turns ---------------------------------------------------------------
 
-    /// Stores the turn's tool results and images as side files and gives
-    /// them handles, as v1 does at commit. A result whose file the stream
-    /// already wrote (`withResultFiles`) keeps it, unwritten a second time.
+    /// Opens the turn on disk if it is not open yet, so a body stored for it
+    /// is a blob of a session on disk (D44). Caller holds the mutex.
+    fn openTurnLocked(self: *Session) !void {
+        if (self.turn_open) return;
+        _ = try self.write(&.{.turn_started});
+        self.startedTurn();
+    }
+
+    /// Opens a subagent child's turn as its work starts: a child streams
+    /// nothing, and its tools may store bodies before the commit (D44).
+    pub fn beginTurn(self: *Session) !void {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        try self.openTurnLocked();
+    }
+
+    /// Stores the turn's tool results and images as blobs and gives them
+    /// handles, as v1 does at commit. A result whose blob the stream already
+    /// wrote (`withResultFiles`) keeps it, unwritten a second time.
     pub fn prepareTurn(self: *Session, turn: *types.HistoryTurn) !void {
         try self.reuseStreamedFiles(turn);
+        {
+            self.mutex.lockUncancelable(io_mod.getIo());
+            defer self.mutex.unlock(io_mod.getIo());
+            const stores = switch (turn.*) {
+                .assistant => |entry| storesBodies(entry.execution),
+                .interrupted => |entry| storesBodies(entry.execution),
+                .compacted_summary => false,
+            };
+            if (stores) try self.openTurnLocked();
+        }
         try session_log.externalizeConversationTurnResults(self.alloc, turn, try self.childCapability());
     }
 
@@ -867,8 +1248,8 @@ pub const Session = struct {
         for (execution.tool_steps) |step| for (step.tool_results) |*result| {
             if (result.output_handle != null) continue;
             const stored = self.stored_results.get(result.tool_call_id) orelse continue;
-            // The name holds the content's hash, so a match means the same bytes.
-            const handle = try result_store.makeHandle(self.alloc, result.tool_call_id, result.tool_name, result.output);
+            // The name is the content's hash, so a match means the same bytes.
+            const handle = try result_store.blobHandle(self.alloc, result.output);
             if (!std.mem.eql(u8, handle, stored)) {
                 self.alloc.free(handle);
                 continue;
@@ -947,6 +1328,8 @@ pub const Session = struct {
         const a = arena.allocator();
         var events: std.ArrayList(Event) = .empty;
         try events.append(a, .{ .user = .{ .text = user.text, .images = user.images, .work_id = user.work_id } });
+        // A result's blob needs the turn on disk first (D44).
+        if (storesBodies(execution)) try self.openTurnLocked();
         // On a missing handle the list keeps the pieces before it.
         session_event.appendExecutionConversationEvents(a, &events, try self.withResultFiles(a, execution)) catch |err| switch (err) {
             error.ConversationArtifactRequired => {},
@@ -1198,6 +1581,57 @@ pub const Session = struct {
         _ = try self.write(&.{.{ .set = .{ .key = .permissions, .value = value } }});
     }
 
+    // -- an ACP client's settings (D46) ---------------------------------------
+
+    /// The system prompt the ACP client gave this session, or null. Caller
+    /// owns it.
+    pub fn clientPrompt(self: *Session, alloc: Allocator) !?[]u8 {
+        var scratch = std.heap.ArenaAllocator.init(self.alloc);
+        defer scratch.deinit();
+        const sa = scratch.allocator();
+        const raw = (try self.handle.state(sa)).client_prompt orelse return null;
+        return try alloc.dupe(u8, try std.json.parseFromSliceLeaky([]const u8, sa, raw, .{}));
+    }
+
+    /// Keeps the ACP client's system prompt with the session; the same
+    /// prompt again writes nothing.
+    pub fn setClientPrompt(self: *Session, text: []const u8) !void {
+        var scratch = std.heap.ArenaAllocator.init(self.alloc);
+        defer scratch.deinit();
+        try self.putSetting(scratch.allocator(), .client_prompt, try jsonString(scratch.allocator(), text));
+    }
+
+    /// The MCP tool identities this ACP session recorded for replay, as
+    /// their JSON object, or null. Caller owns it.
+    pub fn toolIdentities(self: *Session, alloc: Allocator) !?[]u8 {
+        var scratch = std.heap.ArenaAllocator.init(self.alloc);
+        defer scratch.deinit();
+        const raw = (try self.handle.state(scratch.allocator())).tool_identities orelse return null;
+        return try alloc.dupe(u8, raw);
+    }
+
+    /// Keeps the session's tool identity record, a JSON object; the same
+    /// record again writes nothing.
+    pub fn setToolIdentities(self: *Session, record_json: []const u8) !void {
+        var scratch = std.heap.ArenaAllocator.init(self.alloc);
+        defer scratch.deinit();
+        try self.putSetting(scratch.allocator(), .tool_identities, record_json);
+    }
+
+    /// Writes `key` only when its value changed, in `sa`.
+    fn putSetting(self: *Session, sa: Allocator, key: sm.SetKey, value: []const u8) !void {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        const state = try self.handle.state(sa);
+        const current = switch (key) {
+            .client_prompt => state.client_prompt,
+            .tool_identities => state.tool_identities,
+            else => unreachable,
+        };
+        if (current) |stored| if (std.mem.eql(u8, stored, value)) return;
+        _ = try self.write(&.{.{ .set = .{ .key = key, .value = value } }});
+    }
+
     /// A title the user chose. It differs from the derived one, so a
     /// generated title never replaces it.
     pub fn rename(self: *Session, title: []const u8) !void {
@@ -1374,9 +1808,228 @@ pub const Session = struct {
     }
 
     fn source(self: *Session) Source {
-        return .{ .store = self.store, .id = self.id(), .handle = self.handle };
+        return .{ .store = self.store, .id = self.id(), .handle = self.handle, .host = self.host, .files_path = self.files_path };
+    }
+
+    // -- the move off the side folder (D47) -----------------------------------
+
+    /// Makes an older session one manager folder (D47, `tla/MoveSideFiles.tla`)
+    /// on its first writable open, then loads the map its old handles resolve
+    /// through. Every body in the side folder becomes a blob, the map from
+    /// each old name to its blob is one more blob, and one batch records the
+    /// map, every moved blob, and the client's settings from the old files.
+    /// Then the terminal folder moves to `~/.fx/terminal/{id}` and the side
+    /// folder goes. Each step can be repeated, so a crash at any point
+    /// redoes the move on the next open.
+    fn openMoved(self: *Session) !void {
+        try self.moveSideFiles();
+        try self.loadMovedMap();
+        try self.loadRecords();
+    }
+
+    fn moveSideFiles(self: *Session) !void {
+        var files_root = (try self.store.openProfileFolder(files_dir_name)) orelse return;
+        defer files_root.close();
+        const bodies = blk: {
+            var side = (try io_mod.openVerifiedPrivateDirIfPresent(&files_root, self.id())) orelse return;
+            defer side.close();
+            break :blk try self.moveOut(&side);
+        };
+        files_root.dir.deleteTree(io_mod.getIo(), self.id()) catch |err| {
+            // The next open redoes the move; every step is repeatable.
+            debug_trace.logf("session", "event=sessions_v2_move_folder_kept session={s} err={s}", .{ self.id(), @errorName(err) });
+            return;
+        };
+        debug_trace.logf("session", "event=sessions_v2_moved session={s} bodies={d}", .{ self.id(), bodies });
+    }
+
+    /// Every step of the move but the side folder's removal, in the order
+    /// `tla/MoveSideFiles.tla` checks; returns how many bodies moved.
+    fn moveOut(self: *Session, side: *io_mod.VerifiedDir) !usize {
+        var scratch = std.heap.ArenaAllocator.init(self.alloc);
+        defer scratch.deinit();
+        const a = scratch.allocator();
+
+        var moved: std.StringArrayHashMapUnmanaged([]const u8) = .empty;
+        for (moved_body_folders) |folder| try self.moveFolder(a, side, folder, &moved);
+        var map_json: std.Io.Writer.Allocating = .init(a);
+        try std.json.Stringify.value(std.json.ArrayHashMap([]const u8){ .map = moved }, .{}, &map_json.writer);
+        const map_hash = try a.dupe(u8, &(try self.handle.putBlob(map_json.written())));
+
+        var events: std.ArrayList(sm.Event) = .empty;
+        const value = try std.fmt.allocPrint(a, "{{\"map\":\"{s}\"}}", .{map_hash});
+        // One line per chunk of blobs keeps each line well under the limit;
+        // the last one names the map, so the value is the same on each.
+        var refs: std.ArrayList([]const u8) = .empty;
+        try refs.appendSlice(a, moved.values());
+        try refs.append(a, map_hash);
+        var rest = refs.items;
+        while (rest.len > 0) {
+            const take = @min(rest.len, moved_refs_per_line);
+            try events.append(a, .{ .set = .{ .key = .moved_files, .value = value, .blobs = rest[0..take] } });
+            rest = rest[take..];
+        }
+        if (try readSideFile(a, side, moved_client_prompt_file, moved_client_prompt_max)) |text| {
+            if (std.unicode.utf8ValidateSlice(text)) {
+                try events.append(a, .{ .set = .{ .key = .client_prompt, .value = try jsonString(a, text) } });
+            } else debug_trace.logf("session", "event=sessions_v2_move_dropped session={s} file={s} reason=not_utf8", .{ self.id(), moved_client_prompt_file });
+        }
+        if (try readSideFile(a, side, moved_tool_identities_file, moved_tool_identities_max)) |record| {
+            if (isJsonObject(a, record)) {
+                try events.append(a, .{ .set = .{ .key = .tool_identities, .value = record } });
+            } else debug_trace.logf("session", "event=sessions_v2_move_dropped session={s} file={s} reason=not_a_json_object", .{ self.id(), moved_tool_identities_file });
+        }
+        {
+            self.mutex.lockUncancelable(io_mod.getIo());
+            defer self.mutex.unlock(io_mod.getIo());
+            _ = try self.write(events.items);
+        }
+
+        try self.moveTerminalFolder(side);
+        return moved.count();
+    }
+
+    /// Puts each regular file of `side/{folder}` as a blob and records it
+    /// under `{folder}/{name}`. Anything else there is not fx's and is left
+    /// for the side folder's removal, with a trace.
+    fn moveFolder(self: *Session, a: Allocator, side: *io_mod.VerifiedDir, folder: []const u8, moved: *std.StringArrayHashMapUnmanaged([]const u8)) !void {
+        const io = io_mod.getIo();
+        var dir = side.dir.openDir(io, folder, .{ .iterate = true, .follow_symlinks = false }) catch |err| switch (err) {
+            error.FileNotFound => return,
+            else => return err,
+        };
+        defer dir.close(io);
+        var it = dir.iterate();
+        while (try it.next(io)) |entry| {
+            if (entry.kind != .file or entry.name.len > 160) {
+                debug_trace.logf("session", "event=sessions_v2_move_dropped session={s} folder={s} kind={s}", .{ self.id(), folder, @tagName(entry.kind) });
+                continue;
+            }
+            var file = try dir.openFile(io, entry.name, .{ .follow_symlinks = false });
+            defer file.close(io);
+            const stat = try file.stat(io);
+            const hash = try self.handle.putBlobFile(file, stat.size);
+            const key = try std.fmt.allocPrint(a, "{s}/{s}", .{ folder, entry.name });
+            try moved.put(a, key, try a.dupe(u8, &hash));
+        }
+    }
+
+    /// Renames `side/terminal` to `~/.fx/terminal/{id}/terminal`, the layout
+    /// the terminal store keeps (D45). A terminal folder already there was
+    /// moved by an earlier try.
+    fn moveTerminalFolder(self: *Session, side: *io_mod.VerifiedDir) !void {
+        const io = io_mod.getIo();
+        _ = side.dir.statFile(io, terminal_dir_name, .{ .follow_symlinks = false }) catch |err| switch (err) {
+            error.FileNotFound => return,
+            else => return err,
+        };
+        var root = try self.store.makeProfileFolder(terminal_dir_name);
+        defer root.close();
+        var owner = try io_mod.openOrCreateVerifiedPrivateDir(&root, self.id());
+        defer owner.close();
+        if (owner.dir.statFile(io, terminal_dir_name, .{ .follow_symlinks = false })) |_| {
+            debug_trace.logf("session", "event=sessions_v2_move_terminal_kept session={s} reason=already_moved", .{self.id()});
+            return;
+        } else |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        }
+        try std.Io.Dir.rename(side.dir, terminal_dir_name, owner.dir, terminal_dir_name, io);
+        io_mod.syncVerifiedDir(owner.dir) catch |err| debug_trace.logf("session", "event=sessions_v2_move_terminal_unsynced session={s} err={s}", .{ self.id(), @errorName(err) });
+    }
+
+    /// Reads the map a moved session's old names resolve through, once.
+    fn loadMovedMap(self: *Session) !void {
+        var scratch = std.heap.ArenaAllocator.init(self.alloc);
+        defer scratch.deinit();
+        const sa = scratch.allocator();
+        const raw = (try self.handle.state(sa)).moved_files orelse return;
+        const Value = struct { map: []const u8 };
+        const value = std.json.parseFromSliceLeaky(Value, sa, raw, .{ .ignore_unknown_fields = true }) catch return error.InvalidSessionFormat;
+        const bytes = self.store.manager.getBlob(sa, self.id(), value.map) catch |err| switch (err) {
+            // A lost or damaged map damages the session, as a lost blob
+            // does (D39); its old handles read as gone.
+            error.NotFound, error.Corrupt, error.InvalidArgument => {
+                debug_trace.logf("session", "event=sessions_v2_moved_map_unreadable session={s} err={s}", .{ self.id(), @errorName(err) });
+                return;
+            },
+            else => |e| return e,
+        };
+        const map = std.json.parseFromSliceLeaky(std.json.ArrayHashMap([]const u8), sa, bytes, .{}) catch return error.InvalidSessionFormat;
+        const host = self.host;
+        try host.moved.ensureUnusedCapacity(host.alloc, @intCast(map.map.count()));
+        for (map.map.keys(), map.map.values()) |key, hash| {
+            if (key.len > movedKeyMax or hash.len != artifact_digest.blob_hex_bytes) return error.InvalidSessionFormat;
+            if (host.moved.contains(key)) continue;
+            host.moved.putAssumeCapacity(try host.alloc.dupe(u8, key), hash[0..artifact_digest.blob_hex_bytes].*);
+        }
+    }
+
+    /// Reads the compactor's records map (D50), once, as `loadMovedMap` reads
+    /// the move's.
+    fn loadRecords(self: *Session) !void {
+        var scratch = std.heap.ArenaAllocator.init(self.alloc);
+        defer scratch.deinit();
+        const sa = scratch.allocator();
+        const raw = (try self.handle.state(sa)).compaction_records orelse return;
+        const Value = struct { map: []const u8 };
+        const value = std.json.parseFromSliceLeaky(Value, sa, raw, .{ .ignore_unknown_fields = true }) catch return error.InvalidSessionFormat;
+        const bytes = self.store.manager.getBlob(sa, self.id(), value.map) catch |err| switch (err) {
+            // A lost or damaged map damages the session, as a lost blob
+            // does (D39); its records read as gone.
+            error.NotFound, error.Corrupt, error.InvalidArgument => {
+                debug_trace.logf("session", "event=sessions_v2_records_map_unreadable session={s} err={s}", .{ self.id(), @errorName(err) });
+                return;
+            },
+            else => |e| return e,
+        };
+        const map = std.json.parseFromSliceLeaky(std.json.ArrayHashMap([]const u8), sa, bytes, .{}) catch return error.InvalidSessionFormat;
+        const host = self.host;
+        host.mutex.lockUncancelable(io_mod.getIo());
+        defer host.mutex.unlock(io_mod.getIo());
+        try host.records.ensureUnusedCapacity(host.alloc, map.map.count());
+        for (map.map.keys(), map.map.values()) |name, hash| {
+            session_child_store.SessionChildCapability.validateManagedName(name) catch return error.InvalidSessionFormat;
+            if (hash.len != artifact_digest.blob_hex_bytes) return error.InvalidSessionFormat;
+            if (host.records.contains(name)) continue;
+            host.records.putAssumeCapacity(try host.alloc.dupe(u8, name), hash[0..artifact_digest.blob_hex_bytes].*);
+        }
     }
 };
+
+/// The side-folder layouts an older session kept its bodies in (D47); the
+/// first three are `movedFolder`'s, and `images` holds prompt images.
+const moved_body_folders = [_][]const u8{ "tool-results", "logs/commands", "artifacts/web-fetch", "images" };
+/// The side files an ACP client's settings came from, as `acp`'s
+/// `client_instructions.file_name` and `tool_call_identities.file_name`
+/// name them under the `client` folder (D46).
+pub const moved_client_prompt_file = "client/system-prompt.txt";
+pub const moved_tool_identities_file = "client/mcp-tool-identities.json";
+const moved_client_prompt_max = 64 * 1024;
+const moved_tool_identities_max = 256 * 1024;
+/// Blobs listed on one `moved_files` line: about 270 KiB of hashes.
+const moved_refs_per_line = 4096;
+
+/// A side file's bytes, or null when it is missing; at most `max_bytes`.
+fn readSideFile(a: Allocator, side: *io_mod.VerifiedDir, name: []const u8, max_bytes: usize) !?[]u8 {
+    var file = side.dir.openFile(io_mod.getIo(), name, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer file.close(io_mod.getIo());
+    return io_mod.readFileToEnd(a, &file, max_bytes + 1) catch |err| switch (err) {
+        error.StreamTooLong => {
+            debug_trace.logf("session", "event=sessions_v2_move_dropped file={s} reason=too_large", .{name});
+            return null;
+        },
+        else => err,
+    };
+}
+
+fn isJsonObject(a: Allocator, bytes: []const u8) bool {
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{}) catch return false;
+    return parsed == .object;
+}
 
 /// Where replay reads a log: an open session's own handle, or the store by
 /// id without a lock, as for a finished child's result.
@@ -1384,6 +2037,10 @@ const Source = struct {
     store: *Store,
     id: []const u8,
     handle: ?sm.Session = null,
+    /// An open session's blobs, for a moved session's old names (D47).
+    host: ?*BlobHost = null,
+    /// Where that session kept its side files before the move.
+    files_path: ?[]const u8 = null,
 
     fn read(src: Source, sa: Allocator, from: sm.From, limit: usize) !sm.Page {
         return src.readTo(sa, from, .forward, limit);
@@ -1408,10 +2065,41 @@ const Source = struct {
         }
     }
 
-    /// A piece's bytes, from its blob when the line holds a reference.
+    /// `user` with the bytes of each image an older session kept in its side
+    /// folder (D47), from its blob: inside the turn, as a v2 session keeps
+    /// images now (D44). Other images are unchanged; an unreadable one keeps
+    /// its old path, as a lost snapshot does.
+    fn withMovedImages(src: Source, pa: Allocator, user: session_event.ConversationUser) !session_event.ConversationUser {
+        const host = src.host orelse return user;
+        const files_path = src.files_path orelse return user;
+        if (host.moved.count() == 0) return user;
+        var images: ?[]types.ImageAttachment = null;
+        for (user.images, 0..) |image, index| {
+            if (image.inline_data != null) continue;
+            const path = image.snapshot_path orelse continue;
+            if (path.len <= files_path.len + 1 or !std.mem.startsWith(u8, path, files_path) or path[files_path.len] != '/') continue;
+            const hash = host.moved.get(path[files_path.len + 1 ..]) orelse continue;
+            const bytes = src.store.manager.getBlob(pa, src.id, &hash) catch |err| {
+                debug_trace.logf("session", "event=sessions_v2_moved_image_unreadable session={s} err={s}", .{ src.id, @errorName(err) });
+                continue;
+            };
+            if (images == null) images = try pa.dupe(types.ImageAttachment, user.images);
+            images.?[index].inline_data = bytes;
+        }
+        const list = images orelse return user;
+        return .{ .text = user.text, .images = list, .work_id = user.work_id };
+    }
+
+    /// A piece's bytes, from its blob when the line holds a reference. The
+    /// item may list more blobs, the stores' bodies (D44); the reference is
+    /// the one its data names.
     fn pieceData(src: Source, pa: Allocator, piece: sm.Body.Piece) ![]const u8 {
-        if (piece.blobs.len != 1 or !std.mem.startsWith(u8, piece.data, "{\"" ++ blob_ref_key ++ "\":")) return piece.data;
-        return src.store.manager.getBlob(pa, src.id, piece.blobs[0]) catch |err| switch (err) {
+        const hash = blobRefOf(piece.data) orelse return piece.data;
+        const listed = for (piece.blobs) |ref| {
+            if (std.mem.eql(u8, ref, hash)) break true;
+        } else false;
+        if (!listed) return piece.data;
+        return src.store.manager.getBlob(pa, src.id, hash) catch |err| switch (err) {
             // A blob the log names that is gone or damaged damages the
             // session, as a bad line does (D39).
             error.NotFound, error.Corrupt => {
@@ -1743,7 +2431,7 @@ noinline fn replay(
                     // The builder copies what it keeps, as it does for v1's
                     // reader, so strings may point into the page.
                     switch (try decodePiece(pa, kind, data, .alloc_if_needed)) {
-                        .user => |value| try builder.begin(value),
+                        .user => |value| try builder.begin(try src.withMovedImages(pa, value)),
                         .assistant => |value| try builder.appendAssistant(value),
                         .tool_call => |value| {
                             try builder.appendToolCall(value);
@@ -2082,6 +2770,15 @@ const running_type = "tool_running";
 /// What the model reads for a call that was running when its turn ended.
 const unfinished_tool_output = "fx stopped while this tool was running, so it may have partly run. Check its effects before running it again.";
 const blob_ref_key = "$blob";
+const blob_ref_prefix = "{\"" ++ blob_ref_key ++ "\":\"";
+
+/// The blob a large piece's data refers to (`itemAs`), or null for a piece
+/// held inline. Borrows from `data`.
+fn blobRefOf(data: []const u8) ?[]const u8 {
+    if (data.len != blob_ref_prefix.len + artifact_digest.blob_hex_bytes + 2) return null;
+    if (!std.mem.startsWith(u8, data, blob_ref_prefix) or !std.mem.endsWith(u8, data, "\"}")) return null;
+    return data[blob_ref_prefix.len..][0..artifact_digest.blob_hex_bytes];
+}
 
 const CompactedData = struct {
     summary: []const u8,
@@ -2132,11 +2829,54 @@ fn pieceKind(item_type: []const u8) ?PieceKind {
 }
 
 /// A piece's payload as v1 writes it inside its frame.
+/// Whether committing `execution` stores a body: a result without its
+/// output's handle, or with images but no image handle, as
+/// `session_log.externalizeConversationTurnResults` decides.
+fn storesBodies(execution: types.ExecutionMemory) bool {
+    for (execution.tool_steps) |step| for (step.tool_results) |result| {
+        if (result.output_handle == null) return true;
+        if (result.tool_images.len > 0 and result.tool_image_handle == null) return true;
+    };
+    return false;
+}
+
+const ListedBatch = struct {
+    events: []const sm.Event,
+    /// The pending blobs are on the batch's first item.
+    listed: bool,
+};
+
+/// `events` with every pending blob on its first item, in `a`; unchanged
+/// when it has no item or nothing is pending. Only the move lists blobs on a
+/// setting (D47).
+fn listPending(a: Allocator, events: []const sm.Event, pending: []const BlobHost.Hash) !ListedBatch {
+    if (pending.len == 0) return .{ .events = events, .listed = false };
+    const at = for (events, 0..) |event, index| {
+        if (event == .item) break index;
+    } else return .{ .events = events, .listed = false };
+    const copy = try a.dupe(sm.Event, events);
+    var refs: std.ArrayList([]const u8) = .empty;
+    try refs.appendSlice(a, copy[at].item.blobs);
+    for (pending) |*hash| {
+        const known = for (refs.items) |ref| {
+            if (std.mem.eql(u8, ref, hash)) break true;
+        } else false;
+        if (!known) try refs.append(a, hash);
+    }
+    copy[at].item.blobs = refs.items;
+    return .{ .events = copy, .listed = true };
+}
+
 fn encodePiece(alloc: Allocator, event: Event) ![]u8 {
     try session_event.validateConversationEventShape(event, session_event.conversation_schema_version);
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
     switch (event) {
+        .user => |user| {
+            var scratch = std.heap.ArenaAllocator.init(alloc);
+            defer scratch.deinit();
+            try std.json.Stringify.value(try WireUser.of(scratch.allocator(), user), .{}, &out.writer);
+        },
         inline else => |payload| try std.json.Stringify.value(payload, .{}, &out.writer),
     }
     return out.toOwnedSlice();
@@ -2146,6 +2886,7 @@ fn encodePiece(alloc: Allocator, event: Event) ![]u8 {
 /// With `.alloc_if_needed`, strings may point into `data`.
 fn decodePiece(arena: Allocator, kind: PieceKind, data: []const u8, allocate: std.json.AllocWhen) !Event {
     const event: Event = switch (kind) {
+        .user => .{ .user = try (try std.json.parseFromSliceLeaky(WireUser, arena, data, .{ .allocate = allocate })).toUser(arena) },
         inline else => |tag| @unionInit(Event, @tagName(tag), try std.json.parseFromSliceLeaky(
             @FieldType(Event, @tagName(tag)),
             arena,
@@ -2156,6 +2897,66 @@ fn decodePiece(arena: Allocator, kind: PieceKind, data: []const u8, allocate: st
     try session_event.validateConversationEventShape(event, session_event.conversation_schema_version);
     return event;
 }
+
+/// A user piece as v2 writes it: `session_event.ConversationUser` field for
+/// field, so a prompt without inline images encodes as v1's does. An
+/// image's inline bytes, which a v2 session keeps inside the turn (D44),
+/// are base64 text, since a JSON string cannot hold raw bytes.
+const WireUser = struct {
+    text: []const u8,
+    images: []const WireImage = &.{},
+    work_id: ?[]const u8 = null,
+
+    /// `types.ImageAttachment` field for field, with `inline_data` in base64.
+    const WireImage = struct {
+        id: usize = 0,
+        path: []const u8,
+        media_type: []const u8,
+        snapshot_path: ?[]const u8 = null,
+        snapshot_sha256: ?[]const u8 = null,
+        inline_data: ?[]const u8 = null,
+    };
+
+    const codec = std.base64.standard;
+
+    fn of(a: Allocator, user: session_event.ConversationUser) !WireUser {
+        const images = try a.alloc(WireImage, user.images.len);
+        for (user.images, images) |image, *wire| {
+            wire.* = .{
+                .id = image.id,
+                .path = image.path,
+                .media_type = image.media_type,
+                .snapshot_path = image.snapshot_path,
+                .snapshot_sha256 = image.snapshot_sha256,
+                .inline_data = if (image.inline_data) |bytes| blk: {
+                    const encoded = try a.alloc(u8, codec.Encoder.calcSize(bytes.len));
+                    break :blk codec.Encoder.encode(encoded, bytes);
+                } else null,
+            };
+        }
+        return .{ .text = user.text, .images = images, .work_id = user.work_id };
+    }
+
+    fn toUser(wire: WireUser, a: Allocator) !session_event.ConversationUser {
+        const images = try a.alloc(types.ImageAttachment, wire.images.len);
+        for (wire.images, images) |image, *out| {
+            out.* = .{
+                .id = image.id,
+                .path = try a.dupe(u8, image.path),
+                .media_type = try a.dupe(u8, image.media_type),
+                .snapshot_path = if (image.snapshot_path) |value| try a.dupe(u8, value) else null,
+                .snapshot_sha256 = if (image.snapshot_sha256) |value| try a.dupe(u8, value) else null,
+                .inline_data = if (image.inline_data) |encoded| blk: {
+                    const size = codec.Decoder.calcSizeForSlice(encoded) catch return error.InvalidSessionFormat;
+                    const bytes = try a.alloc(u8, size);
+                    codec.Decoder.decode(bytes, encoded) catch return error.InvalidSessionFormat;
+                    break :blk bytes;
+                } else null,
+            };
+        }
+        return .{ .text = wire.text, .images = images, .work_id = wire.work_id };
+    }
+};
 
 fn jsonValue(alloc: Allocator, value: anytype) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
@@ -2304,7 +3105,9 @@ const TestHome = struct {
     store: Store,
 
     fn init(t: *TestHome) !void {
-        t.tmp = testing.tmpDir(.{});
+        // Iterable, so Linux gives a real descriptor that `fsync` accepts
+        // when a test makes `.fx` here (`io_mod.syncVerifiedDir`).
+        t.tmp = testing.tmpDir(.{ .iterate = true });
         errdefer t.tmp.cleanup();
         t.home = try io_mod.dirRealpathAlloc(testing.allocator, t.tmp.dir, ".");
         errdefer testing.allocator.free(t.home);
@@ -2728,19 +3531,18 @@ test "a tool result backed only by its command replay streams as it commits" {
     try s.appendProgress(user, execution, &.{});
     try s.appendProgress(user, execution, &.{});
     const streamed = s.stored_results.get("call-1").?;
-    const written = try (try s.childCapability()).stat(.tool_results, streamed);
+    const written = try (try s.childCapability()).readBlob(testing.allocator, .tool_results, streamed, 1024);
+    defer testing.allocator.free(written);
     // The commit gets the agent's own turn, still without a result file;
     // preparing it fills in the handle and preview.
     try testing.expectEqual(@as(?[]u8, null), results[0].output_handle);
-    try io_mod.getIo().sleep(.fromMilliseconds(5), .awake);
+    try testing.expectEqualStrings("REPLAY_ONLY_OUTPUT", written);
     var turn: types.HistoryTurn = .{ .assistant = .{ .user = user, .assistant = @constCast("done"), .execution = execution } };
     try s.prepareTurn(&turn);
     defer testing.allocator.free(results[0].output_handle.?);
     defer testing.allocator.free(results[0].preview.?);
-    // The same file, not written again.
+    // The same blob: its name is its content's hash.
     try testing.expectEqualStrings(streamed, results[0].output_handle.?);
-    const after = try (try s.childCapability()).stat(.tool_results, streamed);
-    try testing.expectEqual(written.modified_at_ns, after.modified_at_ns);
     try s.commitTurn(turn, types.ConversationLanguage.default());
     const id = try testing.allocator.dupe(u8, s.id());
     defer testing.allocator.free(id);
@@ -3123,84 +3925,191 @@ test "-c resumes the session this host last opened" {
     try testing.expectError(error.NoRememberedSession, Session.resumeSession(testing.allocator, &t.store, .last_opened, "/w", .acp));
 }
 
-test "side files live in a private session-files folder" {
+fn pathExists(t: *TestHome, parts: []const []const u8) bool {
+    const path = std.fs.path.join(testing.allocator, parts) catch return false;
+    defer testing.allocator.free(path);
+    t.tmp.dir.access(io_mod.getIo(), path, .{ .follow_symlinks = false }) catch return false;
+    return true;
+}
+
+fn countSettings(manager: *sm.Manager, id: []const u8, key: sm.SetKey) !usize {
+    var page = try manager.read(testing.allocator, id, .start, .forward, 1000);
+    defer page.deinit();
+    var n: usize = 0;
+    for (page.entries) |entry| {
+        const body = entry.body orelse continue;
+        if (body == .set and body.set.key == key) n += 1;
+    }
+    return n;
+}
+
+/// A turn with one step whose single result answers `call-1`.
+fn toolTurn(user: []const u8, results: []types.PersistedToolResult, steps: []types.ToolExecutionStep) types.HistoryTurn {
+    const calls = struct {
+        var list = [_]types.ToolCall{.{ .id = "call-1", .name = "shell", .arguments_json = "{}" }};
+    };
+    steps[0] = .{ .tool_calls = &calls.list, .tool_results = results };
+    return .{ .assistant = .{
+        .user = .{ .text = @constCast(user) },
+        .assistant = @constCast("done"),
+        .execution = .{ .tool_steps = steps },
+    } };
+}
+
+test "a v2 session keeps its bodies as blobs its items list, and never makes a side folder (D44, D48)" {
     var t: TestHome = undefined;
     try t.init();
     defer t.deinit();
     var model = "m".*;
     const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
-    defer s.close();
-    _ = try s.childCapability();
-    try testing.expect(std.mem.endsWith(u8, s.filesPath(), s.id()));
-    const stat = try t.tmp.dir.statFile(io_mod.getIo(), ".fx/" ++ files_dir_name, .{});
-    try testing.expectEqual(@as(u32, 0o700), @as(u32, @intCast(stat.permissions.toMode() & 0o777)));
+    const user: types.UserTurn = .{ .text = @constCast("run it") };
+    var results = [_]types.PersistedToolResult{.{
+        .tool_call_id = @constCast("call-1"),
+        .tool_name = @constCast("shell"),
+        .status = .success,
+        .output = @constCast("a body kept as a blob"),
+        .output_bytes = 21,
+        .stored_output_bytes = 21,
+    }};
+    var steps: [1]types.ToolExecutionStep = undefined;
+    var turn = toolTurn("run it", &results, &steps);
+    // Streaming the result stores its body before any piece opened the turn.
+    try s.appendProgress(user, turn.assistant.execution, &.{});
+    try s.prepareTurn(&turn);
+    defer testing.allocator.free(results[0].output_handle.?);
+    defer testing.allocator.free(results[0].preview.?);
+    const handle = results[0].output_handle.?;
+    const expected = try result_store.blobHandle(testing.allocator, "a body kept as a blob");
+    defer testing.allocator.free(expected);
+    try testing.expectEqualStrings(expected, handle);
+    try s.commitTurn(turn, types.ConversationLanguage.default());
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    s.close();
+
+    try testing.expect(!pathExists(&t, &.{ ".fx", files_dir_name }));
+    const hash = artifact_digest.blobHash(handle).?;
+    const body = try t.store.manager.getBlob(testing.allocator, id, hash);
+    defer testing.allocator.free(body);
+    try testing.expectEqualStrings("a body kept as a blob", body);
+    // Listed on an item, so verify finds it and a fork links it.
+    try testing.expectEqual(@as(u64, 0), (try t.store.manager.verify(id)).bad_blobs);
+    const fork = try t.store.manager.openFork(.{ .source = id, .at = .{ .turn = 1 }, .workspace = "/w", .host = .ask });
+    const fork_id = try testing.allocator.dupe(u8, fork.id());
+    defer testing.allocator.free(fork_id);
+    fork.release();
+    const forked = try t.store.manager.getBlob(testing.allocator, fork_id, hash);
+    defer testing.allocator.free(forked);
+    try testing.expectEqualStrings("a body kept as a blob", forked);
+
+    // Resumed, the stores read it back by its handle.
+    {
+        const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .ask);
+        defer r.close();
+        const page = try result_store.readByRangeManaged(testing.allocator, try r.childCapability(), handle, 1, 64);
+        defer testing.allocator.free(page);
+        try testing.expect(std.mem.find(u8, page, "kept as a blob") != null);
+    }
+
+    // Because an item lists it, a lost body damages the session (D39).
+    const blob_path = try t.store.manager.blobPath(testing.allocator, id, hash);
+    defer testing.allocator.free(blob_path);
+    try std.Io.Dir.deleteFileAbsolute(io_mod.getIo(), blob_path);
+    try testing.expectEqual(@as(u64, 1), (try t.store.manager.verify(id)).bad_blobs);
 }
 
-fn filesExist(t: *TestHome, id: []const u8) bool {
-    const path = std.fs.path.join(testing.allocator, &.{ ".fx", files_dir_name, id }) catch return false;
-    defer testing.allocator.free(path);
-    t.tmp.dir.access(io_mod.getIo(), path, .{}) catch return false;
-    return true;
-}
-
-test "a session that never reached the disk takes its side folder, and a saved one keeps it" {
+test "a body is stored only while its session is on disk, and a child opens its turn to store one (D44)" {
     var t: TestHome = undefined;
     try t.init();
     defer t.deinit();
     var model = "m".*;
-    const unsaved = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
-    _ = try unsaved.ensureFilesPath();
-    const unsaved_id = try testing.allocator.dupe(u8, unsaved.id());
-    defer testing.allocator.free(unsaved_id);
-    try testing.expect(filesExist(&t, unsaved_id));
-    unsaved.close();
-    try testing.expect(!filesExist(&t, unsaved_id));
-
-    const saved = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
-    _ = try saved.ensureFilesPath();
-    try saved.commitTurn(assistantTurn("q", "a"), types.ConversationLanguage.default());
-    const saved_id = try testing.allocator.dupe(u8, saved.id());
-    defer testing.allocator.free(saved_id);
-    saved.close();
-    try testing.expect(filesExist(&t, saved_id));
-
-    // A first write that landed although the adapter never saw it succeed:
-    // its turn may point into the folder, so the folder stays.
-    const landed = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
-    _ = try landed.ensureFilesPath();
-    _ = try landed.handle.append(&.{ .turn_started, .turn_committed });
-    const landed_id = try testing.allocator.dupe(u8, landed.id());
-    defer testing.allocator.free(landed_id);
-    landed.close();
-    try testing.expect(filesExist(&t, landed_id));
+    const parent = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    defer parent.close();
+    try parent.commitTurn(assistantTurn("q", "a"), types.ConversationLanguage.default());
+    var child_seed = testSeed(&model);
+    child_seed.instructions = "be brief";
+    const child = try Session.openChild(testing.allocator, &t.store, parent.id(), "ChildSession1", "/w", child_seed);
+    defer child.close();
+    const capability = try child.childCapability();
+    try testing.expectError(error.BlobStoreFailed, capability.putBlob("too early"));
+    try child.beginTurn();
+    const hash = try capability.putBlob("a child's body");
+    try child.commitTurn(assistantTurn("work", "done"), types.ConversationLanguage.default());
+    const body = try t.store.manager.getBlob(testing.allocator, child.id(), &hash);
+    defer testing.allocator.free(body);
+    try testing.expectEqualStrings("a child's body", body);
+    try testing.expectEqual(@as(u64, 0), (try t.store.manager.verify(child.id())).bad_blobs);
 }
 
-test "recover copies side files and folders, never a link, and says when it left one out" {
+test "a session that never reached the disk takes its terminal folder, and a saved one keeps it (D45)" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    var fx = try io_mod.openOrCreateVerifiedPrivateDirFromDir(t.tmp.dir, ".fx");
+    defer fx.close();
+    var terminal_root = try io_mod.openOrCreateVerifiedPrivateDir(&fx, terminal_dir_name);
+    defer terminal_root.close();
+
+    const unsaved = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    const unsaved_id = try testing.allocator.dupe(u8, unsaved.id());
+    defer testing.allocator.free(unsaved_id);
+    var made = try io_mod.openOrCreateVerifiedPrivateDir(&terminal_root, unsaved_id);
+    made.close();
+    unsaved.close();
+    try testing.expect(!pathExists(&t, &.{ ".fx", terminal_dir_name, unsaved_id }));
+
+    const saved = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    const saved_id = try testing.allocator.dupe(u8, saved.id());
+    defer testing.allocator.free(saved_id);
+    var kept = try io_mod.openOrCreateVerifiedPrivateDir(&terminal_root, saved_id);
+    kept.close();
+    try saved.commitTurn(assistantTurn("q", "a"), types.ConversationLanguage.default());
+    saved.close();
+    try testing.expect(pathExists(&t, &.{ ".fx", terminal_dir_name, saved_id }));
+
+    // A first write that landed although the adapter never saw it succeed
+    // keeps its folder.
+    const landed = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    const landed_id = try testing.allocator.dupe(u8, landed.id());
+    defer testing.allocator.free(landed_id);
+    var landed_dir = try io_mod.openOrCreateVerifiedPrivateDir(&terminal_root, landed_id);
+    landed_dir.close();
+    _ = try landed.handle.append(&.{ .turn_started, .turn_committed });
+    landed.close();
+    try testing.expect(pathExists(&t, &.{ ".fx", terminal_dir_name, landed_id }));
+}
+
+test "recover copies the folders outside the manager, never a link, and says when it left one out" {
     var t: TestHome = undefined;
     try t.init();
     defer t.deinit();
     const io = io_mod.getIo();
     var model = "m".*;
     const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
-    {
-        var files = try std.Io.Dir.openDirAbsolute(io, try s.ensureFilesPath(), .{ .iterate = true });
-        defer files.close(io);
-        try files.writeFile(io, .{ .sub_path = "top.txt", .data = "top", .flags = .{ .permissions = .fromMode(0o600) } });
-        var nested = try io_mod.openOrCreateVerifiedPrivateDirFromDir(files, "nested");
-        defer nested.close();
-        try nested.dir.writeFile(io, .{ .sub_path = "inner.txt", .data = "inner", .flags = .{ .permissions = .fromMode(0o600) } });
-        try files.symLink(io, "/etc/hosts", "link", .{});
-    }
     try s.commitTurn(assistantTurn("q", "a"), types.ConversationLanguage.default());
     const id = try testing.allocator.dupe(u8, s.id());
     defer testing.allocator.free(id);
     s.close();
+    {
+        var fx = try io_mod.openOrCreateVerifiedPrivateDirFromDir(t.tmp.dir, ".fx");
+        defer fx.close();
+        var root = try io_mod.openOrCreateVerifiedPrivateDir(&fx, terminal_dir_name);
+        defer root.close();
+        var owner = try io_mod.openOrCreateVerifiedPrivateDir(&root, id);
+        defer owner.close();
+        try owner.dir.writeFile(io, .{ .sub_path = "top.txt", .data = "top", .flags = .{ .permissions = .fromMode(0o600) } });
+        var nested = try io_mod.openOrCreateVerifiedPrivateDirFromDir(owner.dir, "nested");
+        defer nested.close();
+        try nested.dir.writeFile(io, .{ .sub_path = "inner.txt", .data = "inner", .flags = .{ .permissions = .fromMode(0o600) } });
+        try owner.dir.symLink(io, "/etc/hosts", "link", .{});
+    }
 
     var recovered = try recover(&t.store, testing.allocator, id);
     defer recovered.deinit(testing.allocator);
     try testing.expect(!recovered.files_complete);
     try testing.expectEqual(@as(usize, 1), recovered.history_len);
-    const copy = try std.fs.path.join(testing.allocator, &.{ ".fx", files_dir_name, recovered.id });
+    const copy = try std.fs.path.join(testing.allocator, &.{ ".fx", terminal_dir_name, recovered.id });
     defer testing.allocator.free(copy);
     var dir = try t.tmp.dir.openDir(io, copy, .{});
     defer dir.close(io);
@@ -3219,6 +4128,321 @@ test "recover copies side files and folders, never a link, and says when it left
     defer copied.deinit(testing.allocator);
     try testing.expectEqualStrings("q", copied.state.history[0].assistant.user.text);
     try testing.expectError(error.SessionNotFound, recover(&t.store, testing.allocator, "NoSuchSession1"));
+}
+
+/// The side folder an older v2 session kept (D27), with one body of each
+/// kind the move carries, the client's settings, and terminal state.
+const OldSideFolder = struct {
+    const result_handle = "result-shell-0011223344556677-8899aabbccddeeff.txt";
+    const replay_handle = "fx-command-replay-00000000000000000000000000000000-0123456789abcdef.bin";
+    const image_name = "image-1.png";
+    const png = [_]u8{ 0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n', 0, 0, 0, 13, 'I', 'H', 'D', 'R', 0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0, 0, 0, 0x1f, 0x15, 0xc4, 0x89 };
+
+    fn write(t: *TestHome, id: []const u8) !void {
+        const io = io_mod.getIo();
+        var fx = try io_mod.openOrCreateVerifiedPrivateDirFromDir(t.tmp.dir, ".fx");
+        defer fx.close();
+        var files = try io_mod.openOrCreateVerifiedPrivateDir(&fx, files_dir_name);
+        defer files.close();
+        var side = try io_mod.openOrCreateVerifiedPrivateDir(&files, id);
+        defer side.close();
+        try side.dir.createDirPath(io, "tool-results");
+        try side.dir.writeFile(io, .{ .sub_path = "tool-results/" ++ result_handle, .data = "an old result body" });
+        try side.dir.writeFile(io, .{ .sub_path = "tool-results/compacted-T9.txt", .data = "T9 kept by the compactor before the move" });
+        try side.dir.createDirPath(io, "logs/commands");
+        try side.dir.writeFile(io, .{ .sub_path = "logs/commands/" ++ replay_handle, .data = "FXRPLY01" });
+        try side.dir.createDirPath(io, "images");
+        try side.dir.writeFile(io, .{ .sub_path = "images/" ++ image_name, .data = &png });
+        try side.dir.createDirPath(io, "client");
+        try side.dir.writeFile(io, .{ .sub_path = moved_client_prompt_file, .data = "You run inside Mini." });
+        try side.dir.writeFile(io, .{ .sub_path = moved_tool_identities_file, .data = "{\"mcp_mini_read\":{\"server\":\"mini\",\"tool\":\"read\",\"title\":null}}" });
+        try side.dir.createDirPath(io, "terminal/state");
+        try side.dir.writeFile(io, .{ .sub_path = "terminal/state/terminal-1.json", .data = "{}" });
+    }
+
+    /// A turn whose user image and tool result point into the side folder.
+    fn commitTurn(t: *TestHome, s: *Session) !void {
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(&png, &digest, .{});
+        var digest_hex = std.fmt.bytesToHex(digest, .lower);
+        const snapshot_path = try std.fs.path.join(testing.allocator, &.{ t.home, ".fx", files_dir_name, s.id(), "images", image_name });
+        defer testing.allocator.free(snapshot_path);
+        var images = [_]types.ImageAttachment{.{
+            .id = 1,
+            .path = @constCast("/Users/me/shot.png"),
+            .media_type = @constCast("image/png"),
+            .snapshot_path = snapshot_path,
+            .snapshot_sha256 = &digest_hex,
+        }};
+        var results = [_]types.PersistedToolResult{.{
+            .tool_call_id = @constCast("call-1"),
+            .tool_name = @constCast("shell"),
+            .status = .success,
+            .output = @constCast("an old result body"),
+            .output_bytes = 18,
+            .stored_output_bytes = 18,
+            .output_handle = @constCast(result_handle),
+            .preview = @constCast("an old"),
+        }};
+        var steps: [1]types.ToolExecutionStep = undefined;
+        var turn = toolTurn("look", &results, &steps);
+        turn.assistant.user.images = &images;
+        try s.commitTurn(turn, types.ConversationLanguage.default());
+    }
+};
+
+test "an older session moves off its side folder on its first writable open, and its old names still resolve (D47)" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .acp, testSeed(&model));
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    try OldSideFolder.write(&t, id);
+    try OldSideFolder.commitTurn(&t, s);
+    s.close();
+
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .acp);
+    defer r.close();
+    // One manager folder, and terminal state where the terminal store looks.
+    try testing.expect(!pathExists(&t, &.{ ".fx", files_dir_name, id }));
+    try testing.expect(pathExists(&t, &.{ ".fx", terminal_dir_name, id, "terminal", "state", "terminal-1.json" }));
+    // Old handles resolve through the map.
+    const capability = try r.childCapability();
+    const body = try capability.readBlob(testing.allocator, .tool_results, OldSideFolder.result_handle, 1024);
+    defer testing.allocator.free(body);
+    try testing.expectEqualStrings("an old result body", body);
+    var replay_file = try capability.openBlobFile(testing.allocator, .command_artifacts, OldSideFolder.replay_handle);
+    replay_file.close(io_mod.getIo());
+    try testing.expectError(error.BlobNotFound, capability.readBlob(testing.allocator, .tool_results, "result-shell-0-0.txt", 1024));
+    // The compactor still lists and reads its old record, until a newer one
+    // of the same name replaces it (D50).
+    {
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const records = result_store.compactorStore(capability);
+        const names = try records.list(arena);
+        var listed = false;
+        for (names) |name| listed = listed or std.mem.eql(u8, name, "compacted-T9.txt");
+        try testing.expect(listed);
+        try testing.expectEqualStrings("T9 kept by the compactor before the move", try records.read(arena, "compacted-T9.txt", 1024));
+        try records.write(testing.allocator, "compacted-T9.txt", "T9 kept again");
+        try testing.expectEqualStrings("T9 kept again", try records.read(arena, "compacted-T9.txt", 1024));
+        var count: usize = 0;
+        for (try records.list(arena)) |name| count += @intFromBool(std.mem.eql(u8, name, "compacted-T9.txt"));
+        try testing.expectEqual(@as(usize, 1), count);
+    }
+    // The image is inside the turn now, and the client's settings are settings.
+    var restored = try r.restore(testing.allocator);
+    defer restored.deinit(testing.allocator);
+    const image = restored.history[0].assistant.user.images[0];
+    try testing.expectEqualSlices(u8, &OldSideFolder.png, image.inline_data.?);
+    const prompt = (try r.clientPrompt(testing.allocator)).?;
+    defer testing.allocator.free(prompt);
+    try testing.expectEqualStrings("You run inside Mini.", prompt);
+    const identities = (try r.toolIdentities(testing.allocator)).?;
+    defer testing.allocator.free(identities);
+    try testing.expect(std.mem.find(u8, identities, "mcp_mini_read") != null);
+    try testing.expectEqual(@as(u64, 0), (try t.store.manager.verify(id)).bad_blobs);
+
+    // An image whose blob is lost keeps its old path, as a lost snapshot does.
+    const image_hash = r.host.moved.get("images/" ++ OldSideFolder.image_name).?;
+    const image_blob = try t.store.manager.blobPath(testing.allocator, id, &image_hash);
+    defer testing.allocator.free(image_blob);
+    try std.Io.Dir.deleteFileAbsolute(io_mod.getIo(), image_blob);
+    var without = try r.restore(testing.allocator);
+    defer without.deinit(testing.allocator);
+    const lost = without.history[0].assistant.user.images[0];
+    try testing.expectEqual(@as(?[]u8, null), lost.inline_data);
+    try testing.expect(std.mem.endsWith(u8, lost.snapshot_path.?, "images/" ++ OldSideFolder.image_name));
+}
+
+test "compactor records on v2 are recorded by one setting with the next write, and come back on resume and in a fork (D50)" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    try s.beginTurn();
+    // Mid-turn, as auto compaction keeps them; a name kept twice is replaced.
+    const records = result_store.compactorStore(try s.childCapability());
+    try records.write(testing.allocator, "compacted-T1.txt", "T1 shell: ls\nResult:\nfirst\n");
+    try records.write(testing.allocator, "compacted-M1.txt", "M1 the first turn\n");
+    try records.write(testing.allocator, "compacted-T1.txt", "T1 shell: ls\nResult:\nreplaced\n");
+    try testing.expectEqual(@as(usize, 0), try countSettings(t.store.manager, s.id(), .compaction_records));
+    try testing.expectEqualStrings("T1 shell: ls\nResult:\nreplaced\n", try records.read(arena, "compacted-T1.txt", 1024));
+    // The turn's next write records them, once.
+    try s.commitTurn(assistantTurn("compact it", "done"), types.ConversationLanguage.default());
+    try testing.expectEqual(@as(usize, 1), try countSettings(t.store.manager, s.id(), .compaction_records));
+    try s.beginTurn();
+    try s.commitTurn(assistantTurn("again", "done again"), types.ConversationLanguage.default());
+    try testing.expectEqual(@as(usize, 1), try countSettings(t.store.manager, s.id(), .compaction_records));
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    s.close();
+    try testing.expect(!pathExists(&t, &.{ ".fx", files_dir_name }));
+    try testing.expectEqual(@as(u64, 0), (try t.store.manager.verify(id)).bad_blobs);
+
+    // A new process reads them back by name, and lists them.
+    {
+        const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .ask);
+        defer r.close();
+        const again = result_store.compactorStore(try r.childCapability());
+        const names = try again.list(arena);
+        try testing.expectEqual(@as(usize, 2), names.len);
+        try testing.expectEqualStrings("T1 shell: ls\nResult:\nreplaced\n", try again.read(arena, "compacted-T1.txt", 1024));
+        try testing.expectEqualStrings("M1 the first turn\n", try again.read(arena, "compacted-M1.txt", 1024));
+        // read_tool_result opens a record by its ID.
+        const page = try result_store.readByRangeManaged(testing.allocator, try r.childCapability(), "compacted-M1.txt", 1, 64);
+        defer testing.allocator.free(page);
+        try testing.expect(std.mem.find(u8, page, "the first turn") != null);
+    }
+
+    // A fork carries the records with the turns that kept them.
+    const fork = try t.store.manager.openFork(.{ .source = id, .at = .{ .turn = 1 }, .workspace = "/w", .host = .ask });
+    const fork_id = try testing.allocator.dupe(u8, fork.id());
+    defer testing.allocator.free(fork_id);
+    fork.release();
+    {
+        const f = try Session.resumeSession(testing.allocator, &t.store, .{ .id = fork_id }, "/w", .ask);
+        defer f.close();
+        try testing.expectEqualStrings("M1 the first turn\n", try result_store.compactorStore(try f.childCapability()).read(arena, "compacted-M1.txt", 1024));
+    }
+}
+
+test "a web-fetch download on v2 is a read-only blob the model opens by its path (D49)" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    defer s.close();
+    try s.beginTurn();
+    var downloads = try @import("web_fetch_artifacts.zig").Store.initBlobs(testing.allocator, try s.childCapability(), s.id());
+    defer downloads.deinit();
+    var artifact = try downloads.write(testing.allocator, "application/pdf", "%PDF-1.7 a download");
+    defer artifact.deinit(testing.allocator);
+    const folder = try s.folderPath(testing.allocator);
+    defer testing.allocator.free(folder);
+    try testing.expect(std.mem.startsWith(u8, artifact.display_path, folder));
+    var file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), artifact.display_path, .{});
+    defer file.close(io_mod.getIo());
+    var buffer: [64]u8 = undefined;
+    const len = try file.readPositionalAll(io_mod.getIo(), &buffer, 0);
+    try testing.expectEqualStrings("%PDF-1.7 a download", buffer[0..len]);
+    const stat = try file.stat(io_mod.getIo());
+    try testing.expectEqual(@as(u32, 0o400), @as(u32, @intCast(stat.permissions.toMode() & 0o777)));
+    try testing.expect(!pathExists(&t, &.{ ".fx", files_dir_name }));
+}
+
+test "a move cut short is redone on the next open, and old names still resolve (D47)" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    try OldSideFolder.commitTurn(&t, s);
+    // The side folder appears while the session is open, and the move stops
+    // after its batch and the terminal rename, before the folder goes.
+    try OldSideFolder.write(&t, id);
+    {
+        var files_root = (try t.store.openProfileFolder(files_dir_name)).?;
+        defer files_root.close();
+        var side = (try io_mod.openVerifiedPrivateDirIfPresent(&files_root, id)).?;
+        defer side.close();
+        // A tool result, a compactor record, a replay and an image.
+        try testing.expectEqual(@as(usize, 4), try s.moveOut(&side));
+    }
+    s.close();
+    try testing.expect(pathExists(&t, &.{ ".fx", files_dir_name, id }));
+    try testing.expectEqual(@as(usize, 1), try countSettings(t.store.manager, id, .moved_files));
+
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .ask);
+    defer r.close();
+    try testing.expect(!pathExists(&t, &.{ ".fx", files_dir_name, id }));
+    try testing.expectEqual(@as(usize, 2), try countSettings(t.store.manager, id, .moved_files));
+    try testing.expect(pathExists(&t, &.{ ".fx", terminal_dir_name, id, "terminal", "state", "terminal-1.json" }));
+    const body = try (try r.childCapability()).readBlob(testing.allocator, .tool_results, OldSideFolder.result_handle, 1024);
+    defer testing.allocator.free(body);
+    try testing.expectEqualStrings("an old result body", body);
+    try testing.expectEqual(@as(u64, 0), (try t.store.manager.verify(id)).bad_blobs);
+}
+
+test "an ACP client's prompt and tool identities are settings, written only when they change (D46)" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .acp, testSeed(&model));
+    // Held with the session until its first turn, like the seed.
+    try testing.expectEqual(@as(?[]u8, null), try s.clientPrompt(testing.allocator));
+    try s.setClientPrompt("You run inside Mini.");
+    try s.setClientPrompt("You run inside Mini.");
+    try s.setToolIdentities("{\"a\":{\"server\":\"s\",\"tool\":\"t\",\"title\":null}}");
+    try s.commitTurn(assistantTurn("q", "a"), types.ConversationLanguage.default());
+    try s.setToolIdentities("{\"a\":{\"server\":\"s\",\"tool\":\"t\",\"title\":null}}");
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    s.close();
+    try testing.expectEqual(@as(usize, 1), try countSettings(t.store.manager, id, .client_prompt));
+    try testing.expectEqual(@as(usize, 1), try countSettings(t.store.manager, id, .tool_identities));
+
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .acp);
+    defer r.close();
+    const prompt = (try r.clientPrompt(testing.allocator)).?;
+    defer testing.allocator.free(prompt);
+    try testing.expectEqualStrings("You run inside Mini.", prompt);
+    try r.setClientPrompt("A new prompt.");
+    try testing.expectEqual(@as(usize, 2), try countSettings(t.store.manager, id, .client_prompt));
+}
+
+test "a prompt image's bytes ride inside the user's item, and an image without them encodes as v1's (D44)" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const bytes = OldSideFolder.png ++ [_]u8{ 0x00, 0xff, '"', '\\' };
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(&bytes, &digest, .{});
+    var digest_hex = std.fmt.bytesToHex(digest, .lower);
+    var images = [_]types.ImageAttachment{.{
+        .id = 1,
+        .path = @constCast("/Users/me/shot.png"),
+        .media_type = @constCast("image/png"),
+        .snapshot_path = @constCast("/tmp/fx-snapshots/image-1.png"),
+        .snapshot_sha256 = &digest_hex,
+        .inline_data = @constCast(&bytes),
+    }};
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    var turn = assistantTurn("look", "a png");
+    turn.assistant.user.images = &images;
+    try s.commitTurn(turn, types.ConversationLanguage.default());
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    s.close();
+
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .app);
+    defer r.close();
+    var restored = try r.restore(testing.allocator);
+    defer restored.deinit(testing.allocator);
+    try testing.expectEqualSlices(u8, &bytes, restored.history[0].assistant.user.images[0].inline_data.?);
+    try testing.expectEqualStrings(&digest_hex, restored.history[0].assistant.user.images[0].snapshot_sha256.?);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    images[0].inline_data = null;
+    const user: session_event.ConversationUser = .{ .text = "look", .images = &images };
+    const ours = try encodePiece(arena.allocator(), .{ .user = user });
+    var v1: std.Io.Writer.Allocating = .init(arena.allocator());
+    try std.json.Stringify.value(user, .{}, &v1.writer);
+    try testing.expectEqualStrings(v1.written(), ours);
 }
 
 test "only the adapter imports the session manager" {

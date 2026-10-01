@@ -203,6 +203,11 @@ pub fn run(
         .subagent_id = trace_context.subagent_id,
     };
     defer if (context.refreshed_credential) |*credential| credential.deinit(turn.alloc);
+    turn.beginTurn() catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        turn.setFailureDiagnostic("turn_open_failed", @errorName(err));
+        return error.ProviderFailed;
+    };
     const recovery_checkpoint = turn.prepareRecoveryForActiveWork(arena) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         turn.setFailureDiagnostic("recovery_admission_failed", @errorName(err));

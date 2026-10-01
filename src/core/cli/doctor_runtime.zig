@@ -322,11 +322,11 @@ fn appendV2StateChecks(checks: *std.ArrayList(Check), alloc: Allocator) !void {
     }
     if (report.checked < report.sessions) try appendSessionDiagnosticsTruncatedCheck(checks, alloc, report.checked);
     if (report.removed > 0) {
-        const detail = try std.fmt.allocPrint(alloc, "removed {d} side folder(s) whose session is gone", .{report.removed});
+        const detail = try std.fmt.allocPrint(alloc, "removed {d} terminal or side folder(s) whose session is gone", .{report.removed});
         try appendCheckOwned(checks, alloc, "session", .ok, detail);
     }
     if (report.kept > 0) {
-        const detail = try std.fmt.allocPrint(alloc, "{d} side folder(s) whose session is gone could not be removed", .{report.kept});
+        const detail = try std.fmt.allocPrint(alloc, "{d} terminal or side folder(s) whose session is gone could not be removed", .{report.kept});
         try appendCheckOwned(checks, alloc, "session", .warn, detail);
     }
     try appendSessionsCountCheck(checks, alloc, report.sessions, report.latest orelse "");
