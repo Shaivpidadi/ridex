@@ -279,12 +279,12 @@ Do not run the complete deterministic test suite locally as the default developm
 After the focused checks pass, create a clean checkpoint commit, push the non-`main` feature branch, and open a draft PR immediately. Linux is the gate for every change because most fx behavior is identical on every platform:
 
 * `.github/workflows/ci.yml` runs on Linux x86_64. It checks formatting, the PGSO corpus, the public surface, and the compactor boundary, then runs the ReleaseSafe unit tests. It builds fx once, smoke-tests it, and shares that binary with four duration-balanced E2E shards and the MCP conformance baseline. Checked-in weights assign every E2E file to exactly one shard, and files inside each shard run sequentially in separate Bun processes so terminal fixtures and process state cannot leak between files. A failed file receives one retry after its tmux server is reset. A file that passes only on retry gets a warning annotation; investigate it as a possible race. The SDK jobs build WASM and the Node-API addons once and run the complete package qualification. `Build & Test` passes only when the unit tests and every SDK job pass, because Publish libfx relies on that result instead of qualifying the package again.
-* `.github/workflows/binary-size.yml` builds each release target on its native runner, reports the size change, and smoke-tests the Linux arm64, macOS x86_64, and macOS arm64 binaries. See **Binary Size Observability**.
+* `.github/workflows/binary-size.yml` builds each release target on its native runner, reports the size change, and smoke-tests every target's binary. See **Binary Size Observability**.
 * `.github/workflows/bench.yml` enforces the startup latency budget. See **Benchmarks**.
 
-Linux jobs install Zig through `.github/actions/setup-zig`, which restores the Zig cache that runs on `main` save with `.github/actions/save-zig-cache`. Pull requests never save a Zig cache, so they cannot push `main`'s entries out of the repository's cache quota.
+Linux jobs install Zig through `.github/actions/setup-zig`, which restores the Zig cache that runs on `main` save with `.github/actions/save-zig-cache`. Pull requests never save a Zig cache through these actions, so they cannot push `main`'s entries out of the repository's cache quota. The PGSO workflow keeps its own cache through `.github/actions/setup-pgso`.
 
-macOS runs only when a change can behave differently there. `.github/workflows/macos.yml` uses `scripts/detect-macos-need.sh` to check the diff. The macOS arm64 unit tests and the E2E files in `tests/e2e/macos-platform-tests.json` run when the change touches a Zig file with a macOS, BSD, or Linux code path, `build.zig`, the macOS signing script, the native SDK addon, a listed E2E file, or the macOS checks themselves. A Linux-only branch counts because macOS takes its other path; a Windows-only branch does not. The listed E2E files run in two weighted shards that share one macOS build. Native SDK addon changes also build and load the addon on macOS. If the detector cannot read the change, the `macOS arm64` check fails instead of passing. To request macOS for any other change, add the `ci:macos` label or run `gh workflow run macos.yml --ref <branch>`. When the change does not need macOS, the `macOS arm64` check passes without starting a macOS runner. Every E2E file that branches on `process.platform === "darwin"` must appear in `tests/e2e/macos-platform-tests.json`, and `tests/e2e/ci-shards.test.ts` enforces that.
+macOS runs only when a change can behave differently there. `.github/workflows/macos.yml` uses `scripts/detect-macos-need.sh` to check the diff. The macOS arm64 unit tests and the E2E files in `tests/e2e/macos-platform-tests.json` run when the change touches a Zig file with a macOS, BSD, or Linux code path, `build.zig`, the macOS signing script, the native SDK addon, a listed E2E file, or the macOS checks themselves. A Linux-only branch counts because macOS takes its other path; a Windows-only branch does not. The listed E2E files run in two weighted shards that share one macOS build. Native SDK addon changes also build and load the addon on macOS. If the detector cannot read the change, the `macOS arm64` check fails instead of passing. To request macOS for any other change, add the `ci:macos` label or run `gh workflow run macos.yml --ref <branch>`. When the change does not need macOS, the `macOS arm64` check passes without starting a macOS runner. Every E2E file that branches on `process.platform` being `darwin` or `linux` must appear in `tests/e2e/macos-platform-tests.json`, and `tests/e2e/ci-shards.test.ts` enforces that.
 
 The macOS arm64 PGSO workflow runs on a pull request only when the PGSO pipeline changes: `scripts/pgso/` other than `corpus.json`, the `setup-pgso` action, or `.github/workflows/pgso-macos-arm64.yml`. To qualify any other change, run `gh workflow run pgso-macos-arm64.yml --ref <branch>`. The stable release always runs it.
 
@@ -369,10 +369,10 @@ Linux arm64, macOS x86_64, and macOS arm64. Each matrix job builds the pull
 request merge commit and its base commit as stripped ReleaseSafe binaries on
 the same native runner, then reports the exact byte and MiB delta plus ELF or
 Mach-O section changes. The base binary is cached by base commit, so later
-pushes to the same pull request reuse it until the base branch moves. The Linux
-arm64, macOS x86_64, and macOS arm64 jobs also smoke-test the pull request
-binary with `scripts/smoke-binary.sh`, because those binaries run nowhere else
-on a pull request.
+pushes to the same pull request reuse it until the base branch moves. Every job
+also smoke-tests the pull request binary with `scripts/smoke-binary.sh`. These
+are release-style builds, and the Linux arm64 and macOS binaries run nowhere
+else on a pull request.
 
 Each platform check is informational. An increase of at least 52,429 bytes
 (0.050000 MiB) emits a warning and retains that platform's binaries for

@@ -15,8 +15,8 @@ on:
   pull_request:
 
 concurrency:
-  # A manual dispatch on main must not cancel the push run that Dev Release
-  # and Publish libfx wait on.
+  # A manual dispatch gets its own group so it cannot cancel the push run on
+  # main.
   group: ci-${{ github.event_name == 'workflow_dispatch' && 'dispatch-' || '' }}${{ github.ref }}
   cancel-in-progress: true
 

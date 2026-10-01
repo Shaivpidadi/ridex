@@ -53,8 +53,8 @@ comparison builds the pull request merge commit and base commit on the same
 native runner, reports exact file and ELF or Mach-O section deltas, and emits a
 warning at increases of 52,429 bytes (0.050000 MiB) or more. The warning requests
 investigation but does not replace the full PGSO release gate or reject a valid
-feature solely for adding code. The same jobs smoke-test the Linux arm64, macOS
-x86_64, and macOS arm64 binaries, which run nowhere else on a pull request.
+feature solely for adding code. The same jobs smoke-test each release-style
+binary; the Linux arm64 and macOS binaries run nowhere else on a pull request.
 
 ## Pull Requests
 

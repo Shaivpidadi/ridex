@@ -83,8 +83,8 @@ jobs:
           fi
           cat "$evidence_dir/head-sections.txt"
 
-      # These are release-style builds. Linux arm64 and both macOS targets run
-      # nowhere else on a pull request, so this is where a broken binary shows up.
+      # These are release-style builds, and the Linux arm64 and macOS binaries
+      # run nowhere else on a pull request.
       - name: Smoke test native binary
         env:
           AI_GATEWAY_API_KEY: ""
