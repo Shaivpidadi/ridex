@@ -17,6 +17,7 @@ const js_host_steering = if (host_target.is_wasm)
 else
     struct {};
 const io_mod = @import("../core/shared/io.zig");
+const host_attachments = @import("../core/hosts/host_attachments.zig");
 const image_attachments = @import("../core/images/image_attachments.zig");
 const jsonrpc = @import("jsonrpc.zig");
 const acp_types = @import("types.zig");
@@ -771,8 +772,12 @@ pub fn handlePrompt(
         }
     }
     const next_image_id = (try image_attachments.calculate_next_image_id(prior_image_catalog)).next_id;
-    var prompt_input = parsePromptInputWithFirstImageId(alloc, params, next_image_id) catch |err|
-        return promptInputFailure(err);
+    var prompt_input = parsePromptInputWithFirstImageId(
+        alloc,
+        params,
+        next_image_id,
+        state.cfg.host_attachments,
+    ) catch |err| return promptInputFailure(err);
     defer prompt_input.deinit(alloc);
     if (prompt_input.pending_images.len > 0) {
         if (session.store == null and session.wasm_state == null and session.v2 == null) {
@@ -1353,13 +1358,59 @@ const ParsedPromptInput = struct {
 };
 
 fn parsePromptInput(alloc: Allocator, params_json: []const u8) !ParsedPromptInput {
-    return parsePromptInputWithFirstImageId(alloc, params_json, 1);
+    return parsePromptInputWithFirstImageId(alloc, params_json, 1, null);
+}
+
+/// Decodes a standard ACP image block's canonical base64 `data`. Caller owns
+/// the returned bytes.
+fn decodePromptImageData(alloc: Allocator, data_value: std.json.Value) ![]u8 {
+    if (data_value != .string) return error.InvalidPromptImage;
+    const decoded_len = std.base64.standard.Decoder.calcSizeForSlice(data_value.string) catch
+        return error.InvalidPromptImage;
+    if (decoded_len == 0) return error.InvalidPromptImage;
+    if (decoded_len > image_attachments.max_image_bytes) {
+        return error.ImageTooLarge;
+    }
+    const decoded = try alloc.alloc(u8, decoded_len);
+    errdefer alloc.free(decoded);
+    std.base64.standard.Decoder.decode(decoded, data_value.string) catch
+        return error.InvalidPromptImage;
+    const canonical_len = std.base64.standard.Encoder.calcSize(decoded.len);
+    if (canonical_len != data_value.string.len) return error.InvalidPromptImage;
+    const canonical = try alloc.alloc(u8, canonical_len);
+    defer alloc.free(canonical);
+    const encoded = std.base64.standard.Encoder.encode(canonical, decoded);
+    if (!std.mem.eql(u8, encoded, data_value.string)) return error.InvalidPromptImage;
+    return decoded;
+}
+
+/// Takes the raw image bytes a libfx host attached beside the prompt frame.
+/// Hosts without an attachment store cannot reference one. Caller owns the
+/// returned bytes.
+fn takePromptImageAttachment(
+    alloc: Allocator,
+    attachments: ?host_attachments.Store,
+    value: std.json.Value,
+) ![]u8 {
+    const store = attachments orelse return error.UnsupportedPromptImage;
+    const id = host_attachments.idFromJson(value) orelse return error.InvalidPromptImage;
+    const bytes = store.take(alloc, id, image_attachments.max_image_bytes) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.AttachmentTooLarge => error.ImageTooLarge,
+        error.AttachmentUnavailable => error.InvalidPromptImage,
+    };
+    if (bytes.len == 0) {
+        alloc.free(bytes);
+        return error.InvalidPromptImage;
+    }
+    return bytes;
 }
 
 fn parsePromptInputWithFirstImageId(
     alloc: Allocator,
     params_json: []const u8,
     first_image_id: usize,
+    attachments: ?host_attachments.Store,
 ) !ParsedPromptInput {
     if (first_image_id == 0) return error.InvalidImageId;
     const parsed = std.json.parseFromSlice(std.json.Value, alloc, params_json, .{}) catch
@@ -1406,27 +1457,15 @@ fn parsePromptInputWithFirstImageId(
                 }
             }
         } else if (std.mem.eql(u8, block_type.string, "image")) {
-            const data_value = block.object.get("data") orelse return error.InvalidPromptImage;
             const media_type_value = block.object.get("mimeType") orelse return error.InvalidPromptImage;
-            if (data_value != .string or media_type_value != .string or media_type_value.string.len == 0) {
+            if (media_type_value != .string or media_type_value.string.len == 0) {
                 return error.InvalidPromptImage;
             }
-            const decoded_len = std.base64.standard.Decoder.calcSizeForSlice(data_value.string) catch
-                return error.InvalidPromptImage;
-            if (decoded_len == 0) return error.InvalidPromptImage;
-            if (decoded_len > image_attachments.max_image_bytes) {
-                return error.ImageTooLarge;
-            }
-            const decoded = try alloc.alloc(u8, decoded_len);
+            const decoded = if (acp_types.fxMetaField(block.object, "attachment")) |attachment| decoded: {
+                if (block.object.get("data") != null) return error.InvalidPromptImage;
+                break :decoded try takePromptImageAttachment(alloc, attachments, attachment);
+            } else try decodePromptImageData(alloc, block.object.get("data") orelse return error.InvalidPromptImage);
             errdefer alloc.free(decoded);
-            std.base64.standard.Decoder.decode(decoded, data_value.string) catch
-                return error.InvalidPromptImage;
-            const canonical_len = std.base64.standard.Encoder.calcSize(decoded.len);
-            if (canonical_len != data_value.string.len) return error.InvalidPromptImage;
-            const canonical = try alloc.alloc(u8, canonical_len);
-            defer alloc.free(canonical);
-            const encoded = std.base64.standard.Encoder.encode(canonical, decoded);
-            if (!std.mem.eql(u8, encoded, data_value.string)) return error.InvalidPromptImage;
 
             const image_id = std.math.add(usize, first_image_id, pending_images.items.len) catch
                 return error.ImageIdOverflow;
@@ -3498,7 +3537,7 @@ test "parsePromptInput accepts explicit recovery continuation metadata" {
 test "parsePromptInput accepts image blocks as owned pending images" {
     const alloc = std.testing.allocator;
     const params = "{\"sessionId\":\"s1\",\"prompt\":[{\"type\":\"text\",\"text\":\"Only text\"},{\"type\":\"image\",\"data\":\"aGVsbG8=\",\"mimeType\":\"image/png\"}]}";
-    var parsed = try parsePromptInputWithFirstImageId(alloc, params, 7);
+    var parsed = try parsePromptInputWithFirstImageId(alloc, params, 7, null);
     defer parsed.deinit(alloc);
 
     try std.testing.expectEqualStrings("Only text\n[Image #7]", parsed.text);
@@ -3512,7 +3551,7 @@ test "captureImagesInline retains validated bytes on the attachment" {
     const alloc = std.testing.allocator;
     const png_b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAAAAAA6fptVAAAACklEQVR42mNkAAAAAgAB4iG8MwAAAABJRU5ErkJggg==";
     const params = "{\"sessionId\":\"s1\",\"prompt\":[{\"type\":\"text\",\"text\":\"describe\"},{\"type\":\"image\",\"data\":\"" ++ png_b64 ++ "\",\"mimeType\":\"image/png\"}]}";
-    var parsed = try parsePromptInputWithFirstImageId(alloc, params, 4);
+    var parsed = try parsePromptInputWithFirstImageId(alloc, params, 4, null);
     defer parsed.deinit(alloc);
 
     try parsed.captureImagesInline(alloc);
@@ -3552,6 +3591,78 @@ test "parsePromptInput rejects empty image data" {
     const alloc = std.testing.allocator;
     const params = "{\"sessionId\":\"s1\",\"prompt\":[{\"type\":\"image\",\"data\":\"\",\"mimeType\":\"image/png\"}]}";
     try std.testing.expectError(error.InvalidPromptImage, parsePromptInput(alloc, params));
+}
+
+const TestAttachmentStore = struct {
+    id: host_attachments.Id,
+    bytes: ?[]const u8,
+    too_large: bool = false,
+    taken: usize = 0,
+
+    fn store(self: *TestAttachmentStore) host_attachments.Store {
+        return .{ .context = self, .take_fn = take, .put_fn = put };
+    }
+
+    fn take(
+        raw: ?*anyopaque,
+        alloc: Allocator,
+        id: host_attachments.Id,
+        max_bytes: usize,
+    ) host_attachments.TakeError![]u8 {
+        const self: *TestAttachmentStore = @ptrCast(@alignCast(raw.?));
+        if (id != self.id) return error.AttachmentUnavailable;
+        const bytes = self.bytes orelse return error.AttachmentUnavailable;
+        self.bytes = null;
+        self.taken += 1;
+        if (self.too_large or bytes.len > max_bytes) return error.AttachmentTooLarge;
+        return alloc.dupe(u8, bytes);
+    }
+
+    fn put(_: ?*anyopaque, _: []const u8) host_attachments.PutError!host_attachments.Id {
+        return error.AttachmentStoreFull;
+    }
+};
+
+test "parsePromptInput takes raw image bytes from a host attachment" {
+    const alloc = std.testing.allocator;
+    var attachments = TestAttachmentStore{ .id = 3, .bytes = "\x89PNG\r\n\x1a\nraw" };
+    const params = "{\"sessionId\":\"s1\",\"prompt\":[{\"type\":\"text\",\"text\":\"look\"},{\"type\":\"image\",\"mimeType\":\"image/png\",\"_meta\":{\"fx\":{\"attachment\":3}}}]}";
+    var parsed = try parsePromptInputWithFirstImageId(alloc, params, 2, attachments.store());
+    defer parsed.deinit(alloc);
+
+    try std.testing.expectEqualStrings("look\n[Image #2]", parsed.text);
+    try std.testing.expectEqual(@as(usize, 1), parsed.pending_images.len);
+    try std.testing.expectEqual(@as(usize, 2), parsed.pending_images[0].id);
+    try std.testing.expectEqualStrings("\x89PNG\r\n\x1a\nraw", parsed.pending_images[0].bytes);
+    try std.testing.expectEqualStrings("image/png", parsed.pending_images[0].media_type);
+    try std.testing.expectEqual(@as(usize, 1), attachments.taken);
+}
+
+test "parsePromptInput rejects unusable image attachment references" {
+    const alloc = std.testing.allocator;
+    const reference = "{\"sessionId\":\"s1\",\"prompt\":[{\"type\":\"image\",\"mimeType\":\"image/png\",\"_meta\":{\"fx\":{\"attachment\":3}}}]}";
+
+    // Standard ACP hosts have no attachment store.
+    try std.testing.expectError(error.UnsupportedPromptImage, parsePromptInput(alloc, reference));
+
+    var missing = TestAttachmentStore{ .id = 4, .bytes = "x" };
+    try std.testing.expectError(error.InvalidPromptImage, parsePromptInputWithFirstImageId(alloc, reference, 1, missing.store()));
+
+    var empty = TestAttachmentStore{ .id = 3, .bytes = "" };
+    try std.testing.expectError(error.InvalidPromptImage, parsePromptInputWithFirstImageId(alloc, reference, 1, empty.store()));
+
+    var oversized = TestAttachmentStore{ .id = 3, .bytes = "x", .too_large = true };
+    try std.testing.expectError(error.ImageTooLarge, parsePromptInputWithFirstImageId(alloc, reference, 1, oversized.store()));
+
+    const zero_id = "{\"sessionId\":\"s1\",\"prompt\":[{\"type\":\"image\",\"mimeType\":\"image/png\",\"_meta\":{\"fx\":{\"attachment\":0}}}]}";
+    var unused = TestAttachmentStore{ .id = 0, .bytes = "x" };
+    try std.testing.expectError(error.InvalidPromptImage, parsePromptInputWithFirstImageId(alloc, zero_id, 1, unused.store()));
+    try std.testing.expectEqual(@as(usize, 0), unused.taken);
+
+    const ambiguous = "{\"sessionId\":\"s1\",\"prompt\":[{\"type\":\"image\",\"mimeType\":\"image/png\",\"data\":\"aGVsbG8=\",\"_meta\":{\"fx\":{\"attachment\":3}}}]}";
+    var stored = TestAttachmentStore{ .id = 3, .bytes = "x" };
+    try std.testing.expectError(error.InvalidPromptImage, parsePromptInputWithFirstImageId(alloc, ambiguous, 1, stored.store()));
+    try std.testing.expectEqual(@as(usize, 0), stored.taken);
 }
 
 test "parsePromptInput preserves resource text and accepts only local absolute file targets" {
