@@ -57,6 +57,7 @@ const image_data = @import("../../images/image_data.zig");
 const runtime_assistant_stream = @import("assistant_stream.zig");
 const runtime_tool_presentation = @import("tool_presentation.zig");
 const runtime_execution_memory = @import("execution_memory.zig");
+const execution_memory_helpers = @import("../execution_memory.zig");
 const runtime_agent = @import("agent.zig");
 const runtime_tool_admission = @import("tool_admission.zig");
 const runtime_interruption = @import("interruption.zig");
@@ -2632,6 +2633,55 @@ fn prepareAvailabilityTerminal(
     };
 }
 
+/// Advertises live MCP tools the model called without loading them first, so
+/// those calls reach normal validation and MCP permission instead of failing
+/// as unselected. Names that do not resolve, including lookups that fail or
+/// are cancelled, keep the unsupported-tool path, where the turn's normal
+/// cancellation handling still applies.
+fn advertiseUnselectedMcpCalls(
+    deps: *const AgentRuntimeDeps,
+    arena: Allocator,
+    calls: []const ToolCall,
+    selected: *std.ArrayList(agent_stream_provider.DynamicFunctionTool),
+    advertised_tools: *[]const agent_stream_provider.DynamicFunctionTool,
+    advertised_names: *[][]const u8,
+) !void {
+    const resolve = deps.resolve_unselected_mcp_tool orelse return;
+    for (calls) |call| {
+        if (deps.tool_registry.lookup(call.name) != null) continue;
+        if (containsToolName(advertised_names.*, call.name)) continue;
+        const resolved = resolve(deps.ctx, arena, call.name) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {
+                debug_trace.logf("mcp", "unselected MCP tool lookup failed tool={s} err={s}", .{ call.name, @errorName(err) });
+                continue;
+            },
+        };
+        const definition = resolved orelse continue;
+        if (!std.mem.eql(u8, definition.name, call.name) or definition.mcp_binding == null) continue;
+        try runtime_gateway_step.recordSelectedDynamicTool(arena, selected, definition);
+        const tool = for (selected.items) |item| {
+            if (std.mem.eql(u8, item.name, call.name)) break item;
+        } else unreachable;
+        const tools = try arena.alloc(agent_stream_provider.DynamicFunctionTool, advertised_tools.len + 1);
+        @memcpy(tools[0..advertised_tools.len], advertised_tools.*);
+        tools[advertised_tools.len] = tool;
+        const names = try arena.alloc([]const u8, advertised_names.len + 1);
+        @memcpy(names[0..advertised_names.len], advertised_names.*);
+        names[advertised_names.len] = tool.name;
+        advertised_tools.* = tools;
+        advertised_names.* = names;
+        debug_trace.logf("mcp", "loaded unselected MCP tool for direct call tool={s}", .{call.name});
+    }
+}
+
+fn containsToolName(names: []const []const u8, name: []const u8) bool {
+    for (names) |candidate| {
+        if (std.mem.eql(u8, candidate, name)) return true;
+    }
+    return false;
+}
+
 fn prepareDeferredDynamicCandidate(
     raw_ctx: ?*anyopaque,
     alloc: Allocator,
@@ -3857,6 +3907,31 @@ noinline fn pausedRequiredAction(
         .continue_later;
 }
 
+/// Hands the model's tool calls to `append_turn_piece` before any of them
+/// runs (D28). Execution memory holds only finished exchanges, so the calls
+/// travel apart, in the form a finished step saves them.
+fn appendRunningToolCalls(
+    deps: *const AgentRuntimeDeps,
+    finalization: *const TurnFinalizationGuard,
+    job: QueuedPrompt,
+    current_turn_messages: []const ChatMessage,
+    calls: []const types.ToolCall,
+) !void {
+    const append = deps.append_turn_piece orelse return;
+    if (calls.len == 0) return;
+    var scratch = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer mem_utils.deinit_arena(scratch);
+    const arena = scratch.allocator();
+    const execution = try runtime_execution_memory.buildExecutionMemory(arena, current_turn_messages);
+    const running = try arena.alloc(types.ToolCall, calls.len);
+    for (calls, running) |call, *saved| saved.* = try execution_memory_helpers.dupePersistedToolCall(arena, call);
+    try append(deps.ctx, .{
+        .user = .{ .text = @constCast(job.prompt), .images = job.images },
+        .execution = try finalization.compacted_execution.project(arena, execution),
+        .running_calls = running,
+    });
+}
+
 fn persistRecoveryCheckpoint(
     deps: *const AgentRuntimeDeps,
     finalization: *const TurnFinalizationGuard,
@@ -3874,7 +3949,7 @@ fn persistRecoveryCheckpoint(
     tool_evidence: model_response_recovery.ToolEvidence,
     trace_ctx: TraceContext,
 ) !void {
-    const effect = deps.recovery_checkpoint orelse return;
+    if (deps.recovery_checkpoint == null and deps.append_turn_piece == null) return;
     // Every sink copies or serializes the borrowed checkpoint synchronously.
     // Retaining these full-history reconstructions in the turn arena is quadratic.
     var scratch = std.heap.ArenaAllocator.init(std.heap.c_allocator);
@@ -3884,14 +3959,16 @@ fn persistRecoveryCheckpoint(
         arena,
         current_turn_messages,
     );
+    const projected = try finalization.compacted_execution.project(arena, execution);
+    const user: types.UserTurn = .{ .text = @constCast(job.prompt), .images = job.images };
+    // Every completed piece reaches the session before the next request.
+    if (deps.append_turn_piece) |append| try append(deps.ctx, .{ .user = user, .execution = projected });
+    const effect = deps.recovery_checkpoint orelse return;
     try effect.set(deps.ctx, .{
         .turn_id = job.turn_id,
-        .user = .{
-            .text = @constCast(job.prompt),
-            .images = job.images,
-        },
+        .user = user,
         .assistant_source = @constCast(assistant_source),
-        .execution = try finalization.compacted_execution.project(arena, execution),
+        .execution = projected,
         .cause = checkpointCause(cause),
         .action = checkpointAction(strategy),
         .tool_state = checkpointToolState(tool_evidence),
@@ -4035,6 +4112,67 @@ test "recovery checkpoints do not accumulate temporary history copies in the tur
     try std.testing.expectError(error.CheckpointWriteFailed, persistRecoveryCheckpoint(&deps, &finalization, fixture.job(), messages.items, "cancelled", "model", false, false, 10, 1, false, .transport_interrupted, .pause, .confirmed, .{}));
     try std.testing.expectEqual(retained_bytes, turn.queryCapacity());
     try std.testing.expectEqual(@as(usize, 1000), sink.checkpoint.?.execution.tool_steps.len);
+}
+
+test "running tool calls reach append_turn_piece before they run" {
+    const support = @import("tests/support.zig");
+    const Sink = struct {
+        appends: usize = 0,
+        finished_steps: usize = 0,
+        running: std.ArrayList([]u8) = .empty,
+
+        fn append(raw: *anyopaque, progress: runtime_deps.TurnProgress) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.appends += 1;
+            self.finished_steps = progress.execution.tool_steps.len;
+            for (progress.running_calls) |call| {
+                try self.running.append(std.testing.allocator, try std.testing.allocator.dupe(u8, call.id));
+            }
+        }
+    };
+    var sink: Sink = .{};
+    defer {
+        for (sink.running.items) |id| std.testing.allocator.free(id);
+        sink.running.deinit(std.testing.allocator);
+    }
+    var fake = support.FakeAgentRuntimeDeps.init(std.testing.allocator);
+    defer fake.deinit();
+    var deps = fake.deps();
+    var fixture: support.PromptFixture = .{};
+    var finalization = TurnFinalizationGuard.init(&deps, 1, support.testLifecycleContext(
+        hooks.RuntimeView.empty(),
+        std.testing.allocator,
+        fixture.workspace_root,
+    ));
+    defer finalization.deinit();
+    var finished = [_]ToolCall{.{ .id = "read_0", .name = "read_file", .arguments_json = "{\"path\":\"b\"}" }};
+    var running = [_]ToolCall{
+        .{ .id = "run_1", .name = "shell", .arguments_json = "{\"command\":\"sleep 9\"}" },
+        .{ .id = "run_2", .name = "read_file", .arguments_json = "{\"path\":\"a\"}" },
+    };
+    const messages = [_]ChatMessage{
+        .{ .role = .assistant, .tool_calls = &finished },
+        .{ .role = .tool, .tool_call_id = "read_0", .tool_name = "read_file", .tool_result_status = .success, .content = "done" },
+        .{ .role = .assistant, .tool_calls = &running },
+    };
+
+    // Without the hook, as on v1, nothing is built or sent.
+    try appendRunningToolCalls(&deps, &finalization, fixture.job(), &messages, &running);
+    try std.testing.expectEqual(@as(usize, 0), sink.appends);
+
+    deps.ctx = &sink;
+    deps.append_turn_piece = Sink.append;
+    try appendRunningToolCalls(&deps, &finalization, fixture.job(), &messages, &running);
+    try std.testing.expectEqual(@as(usize, 1), sink.appends);
+    // The finished step travels as execution memory, the running calls beside it.
+    try std.testing.expectEqual(@as(usize, 1), sink.finished_steps);
+    try std.testing.expectEqual(@as(usize, 2), sink.running.items.len);
+    try std.testing.expectEqualStrings("run_1", sink.running.items[0]);
+    try std.testing.expectEqualStrings("run_2", sink.running.items[1]);
+
+    // A step with no calls sends nothing.
+    try appendRunningToolCalls(&deps, &finalization, fixture.job(), &messages, &.{});
+    try std.testing.expectEqual(@as(usize, 1), sink.appends);
 }
 
 /// Pure formatter for the full-only network record: provider, model, latency,
@@ -6831,8 +6969,8 @@ fn processQueuedPromptLoop(
             restore_recovery_source = false;
         }
 
-        const advertised_dynamic_tools = try runtime_gateway_step.snapshotDynamicTools(arena, deps, &selected_dynamic_tools);
-        const advertised_dynamic_tool_names = try arena.alloc([]const u8, advertised_dynamic_tools.len);
+        var advertised_dynamic_tools = try runtime_gateway_step.snapshotDynamicTools(arena, deps, &selected_dynamic_tools);
+        var advertised_dynamic_tool_names = try arena.alloc([]const u8, advertised_dynamic_tools.len);
         for (advertised_dynamic_tools, 0..) |tool, index| advertised_dynamic_tool_names[index] = tool.name;
         var stream_result: runtime_gateway_step.StreamResult = undefined;
         var stream_result_set = false;
@@ -9300,6 +9438,14 @@ fn processQueuedPromptLoop(
             }
         }
 
+        try advertiseUnselectedMcpCalls(
+            deps,
+            arena,
+            completion.tool_calls,
+            &selected_dynamic_tools,
+            &advertised_dynamic_tools,
+            &advertised_dynamic_tool_names,
+        );
         const prepared_tool_calls = try arena.alloc(
             PreparedToolCall,
             completion.tool_calls.len,
@@ -9647,6 +9793,7 @@ fn processQueuedPromptLoop(
             else
                 provider_replay,
         );
+        try appendRunningToolCalls(deps, finalization, job, within_turn_suffix.items, effective_tool_calls);
 
         const step_has_content = !terminal_provider_completion and completion.content != null and completion.content.?.len > 0;
         if (step_has_content) {
