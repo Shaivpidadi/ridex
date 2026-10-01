@@ -3189,7 +3189,8 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       const pane = (await session.capturePaneGrid()).join("\n");
       expect(hasEmptyComposer(pane)).toBe(true);
       expect(pane).not.toContain("Reasoning effort");
-      expect(pane).not.toContain("default");
+      expect(pane).toContain(`Switched to ${selectedModel} (effort: default, speed: normal)`);
+      expect(pane.split("\n").find((line) => line.startsWith("auto · "))).toBe("auto · deepseek-v4-pro-0813");
       expect(JSON.parse(readFileSync(fixture.settingsPath, "utf8")).models.gateway).toBe(selectedModel);
       expect(await session.paneTitle()).toBe(runningBinaryTitle(fixture.workspace));
       expect(session.isAlive()).toBe(true);
