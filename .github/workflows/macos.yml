@@ -35,7 +35,8 @@ jobs:
       # its pull request run would.
       - uses: actions/checkout@v4
         with:
-          fetch-depth: ${{ github.event_name == 'workflow_dispatch' && 0 || 2 }}
+          # 0 is falsy in expressions, so the dispatch case must come last.
+          fetch-depth: ${{ github.event_name != 'workflow_dispatch' && 2 || 0 }}
 
       - name: Decide whether this change needs macOS
         id: detect
@@ -44,7 +45,8 @@ jobs:
           SDK_NATIVE_REQUESTED: ${{ github.event_name == 'workflow_dispatch' && inputs.sdk_native || false }}
         run: |
           if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
-            scripts/detect-macos-need.sh "$(git merge-base origin/main HEAD)" HEAD
+            base="$(git merge-base origin/main HEAD)"
+            scripts/detect-macos-need.sh "$base" HEAD
           else
             # The pull request merge commit's first parent is the base branch.
             scripts/detect-macos-need.sh HEAD^1 HEAD

@@ -173,6 +173,21 @@ class DetectMacosNeedTests(unittest.TestCase):
         self.commit("nested")
         self.assert_not_needed()
 
+    def test_shared_e2e_helper_with_platform_branch_needs_macos(self) -> None:
+        self.write("tests/e2e/helper.ts", 'const mac = process.platform === "darwin";\n')
+        self.commit("helper")
+        self.assertIn("tests/e2e/helper.ts", self.assert_needed())
+        self.base = self.git("rev-parse", "HEAD")
+
+        self.write("tests/e2e/helper.ts", "const mac = false;\n")
+        self.commit("remove branch")
+        self.assertIn("tests/e2e/helper.ts", self.assert_needed())
+        self.base = self.git("rev-parse", "HEAD")
+
+        self.write("tests/e2e/plain.ts", "export const value = 1;\n")
+        self.commit("plain helper")
+        self.assert_not_needed()
+
     def test_requests_force_the_checks(self) -> None:
         self.assertIn("ci:macos label", self.assert_needed(MACOS_REQUESTED="ci:macos label"))
         self.assert_needed(sdk_native=True, SDK_NATIVE_REQUESTED="true")

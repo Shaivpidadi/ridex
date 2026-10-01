@@ -41,11 +41,15 @@ require_sdk_native() {
   require "$1"
 }
 
+# Matches either side of the change, so removing a platform branch counts too.
 has_platform_code() {
   local content
   content="$({ git show "$head:$1" 2>/dev/null; git show "$base:$1" 2>/dev/null; } || true)"
-  grep -Eq '\.linux([^A-Za-z0-9_]|$)|isBSD|\.macos|isDarwin|[Dd]arwin' <<<"$content"
+  grep -Eq "$2" <<<"$content"
 }
+
+zig_platform_code='\.linux([^A-Za-z0-9_]|$)|isBSD|\.macos|isDarwin|[Dd]arwin'
+ts_platform_code='process\.platform'
 
 if ! jq -e 'type == "array"' "$platform_list" >/dev/null 2>&1; then
   printf 'error: %s is missing or not a JSON array; the macOS check cannot decide\n' "$platform_list" >&2
@@ -89,13 +93,17 @@ while IFS= read -r path; do
     src/napi_*.zig | sdk/node.js | sdk/tests/test-node-napi.mjs)
       require_sdk_native "$path: native SDK addon changed" ;;
     *.zig)
-      if has_platform_code "$path"; then
+      if has_platform_code "$path" "$zig_platform_code"; then
         require "$path: has a macOS or Linux code path"
       fi ;;
     tests/e2e/*.test.ts)
       name="${path#tests/e2e/}"
       if [[ "$name" != */* ]] && is_platform_test "$name"; then
         require "$path: macOS platform E2E file changed"
+      fi ;;
+    tests/e2e/*.ts)
+      if has_platform_code "$path" "$ts_platform_code"; then
+        require "$path: shared E2E helper has a platform branch"
       fi ;;
   esac
 done <<<"$changed_files"
