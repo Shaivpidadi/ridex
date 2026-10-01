@@ -788,9 +788,13 @@ function createRuntime(options) {
   function attachmentTake(id, outputPtr, outputCap) {
     const key = id >>> 0;
     const value = inboundAttachments.get(key);
-    const output = value ? checkedBytes(outputPtr, outputCap) : null;
-    if (!value || !output || value.length > output.length) return -1;
-    output.set(value);
+    if (!value) return -1;
+    // An empty payload needs no output buffer, whose pointer may be arbitrary.
+    if (value.length > 0) {
+      const output = checkedBytes(outputPtr, outputCap);
+      if (!output || value.length > output.length) return -1;
+      output.set(value);
+    }
     inboundAttachments.delete(key);
     return value.length;
   }
@@ -1458,8 +1462,8 @@ function normalizePromptInput(input, { deferImageLimits = false } = {}) {
 
 // Image bytes travel beside the frame as attachment references, but the model
 // request carries them base64 encoded and the native host caps that request at
-// 8 MiB. Images therefore count at their encoded size, so a prompt the SDK
-// accepts fits on both backends. With countImages false, only the frame counts.
+// 8 MiB. Images therefore count at their encoded size, the same budget they
+// had inside the frame. With countImages false, only the frame counts.
 function promptFrameSize(prompt, countImages = true) {
   let encodedImageBytes = 0;
   const projected = prompt.map((block) => {
@@ -1638,6 +1642,11 @@ export async function createFxAgent(options = {}) {
   const hostTools = normalizeHostTools(options.tools);
   const instructions = normalizeInstructions(options.instructions);
   const initialCheckpoint = checkpointBytes(options.checkpoint);
+  // Checked before the core starts, and with the core's message, so both
+  // backends report it the same way.
+  if (initialCheckpoint && initialCheckpoint.byteLength > maxCheckpointBytes) {
+    throw new Error("libfx checkpoint is too large");
+  }
   const pending = new Map();
   let nextId = 1;
   let sessionId = null;
@@ -1795,6 +1804,16 @@ export async function createFxAgent(options = {}) {
       return id;
     });
   };
+  let checkpointTail = null;
+  async function takeCheckpoint() {
+    if (closing) throw new Error("fx agent is closed");
+    if (activeTurn) throw new Error("cannot checkpoint while a prompt is active");
+    const response = await request("libfx/checkpoint", { sessionId });
+    const id = response?.checkpointAttachment;
+    const bytes = Number.isSafeInteger(id) && id > 0 ? runtime.takeAttachment?.(id) : null;
+    if (!(bytes instanceof Uint8Array) || bytes.byteLength === 0) throw new Error("fx returned an invalid checkpoint");
+    return new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  }
   const sendPrompt = (blocks) => {
     const images = blocks.filter((block) => block.type === "image");
     const ids = images.length ? attachBytes(images.map((block) => block.bytes)) : [];
@@ -1867,9 +1886,6 @@ export async function createFxAgent(options = {}) {
     const sessionResult = await request("libfx/new");
     sessionId = sessionResult.sessionId;
     if (initialCheckpoint) {
-      // The native attachment table would otherwise reject this first, with a
-      // different error than the core reports on WebAssembly.
-      if (initialCheckpoint.byteLength > maxCheckpointBytes) throw new Error("libfx checkpoint is too large");
       const [checkpointAttachment] = attachBytes([initialCheckpoint]);
       await request("libfx/restore", { sessionId, checkpointAttachment });
     }
@@ -1888,13 +1904,14 @@ export async function createFxAgent(options = {}) {
       return normalizeTurn(startTurn(input, promptOptions));
     },
     async checkpoint() {
-      if (closing) throw new Error("fx agent is closed");
-      if (activeTurn) throw new Error("cannot checkpoint while a prompt is active");
-      const response = await request("libfx/checkpoint", { sessionId });
-      const id = response?.checkpointAttachment;
-      const bytes = Number.isSafeInteger(id) && id > 0 ? runtime.takeAttachment?.(id) : null;
-      if (!(bytes instanceof Uint8Array) || bytes.byteLength === 0) throw new Error("fx returned an invalid checkpoint");
-      return new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+      // One checkpoint runs at a time: each holds an outbound attachment until
+      // it is taken, and the native table holds only a few. An idle call still
+      // sends its request before returning, ahead of a later prompt().
+      const run = checkpointTail ? checkpointTail.then(takeCheckpoint) : takeCheckpoint();
+      const tail = run.catch(() => {});
+      checkpointTail = tail;
+      void tail.then(() => { if (checkpointTail === tail) checkpointTail = null; });
+      return run;
     },
     async close() {
       if (closing) { await runtime.exited; return; }

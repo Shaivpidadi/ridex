@@ -8,6 +8,7 @@ const agent_steps = @import("core/config/agent_steps.zig");
 const context_contract = @import("core/workspace/context_contract.zig");
 const host = @import("core/hosts/host.zig");
 const host_attachments = @import("core/hosts/host_attachments.zig");
+const agent_checkpoint = @import("core/agent/runtime/checkpoint.zig");
 const io_mod = @import("core/shared/io.zig");
 const fetch_state = @import("napi_fetch_state.zig");
 const streamable_http = @import("core/mcp/streamable_http.zig");
@@ -27,8 +28,8 @@ const max_output_bytes = 8 * 1024 * 1024;
 const max_output_message_bytes = 64 * 1024 * 1024;
 const max_fetch_request_bytes = 8 * 1024 * 1024;
 const max_fetch_response_bytes = 8 * 1024 * 1024;
-// One attachment holds one prompt image or one kernel checkpoint.
-const max_attachment_bytes = 4 * 1024 * 1024;
+// One attachment holds one prompt image or one kernel checkpoint, the larger.
+const max_attachment_bytes = agent_checkpoint.max_checkpoint_bytes;
 const max_inbound_attachments = 8;
 const max_inbound_attachment_bytes = 8 * 1024 * 1024;
 const max_outbound_attachments = 4;

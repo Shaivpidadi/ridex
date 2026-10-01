@@ -304,6 +304,9 @@ for (const resizeImage of [undefined, (image) => image]) {
   ]);
   assert.equal(initial.stopReason, "end_turn");
   const checkpoint = await first.checkpoint();
+  // More concurrent checkpoints than the native outbound table holds all succeed.
+  const concurrent = await Promise.all(Array.from({ length: 16 }, () => first.checkpoint()));
+  for (const bytes of concurrent) assert.deepEqual(Buffer.from(bytes), Buffer.from(checkpoint));
   await first.close();
   const stored = Buffer.from(checkpoint);
   assert.ok(stored.includes(Buffer.from(pngData, "base64")), "checkpoint must store the image bytes raw");
@@ -317,11 +320,32 @@ for (const resizeImage of [undefined, (image) => image]) {
   assert.deepEqual(files, [{ type: "file", mediaType: "image/png", data: { type: "data", data: pngData } }]);
   await restored.close();
 
-  // An oversized restore checkpoint fails with the same error on both backends.
+  // Oversized and empty restore checkpoints fail with the same errors on both backends.
   await assert.rejects(
     createAgent(mockGateway(), { model: "sdk/vision-model", checkpoint: new Uint8Array(4 * 1024 * 1024 + 1) }),
     (error) => error.message === "libfx checkpoint is too large",
   );
+  await assert.rejects(
+    createAgent(mockGateway(), { model: "sdk/vision-model", checkpoint: new Uint8Array(0) }),
+    (error) => error.message === "Invalid or non-fresh libfx checkpoint",
+  );
+}
+
+// An idle checkpoint is sent before a later prompt, while one queued behind it
+// follows the direct-call rule once that prompt is active.
+{
+  const gateway = mockGateway();
+  const agent = await createAgent(gateway, { model: "sdk/vision-model" });
+  await runPrompt(agent, "first");
+  const expected = Buffer.from(await agent.checkpoint());
+  const idle = agent.checkpoint();
+  const queued = agent.checkpoint();
+  const turn = agent.prompt("second");
+  assert.deepEqual(Buffer.from(await idle), expected);
+  await assert.rejects(queued, /cannot checkpoint while a prompt is active/);
+  for await (const _ of turn) {}
+  assert.equal((await turn.result).stopReason, "end_turn");
+  await agent.close();
 }
 
 // SDK-side limits reject synchronously with typed errors naming the bound,
