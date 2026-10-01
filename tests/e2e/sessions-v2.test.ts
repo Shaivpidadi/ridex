@@ -1096,6 +1096,41 @@ test("ACP saves a model change with the session and loads it back", async () => 
   }
 }, TIMEOUT * 3);
 
+test("ACP session/load with another cwd moves the session to that workspace", async () => {
+  const fixture = createFixture("fx-v2-acp-cwd-");
+  const elsewhere = join(fixture.root, "elsewhere");
+  mkdirSync(elsewhere);
+  const other = realpathSync(elsewhere);
+  const gateway = replyToLatest([
+    ["Start in the workspace.", "ACP_HERE"],
+    ["Carry on elsewhere.", "ACP_THERE"],
+  ]);
+  let client: AcpRpc | undefined;
+  try {
+    client = await AcpRpc.start(fixture, gateway);
+    const id = (await client.ok("session/new", { cwd: fixture.workspace, mcpServers: [] })).sessionId;
+    await client.ok("session/prompt", { sessionId: id, ...acpPrompt("Start in the workspace.") });
+    expect(await client.close()).toBe(0);
+
+    client = await AcpRpc.start(fixture, gateway);
+    await client.ok("session/load", { sessionId: id, cwd: other, mcpServers: [] });
+    await client.ok("session/prompt", { sessionId: id, ...acpPrompt("Carry on elsewhere.") });
+    expect(gateway.requests.at(-1)!.body).toContain("ACP_HERE");
+    expect((await client.ok("session/list", { cwd: other })).sessions.map((s: any) => s.sessionId)).toEqual([id]);
+    expect((await client.ok("session/list", { cwd: fixture.workspace })).sessions).toEqual([]);
+    expect(await client.close()).toBe(0);
+    client = undefined;
+    const moves = logLines(fixture, id).filter((line) => line.kind === "set" && line.key === "workspace");
+    expect(moves.map((line: any) => line.value)).toEqual([other]);
+    expectWholeLog(fixture, id);
+    expectNoV1Sessions(fixture);
+  } finally {
+    if (client) await client.kill();
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 3);
+
 test("ACP keeps a tool result as a side file, and load replays the call with its result", async () => {
   const fixture = createFixture("fx-v2-acp-tool-");
   const gateway = startDynamicFakeGateway(async (body) => {

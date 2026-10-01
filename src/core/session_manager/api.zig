@@ -281,8 +281,11 @@ pub const Manager = struct {
             error.NotFound, error.Busy, error.ChildSession, error.Corrupt, error.UnsupportedVersion, error.OutOfMemory => |e| e,
             else => |io_err| storage.ioFault(io_err),
         };
-        m.catalog().opened(inner.id(), options.host, m.nowMs()) catch m.indexStale(inner.id());
-        return .{ .manager = m, .inner = inner };
+        const session: Session = .{ .manager = m, .inner = inner };
+        // The repair may have moved the workspace or interrupted a turn, so
+        // the whole entry is written, not only the open time (D42).
+        session.updateIndexAs(.{ .resumed = options.host });
+        return session;
     }
 
     fn resolve(m: *Manager, workspace: []const u8, target: catalog_mod.Target) OpenError!?[]u8 {
@@ -484,14 +487,19 @@ pub const Session = struct {
         s.updateIndexAs(.changed);
     }
 
-    /// A new session counts as opened by the host that created it, so `-c`
-    /// finds it; later updates leave the open times alone.
-    fn updateIndexAs(s: Session, why: enum { published, changed }) void {
+    /// A new session counts as opened by the host that created it, and a
+    /// resumed one by the host that resumed it, so `-c` finds it; other
+    /// updates leave the open times alone.
+    fn updateIndexAs(s: Session, why: union(enum) { published, changed, resumed: Host }) void {
         const m = s.manager;
         var arena = std.heap.ArenaAllocator.init(m.gpa);
         defer arena.deinit();
         var summary = s.indexSummary(arena.allocator()) catch return m.indexStale(s.id());
-        if (why == .published) summary.opened_ms[@intFromEnum(summary.host)] = summary.updated_ms;
+        switch (why) {
+            .published => summary.opened_ms[@intFromEnum(summary.host)] = summary.updated_ms,
+            .resumed => |host| summary.opened_ms[@intFromEnum(host)] = m.nowMs(),
+            .changed => {},
+        }
         m.catalog().put(summary) catch m.indexStale(s.id());
     }
 
@@ -972,6 +980,40 @@ const api_tests = struct {
         c.release();
         try testing.expectError(error.NotFound, m.openResume(.{ .target = .{ .last_opened = .sdk }, .workspace = "/w", .host = .sdk }));
         try testing.expectError(error.NotFound, m.openResume(.{ .target = .last, .workspace = "/nowhere", .host = .app }));
+    }
+
+    test "a resume from another workspace lists the session there at once, and keeps -c (D42)" {
+        var f: Fixture = undefined;
+        try f.init();
+        defer f.deinit();
+        const m = f.manager;
+        const s = try m.openNew(.{ .workspace = "/w", .host = .acp });
+        _ = try s.append(&.{ .turn_started, .turn_committed });
+        const id = try gpa.dupe(u8, s.id());
+        defer gpa.free(id);
+        s.release();
+
+        // Still open: the index names the new workspace before any close.
+        const r = try m.openResume(.{ .target = .{ .id = id }, .workspace = "/x", .host = .app });
+        try expectListedIn(m, "/x", id);
+        try expectListedIn(m, "/w", null);
+        r.release();
+        try expectListedIn(m, "/x", id);
+        // The resume counts as the app's open, so `-c` in /x finds it.
+        const c = try m.openResume(.{ .target = .{ .last_opened = .app }, .workspace = "/x", .host = .app });
+        try testing.expectEqualStrings(id, c.id());
+        c.release();
+    }
+
+    fn expectListedIn(m: *api.Manager, workspace: []const u8, want: ?[]const u8) !void {
+        var page = try m.list(gpa, .{ .workspace = workspace }, null, 10);
+        defer page.deinit();
+        if (want) |expected| {
+            try testing.expectEqual(@as(usize, 1), page.items.len);
+            try testing.expectEqualStrings(expected, page.items[0].id);
+        } else {
+            try testing.expectEqual(@as(usize, 0), page.items.len);
+        }
     }
 
     test "fork, children, delete: listing and ids" {

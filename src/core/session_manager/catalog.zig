@@ -48,6 +48,8 @@ pub const Summary = struct {
 
 pub const Record = union(enum) {
     put: Summary,
+    /// Read from indexes that older builds wrote; a resume now writes a
+    /// whole `put` (D42).
     opened: struct { id: []const u8, host: schema.Host, ts_ms: u64 },
     del: struct { id: []const u8, ts_ms: u64 },
 };
@@ -268,10 +270,6 @@ pub const Catalog = struct {
     pub fn put(cat: Catalog, summary: Summary) Error!void {
         try cat.append(.{ .put = summary });
         cat.env.observeCatalog(summary.id, .index_put);
-    }
-
-    pub fn opened(cat: Catalog, id: []const u8, host: schema.Host, ts_ms: u64) Error!void {
-        try cat.append(.{ .opened = .{ .id = id, .host = host, .ts_ms = ts_ms } });
     }
 
     pub fn del(cat: Catalog, id: []const u8, ts_ms: u64) Error!void {
