@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { buildShardPlan, selectShard } from "./ci-shards";
+import { buildShardPlan, restrictToFiles, selectShard } from "./ci-shards";
 
 const files = ["a.test.ts", "b.test.ts", "c.test.ts", "d.test.ts"];
 
@@ -146,12 +146,37 @@ describe("macOS platform E2E list", () => {
     expect(names).toEqual([...new Set(names)].sort());
   });
 
-  test("includes every E2E file that branches on macOS", () => {
-    const macosBranch = /(process\.platform|platform\(\))\s*[!=]==\s*["']darwin["']/;
+  test("includes every E2E file that branches on the platform", () => {
+    const platformBranch = /\bplatform(\(\))?\s*[!=]==\s*["'](darwin|linux)["']/;
     const missing = rootTests.filter((name) =>
-      macosBranch.test(readFileSync(join(import.meta.dir, name), "utf8")) &&
+      platformBranch.test(readFileSync(join(import.meta.dir, name), "utf8")) &&
       !(listed as string[]).includes(name)
     );
     expect(missing).toEqual([]);
+  });
+
+  test("plans the listed files with their checked-in weights", () => {
+    const manifest = [
+      { file: "a.test.ts", weight: 9 },
+      { file: "b.test.ts", weight: 7 },
+      { file: "c.test.ts", weight: 5 },
+      { file: "d.test.ts", weight: 3 },
+    ];
+
+    const restricted = restrictToFiles(files, manifest, ["d.test.ts", "b.test.ts", "c.test.ts"]);
+    const plan = buildShardPlan(restricted.files, restricted.manifest, 2);
+
+    expect(plan).toEqual({
+      shards: [["b.test.ts"], ["c.test.ts", "d.test.ts"]],
+      totals: [7, 8],
+    });
+  });
+
+  test("rejects empty, unknown, and duplicate listed files", () => {
+    const manifest = files.map((file) => ({ file, weight: 1 }));
+
+    expect(() => restrictToFiles(files, manifest, [])).toThrow("non-empty array");
+    expect(() => restrictToFiles(files, manifest, ["z.test.ts"])).toThrow("not a discovered test");
+    expect(() => restrictToFiles(files, manifest, ["a.test.ts", "a.test.ts"])).toThrow("duplicate");
   });
 });

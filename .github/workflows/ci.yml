@@ -15,7 +15,9 @@ on:
   pull_request:
 
 concurrency:
-  group: ci-${{ github.ref }}
+  # A manual dispatch on main must not cancel the push run that Dev Release
+  # and Publish libfx wait on.
+  group: ci-${{ github.event_name == 'workflow_dispatch' && 'dispatch-' || '' }}${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -32,7 +34,8 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Setup Zig
-        uses: mlugg/setup-zig@v2
+        id: zig
+        uses: ./.github/actions/setup-zig
         with:
           version: "0.16.0"
           cache-key: ci-unit-${{ matrix.optimize }}
@@ -49,8 +52,8 @@ jobs:
       - name: Check compactor boundary
         run: ./scripts/check-compactor-boundary.sh
 
-      - name: Test signing and release routing
-        run: python3 -m unittest scripts.tests.test_macos_signing scripts.tests.test_signed_macos -q
+      - name: Test CI and release scripts
+        run: python3 -m unittest scripts.tests.test_macos_signing scripts.tests.test_signed_macos scripts.tests.test_detect_macos_need -q
 
       - name: Build
         run: zig build -Doptimize=${{ matrix.optimize }}
@@ -63,16 +66,26 @@ jobs:
           trap 'printf "Unit tests elapsed: %ss\n" "$((SECONDS - started_at))"' EXIT
           timeout "${TEST_TIMEOUT_SECONDS}s" zig build test -Doptimize=${{ matrix.optimize }}
 
+      - name: Save Zig cache
+        uses: ./.github/actions/save-zig-cache
+        with:
+          cache-key: ${{ steps.zig.outputs.cache-key }}
+          cache-hit: ${{ steps.zig.outputs.cache-hit }}
+
+  # The SDK jobs are part of this required check because Publish libfx relies
+  # on them instead of rerunning the package qualification before publishing.
   zig:
     name: Build & Test
     if: ${{ always() }}
-    needs: zig_mode
+    needs: [zig_mode, sdk-node-wasm, sdk-node-napi, sdk-bun, sdk-browser-wasm]
     runs-on: ubuntu-latest
     steps:
-      - name: Require ReleaseSafe
+      - name: Require unit tests and every SDK job
         env:
-          MATRIX_RESULT: ${{ needs.zig_mode.result }}
-        run: test "$MATRIX_RESULT" = success
+          RESULTS: ${{ toJSON(needs.*.result) }}
+        run: |
+          printf '%s\n' "$RESULTS"
+          jq -e 'length == 5 and all(.[]; . == "success")' <<<"$RESULTS"
 
   build:
     name: Build fx (ReleaseSafe)
@@ -85,7 +98,8 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Setup Zig
-        uses: mlugg/setup-zig@v2
+        id: zig
+        uses: ./.github/actions/setup-zig
         with:
           version: "0.16.0"
           cache-key: ci-build-ReleaseSafe
@@ -107,6 +121,12 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+      - name: Save Zig cache
+        uses: ./.github/actions/save-zig-cache
+        with:
+          cache-key: ${{ steps.zig.outputs.cache-key }}
+          cache-hit: ${{ steps.zig.outputs.cache-hit }}
+
   sdk-wasm:
     name: SDK build (WASM)
     runs-on: ubuntu-latest
@@ -115,9 +135,11 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Setup Zig
-        uses: mlugg/setup-zig@v2
+        id: zig
+        uses: ./.github/actions/setup-zig
         with:
           version: "0.16.0"
+          cache-key: ci-sdk-wasm
 
       - name: Build WASM surfaces (ReleaseSmall)
         run: |
@@ -133,6 +155,12 @@ jobs:
             zig-out/bin/fx-term.wasm
           if-no-files-found: error
           retention-days: 1
+
+      - name: Save Zig cache
+        uses: ./.github/actions/save-zig-cache
+        with:
+          cache-key: ${{ steps.zig.outputs.cache-key }}
+          cache-hit: ${{ steps.zig.outputs.cache-hit }}
 
   sdk-napi:
     name: SDK build (N-API, ${{ matrix.platform }})
@@ -153,8 +181,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # build.zig locates node_api.h through the node on PATH.
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
       - name: Setup Zig
-        uses: mlugg/setup-zig@v2
+        id: zig
+        uses: ./.github/actions/setup-zig
         with:
           version: "0.16.0"
           cache-key: ci-sdk-napi-${{ matrix.platform }}
@@ -172,6 +207,12 @@ jobs:
           path: native-addons/libfx.${{ matrix.platform }}.node
           if-no-files-found: error
           retention-days: 1
+
+      - name: Save Zig cache
+        uses: ./.github/actions/save-zig-cache
+        with:
+          cache-key: ${{ steps.zig.outputs.cache-key }}
+          cache-hit: ${{ steps.zig.outputs.cache-hit }}
 
   sdk-node-wasm:
     name: SDK (Node + WASM)
@@ -422,7 +463,8 @@ jobs:
 
       # Some E2E files build their own Zig fixtures.
       - name: Setup Zig
-        uses: mlugg/setup-zig@v2
+        id: zig
+        uses: ./.github/actions/setup-zig
         with:
           version: "0.16.0"
           cache-key: ci-e2e-fixtures
@@ -494,6 +536,13 @@ jobs:
           printf '  %s\n' "${selected[@]}"
           ./ci-run-files.sh "${selected[@]}"
 
+      - name: Save Zig cache
+        if: matrix.shard.index == 0
+        uses: ./.github/actions/save-zig-cache
+        with:
+          cache-key: ${{ steps.zig.outputs.cache-key }}
+          cache-hit: ${{ steps.zig.outputs.cache-hit }}
+
   e2e_conformance:
     name: E2E (MCP conformance)
     needs: build
@@ -517,10 +566,11 @@ jobs:
 
       # The client-request-state scenario builds a Zig dispatcher fixture.
       - name: Setup Zig
-        uses: mlugg/setup-zig@v2
+        id: zig
+        uses: ./.github/actions/setup-zig
         with:
           version: "0.16.0"
-          cache-key: ci-e2e-fixtures
+          cache-key: ci-mcp-fixtures
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
@@ -543,6 +593,12 @@ jobs:
       - name: Run isolated MCP conformance baseline
         run: npm test
         working-directory: tests/e2e/conformance
+
+      - name: Save Zig cache
+        uses: ./.github/actions/save-zig-cache
+        with:
+          cache-key: ${{ steps.zig.outputs.cache-key }}
+          cache-hit: ${{ steps.zig.outputs.cache-hit }}
 
   e2e:
     name: E2E (deterministic)
@@ -574,7 +630,10 @@ jobs:
             scripts/smoke-binary.sh
             tests/e2e/ci-run-files.sh
           )
-          bash -n "${scripts[@]}"
+          # bash -n parses only its first argument, so check each script.
+          for script in "${scripts[@]}"; do
+            bash -n "$script"
+          done
           shellcheck "${scripts[@]}"
 
   e2e_acp_live:
@@ -585,10 +644,11 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Setup Zig
-        uses: mlugg/setup-zig@v2
+        id: zig
+        uses: ./.github/actions/setup-zig
         with:
           version: "0.16.0"
-          cache-key: ci-acp-full-ReleaseSafe
+          cache-key: ci-unit-ReleaseSafe
 
       - name: Build
         run: zig build -Doptimize=ReleaseSafe
