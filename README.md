@@ -41,6 +41,8 @@ Sign in with one of:
 - `fx login grok`: Grok subscription (xAI OAuth)
 - `fx setup`: AI Gateway API key
 
+If a Grok subscription model is missing from xAI's language-model catalog, fx omits that model without blocking other usable models.
+
 Then start the interactive shell from a project:
 
 ```bash

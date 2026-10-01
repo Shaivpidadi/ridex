@@ -1,4 +1,5 @@
 const std = @import("std");
+const debug_trace = @import("../core/shared/debug_trace.zig");
 const credentials = @import("../core/auth/credentials.zig");
 const grok_session = @import("../core/auth/grok_session.zig");
 const model_catalog = @import("../core/gateway/model_catalog.zig");
@@ -308,8 +309,10 @@ fn parseCatalog(
         if (!std.mem.eql(u8, api_backend, "responses")) continue;
         const raw_id = try requiredString(object, "model");
         try validateModelId(raw_id);
-        const modality_object = try findModalityModel(modality_models.array.items, raw_id) orelse
-            return error.InvalidGrokModelCatalog;
+        const modality_object = try findModalityModel(modality_models.array.items, raw_id) orelse {
+            debug_trace.logf("catalog", "Grok model omitted: modality metadata unavailable model={s}", .{raw_id});
+            continue;
+        };
         if (!try stringArrayContains(modality_object, "output_modalities", "text")) continue;
 
         const id = try alloc.dupe(u8, raw_id);
@@ -476,7 +479,68 @@ test "Grok catalog parser joins provider-owned subscription capabilities and mod
     try std.testing.expect(!second.has_vision);
 }
 
-test "Grok catalog rejects missing provider-owned capability metadata" {
+test "Grok catalog skips unmatched models without losing matched capabilities" {
+    const alloc = std.testing.allocator;
+    const first =
+        \\{"model":"current-a","api_backend":"responses","context_window":500123,"max_completion_tokens":32768,"supports_reasoning_effort":true,"reasoning_efforts":[{"value":"medium"}]}
+    ;
+    const second =
+        \\{"model":"current-b","api_backend":"responses","context_window":480321,"supports_reasoning_effort":false,"reasoning_efforts":[]}
+    ;
+    const unmatched =
+        \\{"model":"subscription-only","api_backend":"responses","context_window":1000000,"supports_reasoning_effort":false,"reasoning_efforts":[]}
+    ;
+    const orders = [_][3][]const u8{
+        .{ unmatched, first, second },
+        .{ first, unmatched, second },
+        .{ first, second, unmatched },
+    };
+    const modalities =
+        \\{"models":[{"id":"current-a","input_modalities":["text","image"],"output_modalities":["text"]},{"id":"current-b","input_modalities":["text"],"output_modalities":["text"]}]}
+    ;
+    for (orders) |rows| {
+        const subscription = try std.fmt.allocPrint(alloc, "{{\"data\":[{s},{s},{s}]}}", .{ rows[0], rows[1], rows[2] });
+        defer alloc.free(subscription);
+        var catalog = try parseCatalog(alloc, subscription, modalities);
+        defer model_catalog.freeModelCatalog(alloc, &catalog);
+
+        try std.testing.expectEqual(@as(usize, 2), catalog.items.len);
+        const a = catalog.items[0];
+        const b = catalog.items[1];
+        try std.testing.expectEqualStrings("current-a", a.id);
+        try std.testing.expectEqualStrings("current-b", b.id);
+        try std.testing.expectEqual(@as(u32, 500_123), a.context_window);
+        try std.testing.expectEqual(@as(u32, 32_768), a.max_tokens);
+        try std.testing.expect(a.has_tool_use and a.has_reasoning and a.supports_fast_mode);
+        try std.testing.expect(a.has_vision and a.has_file_input);
+        try std.testing.expectEqual(@as(usize, 1), a.reasoning_efforts.items.len);
+        try std.testing.expectEqualStrings("medium", a.reasoning_efforts.items[0].label());
+        try std.testing.expectEqual(@as(u32, 480_321), b.context_window);
+        try std.testing.expectEqual(@as(u32, 0), b.max_tokens);
+        try std.testing.expect(b.has_tool_use and b.supports_fast_mode);
+        try std.testing.expect(!b.has_reasoning and !b.has_vision and !b.has_file_input);
+    }
+}
+
+test "Grok catalog permits an empty usable catalog when all models lack modalities" {
+    const alloc = std.testing.allocator;
+    const subscription =
+        \\{"data":[{"model":"subscription-only","api_backend":"responses","context_window":1000000,"supports_reasoning_effort":false,"reasoning_efforts":[]}]}
+    ;
+    const cases = [_][]const u8{
+        \\{"models":[]}
+        ,
+        \\{"models":[{"id":"other","input_modalities":["text"],"output_modalities":["text"]}]}
+        ,
+    };
+    for (cases) |modalities| {
+        var catalog = try parseCatalog(alloc, subscription, modalities);
+        defer model_catalog.freeModelCatalog(alloc, &catalog);
+        try std.testing.expectEqual(@as(usize, 0), catalog.items.len);
+    }
+}
+
+test "Grok catalog rejects malformed provider-owned capability metadata" {
     const modalities =
         \\{"models":[{"id":"current","input_modalities":["text"],"output_modalities":["text"]}]}
     ;
@@ -489,13 +553,24 @@ test "Grok catalog rejects missing provider-owned capability metadata" {
     for (cases) |subscription| {
         try expectCatalogParseError(error.InvalidGrokModelCatalog, subscription, modalities);
     }
-    const missing_modalities =
-        \\{"models":[{"id":"other","input_modalities":["text"],"output_modalities":["text"]}]}
-    ;
     const valid_subscription =
         \\{"data":[{"id":"current","model":"current","api_backend":"responses","context_window":500000,"supports_reasoning_effort":false,"reasoning_efforts":[]}]}
     ;
-    try expectCatalogParseError(error.InvalidGrokModelCatalog, valid_subscription, missing_modalities);
+    const malformed_modalities = [_][]const u8{
+        \\{"models":{}}
+        ,
+        \\{"models":[null]}
+        ,
+        \\{"models":[{"input_modalities":["text"],"output_modalities":["text"]}]}
+        ,
+        \\{"models":[{"id":"current","input_modalities":["text"]}]}
+        ,
+        \\{"models":[{"id":"current","input_modalities":[0],"output_modalities":["text"]}]}
+        ,
+    };
+    for (malformed_modalities) |metadata| {
+        try expectCatalogParseError(error.InvalidGrokModelCatalog, valid_subscription, metadata);
+    }
 }
 
 test "Grok catalog URLs use provider-owned subscription and modality endpoints" {
