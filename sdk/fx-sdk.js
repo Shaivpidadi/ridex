@@ -1805,6 +1805,7 @@ export async function createFxAgent(options = {}) {
     });
   };
   let checkpointTail = null;
+  let pendingCheckpoints = 0;
   async function takeCheckpoint() {
     if (closing) throw new Error("fx agent is closed");
     if (activeTurn) throw new Error("cannot checkpoint while a prompt is active");
@@ -1903,14 +1904,16 @@ export async function createFxAgent(options = {}) {
       if (activeTurn) throw new Error("a prompt is already in progress for this session");
       return normalizeTurn(startTurn(input, promptOptions));
     },
-    async checkpoint() {
+    checkpoint() {
       // One checkpoint runs at a time: each holds an outbound attachment until
       // it is taken, and the native table holds only a few. An idle call still
-      // sends its request before returning, ahead of a later prompt().
-      const run = checkpointTail ? checkpointTail.then(takeCheckpoint) : takeCheckpoint();
-      const tail = run.catch(() => {});
-      checkpointTail = tail;
-      void tail.then(() => { if (checkpointTail === tail) checkpointTail = null; });
+      // sends its request before returning, ahead of a later prompt(). The
+      // count drops before the caller's own reaction to `run`, so a call made
+      // right after awaiting the previous one is idle.
+      const run = pendingCheckpoints > 0 ? checkpointTail.then(takeCheckpoint) : takeCheckpoint();
+      pendingCheckpoints++;
+      const settle = () => { pendingCheckpoints--; };
+      checkpointTail = run.then(settle, settle);
       return run;
     },
     async close() {

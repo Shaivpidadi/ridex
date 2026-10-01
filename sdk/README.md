@@ -207,9 +207,11 @@ for await (const event of turn) {
 Cancelling a steered turn drops any guidance that has not reached a safe
 boundary and releases its queue. Applied guidance is part of the same history
 turn, so an idle `checkpoint()` includes the full steered conversation.
-`checkpoint()` returns opaque, bounded, versioned bytes. A newer libfx restores
-checkpoints from older versions, but an older libfx cannot restore one written
-by a newer version. Restore them only when creating a fresh agent:
+`checkpoint()` returns opaque, bounded, versioned bytes. Concurrent calls run
+one at a time, and a call still waiting for an earlier one fails the same way a
+direct call would if a prompt starts or the agent closes first. A newer libfx
+restores checkpoints from older versions, but an older libfx cannot restore one
+written by a newer version. Restore them only when creating a fresh agent:
 
 ```js
 const restored = await createFxAgent({ apiKey, model, checkpoint });
