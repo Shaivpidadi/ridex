@@ -3,6 +3,14 @@ name: Benchmarks
 on:
   workflow_dispatch:
     inputs:
+      long_turn_memory:
+        description: Run the long-turn memory benchmark
+        type: boolean
+        default: false
+      libfx_runtime:
+        description: Run the libfx runtime benchmark
+        type: boolean
+        default: false
       signed_run:
         description: Successful main Release validation run to compare (no signing credentials used)
         type: string
@@ -78,7 +86,7 @@ jobs:
           if-no-files-found: warn
 
   long-turn-memory:
-    if: inputs.signed_run == '' && inputs.pgso_control_artifact == '' && inputs.pgso_candidate_artifact == ''
+    if: github.event_name == 'workflow_dispatch' && inputs.long_turn_memory && inputs.signed_run == '' && inputs.pgso_control_artifact == '' && inputs.pgso_candidate_artifact == ''
     name: Long-turn memory
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -111,7 +119,7 @@ jobs:
           if-no-files-found: warn
 
   libfx-ttft:
-    if: inputs.signed_run == '' && inputs.pgso_control_artifact == '' && inputs.pgso_candidate_artifact == ''
+    if: github.event_name == 'workflow_dispatch' && inputs.libfx_runtime && inputs.signed_run == '' && inputs.pgso_control_artifact == '' && inputs.pgso_candidate_artifact == ''
     name: libfx Runtime
     runs-on: ubuntu-latest
     steps:

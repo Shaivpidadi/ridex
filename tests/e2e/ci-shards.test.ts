@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildShardPlan, selectShard } from "./ci-shards";
@@ -129,5 +129,29 @@ describe("CI shard planner", () => {
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
+  });
+});
+
+describe("macOS platform E2E list", () => {
+  const listed: unknown = JSON.parse(
+    readFileSync(join(import.meta.dir, "macos-platform-tests.json"), "utf8"),
+  );
+  const rootTests = readdirSync(import.meta.dir).filter((name) => name.endsWith(".test.ts"));
+
+  test("names existing root E2E files once, in sorted order", () => {
+    expect(Array.isArray(listed)).toBe(true);
+    const names = listed as string[];
+    expect(names.length).toBeGreaterThan(0);
+    for (const name of names) expect(rootTests).toContain(name);
+    expect(names).toEqual([...new Set(names)].sort());
+  });
+
+  test("includes every E2E file that branches on macOS", () => {
+    const macosBranch = /(process\.platform|platform\(\))\s*[!=]==\s*["']darwin["']/;
+    const missing = rootTests.filter((name) =>
+      macosBranch.test(readFileSync(join(import.meta.dir, name), "utf8")) &&
+      !(listed as string[]).includes(name)
+    );
+    expect(missing).toEqual([]);
   });
 });
