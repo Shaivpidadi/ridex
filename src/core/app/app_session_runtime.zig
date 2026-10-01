@@ -55,6 +55,7 @@ const subagent_resume_admission = @import("../subagent/resume_admission.zig");
 const tool_set_contract = @import("../tooling/tool_set.zig");
 const builtin_tools = @import("../../builtins/tools.zig");
 const types = @import("../shared/types.zig");
+const history_range = @import("../shared/history_range.zig");
 const permissions = @import("../permissions/permissions.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
 const mcp_access = @import("../mcp/access_policy.zig");
@@ -5498,7 +5499,7 @@ pub fn Runtime(comptime App: type) type {
             active_prefix: ?types.AssistantHistoryTurn,
             retained_from: ?types.ContextHistoryCut,
         ) !void {
-            const prepared = try session_runtime.prepareCompactedHistory(app.alloc, app.session.agent.history.items, summary, retained_from orelse .{ .turns = session_runtime.rawHistoryTurnCount(app.session.agent.history.items) });
+            const prepared = try session_runtime.prepareCompactedHistory(app.alloc, app.session.agent.history.items, summary, retained_from orelse .{ .turns = history_range.rawHistoryTurnCount(app.session.agent.history.items) });
             var prepared_owned = true;
             defer if (prepared_owned) types.freeHistoryTurnSlice(app.alloc, prepared);
             if (comptime @hasField(App, "session_persistence")) {

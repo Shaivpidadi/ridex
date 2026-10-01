@@ -87,6 +87,7 @@ const tool_specs = @import("../tooling/tool_specs.zig");
 const web_fetch_runtime = @import("../tooling/web_fetch_runtime.zig");
 const web_search_runtime = @import("../tooling/web_search_runtime.zig");
 const types = @import("../shared/types.zig");
+const history_range = @import("../shared/history_range.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const ask_presentation = @import("../../ui/ask_presentation.zig");
 const url_opener = @import("../hosts/url_opener.zig");
@@ -3161,7 +3162,7 @@ fn commitContextCompaction(
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     ctx.session_write_mutex.lockUncancelable(io_mod.getIo());
     defer ctx.session_write_mutex.unlock(io_mod.getIo());
-    const prepared = try session_runtime.prepareCompactedHistory(ctx.alloc, ctx.session.agent.history.items, summary, retained_from orelse .{ .turns = session_runtime.rawHistoryTurnCount(ctx.session.agent.history.items) });
+    const prepared = try session_runtime.prepareCompactedHistory(ctx.alloc, ctx.session.agent.history.items, summary, retained_from orelse .{ .turns = history_range.rawHistoryTurnCount(ctx.session.agent.history.items) });
     errdefer types.freeHistoryTurnSlice(ctx.alloc, prepared);
     if (ctx.writable) |*writable| {
         _ = writable.commitContextCompaction(ctx.alloc, summary, active_prefix, retained_from, io_mod.milliTimestamp()) catch |err| {

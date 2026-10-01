@@ -1131,6 +1131,7 @@ pub fn Runtime(comptime App: type) type {
                 .activity_origin = .manual,
                 .compactor = .{
                     .history = job.history,
+                    .append_messages = session_runtime.appendHistoryChatMessages,
                     .size = agent_runtime.compactionSize(&app.session.agent, capabilities, settings.auto_compact_percent, job.model),
                     .caller = summary_model.caller(),
                     .records = if (app_session_runtime.Runtime(App).childCapability(app)) |capability| result_store.compactorStore(capability) else null,

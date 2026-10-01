@@ -1,6 +1,7 @@
 const std = @import("std");
 const kernel_agent = @import("../agent/runtime/agent.zig");
 const core_types = @import("../shared/types.zig");
+const history_range = @import("../shared/history_range.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const message = @import("../shared/message.zig");
@@ -2117,68 +2118,6 @@ pub fn snapshotOwnedContextHistory(
     return copy.toOwnedSlice(alloc);
 }
 
-/// Borrows payloads. Only descriptors and rebased steering are arena-owned.
-pub fn contextHistoryRange(
-    arena: Allocator,
-    history: []const HistoryTurn,
-    start: core_types.ContextHistoryCut,
-    end: ?core_types.ContextHistoryCut,
-) ![]HistoryTurn {
-    var view: std.ArrayList(HistoryTurn) = .empty;
-    var raw_index: usize = 0;
-    for (history) |original| {
-        if (original == .compacted_summary) continue;
-        const index = raw_index;
-        raw_index += 1;
-        if (index < start.turns) continue;
-        if (end) |limit| {
-            if (index > limit.turns or (index == limit.turns and limit.tool_steps == 0 and limit.steering == 0)) break;
-        }
-        var turn = original;
-        const execution = switch (turn) {
-            .assistant => |*entry| &entry.execution,
-            .interrupted => |*entry| &entry.execution,
-            .compacted_summary => unreachable,
-        };
-        const first_step = if (index == start.turns) start.tool_steps else 0;
-        const first_steering = if (index == start.turns) start.steering else 0;
-        const partial_end = if (end) |limit| index == limit.turns else false;
-        const last_step = if (partial_end) end.?.tool_steps else execution.tool_steps.len;
-        const last_steering = if (partial_end) end.?.steering else execution.steering.len;
-        if (first_step > last_step or last_step > execution.tool_steps.len or
-            first_steering > last_steering or last_steering > execution.steering.len)
-            return error.InvalidContextHistoryStart;
-        execution.tool_steps = execution.tool_steps[first_step..last_step];
-        execution.steering = execution.steering[first_steering..last_steering];
-        if (first_step > 0 and execution.steering.len > 0) {
-            execution.steering = try arena.dupe(core_types.PersistedSteering, execution.steering);
-            for (execution.steering) |*item| {
-                if (item.after_tool_step_count < first_step) return error.InvalidContextHistoryStart;
-                item.after_tool_step_count -= first_step;
-            }
-        }
-        if (partial_end) {
-            execution.files = &.{};
-            execution.turn_summary = null;
-            switch (turn) {
-                .assistant => |*entry| {
-                    entry.assistant = @constCast("");
-                    entry.provider_replay = null;
-                },
-                .interrupted => |*entry| {
-                    entry.assistant = null;
-                    entry.tool_call = null;
-                    entry.completed_tool_names = &.{};
-                    entry.cancelled_command = null;
-                },
-                .compacted_summary => unreachable,
-            }
-        }
-        try view.append(arena, turn);
-    }
-    return view.toOwnedSlice(arena);
-}
-
 pub fn prepareCompactedHistory(
     alloc: Allocator,
     history: []const HistoryTurn,
@@ -2187,7 +2126,7 @@ pub fn prepareCompactedHistory(
 ) ![]HistoryTurn {
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
-    const retained = try contextHistoryRange(arena_state.allocator(), history, cut, null);
+    const retained = try history_range.contextHistoryRange(arena_state.allocator(), history, cut, null);
     var next: std.ArrayList(HistoryTurn) = .empty;
     errdefer {
         for (next.items) |turn| freeHistoryTurn(alloc, turn);
@@ -2511,7 +2450,7 @@ pub fn appendHistoryChatMessages(
     alloc: Allocator,
     messages: *std.ArrayList(core_types.ChatMessage),
     history: []const HistoryTurn,
-) !void {
+) (Allocator.Error || error{InvalidReplayHandle})!void {
     try appendHistoryChatMessagesImpl(alloc, messages, history, .closed);
 }
 
@@ -2620,14 +2559,6 @@ fn appendActiveContextHistoryChatMessagesWithTrailingProjection(
             interrupted_projection,
         );
     }
-}
-
-pub fn rawHistoryTurnCount(history: []const HistoryTurn) usize {
-    var count: usize = 0;
-    for (history) |turn| if (turn != .compacted_summary) {
-        count += 1;
-    };
-    return count;
 }
 
 test "active context projects checkpoint before retained raw tail" {
