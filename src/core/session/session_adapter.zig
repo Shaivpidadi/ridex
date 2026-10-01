@@ -3105,7 +3105,9 @@ const TestHome = struct {
     store: Store,
 
     fn init(t: *TestHome) !void {
-        t.tmp = testing.tmpDir(.{});
+        // Iterable, so Linux gives a real descriptor that `fsync` accepts
+        // when a test makes `.fx` here (`io_mod.syncVerifiedDir`).
+        t.tmp = testing.tmpDir(.{ .iterate = true });
         errdefer t.tmp.cleanup();
         t.home = try io_mod.dirRealpathAlloc(testing.allocator, t.tmp.dir, ".");
         errdefer testing.allocator.free(t.home);
