@@ -25,6 +25,7 @@ pub const AgentTurnSettings = struct {
     max_tool_result_bytes: usize = tool_result_limits.default_max_tool_result_bytes,
     first_call_tool_choice: types.ToolChoice = .auto,
     fast_mode: bool = false,
+    ultrafast_mode: bool = false,
     effort: types.ReasoningEffort = .auto,
     /// Gateway provider routing for turns built from these settings. When set
     /// on WorkerRuntime.agent_turn_settings the slice is owned by the worker
@@ -1886,6 +1887,13 @@ pub const WorkerRuntime = struct {
         defer self.worker_mutex.unlock(io_mod.getIo());
         self.agent_turn_settings.fast_mode = enabled;
         for (self.queued_prompts.items) |*prompt| prompt.agent_settings.fast_mode = enabled;
+    }
+
+    pub fn syncQueuedPromptUltrafastMode(self: *WorkerRuntime, enabled: bool) void {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        self.agent_turn_settings.ultrafast_mode = enabled;
+        for (self.queued_prompts.items) |*prompt| prompt.agent_settings.ultrafast_mode = enabled;
     }
 
     pub fn syncQueuedPromptEffort(self: *WorkerRuntime, effort: types.ReasoningEffort) void {

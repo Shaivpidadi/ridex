@@ -431,12 +431,14 @@ pub const SessionPreferencePatch = struct {
     model: ?[]const u8 = null,
     effort: ?types.ReasoningEffort = null,
     fast_mode: ?bool = null,
+    ultrafast_mode: ?bool = null,
 
     pub fn userSettingsPatch(self: SessionPreferencePatch) config_runtime.UserSettingsPatch {
         var patch = config_runtime.UserSettingsPatch{
             .provider = self.provider,
             .effort = self.effort,
             .fast_mode = self.fast_mode,
+            .ultrafast_mode = self.ultrafast_mode,
         };
         if (self.model) |model| patch.model_preference = .{
             .provider = self.provider orelse .gateway,
@@ -1294,6 +1296,7 @@ pub const Persistence = struct {
     process_model_override: ?[]u8 = null,
     process_effort_override: ?types.ReasoningEffort = null,
     process_fast_override: ?bool = null,
+    process_ultrafast_override: ?bool = null,
     session_picker: SessionPicker = .{},
     session_picker_load: SessionPickerLoad = .{},
     session_picker_cache: SessionPickerCatalogCache = .{},
@@ -1315,7 +1318,7 @@ pub const Persistence = struct {
     /// in a static release-binary template.
     pub fn initInto(storage: *Persistence) void {
         comptime {
-            if (std.meta.fields(Persistence).len != 29) {
+            if (std.meta.fields(Persistence).len != 30) {
                 @compileError("update Persistence.initInto for the changed field set");
             }
         }
@@ -1335,6 +1338,7 @@ pub const Persistence = struct {
         storage.process_model_override = null;
         storage.process_effort_override = null;
         storage.process_fast_override = null;
+        storage.process_ultrafast_override = null;
         storage.session_picker = .{};
         storage.session_picker_load = .{};
         storage.session_picker_cache = .{};
@@ -1472,6 +1476,8 @@ pub fn Runtime(comptime App: type) type {
             effort: types.ReasoningEffort,
             fast_mode: bool,
             fast_mode_model_bound: bool,
+            configured_ultrafast_mode: bool,
+            ultrafast_process_override: ?bool,
             effort_process_override: ?types.ReasoningEffort,
             fast_process_override: ?bool,
             provider_process_override: ?model_provider.ProviderId,
@@ -1484,6 +1490,7 @@ pub fn Runtime(comptime App: type) type {
                     .model = @constCast(configured_model),
                     .effort = effort,
                     .fast_mode = fast_mode,
+                    .ultrafast_mode = configured_ultrafast_mode,
                 },
             );
             try replacePreferences(
@@ -1502,6 +1509,7 @@ pub fn Runtime(comptime App: type) type {
             }
             app.session_persistence.process_effort_override = effort_process_override;
             app.session_persistence.process_fast_override = fast_process_override;
+            app.session_persistence.process_ultrafast_override = ultrafast_process_override;
             app.session_persistence.process_provider_override = provider_process_override;
             // A provider override must pin the resolved model too, or a resume
             // would restore the session's model from a different provider.
@@ -2339,10 +2347,11 @@ pub fn Runtime(comptime App: type) type {
 
         fn hydrateResumedSession(
             app: *App,
-            state: session_codec.DurableSessionState,
+            loaded_state: session_codec.DurableSessionState,
             display: *const session_display_metadata.DisplayMetadata,
             notice: ResumeNotice,
         ) !void {
+            var state = loaded_state;
             const previous_provider = provider_runtime.provider(app);
             if (comptime @hasField(App, "next_image_id")) {
                 app.next_image_id = try nextImageIdForResume(
@@ -2373,6 +2382,7 @@ pub fn Runtime(comptime App: type) type {
                 state.preferences,
             );
             try restoreRuntimePreferences(app, state.preferences);
+            normalizeRecoveryUltrafastForProcessOverride(app, &state);
 
             app.total_input_tokens = state.total_input_tokens;
             app.total_output_tokens = state.total_output_tokens;
@@ -3494,6 +3504,18 @@ pub fn Runtime(comptime App: type) type {
             else
                 return result;
             if (result.session_error != null) return result;
+            const durable_ultrafast_mode = durableUltrafastEventDelta(
+                loaded.state.preferences.ultrafast_mode,
+                patch.ultrafast_mode,
+            );
+            if (patch.model == null and
+                patch.provider == null and
+                patch.effort == null and
+                patch.fast_mode == null and
+                durable_ultrafast_mode == null)
+            {
+                return result;
+            }
             _ = loaded.appendEvent(
                 app.alloc,
                 .{ .preferences_changed = .{
@@ -3504,6 +3526,7 @@ pub fn Runtime(comptime App: type) type {
                     .provider = patch.provider,
                     .effort = patch.effort,
                     .fast_mode = patch.fast_mode,
+                    .ultrafast_mode = durable_ultrafast_mode,
                 } },
                 io_mod.milliTimestamp(),
             ) catch |err| {
@@ -6040,6 +6063,41 @@ pub fn Runtime(comptime App: type) type {
             };
         }
 
+        fn normalizeRecoveryUltrafastForProcessOverride(
+            app: *App,
+            resumed: *session_codec.DurableSessionState,
+        ) void {
+            const process_override = app.session_persistence.process_ultrafast_override;
+            const local_changed = if (resumed.recovery_checkpoint) |*checkpoint|
+                suppressRecoveryUltrafast(checkpoint, process_override)
+            else
+                false;
+
+            app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
+            defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
+            const durable_changed = if (app.session_persistence.writable) |*loaded|
+                if (loaded.state.recovery_checkpoint) |*checkpoint|
+                    suppressRecoveryUltrafast(checkpoint, process_override)
+                else
+                    false
+            else
+                false;
+            const js_changed = if (app.session_persistence.js_host_session) |*owner|
+                if (owner.state.recovery_checkpoint) |*checkpoint|
+                    suppressRecoveryUltrafast(checkpoint, process_override)
+                else
+                    false
+            else
+                false;
+            if (local_changed or durable_changed or js_changed) {
+                debug_trace.logf(
+                    "session",
+                    "event=recovery_ultrafast_suppressed reason=explicit_process_disable",
+                    .{},
+                );
+            }
+        }
+
         fn restoreRuntimePreferences(
             app: *App,
             preferences: session_codec.DurableSessionPreferences,
@@ -6075,6 +6133,10 @@ pub fn Runtime(comptime App: type) type {
             // stored preferences for this launch, without rewriting them.
             const effective_effort = app.session_persistence.process_effort_override orelse preferences.effort;
             const effective_fast_mode = app.session_persistence.process_fast_override orelse preferences.fast_mode;
+            const effective_ultrafast_mode = resolveUltrafastMode(
+                preferences.ultrafast_mode,
+                app.session_persistence.process_ultrafast_override,
+            );
             app.effort = effective_effort;
             app.fast_mode = effective_fast_mode;
             app.session_persistence.fast_mode_model_bound = if (app.session_persistence.process_fast_override != null)
@@ -6083,6 +6145,7 @@ pub fn Runtime(comptime App: type) type {
                 fast_mode_model_bound;
             app.worker.syncQueuedPromptEffort(effective_effort);
             app.worker.syncQueuedPromptFastMode(effective_fast_mode);
+            app.worker.syncQueuedPromptUltrafastMode(effective_ultrafast_mode);
         }
 
         pub fn fastModeModelBound(app: *const App) bool {
@@ -6187,6 +6250,53 @@ fn replacePreferences(
     target.* = replacement;
 }
 
+/// The old durable event schema exact-matches preference keys. Omit only an
+/// idempotent default-off patch; a stored true must receive an explicit false.
+fn durableUltrafastEventDelta(stored: bool, requested: ?bool) ?bool {
+    const value = requested orelse return null;
+    return if (!value and !stored) null else value;
+}
+
+test "durable ultrafast event delta omits only default-off patches" {
+    try std.testing.expect(durableUltrafastEventDelta(false, false) == null);
+    try std.testing.expectEqual(@as(?bool, false), durableUltrafastEventDelta(true, false));
+    try std.testing.expectEqual(@as(?bool, true), durableUltrafastEventDelta(false, true));
+}
+
+fn resolveUltrafastMode(preference: bool, process_override: ?bool) bool {
+    return process_override orelse preference;
+}
+
+fn suppressRecoveryUltrafast(
+    checkpoint: *session_codec.RecoveryCheckpoint,
+    process_override: ?bool,
+) bool {
+    if (process_override != false) return false;
+    const changed = checkpoint.requested_ultrafast_mode or checkpoint.ultrafast_mode;
+    checkpoint.requested_ultrafast_mode = false;
+    checkpoint.ultrafast_mode = false;
+    return changed;
+}
+
+test "ultrafast process overrides preserve the saved preference baseline" {
+    try std.testing.expect(!resolveUltrafastMode(false, null));
+    try std.testing.expect(resolveUltrafastMode(true, null));
+    try std.testing.expect(!resolveUltrafastMode(true, false));
+    try std.testing.expect(resolveUltrafastMode(false, true));
+}
+
+test "explicit ultrafast disable clears both resumed checkpoint flags" {
+    var checkpoint = try parseTestRecoveryCheckpoint(std.testing.allocator, "network_interrupted");
+    defer checkpoint.deinit(std.testing.allocator);
+    checkpoint.requested_ultrafast_mode = true;
+    checkpoint.ultrafast_mode = true;
+
+    try std.testing.expect(suppressRecoveryUltrafast(&checkpoint, false));
+    try std.testing.expect(!checkpoint.requested_ultrafast_mode);
+    try std.testing.expect(!checkpoint.ultrafast_mode);
+    try std.testing.expect(!suppressRecoveryUltrafast(&checkpoint, false));
+}
+
 fn restoredFastModeModelBound(
     current_bound: bool,
     configured: ?session_codec.DurableSessionPreferences,
@@ -6241,6 +6351,7 @@ fn applyPreferencePatch(
     }
     if (patch.effort) |effort| current.effort = effort;
     if (patch.fast_mode) |fast_mode| current.fast_mode = fast_mode;
+    if (patch.ultrafast_mode) |ultrafast_mode| current.ultrafast_mode = ultrafast_mode;
     target.* = current;
 }
 
@@ -6401,6 +6512,7 @@ const FakeWorker = struct {
     model: std.ArrayList(u8) = .empty,
     effort: types.ReasoningEffort = .auto,
     fast_mode: bool = false,
+    ultrafast_mode: bool = false,
     active_prompt_is_root_authority: bool = false,
     cancel_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
@@ -6436,6 +6548,10 @@ const FakeWorker = struct {
 
     fn syncQueuedPromptFastMode(self: *FakeWorker, fast_mode: bool) void {
         self.fast_mode = fast_mode;
+    }
+
+    fn syncQueuedPromptUltrafastMode(self: *FakeWorker, ultrafast_mode: bool) void {
+        self.ultrafast_mode = ultrafast_mode;
     }
 };
 
@@ -6991,6 +7107,8 @@ test "js-host resume restores transcript context preferences usage and revision"
         .auto,
         false,
         true,
+        false,
+        null,
         null,
         null,
         null,
@@ -7082,6 +7200,8 @@ test "js-host resume store failures and missing records fall back to fresh sessi
             .auto,
             false,
             true,
+            false,
+            null,
             null,
             null,
             null,
@@ -7115,6 +7235,8 @@ test "js-host picker request stays unsupported and starts fresh" {
         .auto,
         false,
         true,
+        false,
+        null,
         null,
         null,
         null,
@@ -7144,6 +7266,8 @@ test "js-host completed and interrupted turns propagate revisions preserve owner
         .auto,
         false,
         true,
+        false,
+        null,
         null,
         null,
         null,
@@ -7215,6 +7339,8 @@ test "js-host preference changes snapshot the updated session preferences" {
         .auto,
         false,
         true,
+        false,
+        null,
         null,
         null,
         null,
@@ -7314,6 +7440,8 @@ fn configureTestPreferences(app: *TestApp) !void {
         types.ReasoningEffort.literal("high"),
         true,
         true,
+        false,
+        null,
         null,
         null,
         null,
@@ -7381,6 +7509,45 @@ test "initializePersistence silently skips optional missing home and errors when
     try Runtime(TestApp).initializePersistence(&app, false);
     try std.testing.expect(app.session_persistence.store == null);
     try std.testing.expectError(error.HomeNotSet, Runtime(TestApp).initializePersistence(&app, true));
+}
+
+test "v2 ultrafast resume applies process overrides without persisting them" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+    for ([_]bool{ false, true }) |baseline| {
+        var app = try TestApp.init(alloc, paths.workspace);
+        defer app.deinit();
+        try configureTestPreferences(&app);
+        app.session_persistence.workspace_preferences.?.ultrafast_mode = baseline;
+        app.session_persistence.process_ultrafast_override = !baseline;
+        app.session_persistence.sessions_v2 = true;
+        try Runtime(TestApp).initializePersistence(&app, true);
+        try Runtime(TestApp).beginFreshPersistedSession(&app);
+        const v2 = app.session_persistence.v2.?;
+        try v2.commitTurn(.{ .assistant = .{
+            .user = .{ .text = @constCast("saved request") },
+            .assistant = @constCast("saved answer"),
+        } }, types.ConversationLanguage.default());
+        const id = try alloc.dupe(u8, v2.id());
+        defer alloc.free(id);
+        const store = &app.session_persistence.v2_store.?;
+        Runtime(TestApp).closeWritableSession(&app);
+        const resumed = try session_adapter.Session.resumeSession(alloc, store, .{ .id = id }, paths.workspace, .app);
+        try Runtime(TestApp).installResumedV2Session(&app, resumed, .session);
+        try std.testing.expectEqual(!baseline, app.worker.ultrafast_mode);
+        try std.testing.expectEqual(baseline, app.session_persistence.session_preferences.?.ultrafast_mode);
+        var durable = try app.session_persistence.v2.?.currentPreferences(alloc);
+        defer durable.deinit(alloc);
+        try std.testing.expectEqual(baseline, durable.ultrafast_mode);
+    }
 }
 
 test "beginFreshPersistedSession and enableSessionStores create per-session stores" {
@@ -9100,6 +9267,8 @@ test "upgrade resume restores active session with the installed version notice" 
         types.ReasoningEffort.literal("high"),
         true,
         false,
+        false,
+        null,
         null,
         null,
         null,
@@ -10951,6 +11120,8 @@ test "fresh interactive session retains one writable schema-v3 handle" {
         types.ReasoningEffort.literal("high"),
         true,
         true,
+        false,
+        null,
         null,
         null,
         null,

@@ -144,6 +144,42 @@ const ProviderTerminalPublication = enum {
     published,
 };
 
+/// Pure final admission for every ACP model request. A persisted or
+/// reconfigured session cannot issue an ultrafast request unless the current
+/// Gateway catalog still verifies the selected model capability.
+fn ultrafastPromptAllowed(
+    state: *const server.ServerState,
+    session: *const server.ActiveSessionState,
+) bool {
+    if (!session.ultrafast_mode) return true;
+    const catalog_ready = state.capability_resolver.catalogEntries() != null;
+    const bundle = state.cfg.provider_set.select(session.provider);
+    const capabilities = state.capability_resolver.available(
+        session.model,
+        bundle.fallbackModelCapabilities(session.model),
+    );
+    return ultrafastCapabilityAllowed(
+        session.provider,
+        catalog_ready,
+        capabilities.supports_ultrafast_mode,
+    );
+}
+
+fn ultrafastCapabilityAllowed(
+    provider: model_provider.ProviderId,
+    catalog_ready: bool,
+    supports_ultrafast: bool,
+) bool {
+    return provider == .gateway and catalog_ready and supports_ultrafast;
+}
+
+test "ultrafastPromptAllowed requires a verified Gateway capability" {
+    try std.testing.expect(ultrafastCapabilityAllowed(.gateway, true, true));
+    try std.testing.expect(!ultrafastCapabilityAllowed(.codex, true, true));
+    try std.testing.expect(!ultrafastCapabilityAllowed(.gateway, false, true));
+    try std.testing.expect(!ultrafastCapabilityAllowed(.gateway, true, false));
+}
+
 const AgentMessageKind = enum {
     assistant,
     operational,
@@ -401,6 +437,7 @@ const AcpContext = struct {
             .gateway_models_path = self.state.cfg.gateway_models_path,
             .agent_step_limit = session.agent_step_limit,
             .fast_mode = session.fast_mode,
+            .ultrafast_mode = session.ultrafast_mode,
             .effort = session.effort,
             .first_call_tool_choice = session.first_call_tool_choice,
             .permission_mode = self.captured_permission_mode orelse session.permission_mode,
@@ -706,6 +743,12 @@ pub fn handlePrompt(
                 credentials.missing_grok_credential_message
             else
                 credentials.missing_credential_message,
+        } };
+    }
+    if (!ultrafastPromptAllowed(state, session)) {
+        return .{ .rpc_error = .{
+            .code = ErrorCode.invalid_request,
+            .message = "Ultrafast mode requires a verified compatible Gateway model",
         } };
     }
 
@@ -1186,6 +1229,7 @@ fn buildAgentConfig(
         .max_tool_result_bytes = session.max_tool_result_bytes,
         .cancel_flag = &session.cancel_flag,
         .fast_mode = session.fast_mode,
+        .ultrafast_mode = session.ultrafast_mode,
         .effort = session.effort,
         .first_call_tool_choice = session.first_call_tool_choice,
         .workspace_root = state.workspace_root,
@@ -2399,6 +2443,7 @@ fn commitContextCompaction(
             next.preferences.provider = session.provider;
             next.preferences.effort = session.effort;
             next.preferences.fast_mode = session.fast_mode;
+            next.preferences.ultrafast_mode = session.ultrafast_mode;
             const usage = try session.session_rt.usage.snapshot(ctx.alloc);
             if (next.usage) |*old| old.deinit(ctx.alloc);
             next.usage = usage;
@@ -5036,6 +5081,7 @@ test "ACP prompt agent config carries request options from active session" {
         .source = .command_line,
     };
     state.active_session.?.fast_mode = true;
+    state.active_session.?.ultrafast_mode = true;
     state.active_session.?.effort = types.ReasoningEffort.literal("high");
 
     const session = &state.active_session.?;
@@ -5046,6 +5092,7 @@ test "ACP prompt agent config carries request options from active session" {
     }, true);
 
     try std.testing.expect(config.fast_mode);
+    try std.testing.expect(config.ultrafast_mode);
     try std.testing.expectEqual(types.ReasoningEffort.literal("high"), config.effort);
     try std.testing.expectEqual(@as(usize, 17), config.context_limits.project_instruction_file_bytes.effectiveBytes());
     try std.testing.expectEqual(config_runtime.context_limits.Source.command_line, config.context_limits.project_instruction_file_bytes.source);
@@ -5065,4 +5112,5 @@ test "ACP prompt agent config carries request options from active session" {
     try std.testing.expectEqual(state.cfg.gateway_retry_count, state.web_search_runtime.gateway_retry_count);
     try std.testing.expectEqualStrings(state.cfg.gateway_chat_url, state.web_search_runtime.gateway_chat_url);
     try std.testing.expectEqualStrings("/models", tool_ctx.gateway_models_path);
+    try std.testing.expect(tool_ctx.ultrafast_mode);
 }

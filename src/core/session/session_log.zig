@@ -693,6 +693,7 @@ fn encodeConversationMetadataWithTitle(
         .model = state.preferences.model,
         .effort = state.preferences.effort.label(),
         .fast_mode = state.preferences.fast_mode,
+        .ultrafast_mode = if (state.preferences.ultrafast_mode) true else null,
         .title = title,
         .subagent_child = state.subagent_child,
     });
@@ -1294,6 +1295,7 @@ fn load_conversation_state_at_boundary(
             .model = model,
             .effort = effort,
             .fast_mode = metadata.value.fast_mode,
+            .ultrafast_mode = metadata.value.ultrafast_mode orelse false,
         },
         .history = history,
         .context_history_start = latestConversationCheckpointIndex(history),
@@ -3318,6 +3320,7 @@ pub const LoadedWritableSession = struct {
             .model = metadata.value.model,
             .effort = metadata.value.effort,
             .fast_mode = metadata.value.fast_mode,
+            .ultrafast_mode = metadata.value.ultrafast_mode,
             .title = title,
             .subagent_child = metadata.value.subagent_child,
         });
@@ -3534,6 +3537,7 @@ pub const LoadedWritableSession = struct {
                 if (patch.provider) |provider| preferences.provider = provider;
                 if (patch.effort) |effort| preferences.effort = effort;
                 if (patch.fast_mode) |fast_mode| preferences.fast_mode = fast_mode;
+                if (patch.ultrafast_mode) |ultrafast_mode| preferences.ultrafast_mode = ultrafast_mode;
                 var proposed = self.state;
                 proposed.preferences = preferences;
                 proposed.updated_at_ms = timestamp_ms;
@@ -4492,6 +4496,7 @@ fn createNativeSession(
         .model = initial_state.preferences.model,
         .effort = initial_state.preferences.effort.label(),
         .fast_mode = initial_state.preferences.fast_mode,
+        .ultrafast_mode = if (initial_state.preferences.ultrafast_mode) true else null,
         .title = if (display.present) display.title else null,
         .subagent_child = initial_state.subagent_child,
     });

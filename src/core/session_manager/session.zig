@@ -2189,6 +2189,30 @@ const session_tests = struct {
         try testing.expect(snapshots >= 5);
     }
 
+    test "snapshot resume preserves ultrafast preference payload" {
+        var t: TestEnv = undefined;
+        t.init(.{ .snapshot_every_bytes = 1 });
+        defer t.deinit();
+        const s = try newRoot(&t);
+        _ = try s.append(&.{
+            .turn_started,
+            .{ .set = .{ .key = .prefs, .value = "{\"model\":\"grok/default\",\"fast_mode\":false,\"ultrafast_mode\":true}" } },
+            .turn_committed,
+        });
+        const id = try gpa.dupe(u8, s.id());
+        defer gpa.free(id);
+        crash(&t, s);
+
+        const resumed = try resumeRoot(&t, id);
+        defer closeAndDestroy(resumed) catch {};
+        var state = try resumed.stateCopy(gpa);
+        defer state.deinit(gpa);
+        try testing.expectEqualStrings(
+            "{\"model\":\"grok/default\",\"fast_mode\":false,\"ultrafast_mode\":true}",
+            state.prefs.?,
+        );
+    }
+
     test "a compaction is followed by a snapshot" {
         var t: TestEnv = undefined;
         t.init(.{});

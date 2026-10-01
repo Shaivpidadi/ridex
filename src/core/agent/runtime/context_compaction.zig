@@ -390,6 +390,9 @@ fn runSummaryCall(
             .account_id = request.account_id,
             .tenant_context = request.gateway_team,
         } };
+    // Compaction is a side call, not an opt-in to the working turn's premium tier.
+    var provider_options = request.provider_options;
+    provider_options.ultrafast = false;
     var usage: types.ToolUsage = .{};
     for (0..2) |attempt| {
         if (request.cancel_flag.load(.seq_cst)) {
@@ -412,7 +415,7 @@ fn runSummaryCall(
                 .messages = &messages,
                 .tools = .{},
                 .tool_choice = .none,
-                .provider_options = request.provider_options,
+                .provider_options = provider_options,
                 .max_output_tokens = request.max_output_tokens,
                 .budget = .{ .cancel_flag = request.cancel_flag, .deadline = deadline },
                 .deadline = deadline,
@@ -671,6 +674,25 @@ test "assistant first compaction keeps normal model limits and options" {
         try std.testing.expect(provider.observed_provider_options.fast);
         try std.testing.expect(provider.observed_provider_options.prompt_caching);
     }
+}
+
+test "Ultrafast is not inherited by compaction side calls" {
+    const alloc = std.testing.allocator;
+    var provider = FakeProvider{ .response = "Continue the original task." };
+    var cancel = std.atomic.Value(bool).init(false);
+    const summary = try runSummaryCall(alloc, .{
+        .stream_provider = provider.provider(),
+        .model = "openai/gpt-6-astra",
+        .api_key = "fixture-key",
+        .retry_count = 1,
+        .cancel_flag = &cancel,
+        .accepted_tokens = 1000,
+        .provider_options = .{ .ultrafast = true, .prompt_caching = true },
+        .trace_ctx = .{},
+    }, "Historical task context", 4096);
+    defer alloc.free(summary.text);
+    try std.testing.expect(!provider.observed_provider_options.ultrafast);
+    try std.testing.expect(provider.observed_provider_options.prompt_caching);
 }
 
 test "assistant first compaction reselects older users when the actual summary needs more room" {

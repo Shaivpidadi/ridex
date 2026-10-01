@@ -194,6 +194,7 @@ pub fn welcomeMessage(alloc: std.mem.Allocator) ![]u8 {
 }
 
 pub const StatuslineItems = struct {
+    ultrafast_indicator_active: bool = false,
     workspace_label: []const u8 = "",
     git_branch: ?[]const u8 = null,
     context_used: u64 = 0,
@@ -392,7 +393,9 @@ fn appendSessionStatusSegments(
     if (model_supports_effort and !effort.isDefault()) {
         appendStatusSegment(out, end, effort.displayLabel());
     }
-    if (fast_indicator_active) {
+    if (statusline.ultrafast_indicator_active) {
+        appendStatusSegment(out, end, "⚡︎⚡︎⚡︎");
+    } else if (fast_indicator_active) {
         appendStatusSegment(out, end, "⚡︎");
     }
     if (statusline.session_title) |title| {
@@ -1018,6 +1021,21 @@ test "buildHintLine uses a monochrome lightning marker for fast mode" {
     const line = buildHintLine(false, true, "anthropic/claude-opus-4.8", .ask, true, types.ReasoningEffort.literal("low"), true, .{}, 80, &buf);
     try std.testing.expectEqualStrings("ask · opus 4.8 · low · ⚡︎", line);
     try std.testing.expectEqual(@as(usize, 25), display_width.visibleWidthIgnoringAnsi(line));
+}
+
+test "buildHintLine uses three monochrome lightning markers for Ultrafast" {
+    initTheme(false, null);
+    defer initTheme(false, null);
+    var buf: [128]u8 = undefined;
+    const line = buildHintLine(false, true, "openai/gpt-6-astra", .auto, true, types.ReasoningEffort.literal("xhigh"), true, .{ .ultrafast_indicator_active = true }, 80, &buf);
+    var expected_buf: [128]u8 = undefined;
+    const expected = try std.fmt.bufPrint(&expected_buf, "{s}auto{s} · gpt-6-astra · xhigh · ⚡︎⚡︎⚡︎", .{ permission_auto_style, statusline_style });
+    try std.testing.expectEqualStrings(expected, line);
+    try std.testing.expectEqual(@as(usize, 35), display_width.visibleWidthIgnoringAnsi(line));
+    for (0..36) |width| {
+        const clipped = buildHintLine(false, true, "openai/gpt-6-astra", .auto, false, types.ReasoningEffort.literal("xhigh"), true, .{ .ultrafast_indicator_active = true }, @intCast(width), &buf);
+        try std.testing.expect(display_width.visibleWidthIgnoringAnsi(clipped) <= width);
+    }
 }
 
 test "buildHintLine shows effort when active" {
