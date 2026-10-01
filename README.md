@@ -41,6 +41,8 @@ Sign in with one of:
 - `fx login grok`: Grok subscription (xAI OAuth)
 - `fx setup`: AI Gateway API key
 
+fx loads Grok models from your subscription's live catalog, so new supported models appear without a static model list. Public xAI metadata enriches image support but does not filter subscription models.
+
 Then start the interactive shell from a project:
 
 ```bash
