@@ -104,14 +104,14 @@ pub const Progress = struct {
 
 /// Appends the chat messages the model saw for `history`. The session owns
 /// that projection, so the caller hands it in.
-pub const AppendMessages = *const fn (
+const AppendMessages = *const fn (
     alloc: Allocator,
     messages: *std.ArrayList(types.ChatMessage),
     history: []const types.HistoryTurn,
 ) AppendMessagesError!void;
 
-/// A saved turn's provider replay may be unreadable.
-pub const AppendMessagesError = Allocator.Error || error{InvalidReplayHandle};
+/// The errors the session's projection declares.
+const AppendMessagesError = Allocator.Error || error{InvalidReplayHandle};
 
 pub const Request = struct {
     /// The saved conversation, oldest first, including earlier checkpoints.
