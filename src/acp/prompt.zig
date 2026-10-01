@@ -1332,12 +1332,6 @@ fn decodePromptImageData(alloc: Allocator, data_value: std.json.Value) ![]u8 {
     errdefer alloc.free(decoded);
     std.base64.standard.Decoder.decode(decoded, data_value.string) catch
         return error.InvalidPromptImage;
-    const canonical_len = std.base64.standard.Encoder.calcSize(decoded.len);
-    if (canonical_len != data_value.string.len) return error.InvalidPromptImage;
-    const canonical = try alloc.alloc(u8, canonical_len);
-    defer alloc.free(canonical);
-    const encoded = std.base64.standard.Encoder.encode(canonical, decoded);
-    if (!std.mem.eql(u8, encoded, data_value.string)) return error.InvalidPromptImage;
     return decoded;
 }
 
@@ -3535,6 +3529,34 @@ test "captureImagesInline rejects a declared media type that contradicts the byt
     defer parsed.deinit(alloc);
     try std.testing.expectError(error.ImageSnapshotMediaTypeMismatch, parsed.captureImagesInline(alloc));
     try std.testing.expectEqual(@as(usize, 0), parsed.images.len);
+}
+
+test "prompt image decoding uses only decoded storage" {
+    var storage: [5]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&storage);
+    const alloc = fixed.allocator();
+    const decoded = try decodePromptImageData(alloc, .{ .string = "aGVsbG8=" });
+    defer alloc.free(decoded);
+    try std.testing.expectEqualStrings("hello", decoded);
+}
+
+test "prompt image decoding requires canonical standard base64" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { encoded: []const u8, bytes: []const u8 }{
+        .{ .encoded = "Zg==", .bytes = "f" },
+        .{ .encoded = "Zm8=", .bytes = "fo" },
+        .{ .encoded = "Zm9v", .bytes = "foo" },
+        .{ .encoded = "/w==", .bytes = "\xff" },
+        .{ .encoded = "//8=", .bytes = "\xff\xff" },
+    };
+    for (cases) |case| {
+        const decoded = try decodePromptImageData(alloc, .{ .string = case.encoded });
+        defer alloc.free(decoded);
+        try std.testing.expectEqualSlices(u8, case.bytes, decoded);
+    }
+    for ([_][]const u8{ "", "Zh==", "Zm9=", "///=", "Zg", "Zg=", "Zg===", "Zm9v=", "Zg==\n", "Zg== ", " Zg==", "Z g=", "AA=A", "__8=" }) |encoded| {
+        try std.testing.expectError(error.InvalidPromptImage, decodePromptImageData(alloc, .{ .string = encoded }));
+    }
 }
 
 test "parsePromptInput rejects malformed base64 image data" {
