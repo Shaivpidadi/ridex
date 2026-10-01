@@ -1,6 +1,7 @@
 const std = @import("std");
 const config_runtime = @import("../config/config_runtime.zig");
 const io_mod = @import("../shared/io.zig");
+const artifact_digest = @import("artifact_digest.zig");
 
 const Allocator = std.mem.Allocator;
 const private_dir_permissions = std.Io.File.Permissions.fromMode(0o700);
@@ -55,6 +56,53 @@ pub const AdvisoryLockError = error{
 pub const ManagedStat = struct {
     size: u64,
     modified_at_ns: i128,
+};
+
+/// What a v2 session's blobs can fail with (D44).
+pub const BlobError = error{
+    OutOfMemory,
+    /// This session holds no body under that name.
+    BlobNotFound,
+    /// The blob's bytes no longer match its name.
+    BlobDamaged,
+    BlobTooLarge,
+    /// The session has closed, so nothing more can be stored.
+    BlobStoreClosed,
+    SessionChildReadOnly,
+    BlobStoreFailed,
+    NoSpaceLeft,
+    AccessDenied,
+    ReadOnlyFileSystem,
+    FileTooBig,
+};
+
+/// The large bodies of a v2 session, each a blob of that session named by
+/// its hash (D44). The session adapter implements it; every capability
+/// that holds it keeps it alive through `retain` and `release`, so a copy
+/// may outlive the session, which then refuses only new bodies.
+pub const Blobs = struct {
+    ctx: *anyopaque,
+    vtable: *const VTable,
+
+    pub const Hash = [artifact_digest.blob_hex_bytes]u8;
+
+    pub const VTable = struct {
+        put: *const fn (ctx: *anyopaque, bytes: []const u8) BlobError!Hash,
+        /// The first `len` bytes of an open file outside the session.
+        put_file: *const fn (ctx: *anyopaque, file: std.Io.File, len: u64) BlobError!Hash,
+        /// The blob a handle of `kind` refers to: the one it names, or in a
+        /// session moved off the side folder, the one its old name maps to
+        /// (D47).
+        resolve: *const fn (ctx: *anyopaque, kind: ManagedChildKind, name: []const u8) BlobError!Hash,
+        /// A blob's bytes, at most `max_bytes`, checked against its name.
+        /// Caller owns.
+        get: *const fn (ctx: *anyopaque, alloc: Allocator, hash: []const u8, max_bytes: usize) BlobError![]u8,
+        /// The read-only file of a blob, for readers that page through a
+        /// large body and tools that open files by path (D49). Caller owns.
+        path: *const fn (ctx: *anyopaque, alloc: Allocator, hash: []const u8) BlobError![]u8,
+        retain: *const fn (ctx: *anyopaque) void,
+        release: *const fn (ctx: *anyopaque) void,
+    };
 };
 
 pub const ManagedEntry = struct {
@@ -171,7 +219,10 @@ pub const ManagedFile = struct {
 const CapabilityImpl = struct {
     alloc: Allocator,
     mode: Mode,
-    session_dir: io_mod.VerifiedDir,
+    /// Null for a v2 session's capability, which holds its bodies as blobs
+    /// and has no side folder (D48).
+    session_dir: ?io_mod.VerifiedDir,
+    blobs: ?Blobs = null,
     display_session_path: []u8,
     legacy_direct_kind: ?ManagedChildKind = null,
     legacy_background_root: bool = false,
@@ -207,7 +258,8 @@ const CapabilityImpl = struct {
         closeOptionalDir(&self.terminal_proofs);
         closeOptionalDir(&self.terminal_parent);
         closeOptionalDir(&self.client_context);
-        self.session_dir.close();
+        closeOptionalDir(&self.session_dir);
+        if (self.blobs) |blobs| blobs.vtable.release(blobs.ctx);
         self.alloc.free(self.display_session_path);
         if (self.legacy_display_route) |path| self.alloc.free(path);
         for (&self.indeterminate_names) |*name| {
@@ -238,9 +290,14 @@ const CapabilityImpl = struct {
                 else => error.SessionChildStoreFailed,
             };
         }
+        // A v2 capability has no side folder: its bodies are blobs (D48).
+        const session_dir = if (self.session_dir) |*dir| dir else return if (create_if_missing)
+            error.SessionChildStoreFailed
+        else
+            null;
         return switch (kind) {
             .background_records => self.ensureComponent(
-                &self.session_dir,
+                session_dir,
                 &self.background_records,
                 "background",
                 create_if_missing,
@@ -259,7 +316,7 @@ const CapabilityImpl = struct {
             },
             .command_artifacts => blk: {
                 const parent = try self.ensureComponent(
-                    &self.session_dir,
+                    session_dir,
                     &self.logs_parent,
                     "logs",
                     create_if_missing,
@@ -273,7 +330,7 @@ const CapabilityImpl = struct {
             },
             .browser_artifacts => blk: {
                 const parent = try self.ensureComponent(
-                    &self.session_dir,
+                    session_dir,
                     &self.artifacts_parent,
                     "artifacts",
                     create_if_missing,
@@ -286,26 +343,26 @@ const CapabilityImpl = struct {
                 );
             },
             .tool_results => self.ensureComponent(
-                &self.session_dir,
+                session_dir,
                 &self.tool_results,
                 "tool-results",
                 create_if_missing,
             ),
             .subagent_control => self.ensureComponent(
-                &self.session_dir,
+                session_dir,
                 &self.subagent_control,
                 "subagent",
                 create_if_missing,
             ),
             .client_context => self.ensureComponent(
-                &self.session_dir,
+                session_dir,
                 &self.client_context,
                 "client",
                 create_if_missing,
             ),
             .terminal_state, .terminal_proofs => blk: {
                 const parent = try self.ensureComponent(
-                    &self.session_dir,
+                    session_dir,
                     &self.terminal_parent,
                     "terminal",
                     create_if_missing,
@@ -515,6 +572,139 @@ const CapabilityImpl = struct {
     }
 };
 
+/// Blobs held in memory, for the stores' tests: bodies by hash, with the
+/// adapter's rules for names and limits, and no moved map. Given a folder,
+/// each body is also written there read-only, so `path` has a file.
+pub const MemoryBlobsForTesting = struct {
+    alloc: Allocator,
+    dir: ?[]const u8 = null,
+    mutex: std.Io.Mutex = .init,
+    bodies: std.StringHashMapUnmanaged([]u8) = .empty,
+    refs: usize = 0,
+    closed: bool = false,
+    puts: usize = 0,
+
+    const vtable: Blobs.VTable = .{
+        .put = put,
+        .put_file = putFile,
+        .resolve = resolve,
+        .get = get,
+        .path = path,
+        .retain = retain,
+        .release = release,
+    };
+
+    pub fn init(alloc: Allocator) MemoryBlobsForTesting {
+        return .{ .alloc = alloc };
+    }
+
+    /// As `init`, also writing each body to `dir`, which must outlive it.
+    pub fn initWithFiles(alloc: Allocator, dir: []const u8) MemoryBlobsForTesting {
+        return .{ .alloc = alloc, .dir = dir };
+    }
+
+    pub fn deinit(self: *MemoryBlobsForTesting) void {
+        std.debug.assert(self.refs == 0);
+        var it = self.bodies.iterator();
+        while (it.next()) |entry| {
+            self.alloc.free(entry.key_ptr.*);
+            self.alloc.free(entry.value_ptr.*);
+        }
+        self.bodies.deinit(self.alloc);
+        self.* = undefined;
+    }
+
+    pub fn blobs(self: *MemoryBlobsForTesting) Blobs {
+        return .{ .ctx = self, .vtable = &vtable };
+    }
+
+    pub fn count(self: *MemoryBlobsForTesting) usize {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        return self.bodies.count();
+    }
+
+    fn from(ctx: *anyopaque) *MemoryBlobsForTesting {
+        return @ptrCast(@alignCast(ctx));
+    }
+
+    fn put(ctx: *anyopaque, bytes: []const u8) BlobError!Blobs.Hash {
+        const self = from(ctx);
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+        const hash = std.fmt.bytesToHex(digest, .lower);
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        if (self.closed) return error.BlobStoreClosed;
+        self.puts += 1;
+        if (self.bodies.contains(&hash)) return hash;
+        const key = try self.alloc.dupe(u8, &hash);
+        errdefer self.alloc.free(key);
+        const body = try self.alloc.dupe(u8, bytes);
+        errdefer self.alloc.free(body);
+        if (self.dir) |dir| {
+            const file_path = try std.fs.path.join(self.alloc, &.{ dir, &hash });
+            defer self.alloc.free(file_path);
+            var file = std.Io.Dir.createFileAbsolute(io_mod.getIo(), file_path, .{
+                .exclusive = true,
+                .permissions = std.Io.File.Permissions.fromMode(0o400),
+            }) catch return error.BlobStoreFailed;
+            defer file.close(io_mod.getIo());
+            file.writeStreamingAll(io_mod.getIo(), bytes) catch return error.BlobStoreFailed;
+        }
+        try self.bodies.put(self.alloc, key, body);
+        return hash;
+    }
+
+    fn putFile(ctx: *anyopaque, file: std.Io.File, len: u64) BlobError!Blobs.Hash {
+        const self = from(ctx);
+        const bytes = try self.alloc.alloc(u8, std.math.cast(usize, len) orelse return error.BlobTooLarge);
+        defer self.alloc.free(bytes);
+        const got = file.readPositionalAll(io_mod.getIo(), bytes, 0) catch return error.BlobStoreFailed;
+        if (got != bytes.len) return error.BlobStoreFailed;
+        return put(ctx, bytes);
+    }
+
+    fn resolve(ctx: *anyopaque, kind: ManagedChildKind, name: []const u8) BlobError!Blobs.Hash {
+        _ = ctx;
+        _ = kind;
+        const hash = artifact_digest.blobHash(name) orelse return error.BlobNotFound;
+        return hash[0..artifact_digest.blob_hex_bytes].*;
+    }
+
+    fn get(ctx: *anyopaque, alloc: Allocator, hash: []const u8, max_bytes: usize) BlobError![]u8 {
+        const self = from(ctx);
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        const body = self.bodies.get(hash) orelse return error.BlobNotFound;
+        if (body.len > max_bytes) return error.BlobTooLarge;
+        return alloc.dupe(u8, body);
+    }
+
+    fn path(ctx: *anyopaque, alloc: Allocator, hash: []const u8) BlobError![]u8 {
+        const self = from(ctx);
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        if (!self.bodies.contains(hash)) return error.BlobNotFound;
+        const dir = self.dir orelse return error.BlobStoreFailed;
+        return std.fs.path.join(alloc, &.{ dir, hash });
+    }
+
+    fn retain(ctx: *anyopaque) void {
+        const self = from(ctx);
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        self.refs += 1;
+    }
+
+    fn release(ctx: *anyopaque) void {
+        const self = from(ctx);
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        self.refs -= 1;
+    }
+};
+
 pub const SessionChildCapability = struct {
     impl: *CapabilityImpl,
 
@@ -522,13 +712,88 @@ pub const SessionChildCapability = struct {
         self: *const SessionChildCapability,
         alloc: Allocator,
     ) !SessionChildCapability {
+        if (self.impl.blobs) |blobs| return initBlobs(alloc, blobs, self.impl.mode);
         return initWithOptions(
             alloc,
-            self.impl.session_dir.dir,
+            self.impl.session_dir.?.dir,
             self.impl.display_session_path,
             self.impl.mode,
             .{},
         );
+    }
+
+    /// A v2 session's capability: its bodies are that session's blobs, and
+    /// it has no side folder, so every other kind is absent (D44, D48).
+    pub fn initBlobs(alloc: Allocator, blobs: Blobs, mode: Mode) !SessionChildCapability {
+        if (mode == .writable) io_mod.e2eFailIfDurableMutationAttempted();
+        const display = try alloc.dupe(u8, "");
+        errdefer alloc.free(display);
+        const impl = try alloc.create(CapabilityImpl);
+        impl.* = .{
+            .alloc = alloc,
+            .mode = mode,
+            .session_dir = null,
+            .blobs = blobs,
+            .display_session_path = display,
+            .replace_ops = .{},
+            .lock_ops = .{},
+        };
+        blobs.vtable.retain(blobs.ctx);
+        return .{ .impl = impl };
+    }
+
+    /// Whether bodies are blobs of a v2 session rather than files (D44).
+    pub fn holdsBlobs(self: *const SessionChildCapability) bool {
+        return self.impl.blobs != null;
+    }
+
+    /// Stores a body as a blob and returns its hash; `holdsBlobs` only.
+    pub fn putBlob(self: *SessionChildCapability, bytes: []const u8) BlobError!Blobs.Hash {
+        const blobs = try self.writableBlobs();
+        return blobs.vtable.put(blobs.ctx, bytes);
+    }
+
+    /// As `putBlob`, for the first `len` bytes of an open file.
+    pub fn putBlobFile(self: *SessionChildCapability, file: std.Io.File, len: u64) BlobError!Blobs.Hash {
+        const blobs = try self.writableBlobs();
+        return blobs.vtable.put_file(blobs.ctx, file, len);
+    }
+
+    /// The body a handle of `kind` refers to, at most `max_bytes` and
+    /// checked against its blob's name; caller owns. `holdsBlobs` only.
+    pub fn readBlob(self: *SessionChildCapability, alloc: Allocator, kind: ManagedChildKind, name: []const u8, max_bytes: usize) BlobError![]u8 {
+        const blobs = self.impl.blobs orelse return error.BlobStoreFailed;
+        const hash = try blobs.vtable.resolve(blobs.ctx, kind, name);
+        return blobs.vtable.get(blobs.ctx, alloc, &hash, max_bytes);
+    }
+
+    /// Opens the read-only file of the blob a handle of `kind` refers to,
+    /// for a reader that pages through it (D49). Its bytes are not checked
+    /// against the name, as a side file's never were. Caller closes it.
+    pub fn openBlobFile(self: *SessionChildCapability, alloc: Allocator, kind: ManagedChildKind, name: []const u8) BlobError!std.Io.File {
+        const blobs = self.impl.blobs orelse return error.BlobStoreFailed;
+        const hash = try blobs.vtable.resolve(blobs.ctx, kind, name);
+        const file_path = try blobs.vtable.path(blobs.ctx, alloc, &hash);
+        defer alloc.free(file_path);
+        return std.Io.Dir.openFileAbsolute(io_mod.getIo(), file_path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+            error.FileNotFound => error.BlobNotFound,
+            error.AccessDenied, error.PermissionDenied => error.AccessDenied,
+            else => error.BlobStoreFailed,
+        };
+    }
+
+    /// The read-only file of the blob a handle of `kind` refers to, for a
+    /// tool that opens files by path (D49); caller owns.
+    pub fn blobPath(self: *SessionChildCapability, alloc: Allocator, kind: ManagedChildKind, name: []const u8) BlobError![]u8 {
+        const blobs = self.impl.blobs orelse return error.BlobStoreFailed;
+        const hash = try blobs.vtable.resolve(blobs.ctx, kind, name);
+        return blobs.vtable.path(blobs.ctx, alloc, &hash);
+    }
+
+    fn writableBlobs(self: *SessionChildCapability) BlobError!Blobs {
+        const blobs = self.impl.blobs orelse return error.BlobStoreFailed;
+        if (self.impl.mode != .writable) return error.SessionChildReadOnly;
+        return blobs;
     }
 
     pub fn init(
@@ -858,13 +1123,16 @@ pub const SessionChildCapability = struct {
         {
             return error.SessionChildStoreFailed;
         }
-        var cloned = try initWithOptions(
-            alloc,
-            self.impl.session_dir.dir,
-            self.impl.display_session_path,
-            .read_only,
-            .{},
-        );
+        var cloned = if (self.impl.blobs) |blobs|
+            try initBlobs(alloc, blobs, .read_only)
+        else
+            try initWithOptions(
+                alloc,
+                self.impl.session_dir.?.dir,
+                self.impl.display_session_path,
+                .read_only,
+                .{},
+            );
         cloned.impl.allowed_kind = self.impl.allowed_kind;
         return cloned;
     }
