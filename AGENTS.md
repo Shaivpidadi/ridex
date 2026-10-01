@@ -67,6 +67,8 @@ Key rules:
 
 * `src/core/` owns contracts, runtimes, config, sessions, permissions, MCP, skills.
 
+* `src/core/compactor/` owns context compaction. Outside code imports only its front door, `compactor.zig`, and the compactor imports only shared basics, model configuration, and the conversation helpers in `src/core/session/session.zig`; its caller hands in the model caller and record store. `scripts/check-compactor-boundary.sh` enforces this in CI.
+
 * `src/tools/` owns built-in tool implementations. Generic tool contracts and dispatch live in `src/core/tooling/`. Default tool specs are centralized in `src/core/tooling/tool_specs.zig` or `src/builtins/tools.zig`, not in individual tool files.
 
 * `src/ui/` owns terminal rendering, event loop, input, transcript. It must not own product state.
@@ -128,7 +130,7 @@ Config precedence (highest wins):
 4. `<workspace>/.fx.json` (committed project defaults)
 5. Built-in defaults
 
-Project `.fx.json` accepts only repo-safe defaults: `sandbox`, `max_agent_steps`, `max_tool_result_bytes`, `context`, `provider_order`, and `provider_strict`. Profile-owned keys such as `provider`, `providers`, `models`, `model`, `effort`, `fast_mode`, `slash_menu_categories`, `startup_scrollback`, `prompt_history`, `statusLine`, `skill_match_fuzzy`, `first_call_tool_choice`, `auto_upgrade`, `permission_mode`, `credential_source`, `permission`, and `skill_symlink_authorities` are ignored from project config before their values are parsed.
+Project `.fx.json` accepts only repo-safe defaults: `sandbox`, `max_agent_steps`, `max_tool_result_bytes`, `context`, `provider_order`, and `provider_strict`. Profile-owned keys such as `provider`, `providers`, `models`, `model`, `effort`, `fast_mode`, `slash_menu_categories`, `startup_scrollback`, `prompt_history`, `statusLine`, `skill_match_fuzzy`, `first_call_tool_choice`, `auto_upgrade`, `auto_compact_percent`, `permission_mode`, `credential_source`, `permission`, and `skill_symlink_authorities` are ignored from project config before their values are parsed.
 
 Runtime state lives under `~/.fx/sessions/<session-id>/` (`session.json`, `background/`, `subagent/`, `logs/`). Sessions are global and portable across workspaces. Each session tracks its `workspace_root`, which updates when resumed in a different workspace. A subagent child is an internal ordinary session with its own history. Its parent owns one bounded `subagent/children.json` registry, and the child carries only an immutable owner marker. Child sessions stay out of ordinary session discovery and cannot be resumed directly. A first `subagent.message` creates a named persistent child in that parent; later messages continue it, and optional instructions replace only its child-specific system overlay.
 
@@ -276,7 +278,7 @@ Do not run the complete deterministic test suite locally as the default developm
 
 After the focused checks pass, create a clean checkpoint commit, push the non-`main` feature branch, and open a draft PR immediately. Linux is the gate for every change because most fx behavior is identical on every platform:
 
-* `.github/workflows/ci.yml` runs on Linux x86_64. It checks formatting, the PGSO corpus, and the public surface, then runs the ReleaseSafe unit tests. It builds fx once, smoke-tests it, and shares that binary with four duration-balanced E2E shards and the MCP conformance baseline. Checked-in weights assign every E2E file to exactly one shard, and files inside each shard run sequentially in separate Bun processes so terminal fixtures and process state cannot leak between files. A failed file receives one retry after its tmux server is reset. A file that passes only on retry gets a warning annotation; investigate it as a possible race. The SDK jobs build WASM and the Node-API addons once and run the complete package qualification.
+* `.github/workflows/ci.yml` runs on Linux x86_64. It checks formatting, the PGSO corpus, the public surface, and the compactor boundary, then runs the ReleaseSafe unit tests. It builds fx once, smoke-tests it, and shares that binary with four duration-balanced E2E shards and the MCP conformance baseline. Checked-in weights assign every E2E file to exactly one shard, and files inside each shard run sequentially in separate Bun processes so terminal fixtures and process state cannot leak between files. A failed file receives one retry after its tmux server is reset. A file that passes only on retry gets a warning annotation; investigate it as a possible race. The SDK jobs build WASM and the Node-API addons once and run the complete package qualification.
 * `.github/workflows/binary-size.yml` builds each release target on its native runner, reports the size change, and smoke-tests the Linux arm64, macOS x86_64, and macOS arm64 binaries. See **Binary Size Observability**.
 * `.github/workflows/bench.yml` enforces the startup latency budget. See **Benchmarks**.
 

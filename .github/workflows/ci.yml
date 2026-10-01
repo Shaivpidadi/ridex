@@ -46,6 +46,9 @@ jobs:
       - name: Audit public surface
         run: ./scripts/check-public-surface.sh
 
+      - name: Check compactor boundary
+        run: ./scripts/check-compactor-boundary.sh
+
       - name: Test signing and release routing
         run: python3 -m unittest scripts.tests.test_macos_signing scripts.tests.test_signed_macos -q
 
@@ -555,6 +558,7 @@ jobs:
         run: |
           scripts=(
             benchmarks/startup.sh
+            scripts/check-compactor-boundary.sh
             scripts/check-public-surface.sh
             scripts/detect-macos-need.sh
             scripts/smoke-binary.sh
