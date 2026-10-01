@@ -557,19 +557,16 @@ pub const Session = struct {
         return hash;
     }
 
-    /// Every blob an item refers to must already exist in this session
-    /// (`tla/Fork.tla` `RefsExist`).
+    /// Every blob an item or a setting refers to must already exist in this
+    /// session (`tla/Fork.tla` `RefsExist`).
     fn checkBlobRefs(session: *Session, live: *Live, bodies: []const schema.Body) AppendError!void {
         if (!hasBlobRefs(bodies)) return;
         const s = session.env.s;
         const dir = s.openDir(live.dir, "blobs") catch |io_err| return storage.ioFault(io_err);
         defer s.closeDir(dir);
-        for (bodies) |body| switch (body) {
-            .item => |piece| for (piece.blobs) |hash| {
-                if (!schema.validBlobHash(hash)) return error.InvalidTransition;
-                _ = s.stat(dir, hash) catch return error.InvalidTransition;
-            },
-            else => {},
+        for (bodies) |body| for (body.blobRefs()) |hash| {
+            if (!schema.validBlobHash(hash)) return error.InvalidTransition;
+            _ = s.stat(dir, hash) catch return error.InvalidTransition;
         };
     }
 
@@ -880,10 +877,9 @@ test "a fault code round trips every I/O fault, and none is no fault" {
 }
 
 fn hasBlobRefs(bodies: []const schema.Body) bool {
-    for (bodies) |body| switch (body) {
-        .item => |piece| if (piece.blobs.len > 0) return true,
-        else => {},
-    };
+    for (bodies) |body| {
+        if (body.blobRefs().len > 0) return true;
+    }
     return false;
 }
 
@@ -926,9 +922,10 @@ fn needsSync(bodies: []const schema.Body) bool {
         .turn_committed, .turn_interrupted, .child_spawned, .child_finished => return true,
         // Usage is durable before fx clears its usage-recovery marker
         // (`tla/Wiring.tla` UsageNeverSilent).
+        // fx removes the side folder only once the move is durable (D47).
         .set => |s| switch (s.key) {
-            .permissions, .usage => return true,
-            .prefs, .title, .workspace, .language => {},
+            .permissions, .usage, .moved_files => return true,
+            .prefs, .title, .workspace, .language, .client_prompt, .tool_identities => {},
         },
         else => {},
     };
@@ -1608,11 +1605,11 @@ fn findForkPoint(env: *const Env, source: []const u8, src: storage.File, end: u6
         const kind = line.header.kind orelse continue;
         switch (kind) {
             .turn_started => turn_seen = true,
-            .item => {
+            .item, .set => {
                 _ = arena.reset(.retain_capacity);
                 const body = schema.parseBody(arena.allocator(), kind, line.body()) catch return error.Corrupt;
                 var whole = true;
-                for (body.item.blobs) |hash| {
+                for (body.blobRefs()) |hash| {
                     if (!try blobIsWhole(env, source, hash)) whole = false;
                 }
                 if (!whole) break;
@@ -1826,11 +1823,11 @@ pub fn verifySession(env: *const Env, id_: []const u8) OpenError!Verified {
             result.damaged_at = line.offset;
             break;
         };
+        for (body.blobRefs()) |hash| {
+            if (!try blobIsWhole(env, id_, hash)) result.bad_blobs += 1;
+        }
         switch (body) {
             .session_created => |c| fork_seq = if (c.forked_from) |o| o.seq else 0,
-            .item => |piece| for (piece.blobs) |hash| {
-                if (!try blobIsWhole(env, id_, hash)) result.bad_blobs += 1;
-            },
             .snapshot => |snap| {
                 var decoded = fold.decodeState(gpa, arena.allocator(), snap.state) catch {
                     result.bad_snapshots += 1;

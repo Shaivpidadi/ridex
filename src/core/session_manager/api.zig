@@ -649,10 +649,13 @@ fn checkEvents(gpa: std.mem.Allocator, events: []const Event, import: bool) Appe
             .cancel, .failed => {},
             .closed, .crash => if (!import) return error.InvalidArgument,
         },
-        .set => |s| switch (s.key) {
-            .title, .workspace => try checkJsonString(gpa, s.value),
-            .language => try checkLanguage(gpa, s.value),
-            .prefs, .permissions, .usage => try checkJson(gpa, s.value),
+        .set => |s| {
+            switch (s.key) {
+                .title, .workspace, .client_prompt => try checkJsonString(gpa, s.value),
+                .language => try checkLanguage(gpa, s.value),
+                .prefs, .permissions, .usage, .tool_identities, .moved_files => try checkJson(gpa, s.value),
+            }
+            for (s.blobs) |hash| if (!schema.validBlobHash(hash)) return error.InvalidArgument;
         },
         .child_spawned => |c| {
             try checkId(c.child);
@@ -1692,6 +1695,84 @@ const api_tests = struct {
             const early = try m.openFork(.{ .source = id, .at = .{ .turn = 1 }, .workspace = "/w", .host = .app });
             early.release();
         }
+    }
+
+    test "a setting lists blobs outside a turn under the item's rule, and fork, verify and recover follow it (D47)" {
+        var f: Fixture = undefined;
+        try f.init();
+        defer f.deinit();
+        const m = f.manager;
+        const s = try m.openNew(.{ .workspace = "/w", .host = .app });
+        // Held before the first turn: nothing is on disk, so no blob exists.
+        const absent = [_][]const u8{"a" ** 64};
+        try testing.expectError(error.InvalidTransition, s.append(&.{.{ .set = .{ .key = .moved_files, .value = "{}", .blobs = &absent } }}));
+        _ = try s.append(&.{ .turn_started, piece, .turn_committed });
+        // A malformed hash is refused at the boundary, a missing one by the rule.
+        const malformed = [_][]const u8{"../x"};
+        try testing.expectError(error.InvalidArgument, s.append(&.{.{ .set = .{ .key = .moved_files, .value = "{}", .blobs = &malformed } }}));
+        try testing.expectError(error.InvalidTransition, s.append(&.{.{ .set = .{ .key = .moved_files, .value = "{}", .blobs = &absent } }}));
+        const hash = try s.putBlob("a body from the side folder");
+        const refs = [_][]const u8{&hash};
+        const value = try std.fmt.allocPrint(gpa, "{{\"map\":\"{s}\"}}", .{&hash});
+        defer gpa.free(value);
+        _ = try s.append(&.{.{ .set = .{ .key = .moved_files, .value = value, .blobs = &refs } }});
+        _ = try s.append(&.{ .turn_started, piece, .turn_committed });
+        const id = try gpa.dupe(u8, s.id());
+        defer gpa.free(id);
+        s.release();
+
+        const r = try m.openResume(.{ .target = .{ .id = id }, .workspace = "/w", .host = .app });
+        var st = try r.state(gpa);
+        defer st.deinit(gpa);
+        try testing.expectEqualStrings(value, st.moved_files.?);
+        r.release();
+        try testing.expectEqual(@as(u64, 0), (try m.verify(id)).bad_blobs);
+        const fork = try m.openFork(.{ .source = id, .at = .{ .turn = 2 }, .workspace = "/w", .host = .app });
+        const fork_id = try gpa.dupe(u8, fork.id());
+        defer gpa.free(fork_id);
+        fork.release();
+        const body = try m.getBlob(gpa, fork_id, &hash);
+        defer gpa.free(body);
+        try testing.expectEqualStrings("a body from the side folder", body);
+
+        // A lost blob that only the setting names damages the session there.
+        var root = try f.dir();
+        defer root.close(io);
+        const path = try std.fmt.allocPrint(gpa, "{s}/blobs/{s}", .{ id, &hash });
+        defer gpa.free(path);
+        try root.deleteFile(io, path);
+        try testing.expectEqual(@as(u64, 1), (try m.verify(id)).bad_blobs);
+        const copy = try m.openFork(.{ .source = id, .at = .last_good, .workspace = "/w", .host = .app });
+        var copied = try copy.state(gpa);
+        defer copied.deinit(gpa);
+        try testing.expectEqual(@as(u64, 1), copied.last_turn);
+        try testing.expectEqual(@as(?[]u8, null), copied.moved_files);
+        copy.release();
+    }
+
+    test "an ACP client's prompt and tool identities are settings that resume keeps (D46)" {
+        var f: Fixture = undefined;
+        try f.init();
+        defer f.deinit();
+        const m = f.manager;
+        const s = try m.openNew(.{ .workspace = "/w", .host = .acp });
+        // The prompt is a JSON string; anything else is refused.
+        try testing.expectError(error.InvalidArgument, s.append(&.{.{ .set = .{ .key = .client_prompt, .value = "{\"text\":1}" } }}));
+        _ = try s.append(&.{
+            .{ .set = .{ .key = .client_prompt, .value = "\"You run inside Mini.\"" } },
+            .{ .set = .{ .key = .tool_identities, .value = "{\"mcp_mini_read\":{\"server\":\"mini\",\"tool\":\"read\"}}" } },
+        });
+        _ = try s.append(&.{ .turn_started, piece, .turn_committed });
+        const id = try gpa.dupe(u8, s.id());
+        defer gpa.free(id);
+        s.release();
+
+        const r = try m.openResume(.{ .target = .{ .id = id }, .workspace = "/w", .host = .acp });
+        defer r.release();
+        var st = try r.state(gpa);
+        defer st.deinit(gpa);
+        try testing.expectEqualStrings("\"You run inside Mini.\"", st.client_prompt.?);
+        try testing.expectEqualStrings("{\"mcp_mini_read\":{\"server\":\"mini\",\"tool\":\"read\"}}", st.tool_identities.?);
     }
 };
 
