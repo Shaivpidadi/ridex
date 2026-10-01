@@ -51,6 +51,8 @@ The test suites under `tests/` use Bun but are separate from the Zig codebase. S
 
 * In documentation, never use double hyphens (`--`) as a dash. Use an emdash (—) sparingly, or rewrite to avoid dashes.
 
+* Use the `technical-writer` skill (`.fx/skills/technical-writer/SKILL.md`) when you write or edit prose, including documentation, commit messages, PR titles and descriptions, and issues. Where the skill and this section differ, such as on em dashes, this section takes precedence.
+
 * CLI flags use kebab-case (e.g. `--no-save`, `--json`). Never use camelCase for flags.
 
 * Prefer `snake_case` for all Zig identifiers. Types use `PascalCase` per Zig convention.

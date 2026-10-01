@@ -184,7 +184,11 @@ for (const action of ["run", "message"] as const) for (const stop of [false, tru
       await tui.waitForPane(() => tui!.paneStatus().dead, 10000);
       expect(tui.paneStatus().status).toBe(0);
       expect(readFileSync(join(root.root, "stderr.log"), "utf8")).toBe("");
-      const frames = readFileSync(join(root.home, ".fx/sessions", registry().id, "events.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+      const events = readFileSync(join(root.home, ".fx/sessions", registry().id, "events.jsonl"), "utf8");
+      const frames = events.trim().split("\n").map(line => JSON.parse(line));
+      // The saved turn keeps what the user typed while the child ran, whether
+      // the turn finished or was cancelled.
+      expect(events.split("STEERING_FIRST").length - 1).toBe(1);
       expect(frames.filter(frame => frame.event?.tool_result?.call_id === "steering-delegation")).toHaveLength(1);
       const trace = readFileSync(join(root.root, "trace.log"), "utf8");
       expect(trace).toContain("event=steering_wait_yielded ");
@@ -7684,6 +7688,54 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         expect(request.body).not.toContain('"name":"task"');
       }
       await waitForProcessExit(pid);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("subagent starts when the parent has more than 256 MCP tools", async () => {
+    const root = createFixtureRoot("subagent-large-mcp-catalog");
+    const tracePath = join(root.root, "trace.log");
+    writeMcpFixture(root, { toolCount: 257 });
+    const childPrompt = "Summarize the large MCP catalog fixture.";
+    let parentResult = "";
+    let childRequested = false;
+    const gateway = startDynamicFakeGateway(async (body) => {
+      if (body.includes('"toolCallId":"parent_subagent_large_1"')) {
+        parentResult = toolResultOutput(body, "parent_subagent_large_1");
+        return fakeGatewayFinalText("Parent observed child completion.");
+      }
+      if (body.includes(childPrompt)) {
+        expect(promptText(body)).toContain(
+          '<server name="fixture" state="ready" tools="257" />',
+        );
+        childRequested = true;
+        return fakeGatewayFinalText("Child with large MCP catalog complete.");
+      }
+      return fakeGatewayToolCall("parent_subagent_large_1", "subagent", {
+        request: { action: "run", task: childPrompt },
+      });
+    }, {
+      classifierDecision: "clear",
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+    });
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "Delegate the large catalog summary."],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 20_000,
+        },
+      );
+      expect(result.code).toBe(0);
+      expect(parentResult).not.toContain("AdmissionFailed");
+      expect(parentResult).toContain("Child with large MCP catalog complete.");
+      expect(childRequested).toBe(true);
+      expect(parseAskJson(result.stdout).tool_calls).toEqual([
+        { name: "subagent", status: "success" },
+      ]);
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });
