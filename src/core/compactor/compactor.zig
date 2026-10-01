@@ -66,7 +66,8 @@ pub const resolvePercent = settings.resolvePercent;
 pub const modelText = checkpoint.modelText;
 pub const replacesPriorContext = checkpoint.replacesPriorContext;
 
-// Saved turns (M1, M2, ...) and tool calls (T1, T2, ...).
+// Saved turns (M1, M2, ...), tool calls (T1, T2, ...) and earlier
+// compactions (L1, L2, ...).
 pub const Store = records.Store;
 pub const max_search_phrases = records.max_search_phrases;
 pub const RecordFileBuffer = [records.max_file_name_bytes]u8;
@@ -77,8 +78,9 @@ pub fn recordFile(buffer: *RecordFileBuffer, text: []const u8) ?[]const u8 {
     return records.fileName(buffer, records.parseId(text) orelse return null);
 }
 
-/// Searches every saved turn and tool call, and older conversation
-/// archives, for 1 to `max_search_phrases` phrases. Caller owns the text.
+/// Searches every saved turn, tool call and earlier compaction, and older
+/// conversation archives, for 1 to `max_search_phrases` phrases. Caller owns
+/// the text.
 pub fn search(alloc: Allocator, store: Store, phrases: []const []const u8) ![]u8 {
     return records.search(alloc, store, phrases, records.search_result_limit);
 }

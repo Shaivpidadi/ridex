@@ -21,7 +21,8 @@ pub const Input = struct {
             byte_count: usize = result_store.read_default_bytes,
         },
         query: []u8,
-        /// Searches every turn and tool call saved by context compaction.
+        /// Searches every turn, tool call and earlier compaction saved by
+        /// context compaction.
         search: [][]u8,
     } = .{ .range = .{} },
 
@@ -169,7 +170,7 @@ pub fn call(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.ToolInput)
         };
         const queries: []const []const u8 = input.selector.search;
         const output = compactor.search(ctx.allocator, result_store.compactorStore(capability), queries) catch |err| return .{
-            .failure = try std.fmt.allocPrint(ctx.allocator, "Searching saved turns and tool calls failed: {s}", .{@errorName(err)}),
+            .failure = try std.fmt.allocPrint(ctx.allocator, "Searching saved turns, tool calls and earlier compactions failed: {s}", .{@errorName(err)}),
         };
         return .{ .success = output };
     }

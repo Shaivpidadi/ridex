@@ -585,7 +585,7 @@ fn askNotes(out: Allocator, model: Model, prompt: Prompt, known: ledger.Known, e
 /// it. Either way every one of them stays saved whole.
 fn foldSummary(fold: Fold, written: ledger.Written) []const u8 {
     if (written.earlier.len > 0) return written.earlier;
-    trace.log(true, "the notes have no summary of the earlier compaction; keeping the summary before it ledger=L{d} kept_bytes={d}", .{ fold.ledger, fold.summary.len });
+    trace.log(true, "no summary of the earlier compaction was written; keeping the summary before it ledger=L{d} kept_bytes={d}", .{ fold.ledger, fold.summary.len });
     return fold.summary;
 }
 
@@ -1729,14 +1729,14 @@ test "compacting again saves the previous compaction whole and shows its summary
     try testing.expectEqual(@as(usize, 1), compacted.ledger_count);
     try testing.expectEqualStrings("The user asked to fix the build on main. A missing semicolon at src/a.zig:4 broke it (T1).", compacted.earlier);
 
-    // F1 stays only in L1, so the rewrite of it is kept under the next free
-    // ID and replaces it; a rule may quote a folded turn.
+    // F1 stays only in L1, so the entry under its ID is kept under the next
+    // free ID; a rule may quote a folded turn.
     const ids = [_][]const u8{ "R1", "R2", "F3", "F2", "S1" };
     try testing.expectEqual(ids.len, compacted.entries.len);
     for (ids, compacted.entries) |id, entry| try testing.expectEqualStrings(id, entry.id);
     try testing.expectEqualStrings("R1 (M1): \"It fails on main\"", compacted.entries[0].text);
     try testing.expectEqualStrings("R2 (M3): \"never skip the tests\" [check: not the user's exact words]", compacted.entries[1].text);
-    try testing.expectEqualStrings("F3 (T2): a rewrite of an old fact; replaces F1", compacted.entries[2].text);
+    try testing.expectEqualStrings("F3 (T2): a rewrite of an old fact", compacted.entries[2].text);
     try testing.expectEqual(@as(usize, 3), compacted.highest[1]);
 
     // The first compaction is saved whole as L1 and leaves the text, which

@@ -366,3 +366,63 @@ test "a compactor request after the conversation sends it unchanged, then the re
     defer testing.allocator.free(other.failed.detail);
     try testing.expect(other.failed.reason == .provider);
 }
+
+test "a compactor request carries host-managed authority without secret bytes and the host's pulse" {
+    const testing = std.testing;
+    const Fake = struct {
+        credential_source: ?types.CredentialSource = null,
+        secret: ?[]const u8 = null,
+
+        fn stream(raw: ?*anyopaque, alloc: Allocator, request: agent_stream_provider.ModelRequest) !runtime_gateway_step.StreamResult {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try request.admission.admit();
+            if (request.cooperative_pulse) |pulse| try pulse.pulse();
+            self.credential_source = request.credential.credentialSource();
+            self.secret = request.credential.secret();
+            return .{ .completed = .{
+                .completion = .{ .content = try alloc.dupe(u8, "notes"), .finish_reason = .stop },
+                .ownership = .owned,
+            } };
+        }
+
+        fn capabilities(_: *anyopaque, _: []const u8) model_capabilities.Capabilities {
+            return .{};
+        }
+    };
+    const Pulse = struct {
+        calls: usize = 0,
+
+        fn run(raw: *anyopaque) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+        }
+    };
+    var fake: Fake = .{};
+    var pulse: Pulse = .{};
+    var summary_model: CompactorCaller = .{
+        .stream_provider = .{ .context = &fake, .stream_fn = Fake.stream },
+        .cooperative_transport_pulse = .{ .ctx = &pulse, .run = Pulse.run },
+        .provider = .gateway,
+        .model = "m",
+        .api_key = "",
+        .credential_source = .host_managed,
+        .retry_count = 0,
+        .capabilities_context = &fake,
+        .capabilities_fn = Fake.capabilities,
+    };
+    const caller = summary_model.caller();
+    try testing.expectEqual(types.CredentialSource.host_managed, caller.credential_source.?);
+    var cancel = std.atomic.Value(bool).init(false);
+    var call: compactor.Call = .{ .model = "m", .reasoning = types.ReasoningEffort.literal("none"), .system = "s", .user = "u", .max_bytes = 1024, .cancel_flag = &cancel, .trace_ctx = .{} };
+    // The conversation's model and the fallback model alike.
+    for ([_][]const u8{ "m", "other" }, 1..) |model, calls| {
+        call.model = model;
+        fake.credential_source = null;
+        fake.secret = "unset";
+        const reply = try caller.vtable.send(caller.context, testing.allocator, call);
+        defer testing.allocator.free(reply.text);
+        try testing.expectEqual(types.CredentialSource.host_managed, fake.credential_source.?);
+        try testing.expect(fake.secret == null);
+        try testing.expectEqual(calls, pulse.calls);
+    }
+}

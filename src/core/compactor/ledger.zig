@@ -8,8 +8,7 @@
 //! the model is asked for and reads what it wrote:
 //! - a note counts only for a turn or tool call of this compaction;
 //! - entries are only added: one repeated word for word is left out, and one
-//!   whose ID is taken is kept under the next free ID, replacing the entry
-//!   it rewrites.
+//!   whose ID is taken is kept under the next free ID.
 //! lint.zig then checks what the notes and entries say.
 //! It also lists, from the tool calls alone, the skills and MCP tools used,
 //! and finds the sentences of the user's messages that may set rules, so the
@@ -232,7 +231,7 @@ pub fn candidates(arena: Allocator, messages: []const Message, filed: []const ch
                     if (std.mem.eql(u8, item.text, text)) break true;
                 } else false;
                 const quoted = for (filed) |entry| {
-                    if (entry.id[0] == 'R' and std.mem.find(u8, entry.text, sentence) != null) break true;
+                    if (std.mem.startsWith(u8, entry.id, "R") and std.mem.find(u8, entry.text, sentence) != null) break true;
                 } else false;
                 if (seen or quoted) continue;
                 if (bytes + text.len > max_candidate_bytes) {
@@ -415,9 +414,12 @@ const max_unread_bytes = 8 * 1024;
 
 /// Reads the model's notes. Notes for turns and tool calls that `known`
 /// does not have are left out, like entries repeating one of `earlier` word
-/// for word. An entry whose ID is taken, by `highest` or by an earlier entry
-/// of the reply, is kept under the next free ID. A reply in none of the asked
-/// form becomes the notes of the newest turn. `arena` owns the result.
+/// for word and lines copied with the mark of an entry another replaced. An
+/// entry whose ID is taken, by `highest` or by an earlier entry of the reply,
+/// or numbered far above the highest, is kept under the next free ID. A reply
+/// in none of the asked form becomes the notes of the newest turn, or with no
+/// turn asked for, the summary of earlier compactions. `arena` owns the
+/// result.
 pub fn read(arena: Allocator, reply: []const u8, known: Known, earlier: []const checkpoint.Entry, highest: [entry_kinds.len]usize) Allocator.Error!Written {
     const Building = struct { number: usize, text: std.ArrayList(u8) = .empty, limit: usize };
     var works: std.ArrayList(Building) = .empty;
@@ -500,12 +502,15 @@ pub fn read(arena: Allocator, reply: []const u8, known: Known, earlier: []const 
     }
 
     // A reply in none of the asked form is kept whole as the notes of the
-    // newest turn it covers rather than lost.
+    // newest turn it covers rather than lost; asked for no turn, only for the
+    // summary of earlier compactions, it is that summary.
     if (works.items.len == 0 and tool_notes.items.len == 0 and sections.items.len == 0 and earlier_summary.items.len == 0 and unknown == 0) {
         const newest: ?usize = if (known.open) 0 else if (known.turns.len > 0) known.turns[known.turns.len - 1] else null;
         if (newest) |number| {
             try works.append(arena, .{ .number = number, .limit = max_unread_bytes });
             try works.items[0].text.appendSlice(arena, std.mem.trim(u8, reply, " \t\r\n"));
+        } else {
+            try earlier_summary.appendSlice(arena, reply);
         }
     }
 
@@ -530,10 +535,10 @@ pub fn read(arena: Allocator, reply: []const u8, known: Known, earlier: []const 
     }
 
     // New IDs are kept first, so a taken one never pushes a later entry off
-    // the ID the model gave it; taken ones then get the next free IDs. An
-    // entry written under the ID of one that exists is a rewrite of it, so it
-    // replaces it.
-    const Fate = union(enum) { repeat, keep: []const u8, renumber: struct { replaces: bool } };
+    // the ID the model gave it; taken ones, and numbers far above the
+    // highest, then get the next free IDs. A taken ID may be a rewrite or a
+    // new entry, so both entries stay.
+    const Fate = enum { repeat, keep, renumber };
     const found = try items(arena, sections.items);
     const fates = try arena.alloc(Fate, found.len);
     const before = checkpoint.highestIds(.{ .entries = earlier, .highest = highest });
@@ -553,38 +558,30 @@ pub fn read(arena: Allocator, reply: []const u8, known: Known, earlier: []const 
         const reused = for (found[0..index], fates[0..index]) |other, other_fate| {
             if (other_fate == .keep and std.mem.eql(u8, other.id, item.id)) break true;
         } else false;
-        if (number == 0 or number <= before[kind] or reused) {
-            fate.* = .{ .renumber = .{ .replaces = number > 0 and number <= before[kind] and !reused } };
-            continue;
-        }
         // Far above the highest is a slip, not a real number; renumbered, the
         // numbers stay small and never run out.
-        if (number - before[kind] > max_id_gap) {
-            fate.* = .{ .renumber = .{ .replaces = false } };
+        if (number <= before[kind] or reused or number - before[kind] > max_id_gap) {
+            fate.* = .renumber;
             continue;
         }
-        fate.* = .{ .keep = item.id };
+        fate.* = .keep;
         next[kind] = @max(next[kind], number);
     }
     var entries: std.ArrayList(checkpoint.Entry) = .empty;
     for (found, fates) |item, fate| {
-        const id, const replaces = switch (fate) {
+        const id = switch (fate) {
             .repeat => continue,
-            .keep => |id| .{ id, false },
-            .renumber => |renumber| renumbered: {
+            .keep => item.id,
+            .renumber => renumbered: {
                 const kind = std.mem.findScalar(u8, entry_kinds, item.id[0]).?;
                 next[kind] +|= 1;
                 written.renumbered += 1;
-                break :renumbered .{ try std.fmt.allocPrint(arena, "{c}{d}", .{ entry_kinds[kind], next[kind] }), renumber.replaces };
+                break :renumbered try std.fmt.allocPrint(arena, "{c}{d}", .{ entry_kinds[kind], next[kind] });
             },
         };
-        const text = if (replaces)
-            try std.mem.concat(arena, u8, &.{ id, entryRest(item), "; replaces ", item.id })
-        else
-            try std.mem.concat(arena, u8, &.{ id, entryRest(item) });
-        try entries.append(arena, .{ .id = id, .text = text });
+        try entries.append(arena, .{ .id = id, .text = try std.mem.concat(arena, u8, &.{ id, entryRest(item) }) });
     }
-    if (written.renumbered > 0) trace.log(false, "compaction entries renumbered because their IDs were taken count={d}", .{written.renumbered});
+    if (written.renumbered > 0) trace.log(false, "compaction entries renumbered because their IDs were taken or far above the highest count={d}", .{written.renumbered});
     written.entries = entries.items;
     return written;
 }
@@ -723,7 +720,7 @@ fn isToolsLabel(plain: []const u8) bool {
 /// A line copied from the compacted conversation, where an entry a later one
 /// replaced ends like ` (replaced by S2)`.
 fn copiesReplaced(rest: []const u8) bool {
-    const line = std.mem.trimEnd(u8, rest, " ");
+    const line = std.mem.trimEnd(u8, rest, " .");
     const at = std.mem.findLast(u8, line, checkpoint.replaced_mark) orelse return false;
     const tail = line[at + checkpoint.replaced_mark.len ..];
     return tail.len > 1 and tail[tail.len - 1] == ')' and checkpoint.isEntryId(tail[0 .. tail.len - 1]);
@@ -923,8 +920,8 @@ test "notes are read per turn and tool call, and entries only ever add" {
     try testing.expectEqualStrings("ran the tests; 1 of 6 failed", written.tool(9));
     try testing.expectEqual(@as(usize, 1), written.unknown);
 
-    // The rewrite of D1 is kept under the next free ID, after the D2 the
-    // model numbered right, and replaces D1; entries keep their text as
+    // The entry under D1's ID is kept under the next free ID, after the D2
+    // the model numbered right, and D1 stays too; entries keep their text as
     // written.
     try testing.expectEqual(@as(usize, 0), written.repeated);
     try testing.expectEqual(@as(usize, 1), written.renumbered);
@@ -932,23 +929,30 @@ test "notes are read per turn and tool call, and entries only ever add" {
     try testing.expectEqualStrings("R2 (M3): \"Store every price as integer cents.\"", written.entries[0].text);
     try testing.expectEqualStrings("R3 (M4): \"keep it short\"", written.entries[1].text);
     try testing.expectEqualStrings("F4", written.entries[2].id);
-    try testing.expectEqualStrings("D3 (M3): a rewrite of an entry that already exists; replaces D1", written.entries[3].text);
+    try testing.expectEqualStrings("D3 (M3): a rewrite of an entry that already exists", written.entries[3].text);
     try testing.expectEqualStrings("D2 (M4): no cache; replaces D1", written.entries[4].text);
 
     // An entry repeated word for word is left out, and so is a line copied
     // with the mark of an entry another replaced. One whose ID only a saved
-    // ledger still holds is a rewrite of that one, renumbered above it.
+    // ledger still holds is renumbered above it.
     const again = try read(arena,
         \\Decisions:
         \\- D1 (M2): cache in a pickle file
         \\- D1 (M2): cache in a file (replaced by D2)
+        \\- D5 (M2): cache on disk (replaced by D6).
         \\- D8 (M5): the old loader (replaced by a new one) stays for tests
         \\- D4 (M5): keep the pickle cache
     , .{ .turns = &.{5}, .tools = &.{} }, &earlier, .{ 0, 0, 6, 0, 0 });
-    try testing.expectEqual(@as(usize, 2), again.repeated);
+    try testing.expectEqual(@as(usize, 3), again.repeated);
     try testing.expectEqual(@as(usize, 2), again.entries.len);
     try testing.expectEqualStrings("D8 (M5): the old loader (replaced by a new one) stays for tests", again.entries[0].text);
-    try testing.expectEqualStrings("D9 (M5): keep the pickle cache; replaces D4", again.entries[1].text);
+    try testing.expectEqualStrings("D9 (M5): keep the pickle cache", again.entries[1].text);
+
+    // Asked for no turn, only for the summary of earlier compactions, a
+    // reply without its heading is that summary.
+    const summary_only = try read(arena, "The user fixed the build; the tests pass.", .{ .turns = &.{}, .tools = &.{8} }, &earlier, @splat(0));
+    try testing.expectEqualStrings("The user fixed the build; the tests pass.", summary_only.earlier);
+    try testing.expectEqual(@as(usize, 0), summary_only.works.len);
 
     // An ID far above the highest is renumbered, so numbers never run out.
     const far = try read(arena, "Facts:\n- F18446744073709551615 (T8): the parser is slow\n- F1000 (T8): the loader is fast", .{ .turns = &.{3}, .tools = &.{8} }, &.{}, @splat(0));
