@@ -1692,7 +1692,10 @@ fn writeExecutionToolResult(
             try writeDurableBytes(writer, handle);
         } else if (result.tool_images.len > 0) {
             try writer.writeAll(",\"tool_images\":");
-            try writePersistedToolImages(writer, result.tool_images);
+            writePersistedToolImages(writer, result.tool_images) catch |err| switch (err) {
+                error.InvalidSourceRef, error.InvalidImage => return error.InvalidSessionFormat,
+                else => |write_err| return write_err,
+            };
         }
     }
     try writer.writeByte('}');
@@ -3304,6 +3307,31 @@ test "durable byte fields use canonical string or padded base64 representation" 
         var bad = try std.json.parseFromSlice(std.json.Value, alloc, json_text, .{});
         defer bad.deinit();
         try std.testing.expectError(error.InvalidDurableBytes, parseDurableBytes(alloc, bad.value));
+    }
+}
+
+test "durable tool image validation preserves the session format error contract" {
+    const alloc = std.testing.allocator;
+    const invalid_images = [_]types.ToolImage{
+        .{ .data = @constCast(""), .mime_type = @constCast("image/png"), .source_ref = @constCast("bad\nref") },
+        .{ .data = @constCast(""), .mime_type = @constCast("image/png") },
+    };
+    for (invalid_images) |image| {
+        var images = [_]types.ToolImage{image};
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        try std.testing.expectError(error.InvalidSessionFormat, writeExecutionToolResult(&out.writer, .{
+            .tool_call_id = @constCast("call"),
+            .tool_name = @constCast("host_image"),
+            .status = .success,
+            .output = @constCast(""),
+            .output_bytes = 0,
+            .stored_output_bytes = 0,
+            .truncated = false,
+            .provider_native = false,
+            .created_at_ms = 0,
+            .tool_images = &images,
+        }, .durable));
     }
 }
 
