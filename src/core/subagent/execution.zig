@@ -20,6 +20,7 @@ const session_store = @import("../session/session_store.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const tool_dispatch = @import("../tooling/tool_dispatch.zig");
 const types = @import("../shared/types.zig");
+const history_range = @import("../shared/history_range.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -635,7 +636,7 @@ pub const TurnContext = struct {
         if (prefix) |*value| {
             try session.copyWorkIdToTurn(self.alloc, value, self.active_work_id orelse return error.InvalidWorkId);
         }
-        const prepared = try session.prepareCompactedHistory(self.alloc, self.runtime.agent.history.items, summary, retained_from orelse .{ .turns = session.rawHistoryTurnCount(self.runtime.agent.history.items) });
+        const prepared = try session.prepareCompactedHistory(self.alloc, self.runtime.agent.history.items, summary, retained_from orelse .{ .turns = history_range.rawHistoryTurnCount(self.runtime.agent.history.items) });
         errdefer types.freeHistoryTurnSlice(self.alloc, prepared);
         switch (self.loaded) {
             .v1 => |loaded| _ = try loaded.commitContextCompaction(

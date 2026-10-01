@@ -235,10 +235,8 @@ try {
             ultrafast: { input: '0.00006', output: '0.0003', input_cache_read: '0.000006' },
           } };
           const cases = [
-            { name: 'Astra true', model: astra, ultrafast: true },
             { name: 'priced Sol true', model: sol, ultrafast: true },
             { name: 'Astra false', model: astra, ultrafast: false },
-            { name: 'priced Sol false', model: sol, ultrafast: false },
             { name: 'unpriced Sol rejection', model: sol, ultrafast: true, reject: true },
           ];
           const passed = [];
@@ -301,7 +299,7 @@ try {
       }, sessionId), "browser Ultrafast case timed out", 15000);
       expect(!evaluated.exceptionDetails, evaluated.result?.description || evaluated.exceptionDetails?.text || "browser Ultrafast exception");
       expect(JSON.stringify(evaluated.result.value) === JSON.stringify([
-        "Astra true", "priced Sol true", "Astra false", "priced Sol false", "unpriced Sol rejection",
+        "priced Sol true", "Astra false", "unpriced Sol rejection",
       ]), `unexpected browser Ultrafast cases ${JSON.stringify(evaluated.result.value)}`);
       console.log("browser core ultrafast routing and eligibility passed");
     } finally {

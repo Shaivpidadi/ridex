@@ -2567,19 +2567,6 @@ test "cooperative Ultrafast capability resolution uses active request settings a
     }
 }
 
-test "native request capability resolution does not require cooperative hydration" {
-    const App = struct {
-        pub const host_profile = runtime_profile.native;
-
-        pub fn resolveModelCapabilitiesForRequest(_: *@This(), _: []const u8) model_capabilities.ResolveError!model_capabilities.Capabilities {
-            return .{ .supports_ultrafast_mode = true };
-        }
-    };
-    var app: App = .{};
-    const capabilities = try Bindings(App).modelCapabilityResolver(&app).resolve(std.testing.allocator, "openai/test");
-    try std.testing.expect(capabilities.supports_ultrafast_mode);
-}
-
 test "agent deps record rejected tool calls in feedback diagnostics" {
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();

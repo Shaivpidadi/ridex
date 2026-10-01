@@ -394,7 +394,10 @@ fn appendSessionStatusSegments(
         appendStatusSegment(out, end, effort.displayLabel());
     }
     if (statusline.ultrafast_indicator_active) {
-        appendStatusSegment(out, end, "⚡︎⚡︎⚡︎");
+        const marker_style = if (truecolor_enabled) "\x1b[38;2;255;204;0m" else "\x1b[38;5;220m";
+        var marker_buf: [64]u8 = undefined;
+        const marker = std.fmt.bufPrint(&marker_buf, "{s}⚡︎{s}", .{ marker_style, statusline_style }) catch "⚡︎";
+        appendStatusSegment(out, end, marker);
     } else if (fast_indicator_active) {
         appendStatusSegment(out, end, "⚡︎");
     }
@@ -1023,18 +1026,40 @@ test "buildHintLine uses a monochrome lightning marker for fast mode" {
     try std.testing.expectEqual(@as(usize, 25), display_width.visibleWidthIgnoringAnsi(line));
 }
 
-test "buildHintLine uses three monochrome lightning markers for Ultrafast" {
-    initTheme(false, null);
+test "buildHintLine uses one vivid yellow lightning marker for Ultrafast in both themes" {
+    const terminal_engine = @import("../core/terminal/engine.zig");
     defer initTheme(false, null);
-    var buf: [128]u8 = undefined;
-    const line = buildHintLine(false, true, "openai/gpt-6-astra", .auto, true, types.ReasoningEffort.literal("xhigh"), true, .{ .ultrafast_indicator_active = true }, 80, &buf);
-    var expected_buf: [128]u8 = undefined;
-    const expected = try std.fmt.bufPrint(&expected_buf, "{s}auto{s} · gpt-6-astra · xhigh · ⚡︎⚡︎⚡︎", .{ permission_auto_style, statusline_style });
-    try std.testing.expectEqualStrings(expected, line);
-    try std.testing.expectEqual(@as(usize, 35), display_width.visibleWidthIgnoringAnsi(line));
-    for (0..36) |width| {
-        const clipped = buildHintLine(false, true, "openai/gpt-6-astra", .auto, false, types.ReasoningEffort.literal("xhigh"), true, .{ .ultrafast_indicator_active = true }, @intCast(width), &buf);
-        try std.testing.expect(display_width.visibleWidthIgnoringAnsi(clipped) <= width);
+    defer setTruecolorSupport(true);
+    for ([_]bool{ false, true }) |light| {
+        initTheme(light, null);
+        for ([_]bool{ true, false }) |truecolor| {
+            setTruecolorSupport(truecolor);
+            var buf: [128]u8 = undefined;
+            const line = buildHintLine(false, true, "openai/gpt-6-astra", .auto, true, types.ReasoningEffort.literal("xhigh"), true, .{ .ultrafast_indicator_active = true }, 80, &buf);
+            var expected_buf: [128]u8 = undefined;
+            const yellow = if (truecolor) "\x1b[38;2;255;204;0m" else "\x1b[38;5;220m";
+            const expected = try std.fmt.bufPrint(&expected_buf, "{s}auto{s} · gpt-6-astra · xhigh · {s}⚡︎{s}", .{ permission_auto_style, statusline_style, yellow, statusline_style });
+            try std.testing.expectEqualStrings(expected, line);
+            try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, line, "⚡︎"));
+            try std.testing.expectEqual(@as(usize, 31), display_width.visibleWidthIgnoringAnsi(line));
+            var grid = try terminal_engine.Grid.init(std.testing.allocator, 80, 1);
+            defer grid.deinit();
+            try grid.feed(line);
+            const marker_color: terminal_engine.Color = if (truecolor) .{ .rgb = .{ .r = 255, .g = 204, .b = 0 } } else .{ .indexed = 220 };
+            var markers: usize = 0;
+            for (grid.cells) |cell| {
+                if (cell.codepoint != 0x26a1) continue;
+                markers += 1;
+                try std.testing.expect(cell.style.fg.eql(marker_color));
+                try std.testing.expect(!cell.style.flags.dim);
+            }
+            try std.testing.expectEqual(@as(usize, 1), markers);
+            try std.testing.expect(grid.current_style.fg.eql(.{ .indexed = if (light) 241 else 245 }));
+            for (0..32) |width| {
+                const clipped = buildHintLine(false, true, "openai/gpt-6-astra", .auto, false, types.ReasoningEffort.literal("xhigh"), true, .{ .ultrafast_indicator_active = true }, @intCast(width), &buf);
+                try std.testing.expect(display_width.visibleWidthIgnoringAnsi(clipped) <= width);
+            }
+        }
     }
 }
 

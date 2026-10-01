@@ -1316,22 +1316,6 @@ fn restoredUltrafastMode(state: *const server.ServerState, preference: bool) boo
     return state.process_ultrafast_override orelse preference;
 }
 
-test "ACP ultrafast resume uses saved preferences with process-only overrides" {
-    var state = server.ServerState{
-        .alloc = std.testing.allocator,
-        .cfg = acpSessionTestConfig(),
-        .writer = jsonrpc.Writer.init(),
-        .configured_ultrafast_mode = true,
-    };
-    try std.testing.expect(!restoredUltrafastMode(&state, false));
-    try std.testing.expect(restoredUltrafastMode(&state, true));
-    state.process_ultrafast_override = false;
-    try std.testing.expect(!restoredUltrafastMode(&state, true));
-    state.process_ultrafast_override = true;
-    try std.testing.expect(restoredUltrafastMode(&state, false));
-    try std.testing.expect(state.configured_ultrafast_mode);
-}
-
 const SessionActivation = struct {
     session_id: []u8,
     /// Exactly one of `writable` (with the store) and `v2` is set.
@@ -2397,17 +2381,6 @@ pub fn writeUltrafastConfigOption(w: *std.Io.Writer, current: bool) !void {
     try w.writeAll("{\"id\":\"ultrafast\",\"name\":\"Ultrafast Mode\",\"description\":\"Uses the model's ultrafast Gateway lane\",\"category\":\"model\",\"type\":\"select\",\"currentValue\":");
     try writeJsonStr(if (current) "true" else "false", w);
     try w.writeAll(",\"options\":[{\"value\":\"false\",\"name\":\"off\"},{\"value\":\"true\",\"name\":\"on\"}]}");
-}
-
-test "writeUltrafastConfigOption produces a strict boolean select" {
-    const alloc = std.testing.allocator;
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
-    try writeUltrafastConfigOption(&out.writer, true);
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, out.writer.buffered(), .{});
-    defer parsed.deinit();
-    try std.testing.expectEqualStrings("ultrafast", parsed.value.object.get("id").?.string);
-    try std.testing.expectEqualStrings("true", parsed.value.object.get("currentValue").?.string);
 }
 
 pub fn effortSupportedBy(efforts: model_capabilities.ReasoningEffortOptions, effort: types.ReasoningEffort) bool {

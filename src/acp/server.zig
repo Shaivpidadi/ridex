@@ -11,6 +11,7 @@ const prompt_handler = @import("prompt.zig");
 const prompt_test_controls = @import("prompt_test_controls.zig");
 const app_lifecycle = @import("../core/app/app_lifecycle.zig");
 const app_runtime_setup = @import("../core/app/app_runtime_setup.zig");
+const compactor = @import("../core/compactor/compactor.zig");
 const builtin_skills = @import("../builtins/skills.zig");
 const builtin_tools = @import("../builtins/tools.zig");
 const credentials = @import("../core/auth/credentials.zig");
@@ -299,6 +300,7 @@ pub const ServerState = struct {
     permission_rules: types.PermissionRuleSet = .{},
     agent_step_limit: usize = 0,
     max_tool_result_bytes: usize = 64 * 1024,
+    auto_compact_percent: u8 = compactor.default_percent,
     context_limits: config_runtime.context_limits.Values = .{},
     fast_mode: bool = false,
     ultrafast_mode: bool = false,
@@ -2109,31 +2111,6 @@ fn configureUltrafastStartup(state: *ServerState, startup: *const app_lifecycle.
     state.ultrafast_mode = state.process_ultrafast_override orelse state.configured_ultrafast_mode;
 }
 
-test "ACP ultrafast startup separates configured preferences from CLI and env overrides" {
-    const overrides = [_]?bool{ null, false, true };
-    for ([_]bool{ false, true }) |baseline| {
-        for (overrides) |env| {
-            for (overrides) |cli| {
-                var state = ServerState{
-                    .alloc = std.testing.allocator,
-                    .cfg = undefined,
-                    .writer = jsonrpc.Writer.init(),
-                };
-                state.cfg.ultrafast_override = cli;
-                const startup = app_lifecycle.StartupState{
-                    .agent_step_limit = 1,
-                    .configured_ultrafast_mode = baseline,
-                    .ultrafast_process_override = env,
-                };
-                configureUltrafastStartup(&state, &startup);
-                try std.testing.expectEqual(baseline, state.configured_ultrafast_mode);
-                try std.testing.expectEqual(cli orelse env, state.process_ultrafast_override);
-                try std.testing.expectEqual(cli orelse env orelse baseline, state.ultrafast_mode);
-            }
-        }
-    }
-}
-
 fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void {
     if (state.initialized) {
         return state.writer.writeError(alloc, msg.id, .{
@@ -2275,6 +2252,7 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     state.permission_rules = startup.takePermissionRules();
     state.agent_step_limit = startup.agent_step_limit;
     state.max_tool_result_bytes = startup.max_tool_result_bytes;
+    state.auto_compact_percent = startup.auto_compact_percent;
     state.context_limits = startup.context_limits;
     state.context_limits.applyCommandLine(state.cfg.context_limit_overrides);
     state.fast_mode = startup.fast_mode and

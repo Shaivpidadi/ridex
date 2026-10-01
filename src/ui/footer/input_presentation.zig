@@ -620,9 +620,9 @@ pub fn composeMcpMenuHintRow(
     }
 
     const root_variants = [_][]const u8{
-        "↑↓ move  tab section  enter inspect  a add  r reload  c help  esc close",
-        "↑↓ move  tab section  enter  a add  r reload  c help  esc",
-        "tab enter a r c esc",
+        "↑↓ move  tab section  enter inspect  s add Slack  a add  r reload  c help  esc close",
+        "↑↓ move  tab section  enter  s Slack  a add  r reload  c help  esc",
+        "tab enter s a r c esc",
     };
     const catalog_variants = [_][]const u8{
         "↑↓ navigate     tab section     enter open     / filter     esc back",
@@ -1627,7 +1627,7 @@ test "compose hint row carries the Ultrafast marker projection" {
     };
     var row = try composeHintRow(std.testing.allocator, false, ctx, 80);
     defer row.deinit(std.testing.allocator);
-    try std.testing.expect(std.mem.find(u8, row.items, "gpt-6-astra · xhigh · ⚡︎⚡︎⚡︎") != null);
+    try std.testing.expect(std.mem.find(u8, row.items, "gpt-6-astra · xhigh · \x1b[38;2;255;204;0m⚡︎") != null);
 }
 
 test "compose hint row keeps model in left hint text" {

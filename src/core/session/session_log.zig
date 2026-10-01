@@ -10,6 +10,7 @@ const session_child_store = @import("session_child_store.zig");
 const session_codec = @import("session_codec.zig");
 const session_compaction = @import("session_compaction.zig");
 const types = @import("../shared/types.zig");
+const history_range = @import("../shared/history_range.zig");
 const session_event = @import("session_event.zig");
 const history_snapshot = @import("history_snapshot.zig");
 const session_layout = @import("session_layout.zig");
@@ -385,7 +386,7 @@ pub const ConversationWriter = struct {
         const unwritten = if (self.turn_open) blk: {
             var progress: ConversationProgress = .{};
             try self.scanContext(alloc, &progress, null);
-            const view = try session.contextHistoryRange(arena.allocator(), &.{turn}, .{
+            const view = try history_range.contextHistoryRange(arena.allocator(), &.{turn}, .{
                 .tool_steps = progress.point.tool_steps,
                 .steering = progress.point.steering,
             }, null);
