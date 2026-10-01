@@ -103,8 +103,8 @@ pub const Observer = struct {
     notify: *const fn (context: *anyopaque, session: *Session, what: Observed) void,
 };
 
-pub const AppendError = error{ InvalidTransition, SessionClosed, TooLarge, Io, OutOfMemory };
-pub const OpenError = error{ NotFound, Busy, ChildSession, Corrupt, UnsupportedVersion, Io, OutOfMemory };
+pub const AppendError = error{ InvalidTransition, SessionClosed, TooLarge, OutOfMemory } || storage.IoFault;
+pub const OpenError = error{ NotFound, Busy, ChildSession, Corrupt, UnsupportedVersion, OutOfMemory } || storage.IoFault;
 
 pub const Identity = struct {
     id: []u8,
@@ -232,7 +232,11 @@ pub const Session = struct {
     synced_seq: u64 = 0,
     /// Written under `mutex`, read under `sync_mutex`.
     written_seq: SeqCell = .{},
-    sync_failed: std.atomic.Value(bool) = .init(false),
+    /// A sync that failed outside `mutex`, as a `FaultCode`; `none` until then.
+    sync_fault: std.atomic.Value(u8) = .init(@intFromEnum(FaultCode.none)),
+    /// Under `mutex`: the cause of the write or sync that failed the
+    /// session. Every later call reports it (D40).
+    fault: ?storage.IoFault = null,
 
     pub fn id(session: *const Session) []const u8 {
         return session.identity.id;
@@ -263,7 +267,7 @@ pub const Session = struct {
         from: From,
         direction: Direction,
         limit: usize,
-    ) error{ SessionClosed, Io, OutOfMemory }!Page {
+    ) (error{ SessionClosed, OutOfMemory } || storage.IoFault)!Page {
         const io = session.env.s.io;
         session.mutex.lockUncancelable(io);
         defer session.mutex.unlock(io);
@@ -336,12 +340,12 @@ pub const Session = struct {
     fn appendLocked(session: *Session, events: []const fold.Event, sync_through: *?u64) AppendError!u64 {
         switch (session.phase) {
             .closed => return error.SessionClosed,
-            .failed => return error.Io,
+            .failed => return session.fault orelse error.Io,
             .held, .live => {},
         }
-        if (session.sync_failed.load(.acquire)) {
-            session.markFailed();
-            return error.Io;
+        if (faultFromCode(session.sync_fault.load(.acquire))) |cause| {
+            session.markFailed(cause);
+            return cause;
         }
         if (events.len == 0) return session.state.last_seq;
         const gpa = session.env.gpa;
@@ -403,7 +407,11 @@ pub const Session = struct {
     /// session always has a durable first line (`tla/Lifecycle.tla`).
     fn publish(session: *Session, bodies: []const schema.Body, ts: u64) AppendError!void {
         const gpa = session.env.gpa;
-        errdefer session.phase = .{ .failed = null };
+        // Nothing is visible; later calls name the cause (D40).
+        errdefer |err| {
+            session.phase = .{ .failed = null };
+            if (session.fault == null) session.fault = asIoFault(err);
+        }
 
         // Frame everything first: line 1, the held lines, then the batch.
         session.batch.clearRetainingCapacity();
@@ -449,41 +457,41 @@ pub const Session = struct {
         const env = session.env;
         const s = env.s;
         const id_ = session.identity.id;
-        const tmp = s.ensureDir(env.root, ".tmp") catch return error.Io;
+        const tmp = s.ensureDir(env.root, ".tmp") catch |io_err| return storage.ioFault(io_err);
         defer s.closeDir(tmp);
         s.makeDir(tmp, id_) catch |err| switch (err) {
             // A leftover from a crashed attempt with the same id (an import).
             error.AlreadyExists => {
-                s.deleteTree(tmp, id_) catch return error.Io;
-                s.makeDir(tmp, id_) catch return error.Io;
+                s.deleteTree(tmp, id_) catch |io_err| return storage.ioFault(io_err);
+                s.makeDir(tmp, id_) catch |io_err| return storage.ioFault(io_err);
             },
-            else => return error.Io,
+            else => |io_err| return storage.ioFault(io_err),
         };
         session.observe(.made_tmp);
-        const dir = s.openDir(tmp, id_) catch return error.Io;
+        const dir = s.openDir(tmp, id_) catch |io_err| return storage.ioFault(io_err);
         errdefer s.closeDir(dir);
         {
-            const blobs = s.ensureDir(dir, "blobs") catch return error.Io;
+            const blobs = s.ensureDir(dir, "blobs") catch |io_err| return storage.ioFault(io_err);
             defer s.closeDir(blobs);
             if (source_blobs) |source| {
                 try session.linkBlobs(source, blobs);
-                s.syncDir(blobs) catch return error.Io;
+                s.syncDir(blobs) catch |io_err| return storage.ioFault(io_err);
             }
         }
-        var log = Log.create(s, dir, "log.jsonl", .{}) catch return error.Io;
+        var log = Log.create(s, dir, "log.jsonl", .{}) catch |io_err| return storage.ioFault(io_err);
         errdefer log.close();
-        session.writeFramed(&log, 1, .header) catch return error.Io;
+        session.writeFramed(&log, 1, .header) catch |io_err| return storage.ioFault(io_err);
 
         const rename_first = env.isPlanted(.rename_before_fsync);
         if (rename_first) try session.publishRename(tmp);
-        s.sync(log.file) catch return error.Io;
+        s.sync(log.file) catch |io_err| return storage.ioFault(io_err);
         session.observe(.publish_synced);
-        const lock = s.createFile(dir, "lock") catch return error.Io;
+        const lock = s.createFile(dir, "lock") catch |io_err| return storage.ioFault(io_err);
         errdefer s.closeFile(lock);
-        if (!(s.tryLock(lock) catch return error.Io)) return error.Io;
-        s.syncDir(dir) catch return error.Io;
+        if (!(s.tryLock(lock) catch |io_err| return storage.ioFault(io_err))) return error.Io;
+        s.syncDir(dir) catch |io_err| return storage.ioFault(io_err);
         if (!rename_first) try session.publishRename(tmp);
-        s.syncDir(env.root) catch return error.Io;
+        s.syncDir(env.root) catch |io_err| return storage.ioFault(io_err);
         session.observe(.published);
         return .{ .dir = dir, .log = log, .lock = lock };
     }
@@ -494,7 +502,7 @@ pub const Session = struct {
         const s = session.env.s;
         var skipped_one = false;
         var listing = s.list(source);
-        while (listing.next() catch return error.Io) |entry| {
+        while (listing.next() catch |io_err| return storage.ioFault(io_err)) |entry| {
             if (entry.kind != .file or !schema.validBlobHash(entry.name)) continue;
             if (session.env.isPlanted(.fork_skips_blob_link) and !skipped_one) {
                 skipped_one = true;
@@ -502,7 +510,7 @@ pub const Session = struct {
             }
             s.link(source, entry.name, target, entry.name) catch |err| switch (err) {
                 error.AlreadyExists => {},
-                error.NoSpace => return error.Io,
+                error.NoSpace => return error.NoSpaceLeft,
                 else => try copyBlob(session.env, source, target, entry.name),
             };
         }
@@ -524,9 +532,9 @@ pub const Session = struct {
             session.mutex.lockUncancelable(io);
             defer session.mutex.unlock(io);
             switch (session.phase) {
-                .live => |live| break :blk s.openDir(live.dir, "blobs") catch return error.Io,
+                .live => |live| break :blk s.openDir(live.dir, "blobs") catch |io_err| return storage.ioFault(io_err),
                 .held => return error.InvalidTransition,
-                .failed => return error.Io,
+                .failed => return session.fault orelse error.Io,
                 .closed => return error.SessionClosed,
             }
         };
@@ -536,16 +544,16 @@ pub const Session = struct {
         var suffix: [8]u8 = undefined;
         io.random(&suffix);
         const name = std.fmt.bufPrint(&tmp_name, ".{s}.{x}.tmp", .{ &hash, &suffix }) catch unreachable;
-        const file = s.createFile(dir, name) catch return error.Io;
+        const file = s.createFile(dir, name) catch |io_err| return storage.ioFault(io_err);
         var file_open = true;
         defer if (file_open) s.closeFile(file);
         errdefer s.deleteFile(dir, name) catch {};
-        s.writeAt(file, bytes, 0) catch return error.Io;
-        s.sync(file) catch return error.Io;
+        s.writeAt(file, bytes, 0) catch |io_err| return storage.ioFault(io_err);
+        s.sync(file) catch |io_err| return storage.ioFault(io_err);
         s.closeFile(file);
         file_open = false;
-        s.rename(dir, name, dir, &hash) catch return error.Io;
-        s.syncDir(dir) catch return error.Io;
+        s.rename(dir, name, dir, &hash) catch |io_err| return storage.ioFault(io_err);
+        s.syncDir(dir) catch |io_err| return storage.ioFault(io_err);
         return hash;
     }
 
@@ -554,7 +562,7 @@ pub const Session = struct {
     fn checkBlobRefs(session: *Session, live: *Live, bodies: []const schema.Body) AppendError!void {
         if (!hasBlobRefs(bodies)) return;
         const s = session.env.s;
-        const dir = s.openDir(live.dir, "blobs") catch return error.Io;
+        const dir = s.openDir(live.dir, "blobs") catch |io_err| return storage.ioFault(io_err);
         defer s.closeDir(dir);
         for (bodies) |body| switch (body) {
             .item => |piece| for (piece.blobs) |hash| {
@@ -566,7 +574,7 @@ pub const Session = struct {
     }
 
     fn publishRename(session: *Session, tmp: storage.Dir) AppendError!void {
-        session.env.s.rename(tmp, session.identity.id, session.env.root, session.identity.id) catch return error.Io;
+        session.env.s.rename(tmp, session.identity.id, session.env.root, session.identity.id) catch |io_err| return storage.ioFault(io_err);
         session.observe(.renamed);
     }
 
@@ -578,9 +586,10 @@ pub const Session = struct {
         session.batch.clearRetainingCapacity();
         session.bounds.clearRetainingCapacity();
         for (bodies, 0..) |body, i| try session.frameMarked(first_seq + i, ts, body);
-        session.writeFramed(&live.log, first_seq, cause) catch {
-            session.markFailed();
-            return error.Io;
+        session.writeFramed(&live.log, first_seq, cause) catch |err| {
+            const fault = storage.ioFault(err);
+            session.markFailed(fault);
+            return fault;
         };
         const fork_seq = session.identity.forkSeq();
         for (bodies, 0..) |body, i| {
@@ -683,9 +692,11 @@ pub const Session = struct {
         const file = session.sync_file orelse return error.SessionClosed;
         const target = session.written_seq.load(io);
         std.debug.assert(target >= seq);
-        session.env.s.sync(file) catch {
-            session.sync_failed.store(true, .release);
-            return error.Io;
+        session.env.s.sync(file) catch |err| {
+            const fault = storage.ioFault(err);
+            // Only the first cause is kept; a later failure changes nothing.
+            _ = session.sync_fault.cmpxchgStrong(@intFromEnum(FaultCode.none), @intFromEnum(faultCode(fault)), .release, .monotonic);
+            return fault;
         };
         session.synced_seq = target;
     }
@@ -698,11 +709,13 @@ pub const Session = struct {
         session.synced_seq = synced;
     }
 
-    fn markFailed(session: *Session) void {
+    /// Fails a live session with `cause`; the first cause is the one kept.
+    fn markFailed(session: *Session, cause: storage.IoFault) void {
         switch (session.phase) {
             .live => |live| session.phase = .{ .failed = live },
             else => {},
         }
+        if (session.fault == null) session.fault = cause;
     }
 
     fn timestamp(session: *const Session) u64 {
@@ -823,6 +836,49 @@ pub const Session = struct {
 /// Blobs above this size are refused; the adapter keeps fx's own, smaller limits.
 pub const max_blob_bytes: usize = 512 << 20;
 
+/// An I/O fault as one byte, so a sync on another thread can hand its cause
+/// to the next append through an atomic.
+const FaultCode = enum(u8) { none, io, no_space, access_denied, read_only, too_big };
+
+fn faultCode(fault: storage.IoFault) FaultCode {
+    return switch (fault) {
+        error.Io => .io,
+        error.NoSpaceLeft => .no_space,
+        error.AccessDenied => .access_denied,
+        error.ReadOnlyFileSystem => .read_only,
+        error.FileTooBig => .too_big,
+    };
+}
+
+/// The I/O fault an append failed with, if it was one.
+fn asIoFault(err: AppendError) ?storage.IoFault {
+    return switch (err) {
+        error.Io => error.Io,
+        error.NoSpaceLeft => error.NoSpaceLeft,
+        error.AccessDenied => error.AccessDenied,
+        error.ReadOnlyFileSystem => error.ReadOnlyFileSystem,
+        error.FileTooBig => error.FileTooBig,
+        else => null,
+    };
+}
+
+fn faultFromCode(code: u8) ?storage.IoFault {
+    return switch (std.enums.fromInt(FaultCode, code) orelse .io) {
+        .none => null,
+        .io => error.Io,
+        .no_space => error.NoSpaceLeft,
+        .access_denied => error.AccessDenied,
+        .read_only => error.ReadOnlyFileSystem,
+        .too_big => error.FileTooBig,
+    };
+}
+
+test "a fault code round trips every I/O fault, and none is no fault" {
+    const faults = [_]storage.IoFault{ error.Io, error.NoSpaceLeft, error.AccessDenied, error.ReadOnlyFileSystem, error.FileTooBig };
+    for (faults) |fault| try std.testing.expectEqual(fault, faultFromCode(@intFromEnum(faultCode(fault))).?);
+    try std.testing.expectEqual(@as(?storage.IoFault, null), faultFromCode(@intFromEnum(FaultCode.none)));
+}
+
 fn hasBlobRefs(bodies: []const schema.Body) bool {
     for (bodies) |body| switch (body) {
         .item => |piece| if (piece.blobs.len > 0) return true,
@@ -836,17 +892,17 @@ fn hasBlobRefs(bodies: []const schema.Body) bool {
 fn copyBlob(env: *const Env, source: storage.Dir, target: storage.Dir, name: []const u8) AppendError!void {
     const s = env.s;
     const gpa = env.gpa;
-    const from = s.openFile(source, name, .read_only) catch return error.Io;
+    const from = s.openFile(source, name, .read_only) catch |io_err| return storage.ioFault(io_err);
     defer s.closeFile(from);
-    const len = s.length(from) catch return error.Io;
+    const len = s.length(from) catch |io_err| return storage.ioFault(io_err);
     if (len > max_blob_bytes) return error.Io;
     const bytes = try gpa.alloc(u8, @intCast(len));
     defer gpa.free(bytes);
-    if ((s.readAt(from, bytes, 0) catch return error.Io) != bytes.len) return error.Io;
-    const to = s.createFile(target, name) catch return error.Io;
+    if ((s.readAt(from, bytes, 0) catch |io_err| return storage.ioFault(io_err)) != bytes.len) return error.Io;
+    const to = s.createFile(target, name) catch |io_err| return storage.ioFault(io_err);
     defer s.closeFile(to);
-    s.writeAt(to, bytes, 0) catch return error.Io;
-    s.sync(to) catch return error.Io;
+    s.writeAt(to, bytes, 0) catch |io_err| return storage.ioFault(io_err);
+    s.sync(to) catch |io_err| return storage.ioFault(io_err);
 }
 
 fn changesListing(events: []const fold.Event) bool {
@@ -923,6 +979,9 @@ pub const ResumeOptions = struct {
     host: schema.Host,
     /// Required to resume a child session.
     parent: ?[]const u8 = null,
+    /// How long to wait for the flock before Busy; null uses the
+    /// environment's `lock_wait_ms` (D38).
+    lock_wait_ms: ?u64 = null,
 };
 
 /// Opens a published session for writing: the flock (else Busy after the
@@ -951,7 +1010,7 @@ pub fn openResume(env: *const Env, options: ResumeOptions) OpenError!*Session {
         session.abandon();
         return switch (err) {
             error.OutOfMemory => error.OutOfMemory,
-            else => error.Io,
+            else => |io_err| storage.ioFault(io_err),
         };
     };
     return session;
@@ -979,20 +1038,20 @@ fn openParts(env: *const Env, options: ResumeOptions) OpenError!Parts {
     if (!schema.validId(options.id)) return error.NotFound;
     const dir = s.openDir(env.root, options.id) catch |err| return switch (err) {
         error.NotFound => error.NotFound,
-        else => error.Io,
+        else => |io_err| storage.ioFault(io_err),
     };
     errdefer s.closeDir(dir);
     const lock = s.openFile(dir, "lock", .read_write) catch |err| return switch (err) {
         error.NotFound => error.Corrupt,
-        else => error.Io,
+        else => |io_err| storage.ioFault(io_err),
     };
     errdefer s.closeFile(lock);
-    if (!env.isPlanted(.skip_flock)) try acquireLock(env, lock);
+    if (!env.isPlanted(.skip_flock)) try acquireLock(env, lock, options.lock_wait_ms orelse env.options.lock_wait_ms);
 
     var opened = Log.open(gpa, s, dir, "log.jsonl", .read_write, .{}) catch |err| return switch (err) {
         error.NotFound => error.Corrupt,
         error.OutOfMemory => error.OutOfMemory,
-        else => error.Io,
+        else => |io_err| storage.ioFault(io_err),
     };
     errdefer opened.log.close();
     if (opened.cut_bytes > 0) diag.report(env.diagnostics, .{
@@ -1036,13 +1095,13 @@ fn openParts(env: *const Env, options: ResumeOptions) OpenError!Parts {
     return .{ .dir = dir, .lock = lock, .log = opened.log, .loaded = loaded };
 }
 
-fn acquireLock(env: *const Env, lock: storage.File) OpenError!void {
+fn acquireLock(env: *const Env, lock: storage.File, wait_ms: u64) OpenError!void {
     const io = env.s.io;
     const step_ms: u64 = 10;
     var waited: u64 = 0;
     while (true) {
-        if (env.s.tryLock(lock) catch return error.Io) return;
-        if (waited >= env.options.lock_wait_ms) return error.Busy;
+        if (env.s.tryLock(lock) catch |io_err| return storage.ioFault(io_err)) return;
+        if (waited >= wait_ms) return error.Busy;
         io.sleep(.fromMilliseconds(@intCast(step_ms)), .awake) catch return error.Busy;
         waited += step_ms;
     }
@@ -1148,7 +1207,7 @@ fn mapRead(err: log_mod.ReadError) OpenError {
     return switch (err) {
         error.Corrupt => error.Corrupt,
         error.OutOfMemory => error.OutOfMemory,
-        else => error.Io,
+        else => |io_err| storage.ioFault(io_err),
     };
 }
 
@@ -1261,7 +1320,7 @@ pub const Page = struct {
     }
 };
 
-pub const ReadError = error{ NotFound, Io, OutOfMemory };
+pub const ReadError = error{ NotFound, OutOfMemory } || storage.IoFault;
 
 /// Reads up to `limit` lines of any session without taking its lock. Only
 /// complete, valid lines are returned; written lines never change, so a
@@ -1278,24 +1337,27 @@ pub fn readPage(
     if (!schema.validId(id_)) return error.NotFound;
     const dir = s.openDir(env.root, id_) catch |err| return switch (err) {
         error.NotFound => error.NotFound,
-        else => error.Io,
+        else => |io_err| storage.ioFault(io_err),
     };
     defer s.closeDir(dir);
     const file = s.openFile(dir, "log.jsonl", .read_only) catch |err| return switch (err) {
         error.NotFound => error.NotFound,
-        else => error.Io,
+        else => |io_err| storage.ioFault(io_err),
     };
     defer s.closeFile(file);
-    const len = s.length(file) catch return error.Io;
+    const len = s.length(file) catch |io_err| return storage.ioFault(io_err);
     const end = log_mod.lastLineEnd(s, file, len) catch |err| return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
-        else => error.Io,
+        else => |io_err| storage.ioFault(io_err),
     };
     return readLines(s, gpa, file, end, from, direction, limit);
 }
 
 /// A page of the lines before `end` in an open log, shared by the read by
 /// id and `Session.readPage`. The caller keeps `file` open throughout.
+/// Entries of a page allocated up front, without the safety fill.
+const max_raw_page_entries = 1024;
+
 fn readLines(
     s: storage.Storage,
     gpa: std.mem.Allocator,
@@ -1304,11 +1366,16 @@ fn readLines(
     from: From,
     direction: Direction,
     limit: usize,
-) error{ Io, OutOfMemory }!Page {
+) (error{OutOfMemory} || storage.IoFault)!Page {
     var page: Page = .{ .arena = .init(gpa), .entries = &.{}, .next = null, .damaged = false };
     errdefer page.arena.deinit();
     const arena = page.arena.allocator();
-    var entries: std.ArrayList(Entry) = .empty;
+    // Raw, as `log.ReadBuffer` explains: every entry is written in full
+    // before it is read. A longer page grows the list as usual.
+    const first_capacity: usize = @min(limit, max_raw_page_entries);
+    const first_memory = arena.rawAlloc(first_capacity * @sizeOf(Entry), .of(Entry), @returnAddress()) orelse return error.OutOfMemory;
+    const first_entries: [*]Entry = @ptrCast(@alignCast(first_memory));
+    var entries: std.ArrayList(Entry) = .initBuffer(first_entries[0..first_capacity]);
     switch (direction) {
         .forward => {
             const at: Cursor = switch (from) {
@@ -1326,7 +1393,7 @@ fn readLines(
                         break;
                     },
                     error.OutOfMemory => return error.OutOfMemory,
-                    else => return error.Io,
+                    else => |io_err| return storage.ioFault(io_err),
                 } orelse break;
                 try entries.append(arena, try copyEntry(arena, line));
                 last = .{ .offset = line.offset + line.bytes.len, .seq = line.header.seq + 1 };
@@ -1356,7 +1423,7 @@ fn readLines(
                         break;
                     },
                     error.OutOfMemory => return error.OutOfMemory,
-                    else => return error.Io,
+                    else => |io_err| return storage.ioFault(io_err),
                 } orelse break;
                 try entries.append(arena, try copyEntry(arena, line));
                 oldest = .{ .offset = line.offset, .seq = line.header.seq };
@@ -1374,11 +1441,15 @@ fn readLines(
 
 fn copyEntry(arena: std.mem.Allocator, line: log_mod.Line) error{OutOfMemory}!Entry {
     // The reader's buffer is reused on the next line: copy before parsing.
-    const bytes = try arena.dupe(u8, line.bytes);
-    const header = log_mod.checkLine(bytes) catch unreachable;
+    // Raw, as `log.ReadBuffer` explains: the copy writes every byte.
+    const bytes = (arena.rawAlloc(line.bytes.len, .@"1", @returnAddress()) orelse return error.OutOfMemory)[0..line.bytes.len];
+    @memcpy(bytes, line.bytes);
+    // The reader checked the line; only the header's name moves.
+    var header = line.header;
+    header.kind_name = bytes[@intFromPtr(header.kind_name.ptr) - @intFromPtr(line.bytes.ptr) ..][0..header.kind_name.len];
     const kind = header.kind;
     const body: ?schema.Body = if (kind) |k|
-        schema.parseBody(arena, k, log_mod.lineBody(bytes, header)) catch |err| switch (err) {
+        schema.parseLineBody(arena, k, bytes) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.BadBody => null,
         }
@@ -1390,7 +1461,7 @@ fn copyEntry(arena: std.mem.Allocator, line: log_mod.Line) error{OutOfMemory}!En
 // ---------------------------------------------------------------------------
 // Blobs, fork and delete
 
-pub const BlobError = error{ NotFound, Corrupt, Io, OutOfMemory };
+pub const BlobError = error{ NotFound, Corrupt, OutOfMemory } || storage.IoFault;
 
 /// Reads a blob of any session without a lock. The bytes are checked
 /// against their name, so a damaged blob is reported, never returned.
@@ -1404,18 +1475,29 @@ pub fn readBlob(env: *const Env, gpa: std.mem.Allocator, id_: []const u8, hash: 
     defer s.closeDir(blobs);
     const file = s.openFile(blobs, hash, .read_only) catch |err| return notFoundOr(err);
     defer s.closeFile(file);
-    const len = s.length(file) catch return error.Io;
+    const len = s.length(file) catch |io_err| return storage.ioFault(io_err);
     if (len > max_blob_bytes) return error.Corrupt;
     const bytes = try gpa.alloc(u8, @intCast(len));
     errdefer gpa.free(bytes);
-    if ((s.readAt(file, bytes, 0) catch return error.Io) != bytes.len) return error.Io;
+    if ((s.readAt(file, bytes, 0) catch |io_err| return storage.ioFault(io_err)) != bytes.len) return error.Io;
     const actual = schema.blobHash(bytes);
     if (!std.mem.eql(u8, &actual, hash)) return error.Corrupt;
     return bytes;
 }
 
-fn notFoundOr(err: storage.Error) error{ NotFound, Io } {
+fn notFoundOr(err: storage.Error) (error{NotFound} || storage.IoFault) {
     return if (err == error.NotFound) error.NotFound else error.Io;
+}
+
+/// Whether a blob of session `id_` is present and matches its name. A
+/// missing or damaged one damages its session like a bad line (D39).
+fn blobIsWhole(env: *const Env, id_: []const u8, hash: []const u8) (error{OutOfMemory} || storage.IoFault)!bool {
+    const bytes = readBlob(env, env.gpa, id_, hash) catch |err| switch (err) {
+        error.NotFound, error.Corrupt => return false,
+        else => |e| return e,
+    };
+    env.gpa.free(bytes);
+    return true;
 }
 
 pub const ForkPoint = union(enum) {
@@ -1446,12 +1528,12 @@ pub fn openFork(env: *const Env, options: ForkOptions) ForkError!*Session {
     defer s.closeDir(src_dir);
     const src = s.openFile(src_dir, "log.jsonl", .read_only) catch |err| return switch (err) {
         error.NotFound => error.Corrupt,
-        else => error.Io,
+        else => |io_err| storage.ioFault(io_err),
     };
     defer s.closeFile(src);
-    const len = s.length(src) catch return error.Io;
+    const len = s.length(src) catch |io_err| return storage.ioFault(io_err);
     const end = log_mod.lastLineEnd(s, src, len) catch return error.Corrupt;
-    const point = try findForkPoint(env, src, end, options.at);
+    const point = try findForkPoint(env, options.source, src, end, options.at);
 
     const session = try openNew(env, .{
         .workspace = options.workspace,
@@ -1470,11 +1552,11 @@ pub fn openFork(env: *const Env, options: ForkOptions) ForkError!*Session {
     session.created_ms = created;
     const copied = try gpa.alloc(u8, @intCast(point.end - point.line1_end));
     defer gpa.free(copied);
-    if ((s.readAt(src, copied, point.line1_end) catch return error.Io) != copied.len) return error.Io;
+    if ((s.readAt(src, copied, point.line1_end) catch |io_err| return storage.ioFault(io_err)) != copied.len) return error.Io;
     copyFolded(session, copied, point.seq) catch |err| return forkError(err);
     const blobs = s.openDir(src_dir, "blobs") catch |err| switch (err) {
         error.NotFound => null,
-        else => return error.Io,
+        else => |io_err| return storage.ioFault(io_err),
     };
     defer if (blobs) |b| s.closeDir(b);
     const live = session.stage(blobs) catch |err| return forkError(err);
@@ -1489,7 +1571,8 @@ fn forkError(err: AppendError) ForkError {
     return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         // Copied lines were checked on read; anything else is an I/O failure.
-        error.InvalidTransition, error.SessionClosed, error.TooLarge, error.Io => error.Io,
+        error.InvalidTransition, error.SessionClosed, error.TooLarge => error.Io,
+        else => |io_err| storage.ioFault(io_err),
     };
 }
 
@@ -1501,8 +1584,9 @@ const ForkPointFound = struct {
     line1_end: u64,
 };
 
-/// Pass 1 of a fork: where S is. Reading stops at the first damage.
-fn findForkPoint(env: *const Env, src: storage.File, end: u64, at: ForkPoint) ForkError!ForkPointFound {
+/// Pass 1 of a fork: where S is. Reading stops at the first damage: a bad
+/// line, or a line naming a missing or damaged blob (D39).
+fn findForkPoint(env: *const Env, source: []const u8, src: storage.File, end: u64, at: ForkPoint) ForkError!ForkPointFound {
     const gpa = env.gpa;
     var reader = log_mod.ForwardReader.init(gpa, env.s, src, 0, end, 1);
     defer reader.deinit();
@@ -1518,12 +1602,21 @@ fn findForkPoint(env: *const Env, src: storage.File, end: u64, at: ForkPoint) Fo
         const line = (reader.next() catch |err| switch (err) {
             error.Corrupt => break, // the good part ends here (D15)
             error.OutOfMemory => return error.OutOfMemory,
-            else => return error.Io,
+            else => |io_err| return storage.ioFault(io_err),
         }) orelse break;
         const here: ForkPointFound = .{ .seq = line.header.seq, .end = line.offset + line.bytes.len, .line1_end = line1_end };
         const kind = line.header.kind orelse continue;
         switch (kind) {
             .turn_started => turn_seen = true,
+            .item => {
+                _ = arena.reset(.retain_capacity);
+                const body = schema.parseBody(arena.allocator(), kind, line.body()) catch return error.Corrupt;
+                var whole = true;
+                for (body.item.blobs) |hash| {
+                    if (!try blobIsWhole(env, source, hash)) whole = false;
+                }
+                if (!whole) break;
+            },
             .turn_committed, .turn_interrupted => {
                 _ = arena.reset(.retain_capacity);
                 const body = schema.parseBody(arena.allocator(), kind, line.body()) catch return error.Corrupt;
@@ -1560,7 +1653,7 @@ fn copyFolded(session: *Session, copied: []const u8, fork_seq: u64) AppendError!
     while (std.mem.findScalarPos(u8, copied, at, '\n')) |nl| : (at = nl + 1) {
         _ = arena.reset(.retain_capacity);
         const source_line = copied[at .. nl + 1];
-        const source_header = log_mod.checkLine(source_line) catch return error.Io;
+        const source_header = log_mod.checkLine(source_line) catch |io_err| return storage.ioFault(io_err);
         const start = session.batch.items.len;
         if (source_header.kind == .snapshot) {
             encoded.clearRetainingCapacity();
@@ -1572,7 +1665,7 @@ fn copyFolded(session: *Session, copied: []const u8, fork_seq: u64) AppendError!
         const line = session.batch.items[start..];
         const header = log_mod.checkLine(line) catch unreachable;
         if (header.kind) |kind| {
-            const body = schema.parseBody(arena.allocator(), kind, log_mod.lineBody(line, header)) catch return error.Io;
+            const body = schema.parseBody(arena.allocator(), kind, log_mod.lineBody(line, header)) catch |io_err| return storage.ioFault(io_err);
             try fold.apply(gpa, &session.state, fork_seq, .{ .seq = header.seq, .offset = start, .body = body });
             if (kind == .snapshot) session.snapshot_base = session.batch.items.len;
         } else {
@@ -1583,7 +1676,7 @@ fn copyFolded(session: *Session, copied: []const u8, fork_seq: u64) AppendError!
     std.debug.assert(session.state.children.items.len == 0);
 }
 
-pub const DeleteError = error{ NotFound, Busy, Io, OutOfMemory };
+pub const DeleteError = error{ NotFound, Busy, OutOfMemory } || storage.IoFault;
 
 /// The child ids a session owns, from its `child_spawned` lines. The
 /// caller frees each id and the list.
@@ -1615,17 +1708,17 @@ pub fn trashSession(env: *const Env, id_: []const u8) DeleteError!void {
     defer if (dir_open) s.closeDir(dir);
     const lock = s.openFile(dir, "lock", .read_write) catch |err| switch (err) {
         error.NotFound => null,
-        else => return error.Io,
+        else => |io_err| return storage.ioFault(io_err),
     };
     defer if (lock) |l| s.closeFile(l);
-    if (lock) |l| if (!(s.tryLock(l) catch return error.Io)) return error.Busy;
-    const trash = s.ensureDir(env.root, ".trash") catch return error.Io;
+    if (lock) |l| if (!(s.tryLock(l) catch |io_err| return storage.ioFault(io_err))) return error.Busy;
+    const trash = s.ensureDir(env.root, ".trash") catch |io_err| return storage.ioFault(io_err);
     defer s.closeDir(trash);
-    s.deleteTree(trash, id_) catch return error.Io;
+    s.deleteTree(trash, id_) catch |io_err| return storage.ioFault(io_err);
     s.closeDir(dir);
     dir_open = false;
     s.rename(env.root, id_, trash, id_) catch |err| return notFoundOr(err);
-    s.syncDir(env.root) catch return error.Io;
+    s.syncDir(env.root) catch |io_err| return storage.ioFault(io_err);
     env.observeCatalog(id_, .trashed);
 }
 
@@ -1634,7 +1727,7 @@ pub fn purgeTrashed(env: *const Env, id_: []const u8) DeleteError!void {
     const s = env.s;
     const trash = s.openDir(env.root, ".trash") catch |err| return notFoundOr(err);
     defer s.closeDir(trash);
-    s.deleteTree(trash, id_) catch return error.Io;
+    s.deleteTree(trash, id_) catch |io_err| return storage.ioFault(io_err);
     env.observeCatalog(id_, .purged);
 }
 
@@ -1646,10 +1739,10 @@ pub fn isBusy(env: *const Env, id_: []const u8) DeleteError!bool {
     defer s.closeDir(dir);
     const lock = s.openFile(dir, "lock", .read_write) catch |err| return switch (err) {
         error.NotFound => false,
-        else => error.Io,
+        else => |io_err| storage.ioFault(io_err),
     };
     defer s.closeFile(lock);
-    if (!(s.tryLock(lock) catch return error.Io)) return true;
+    if (!(s.tryLock(lock) catch |io_err| return storage.ioFault(io_err))) return true;
     s.unlock(lock);
     return false;
 }
@@ -1660,10 +1753,10 @@ fn collectChildren(env: *const Env, dir: storage.Dir, out: *std.ArrayList([]u8))
     const gpa = env.gpa;
     const file = s.openFile(dir, "log.jsonl", .read_only) catch |err| return switch (err) {
         error.NotFound => {},
-        else => error.Io,
+        else => |io_err| storage.ioFault(io_err),
     };
     defer s.closeFile(file);
-    const len = s.length(file) catch return error.Io;
+    const len = s.length(file) catch |io_err| return storage.ioFault(io_err);
     var reader = log_mod.ForwardReader.init(gpa, s, file, 0, len, 1);
     defer reader.deinit();
     var arena = std.heap.ArenaAllocator.init(gpa);
@@ -1692,6 +1785,8 @@ pub const Verified = struct {
     damaged_at: ?u64,
     /// Snapshots whose state differs from the fold at their position.
     bad_snapshots: u64,
+    /// Blobs a line names that are missing or fail their hash (D39).
+    bad_blobs: u64 = 0,
 };
 
 /// Reads a whole log without its lock: every line's frame, checksum and
@@ -1705,7 +1800,7 @@ pub fn verifySession(env: *const Env, id_: []const u8) OpenError!Verified {
     defer s.closeDir(dir);
     const file = s.openFile(dir, "log.jsonl", .read_only) catch |err| return notFoundOr(err);
     defer s.closeFile(file);
-    const len = s.length(file) catch return error.Io;
+    const len = s.length(file) catch |io_err| return storage.ioFault(io_err);
     const end = log_mod.lastLineEnd(s, file, len) catch return error.Corrupt;
     var reader = log_mod.ForwardReader.init(gpa, s, file, 0, end, 1);
     defer reader.deinit();
@@ -1722,7 +1817,7 @@ pub fn verifySession(env: *const Env, id_: []const u8) OpenError!Verified {
                 break;
             },
             error.OutOfMemory => return error.OutOfMemory,
-            else => return error.Io,
+            else => |io_err| return storage.ioFault(io_err),
         }) orelse break;
         result.lines += 1;
         _ = arena.reset(.retain_capacity);
@@ -1733,6 +1828,9 @@ pub fn verifySession(env: *const Env, id_: []const u8) OpenError!Verified {
         };
         switch (body) {
             .session_created => |c| fork_seq = if (c.forked_from) |o| o.seq else 0,
+            .item => |piece| for (piece.blobs) |hash| {
+                if (!try blobIsWhole(env, id_, hash)) result.bad_blobs += 1;
+            },
             .snapshot => |snap| {
                 var decoded = fold.decodeState(gpa, arena.allocator(), snap.state) catch {
                     result.bad_snapshots += 1;
@@ -1774,7 +1872,7 @@ pub fn readSummary(env: *const Env, id_: []const u8) OpenError!Summary {
     defer s.closeDir(dir);
     const file = s.openFile(dir, "log.jsonl", .read_only) catch |err| return notFoundOr(err);
     defer s.closeFile(file);
-    const len = s.length(file) catch return error.Io;
+    const len = s.length(file) catch |io_err| return storage.ioFault(io_err);
     const end = log_mod.lastLineEnd(s, file, len) catch return error.Corrupt;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -2255,6 +2353,48 @@ const session_tests = struct {
         defer page.deinit();
         try testing.expect(page.damaged);
         try testing.expectEqual(@as(usize, 1), page.entries.len);
+    }
+
+    test "a failed write or sync reports its OS cause, and every later call reports it too (D40)" {
+        if (!hooks) return error.SkipZigTest;
+        var t: TestEnv = undefined;
+        t.init(.{});
+        defer t.deinit();
+
+        // A full disk on a log write (D29).
+        const s = try newRoot(&t);
+        _ = try s.append(&.{ .turn_started, item, .turn_committed });
+        const id = try gpa.dupe(u8, s.id());
+        defer gpa.free(id);
+        t.fault.fail_error = error.NoSpace;
+        t.fault.next_write = .{ .keep = 0, .then = .fail };
+        try testing.expectError(error.NoSpaceLeft, s.append(&.{.turn_started}));
+        // Durability is unknown after a failed write, so nothing more is
+        // written; later calls still name the cause (D40).
+        try testing.expectError(error.NoSpaceLeft, s.append(&.{.turn_started}));
+        try testing.expectError(error.NoSpaceLeft, s.putBlob("after the full disk"));
+        try closeAndDestroy(s);
+        try expectKinds(&t, id, &.{ .session_created, .turn_started, .item, .turn_committed });
+
+        // A read-only file system on the sync that ends a turn.
+        const r = try resumeRoot(&t, id);
+        _ = try r.append(&.{ .turn_started, item });
+        t.fault.fail_error = error.ReadOnly;
+        t.fault.fail_next_sync = true;
+        try testing.expectError(error.ReadOnlyFileSystem, r.append(&.{.turn_committed}));
+        try testing.expectError(error.ReadOnlyFileSystem, r.append(&.{.turn_started}));
+        try closeAndDestroy(r);
+        // The close does not sync again: the failed sync's bytes stay unknown.
+        try testing.expectEqual(@as(usize, 1), t.fault.closed_unsynced);
+        t.fault.closed_unsynced = 0;
+
+        // A permission denial on the first turn, before the session exists.
+        const n = try newRoot(&t);
+        t.fault.fail_error = error.Refused;
+        t.fault.next_write = .{ .keep = 0, .then = .fail };
+        try testing.expectError(error.AccessDenied, n.append(&.{ .turn_started, item }));
+        try testing.expectError(error.AccessDenied, n.append(&.{.turn_started}));
+        try closeAndDestroy(n);
     }
 
     // ---------------------------------------------------------------------------

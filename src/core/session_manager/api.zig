@@ -58,16 +58,18 @@ pub const max_blob_bytes = session_mod.max_blob_bytes;
 pub const max_value_bytes: usize = log_mod.max_line_bytes - 64 * 1024;
 const max_text_bytes = 4096;
 
-pub const OpenError = error{ InvalidArgument, NotFound, Busy, ChildSession, Corrupt, UnsupportedVersion, InvalidForkPoint, Exists, Io, OutOfMemory };
-pub const AppendError = error{ InvalidArgument, InvalidTransition, SessionClosed, TooLarge, Io, OutOfMemory };
-pub const CloseError = error{ Io, OutOfMemory };
-pub const ReadError = error{ InvalidArgument, NotFound, Io, OutOfMemory };
-pub const SessionReadError = error{ InvalidArgument, SessionClosed, Io, OutOfMemory };
-pub const BlobError = error{ InvalidArgument, NotFound, Corrupt, Io, OutOfMemory };
-pub const ListError = error{ Busy, Io, OutOfMemory };
-pub const DeleteError = error{ InvalidArgument, NotFound, Busy, Io, OutOfMemory };
-pub const VerifyError = error{ InvalidArgument, NotFound, Io, OutOfMemory };
-pub const RebuildError = error{ Busy, Io, OutOfMemory };
+/// An I/O failure with its OS cause when known, `Io` otherwise (D29).
+pub const IoFault = storage.IoFault;
+pub const OpenError = error{ InvalidArgument, NotFound, Busy, ChildSession, Corrupt, UnsupportedVersion, InvalidForkPoint, Exists, OutOfMemory } || storage.IoFault;
+pub const AppendError = error{ InvalidArgument, InvalidTransition, SessionClosed, TooLarge, OutOfMemory } || storage.IoFault;
+pub const CloseError = error{OutOfMemory} || storage.IoFault;
+pub const ReadError = error{ InvalidArgument, NotFound, OutOfMemory } || storage.IoFault;
+pub const SessionReadError = error{ InvalidArgument, SessionClosed, OutOfMemory } || storage.IoFault;
+pub const BlobError = error{ InvalidArgument, NotFound, Corrupt, OutOfMemory } || storage.IoFault;
+pub const ListError = error{ Busy, OutOfMemory } || storage.IoFault;
+pub const DeleteError = error{ InvalidArgument, NotFound, Busy, OutOfMemory } || storage.IoFault;
+pub const VerifyError = error{ InvalidArgument, NotFound, OutOfMemory } || storage.IoFault;
+pub const RebuildError = error{ Busy, OutOfMemory } || storage.IoFault;
 
 pub const Backend = enum { posix };
 
@@ -92,6 +94,10 @@ pub const NewOptions = struct {
     role: Role = .root,
     /// Required for a child session.
     parent: ?[]const u8 = null,
+    /// A child's id, already named in its parent's `child_spawned` (D34); a
+    /// root always gets a fresh one. A taken id fails the first turn's
+    /// append and leaves the existing session as it was.
+    id: ?[]const u8 = null,
 };
 
 pub const ResumeTarget = union(enum) {
@@ -108,6 +114,10 @@ pub const ResumeOptions = struct {
     workspace: []const u8,
     host: Host,
     parent: ?[]const u8 = null,
+    /// How long this open waits for the session's writer lock before Busy;
+    /// null uses the manager's `lock_wait_ms`. A picker passes 0 so a
+    /// session open elsewhere shows as busy at once (D38).
+    lock_wait_ms: ?u64 = null,
 };
 
 pub const ForkOptions = struct {
@@ -125,6 +135,23 @@ pub const ImportOptions = struct {
     role: Role = .root,
     parent: ?[]const u8 = null,
     created_ms: u64,
+};
+
+/// A saved session as `peek` reads it. Owns everything; free with `deinit`.
+pub const Peeked = struct {
+    role: Role,
+    /// A child's parent; null for a root.
+    parent: ?[]u8 = null,
+    workspace: []u8,
+    /// With `created_ms` and `updated_ms` set, as `Session.state` sets them.
+    state: State,
+
+    pub fn deinit(p: *Peeked, gpa: std.mem.Allocator) void {
+        if (p.parent) |value| gpa.free(value);
+        gpa.free(p.workspace);
+        p.state.deinit(gpa);
+        p.* = undefined;
+    }
 };
 
 pub const Manager = struct {
@@ -186,13 +213,29 @@ pub const Manager = struct {
         if (storage.hooks) m.env.s.fault = fault;
     }
 
-    fn ready(m: *Manager) error{Io}!void {
+    fn ready(m: *Manager) storage.IoFault!void {
         const io = m.env.s.io;
         m.root_mutex.lockUncancelable(io);
         defer m.root_mutex.unlock(io);
         if (m.root_open) return;
-        m.env.root = m.env.s.openRoot(m.root_path) catch return error.Io;
+        m.env.root = m.env.s.openRoot(m.root_path) catch |io_err| return storage.ioFault(io_err);
         m.root_open = true;
+    }
+
+    /// `ready` for calls that only find or read: a missing root is not
+    /// created, so reading on a machine that never saved a session writes
+    /// nothing. False means there is nothing to find.
+    fn readyToRead(m: *Manager) storage.IoFault!bool {
+        {
+            const io = m.env.s.io;
+            m.root_mutex.lockUncancelable(io);
+            defer m.root_mutex.unlock(io);
+            if (m.root_open) return true;
+        }
+        const present = m.env.s.rootExists(m.root_path) catch |io_err| return storage.ioFault(io_err);
+        if (!present) return false;
+        try ready(m);
+        return true;
     }
 
     fn catalog(m: *Manager) catalog_mod.Catalog {
@@ -215,11 +258,16 @@ pub const Manager = struct {
     pub fn openNew(m: *Manager, options: NewOptions) OpenError!Session {
         try checkText(options.workspace);
         try checkRoleParent(options.role, options.parent);
+        if (options.id) |id| {
+            if (options.role != .child) return error.InvalidArgument;
+            try checkId(id);
+        }
         const inner = try session_mod.openNew(&m.env, .{
             .workspace = options.workspace,
             .host = options.host,
             .role = options.role,
             .parent = options.parent,
+            .id = options.id,
         });
         return .{ .manager = m, .inner = inner };
     }
@@ -228,15 +276,17 @@ pub const Manager = struct {
     pub fn openResume(m: *Manager, options: ResumeOptions) OpenError!Session {
         try checkText(options.workspace);
         if (options.parent) |p| try checkId(p);
-        try ready(m);
+        // Arguments are checked before the disk is asked anything.
+        switch (options.target) {
+            .id => |id| try checkId(id),
+            .last, .last_opened => {},
+        }
+        if (!try readyToRead(m)) return error.NotFound;
         // An id resolved from the index is owned here.
         var resolved: ?[]u8 = null;
         defer if (resolved) |r| m.gpa.free(r);
         const id: []const u8 = switch (options.target) {
-            .id => |id| blk: {
-                try checkId(id);
-                break :blk id;
-            },
+            .id => |id| id,
             .last, .last_opened => blk: {
                 const target: catalog_mod.Target = switch (options.target) {
                     .last => .last,
@@ -252,18 +302,23 @@ pub const Manager = struct {
             .workspace = options.workspace,
             .host = options.host,
             .parent = options.parent,
+            .lock_wait_ms = options.lock_wait_ms,
         }) catch |err| return switch (err) {
-            error.NotFound, error.Busy, error.ChildSession, error.Corrupt, error.UnsupportedVersion, error.Io, error.OutOfMemory => |e| e,
+            error.NotFound, error.Busy, error.ChildSession, error.Corrupt, error.UnsupportedVersion, error.OutOfMemory => |e| e,
+            else => |io_err| storage.ioFault(io_err),
         };
-        m.catalog().opened(inner.id(), options.host, m.nowMs()) catch m.indexStale(inner.id());
-        return .{ .manager = m, .inner = inner };
+        const session: Session = .{ .manager = m, .inner = inner };
+        // The repair may have moved the workspace or interrupted a turn, so
+        // the whole entry is written, not only the open time (D42).
+        session.updateIndexAs(.{ .resumed = options.host });
+        return session;
     }
 
     fn resolve(m: *Manager, workspace: []const u8, target: catalog_mod.Target) OpenError!?[]u8 {
         return m.catalog().resolve(m.gpa, workspace, target) catch |err| switch (err) {
             error.Busy => error.Busy,
-            error.Io => error.Io,
             error.OutOfMemory => error.OutOfMemory,
+            else => |io_err| storage.ioFault(io_err),
         };
     }
 
@@ -280,7 +335,8 @@ pub const Manager = struct {
             .workspace = options.workspace,
             .host = options.host,
         }) catch |err| return switch (err) {
-            error.NotFound, error.Busy, error.ChildSession, error.Corrupt, error.UnsupportedVersion, error.InvalidForkPoint, error.Io, error.OutOfMemory => |e| e,
+            error.NotFound, error.Busy, error.ChildSession, error.Corrupt, error.UnsupportedVersion, error.InvalidForkPoint, error.OutOfMemory => |e| e,
+            else => |io_err| storage.ioFault(io_err),
         };
         const session: Session = .{ .manager = m, .inner = inner };
         session.updateIndexAs(.published);
@@ -297,12 +353,12 @@ pub const Manager = struct {
         try ready(m);
         if (m.env.s.stat(m.env.root, options.id)) |_| return error.Exists else |err| switch (err) {
             error.NotFound => {},
-            else => return error.Io,
+            else => |io_err| return storage.ioFault(io_err),
         }
         const deleted = m.catalog().isDeleted(m.gpa, options.id) catch |err| return switch (err) {
             error.Busy => error.Busy,
-            error.Io => error.Io,
             error.OutOfMemory => error.OutOfMemory,
+            else => |io_err| storage.ioFault(io_err),
         };
         if (deleted) return error.Exists;
         const inner = try session_mod.openNew(&m.env, .{
@@ -323,21 +379,43 @@ pub const Manager = struct {
     pub fn read(m: *Manager, gpa: std.mem.Allocator, id: []const u8, from: From, direction: Direction, limit: usize) ReadError!Page {
         try checkId(id);
         if (limit == 0) return error.InvalidArgument;
-        try ready(m);
+        if (!try readyToRead(m)) return error.NotFound;
         return session_mod.readPage(&m.env, gpa, id, from, direction, limit);
     }
 
     /// A blob's bytes, checked against its hash. The caller frees them.
+    /// A saved session's state, folded without its lock as the catalog
+    /// reads it: line 1, the newest snapshot, then the tail (D37). A torn
+    /// tail is left as it is, and a child needs no parent to be read.
+    pub fn peek(m: *Manager, gpa: std.mem.Allocator, id: []const u8) OpenError!Peeked {
+        try checkId(id);
+        if (!try readyToRead(m)) return error.NotFound;
+        var summary = try session_mod.readSummary(&m.env, id);
+        defer summary.deinit(m.gpa);
+        var state = try summary.state.clone(gpa);
+        errdefer state.deinit(gpa);
+        state.created_ms = summary.created_ms;
+        state.updated_ms = summary.updated_ms;
+        const workspace = try gpa.dupe(u8, summary.identity.workspace);
+        errdefer gpa.free(workspace);
+        return .{
+            .role = summary.identity.role,
+            .parent = if (summary.identity.parent) |parent| try gpa.dupe(u8, parent) else null,
+            .workspace = workspace,
+            .state = state,
+        };
+    }
+
     pub fn getBlob(m: *Manager, gpa: std.mem.Allocator, id: []const u8, hash: []const u8) BlobError![]u8 {
         try checkId(id);
         if (!schema.validBlobHash(hash)) return error.InvalidArgument;
-        try ready(m);
+        if (!try readyToRead(m)) return error.NotFound;
         return session_mod.readBlob(&m.env, gpa, id, hash);
     }
 
     /// Root sessions, newest first, from the index alone.
     pub fn list(m: *Manager, gpa: std.mem.Allocator, filter: Filter, cursor: ?ListCursor, limit: usize) ListError!ListPage {
-        try ready(m);
+        if (!try readyToRead(m)) return .{ .arena = .init(gpa), .items = &.{}, .next = null };
         return m.catalog().list(gpa, filter, cursor, @max(limit, 1));
     }
 
@@ -347,7 +425,7 @@ pub const Manager = struct {
     /// the matching terminal folders (D13).
     pub fn delete(m: *Manager, id: []const u8) DeleteError!void {
         try checkId(id);
-        try ready(m);
+        if (!try readyToRead(m)) return error.NotFound;
         return m.deleteDepth(id, 0);
     }
 
@@ -371,10 +449,11 @@ pub const Manager = struct {
     /// Doctor: checks every line and snapshot of one session.
     pub fn verify(m: *Manager, id: []const u8) VerifyError!Verified {
         try checkId(id);
-        try ready(m);
+        if (!try readyToRead(m)) return error.NotFound;
         return session_mod.verifySession(&m.env, id) catch |err| switch (err) {
-            error.NotFound, error.Io, error.OutOfMemory => |e| e,
+            error.NotFound, error.OutOfMemory => |e| e,
             error.Busy, error.ChildSession, error.Corrupt, error.UnsupportedVersion => error.Io,
+            else => |io_err| storage.ioFault(io_err),
         };
     }
 
@@ -440,7 +519,7 @@ pub const Session = struct {
     pub fn close(s: Session) CloseError!void {
         const was_live = s.inner.closeReport() catch |err| return switch (err) {
             error.OutOfMemory => error.OutOfMemory,
-            else => error.Io,
+            else => |io_err| storage.ioFault(io_err),
         };
         if (was_live) s.updateIndex();
     }
@@ -456,14 +535,19 @@ pub const Session = struct {
         s.updateIndexAs(.changed);
     }
 
-    /// A new session counts as opened by the host that created it, so `-c`
-    /// finds it; later updates leave the open times alone.
-    fn updateIndexAs(s: Session, why: enum { published, changed }) void {
+    /// A new session counts as opened by the host that created it, and a
+    /// resumed one by the host that resumed it, so `-c` finds it; other
+    /// updates leave the open times alone.
+    fn updateIndexAs(s: Session, why: union(enum) { published, changed, resumed: Host }) void {
         const m = s.manager;
         var arena = std.heap.ArenaAllocator.init(m.gpa);
         defer arena.deinit();
         var summary = s.indexSummary(arena.allocator()) catch return m.indexStale(s.id());
-        if (why == .published) summary.opened_ms[@intFromEnum(summary.host)] = summary.updated_ms;
+        switch (why) {
+            .published => summary.opened_ms[@intFromEnum(summary.host)] = summary.updated_ms,
+            .resumed => |host| summary.opened_ms[@intFromEnum(host)] = m.nowMs(),
+            .changed => {},
+        }
         m.catalog().put(summary) catch m.indexStale(s.id());
     }
 
@@ -799,6 +883,47 @@ const api_tests = struct {
         root.close(io);
     }
 
+    test "reads before any session create nothing on disk" {
+        var f: Fixture = undefined;
+        try f.init();
+        defer f.deinit();
+        // An editor listing sessions on a machine that never saved one.
+        var page = try f.manager.list(gpa, .all, null, 10);
+        try testing.expectEqual(@as(usize, 0), page.items.len);
+        page.deinit();
+        try testing.expectError(error.NotFound, f.manager.read(gpa, "AAAAAAAAAAAA", .start, .forward, 10));
+        try testing.expectError(error.NotFound, f.manager.getBlob(gpa, "AAAAAAAAAAAA", "0" ** 64));
+        try testing.expectError(error.NotFound, f.manager.openResume(.{ .target = .last, .workspace = "/w", .host = .acp }));
+        try testing.expectError(error.NotFound, f.manager.verify("AAAAAAAAAAAA"));
+        try testing.expectError(error.NotFound, f.manager.delete("AAAAAAAAAAAA"));
+        try testing.expectError(error.FileNotFound, f.dir());
+        // Once a session is saved, the same calls find it.
+        const s = try f.manager.openNew(.{ .workspace = "/w", .host = .acp });
+        _ = try s.append(&.{ .turn_started, piece, .turn_committed });
+        s.release();
+        var listed = try f.manager.list(gpa, .all, null, 10);
+        defer listed.deinit();
+        try testing.expectEqual(@as(usize, 1), listed.items.len);
+    }
+
+    test "a read-only session folder fails with AccessDenied, not Io (D29)" {
+        var f: Fixture = undefined;
+        try f.init();
+        defer f.deinit();
+        const s = try f.manager.openNew(.{ .workspace = "/w", .host = .app });
+        _ = try s.append(&.{ .turn_started, piece, .turn_committed });
+        const id = try gpa.dupe(u8, s.id());
+        defer gpa.free(id);
+        s.release();
+        var root = try f.dir();
+        defer root.close(io);
+        var folder = try root.openDir(io, id, .{});
+        defer folder.close(io);
+        try folder.setFilePermissions(io, "log.jsonl", .fromMode(0o400), .{});
+        defer folder.setFilePermissions(io, "log.jsonl", .fromMode(0o600), .{}) catch {};
+        try testing.expectError(error.AccessDenied, f.manager.openResume(.{ .target = .{ .id = id }, .workspace = "/w", .host = .app }));
+    }
+
     test "a session's whole life through the API" {
         var f: Fixture = undefined;
         try f.init();
@@ -905,6 +1030,40 @@ const api_tests = struct {
         try testing.expectError(error.NotFound, m.openResume(.{ .target = .last, .workspace = "/nowhere", .host = .app }));
     }
 
+    test "a resume from another workspace lists the session there at once, and keeps -c (D42)" {
+        var f: Fixture = undefined;
+        try f.init();
+        defer f.deinit();
+        const m = f.manager;
+        const s = try m.openNew(.{ .workspace = "/w", .host = .acp });
+        _ = try s.append(&.{ .turn_started, .turn_committed });
+        const id = try gpa.dupe(u8, s.id());
+        defer gpa.free(id);
+        s.release();
+
+        // Still open: the index names the new workspace before any close.
+        const r = try m.openResume(.{ .target = .{ .id = id }, .workspace = "/x", .host = .app });
+        try expectListedIn(m, "/x", id);
+        try expectListedIn(m, "/w", null);
+        r.release();
+        try expectListedIn(m, "/x", id);
+        // The resume counts as the app's open, so `-c` in /x finds it.
+        const c = try m.openResume(.{ .target = .{ .last_opened = .app }, .workspace = "/x", .host = .app });
+        try testing.expectEqualStrings(id, c.id());
+        c.release();
+    }
+
+    fn expectListedIn(m: *api.Manager, workspace: []const u8, want: ?[]const u8) !void {
+        var page = try m.list(gpa, .{ .workspace = workspace }, null, 10);
+        defer page.deinit();
+        if (want) |expected| {
+            try testing.expectEqual(@as(usize, 1), page.items.len);
+            try testing.expectEqualStrings(expected, page.items[0].id);
+        } else {
+            try testing.expectEqual(@as(usize, 0), page.items.len);
+        }
+    }
+
     test "fork, children, delete: listing and ids" {
         var f: Fixture = undefined;
         try f.init();
@@ -944,6 +1103,121 @@ const api_tests = struct {
         // A deleted id never comes back, not even through an import.
         try testing.expectError(error.Exists, m.openImport(.{ .id = p_id, .workspace = "/w", .host = .app, .created_ms = 1 }));
         try testing.expectError(error.NotFound, m.delete(p_id));
+    }
+
+    test "a child opens under the id its parent recorded, until its first turn creates the log (D34)" {
+        var f: Fixture = undefined;
+        try f.init();
+        defer f.deinit();
+        const m = f.manager;
+        const p = try m.openNew(.{ .workspace = "/w", .host = .app });
+        defer p.release();
+        const child_id = "1786460757753-child";
+        _ = try p.append(&.{ .turn_started, .{ .child_spawned = .{ .child = child_id, .work_id = "w1" } } });
+
+        // The first attempt never starts a turn, as when a crash loses the work:
+        // nothing reaches the disk, and the id stays free for the next attempt.
+        const lost = try m.openNew(.{ .workspace = "/w", .host = .child, .role = .child, .parent = p.id(), .id = child_id });
+        try testing.expectEqualStrings(child_id, lost.id());
+        lost.release();
+        try testing.expectError(error.NotFound, m.read(gpa, child_id, .start, .forward, 1));
+
+        const c = try m.openNew(.{ .workspace = "/w", .host = .child, .role = .child, .parent = p.id(), .id = child_id });
+        _ = try c.append(&.{ .turn_started, piece, .turn_committed });
+        c.release();
+        var page = try m.read(gpa, child_id, .start, .forward, 1);
+        defer page.deinit();
+        try testing.expectEqual(api.Kind.session_created, page.entries[0].kind.?);
+        // Resuming it needs its parent, as for any child.
+        try testing.expectError(error.ChildSession, m.openResume(.{ .target = .{ .id = child_id }, .workspace = "/w", .host = .child }));
+        const again = try m.openResume(.{ .target = .{ .id = child_id }, .workspace = "/w", .host = .child, .parent = p.id() });
+        again.release();
+    }
+
+    test "only a child takes an id, it must be valid, and a taken id never replaces a session (D34)" {
+        var f: Fixture = undefined;
+        try f.init();
+        defer f.deinit();
+        const m = f.manager;
+        try testing.expectError(error.InvalidArgument, m.openNew(.{ .workspace = "/w", .host = .app, .id = "1786460757753-root" }));
+        const p = try m.openNew(.{ .workspace = "/w", .host = .app });
+        defer p.release();
+        _ = try p.append(&.{ .turn_started, piece, .turn_committed });
+        try testing.expectError(error.InvalidArgument, m.openNew(.{ .workspace = "/w", .host = .child, .role = .child, .parent = p.id(), .id = "../escape" }));
+
+        const first = try m.openNew(.{ .workspace = "/w", .host = .child, .role = .child, .parent = p.id(), .id = "1786460757753-taken" });
+        _ = try first.append(&.{ .turn_started, piece, .turn_committed });
+        first.release();
+        var before = try m.read(gpa, "1786460757753-taken", .start, .forward, 100);
+        defer before.deinit();
+
+        const second = try m.openNew(.{ .workspace = "/w", .host = .child, .role = .child, .parent = p.id(), .id = "1786460757753-taken" });
+        defer second.release();
+        try testing.expectError(error.Io, second.append(&.{ .turn_started, piece, .turn_committed }));
+        var after = try m.read(gpa, "1786460757753-taken", .start, .forward, 100);
+        defer after.deinit();
+        try testing.expectEqual(before.entries.len, after.entries.len);
+        for (before.entries, after.entries) |b, a| {
+            try testing.expectEqual(b.seq, a.seq);
+            try testing.expectEqual(b.kind, a.kind);
+            try testing.expectEqual(b.ts_ms, a.ts_ms);
+        }
+    }
+
+    test "peek reads a session without its lock and repairs nothing (D37)" {
+        var f: Fixture = undefined;
+        try f.init();
+        defer f.deinit();
+        const m = f.manager;
+        // Nothing saved yet: NotFound, and the root is not created.
+        try testing.expectError(error.NotFound, m.peek(gpa, "1786460757753-none"));
+        try testing.expectError(error.InvalidArgument, m.peek(gpa, "../escape"));
+
+        const p = try m.openNew(.{ .workspace = "/w", .host = .app });
+        _ = try p.append(&.{ .turn_started, piece, .turn_committed, .{ .set = .{ .key = .title, .value = "\"T\"" } } });
+        const p_id = try gpa.dupe(u8, p.id());
+        defer gpa.free(p_id);
+        // Open for writing elsewhere: peek still reads it.
+        {
+            var peeked = try m.peek(gpa, p_id);
+            defer peeked.deinit(gpa);
+            try testing.expectEqual(api.Role.root, peeked.role);
+            try testing.expectEqualStrings("/w", peeked.workspace);
+            try testing.expectEqual(@as(u64, 1), peeked.state.last_turn);
+            try testing.expectEqualStrings("\"T\"", peeked.state.title.?);
+            try testing.expect(peeked.state.created_ms > 0);
+        }
+        const c = try m.openNew(.{ .workspace = "/w", .host = .child, .role = .child, .parent = p_id, .id = "1786460757753-peek-kid" });
+        _ = try p.append(&.{.{ .child_spawned = .{ .child = c.id(), .work_id = "w" } }});
+        _ = try c.append(&.{ .turn_started, .turn_committed });
+        c.release();
+        p.release();
+
+        // A child reads without its parent.
+        {
+            var peeked = try m.peek(gpa, "1786460757753-peek-kid");
+            defer peeked.deinit(gpa);
+            try testing.expectEqual(api.Role.child, peeked.role);
+            try testing.expectEqualStrings(p_id, peeked.parent.?);
+        }
+
+        // A torn tail is read around and left in place.
+        var root = try f.dir();
+        defer root.close(io);
+        const log_path = try std.fs.path.join(gpa, &.{ p_id, "log.jsonl" });
+        defer gpa.free(log_path);
+        var torn_len: u64 = 0;
+        {
+            var log = try root.openFile(io, log_path, .{ .mode = .read_write });
+            defer log.close(io);
+            try log.writePositionalAll(io, "{\"v\":1,\"seq", try log.length(io));
+            torn_len = try log.length(io);
+        }
+        var peeked = try m.peek(gpa, p_id);
+        defer peeked.deinit(gpa);
+        try testing.expectEqual(@as(u64, 1), peeked.state.last_turn);
+        const after = try root.statFile(io, log_path, .{});
+        try testing.expectEqual(torn_len, after.size);
     }
 
     test "import keeps the v1 id and the original times" {
@@ -1341,6 +1615,83 @@ const api_tests = struct {
         try s.close();
         try testing.expectError(error.SessionClosed, s.read(gpa, .end, .backward, 10));
         s.release();
+    }
+
+    test "a resume sets its own wait for a held session, and none is Busy at once (D38)" {
+        var f: Fixture = undefined;
+        try f.init();
+        defer f.deinit();
+        const m = f.manager;
+        const held = try m.openNew(.{ .workspace = "/w", .host = .app });
+        _ = try held.append(&.{ .turn_started, piece, .turn_committed });
+        const id = try gpa.dupe(u8, held.id());
+        defer gpa.free(id);
+        var released = false;
+        defer if (!released) held.release();
+
+        const Timed = struct {
+            fn busyAfterMs(manager: *api.Manager, session_id: []const u8, wait: ?u64) !i64 {
+                const started = std.Io.Timestamp.now(io, .awake).toMilliseconds();
+                try testing.expectError(error.Busy, manager.openResume(.{ .target = .{ .id = session_id }, .workspace = "/w", .host = .app, .lock_wait_ms = wait }));
+                return std.Io.Timestamp.now(io, .awake).toMilliseconds() - started;
+            }
+        };
+        // The fixture's manager waits 50 ms; each open's own wait wins.
+        try testing.expect(try Timed.busyAfterMs(m, id, 400) >= 400);
+        try testing.expect(try Timed.busyAfterMs(m, id, 0) < 400);
+        try testing.expect(try Timed.busyAfterMs(m, id, null) < 400);
+
+        held.release();
+        released = true;
+        const reopened = try m.openResume(.{ .target = .{ .id = id }, .workspace = "/w", .host = .app, .lock_wait_ms = 0 });
+        reopened.release();
+    }
+
+    test "a lost or damaged blob damages its session: verify counts it and a recover fork stops before it (D39)" {
+        for ([_]bool{ false, true }) |overwrite| {
+            var f: Fixture = undefined;
+            try f.init();
+            defer f.deinit();
+            const m = f.manager;
+            const s = try m.openNew(.{ .workspace = "/w", .host = .app });
+            // Turn 1 names no blob, turn 2 names one, turn 3 names none.
+            _ = try s.append(&.{ .turn_started, piece, .turn_committed });
+            _ = try s.append(&.{.turn_started});
+            const hash = try s.putBlob("the body of a long answer");
+            const refs = [_][]const u8{&hash};
+            _ = try s.append(&.{ .{ .item = .{ .type = "assistant", .data = "{}", .blobs = &refs } }, .turn_committed });
+            _ = try s.append(&.{ .turn_started, piece, .turn_committed });
+            const id = try gpa.dupe(u8, s.id());
+            defer gpa.free(id);
+            s.release();
+            try testing.expectEqual(@as(u64, 0), (try m.verify(id)).bad_blobs);
+
+            var root = try f.dir();
+            defer root.close(io);
+            const path = try std.fmt.allocPrint(gpa, "{s}/blobs/{s}", .{ id, &hash });
+            defer gpa.free(path);
+            if (overwrite) {
+                try root.writeFile(io, .{ .sub_path = path, .data = "the body of a long ANSWER" });
+            } else {
+                try root.deleteFile(io, path);
+            }
+
+            // The log is intact; the blob it names is not.
+            const verified = try m.verify(id);
+            try testing.expectEqual(@as(u64, 1), verified.bad_blobs);
+            try testing.expectEqual(@as(?u64, null), verified.damaged_at);
+            try testing.expectError(if (overwrite) error.Corrupt else error.NotFound, m.getBlob(gpa, id, &hash));
+
+            // Recover copies turn 1 only; a fork past turn 1 is refused.
+            const copy = try m.openFork(.{ .source = id, .at = .last_good, .workspace = "/w", .host = .app });
+            var st = try copy.state(gpa);
+            defer st.deinit(gpa);
+            try testing.expectEqual(@as(u64, 1), st.last_turn);
+            copy.release();
+            try testing.expectError(error.InvalidForkPoint, m.openFork(.{ .source = id, .at = .{ .turn = 3 }, .workspace = "/w", .host = .app }));
+            const early = try m.openFork(.{ .source = id, .at = .{ .turn = 1 }, .workspace = "/w", .host = .app });
+            early.release();
+        }
     }
 };
 
