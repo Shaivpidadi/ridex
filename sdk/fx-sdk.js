@@ -29,6 +29,8 @@ const maxPromptImagesBytes = (8 * 1024 * 1024 / 4) * 3;
 // Matches the native attachment table: one prompt's images or one checkpoint.
 const maxPendingAttachments = 8;
 const maxOutboundAttachments = 4;
+// Matches the core's kernel checkpoint limit (max_checkpoint_bytes).
+const maxCheckpointBytes = 4 * 1024 * 1024;
 // The core's ACP reader drops frames over 8 MiB without a request id to answer
 // (jsonrpc frame_resource_byte_limit), so the SDK must never emit one. The
 // envelope allowance covers the method key and request id.
@@ -1454,12 +1456,25 @@ function normalizePromptInput(input, { deferImageLimits = false } = {}) {
   });
 }
 
-// Image bytes never enter the frame; each image is a small attachment reference.
-function promptFrameSize(prompt) {
-  const projected = prompt.map((block) => block.type === "image"
-    ? { type: "image", mimeType: block.mimeType, _meta: { fx: { attachment: 0xffffffff } } }
-    : block);
-  return encoder.encode(JSON.stringify({ sessionId: "", prompt: projected })).length + promptFrameEnvelopeBytes;
+// Image bytes travel beside the frame as attachment references, but the model
+// request carries them base64 encoded and the native host caps that request at
+// 8 MiB. Images therefore count at their encoded size, so a prompt the SDK
+// accepts fits on both backends. With countImages false, only the frame counts.
+function promptFrameSize(prompt, countImages = true) {
+  let encodedImageBytes = 0;
+  const projected = prompt.map((block) => {
+    if (block.type !== "image") return block;
+    if (countImages) encodedImageBytes += Math.ceil((block.bytes?.byteLength ?? block.byteLength) / 3) * 4;
+    return { type: "image", mimeType: block.mimeType, _meta: { fx: { attachment: 0xffffffff } } };
+  });
+  return encoder.encode(JSON.stringify({ sessionId: "", prompt: projected })).length +
+    encodedImageBytes + promptFrameEnvelopeBytes;
+}
+
+function checkPromptFrameSize(prompt, countImages) {
+  if (promptFrameSize(prompt, countImages) > maxPromptFrameBytes) {
+    throw new RangeError(`prompt exceeds the ${maxPromptFrameBytes} byte libfx frame limit`);
+  }
 }
 
 // Returns prompt blocks whose images carry { mimeType, bytes }. Synchronous
@@ -1478,11 +1493,12 @@ function resizedPromptImage(value, index) {
     value.mimeType.length === 0 || value.mimeType.length > 128) {
     throw new TypeError(`resizeImage must return non-empty bytes and a mimeType for image prompt block ${index}`);
   }
-  return { bytes, mimeType: value.mimeType };
+  // Copied because a hook may reuse its output buffer for the next image.
+  return { bytes: bytes.slice(), mimeType: value.mimeType };
 }
 
-// Reads Blob images and applies resizeImage, then checks the final byte
-// limits. Returns null when the turn is cancelled first.
+// Reads Blob images and applies resizeImage, then checks the final byte and
+// frame limits. Returns null when the turn is cancelled first.
 async function materializePromptImages(blocks, isCancelled, resizeImage) {
   const prepared = [];
   let imageBytes = 0;
@@ -1505,6 +1521,7 @@ async function materializePromptImages(blocks, isCancelled, resizeImage) {
     checkPromptImagesByteLength(imageBytes);
     prepared.push({ type: "image", mimeType: image.mimeType, bytes: image.bytes });
   }
+  checkPromptFrameSize(prepared, true);
   return prepared;
 }
 
@@ -1793,7 +1810,7 @@ export async function createFxAgent(options = {}) {
     closing = true;
     const error = runtime.error ?? new Error(`fx-core exited with code ${code} before completing the ACP request`);
     coreExitError = error;
-    activeTurn?.failPendingBlob(error);
+    activeTurn?.failImagePrep(error);
     for (const waiter of pending.values()) waiter.reject(error);
     pending.clear();
     emit("runtime.exit", { code });
@@ -1850,6 +1867,9 @@ export async function createFxAgent(options = {}) {
     const sessionResult = await request("libfx/new");
     sessionId = sessionResult.sessionId;
     if (initialCheckpoint) {
+      // The native attachment table would otherwise reject this first, with a
+      // different error than the core reports on WebAssembly.
+      if (initialCheckpoint.byteLength > maxCheckpointBytes) throw new Error("libfx checkpoint is too large");
       const [checkpointAttachment] = attachBytes([initialCheckpoint]);
       await request("libfx/restore", { sessionId, checkpointAttachment });
     }
@@ -1982,9 +2002,8 @@ export async function createFxAgent(options = {}) {
     // Blob reads and resizeImage run before the prompt frame is sent.
     const asyncImages = hasImages && (resizeImage !== undefined ||
       normalized.some((block) => block.type === "image" && block.source === "blob"));
-    if (promptFrameSize(normalized) > maxPromptFrameBytes) {
-      throw new RangeError(`prompt exceeds the ${maxPromptFrameBytes} byte libfx frame limit`);
-    }
+    // resizeImage decides the final image sizes, so they are counted after it runs.
+    checkPromptFrameSize(normalized, resizeImage === undefined);
     // Snapshot caller-owned bytes, which could change before an async send.
     const prompt = asyncImages
       ? normalized.map((block) => block.type === "image" && block.source === "bytes" ? { ...block, data: block.data.slice() } : block)
@@ -1999,8 +2018,8 @@ export async function createFxAgent(options = {}) {
     let terminalError;
     let reportedPressure = false;
     let discardedBytes = 0;
-    let cancelBlobRead = null;
-    let rejectBlobRead = null;
+    let cancelImagePrep = null;
+    let rejectImagePrep = null;
     let resolvePromptStart = null;
     const promptStarted = asyncImages ? new Promise((resolve) => { resolvePromptStart = resolve; }) : null;
     let pendingSteeringCount = 0;
@@ -2029,10 +2048,10 @@ export async function createFxAgent(options = {}) {
       transportBytes: 0,
       lastTransportActivityAt: null,
       get cancelled() { return cancelled; },
-      failPendingBlob(error) {
-        rejectBlobRead?.(error);
-        rejectBlobRead = null;
-        cancelBlobRead = null;
+      failImagePrep(error) {
+        rejectImagePrep?.(error);
+        rejectImagePrep = null;
+        cancelImagePrep = null;
       },
       promptWritten() {
         resolvePromptStart?.(true);
@@ -2077,9 +2096,9 @@ export async function createFxAgent(options = {}) {
       cancel() {
         if (finished || cancelled) return;
         cancelled = true;
-        cancelBlobRead?.();
-        cancelBlobRead = null;
-        rejectBlobRead = null;
+        cancelImagePrep?.();
+        cancelImagePrep = null;
+        rejectImagePrep = null;
         resolvePromptStart?.(false);
         resolvePromptStart = null;
         runtime.closeSteering?.();
@@ -2120,18 +2139,18 @@ export async function createFxAgent(options = {}) {
     runtime.openSteering?.();
     const abort = () => turn.cancel();
     signal?.addEventListener("abort", abort, { once: true });
-    const blobReadCancelled = asyncImages ? new Promise((resolve, reject) => {
-      cancelBlobRead = () => resolve(null);
-      rejectBlobRead = reject;
+    const imagePrepCancelled = asyncImages ? new Promise((resolve, reject) => {
+      cancelImagePrep = () => resolve(null);
+      rejectImagePrep = reject;
     }) : null;
     let response;
     if (asyncImages) {
       response = Promise.race([
         Promise.resolve().then(() => materializePromptImages(prompt, () => cancelled || closing, resizeImage)),
-        blobReadCancelled,
+        imagePrepCancelled,
       ]).then((prepared) => {
-        cancelBlobRead = null;
-        rejectBlobRead = null;
+        cancelImagePrep = null;
+        rejectImagePrep = null;
         if (coreExitError && !cancelled) throw coreExitError;
         if (prepared === null || cancelled || closing) {
           resolvePromptStart?.(false);
@@ -2146,8 +2165,8 @@ export async function createFxAgent(options = {}) {
     turn.result = response
       .then((value) => ({ stopReason: cancelled ? "cancelled" : value.stopReason, usage: value.usage }))
       .catch((error) => {
-        cancelBlobRead = null;
-        rejectBlobRead = null;
+        cancelImagePrep = null;
+        rejectImagePrep = null;
         resolvePromptStart?.(error);
         resolvePromptStart = null;
         if (cancelled && error.message === "Cancelled") return { stopReason: "cancelled" };

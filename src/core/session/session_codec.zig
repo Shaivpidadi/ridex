@@ -533,6 +533,24 @@ pub const ImageBlobs = struct {
     items: *std.ArrayList([]const u8),
 };
 
+/// Hands out a libfx kernel checkpoint's raw image blobs in the order
+/// `ImageBlobs` collected them. Each image must name the next unread blob, so a
+/// checkpoint cannot decode one blob into many images.
+pub const ImageBlobReader = struct {
+    blobs: []const []const u8,
+    next: usize = 0,
+
+    fn take(self: *ImageBlobReader, index: usize) ![]const u8 {
+        if (index != self.next or index >= self.blobs.len) return error.InvalidSessionFormat;
+        self.next += 1;
+        return self.blobs[index];
+    }
+
+    pub fn consumedAll(self: ImageBlobReader) bool {
+        return self.next == self.blobs.len;
+    }
+};
+
 pub fn writeHistoryTurn(writer: *std.Io.Writer, turn: session.HistoryTurn) !void {
     return writeHistoryTurnTo(writer, turn, {});
 }
@@ -638,7 +656,7 @@ pub fn parseHistoryTurn(alloc: Allocator, value: std.json.Value) !session.Histor
 pub fn parseHistoryTurnWithImageBlobs(
     alloc: Allocator,
     value: std.json.Value,
-    image_blobs: ?[]const []const u8,
+    image_blobs: ?*ImageBlobReader,
 ) !session.HistoryTurn {
     const kind = try requireString(try requireObject(value), "kind");
     if (std.mem.eql(u8, kind, "compacted_summary")) {
@@ -1940,7 +1958,7 @@ fn writeExecutionFileEvidence(
     try writer.writeByte('}');
 }
 
-fn parseUserTurn(alloc: Allocator, value: std.json.Value, image_blobs: ?[]const []const u8) !session.UserTurn {
+fn parseUserTurn(alloc: Allocator, value: std.json.Value, image_blobs: ?*ImageBlobReader) !session.UserTurn {
     const source = try requireObject(value);
     const object = if (source.count() == 2)
         try exactObject(value, &.{ "text", "images" })
@@ -2008,15 +2026,14 @@ fn parseUserTurn(alloc: Allocator, value: std.json.Value, image_blobs: ?[]const 
 fn parseInlineImageBytes(
     alloc: Allocator,
     image: std.json.ObjectMap,
-    image_blobs: ?[]const []const u8,
+    image_blobs: ?*ImageBlobReader,
 ) !?[]u8 {
     const blob_value = image.get("inline_blob") orelse
         return parseOptionalDurableBytes(alloc, image.get("inline_data") orelse .null);
     const blobs = image_blobs orelse return error.InvalidSessionFormat;
     if (image.get("inline_data") != null or blob_value != .integer) return error.InvalidSessionFormat;
     const index = std.math.cast(usize, blob_value.integer) orelse return error.InvalidSessionFormat;
-    if (index >= blobs.len) return error.InvalidSessionFormat;
-    return try alloc.dupe(u8, blobs[index]);
+    return try alloc.dupe(u8, try blobs.take(index));
 }
 
 fn imageAttachmentObject(value: std.json.Value) !std.json.ObjectMap {

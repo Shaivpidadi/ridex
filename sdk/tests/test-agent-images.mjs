@@ -210,10 +210,17 @@ for (const resizeImage of [undefined, (image) => image]) {
       if (mode === "throw") throw new Error("resize failed");
       if (mode === "invalid") return { bytes: "not bytes", mimeType };
       if (mode === "oversized") return { bytes: new Uint8Array(4 * 1024 * 1024), mimeType };
+      if (mode === "fill") return { bytes: new Uint8Array(3 * 1024 * 1024), mimeType };
       return { bytes, mimeType };
     },
   });
   const image = [{ type: "image", data: pngData, mimeType: "image/png" }];
+  // Hook output within the image budgets still counts toward the frame bound.
+  mode = "fill";
+  await assert.rejects(
+    agent.prompt([...image, ...image]).result,
+    (error) => error instanceof RangeError && /frame limit/.test(error.message),
+  );
   mode = "throw";
   await assert.rejects(agent.prompt(image).result, /resize failed/);
   mode = "invalid";
@@ -231,6 +238,27 @@ for (const resizeImage of [undefined, (image) => image]) {
   assert.equal((await runPrompt(agent, image)).stopReason, "end_turn");
   await agent.close();
   await assert.rejects(createAgent(mockGateway(), { resizeImage: "nope" }), /resizeImage must be a function/);
+}
+
+// A resizeImage that reuses one output buffer for every image still sends
+// each image with the bytes the hook returned for it.
+{
+  const gateway = mockGateway();
+  const scratch = new Uint8Array(4096);
+  const agent = await createAgent(gateway, {
+    model: "sdk/vision-model",
+    resizeImage({ bytes, mimeType }) {
+      scratch.set(bytes);
+      return { bytes: scratch.subarray(0, bytes.byteLength), mimeType };
+    },
+  });
+  const result = await runPrompt(agent, [
+    { type: "image", data: pngData, mimeType: "image/png" },
+    { type: "image", data: resizedPng, mimeType: "image/png" },
+  ]);
+  assert.equal(result.stopReason, "end_turn");
+  assert.deepEqual(fileParts(gateway.state.chatBodies[0]).map((part) => part.data.data), [pngData, resizedPng]);
+  await agent.close();
 }
 
 // A pure-image prompt is valid; the placeholder keeps the turn non-empty.
@@ -288,6 +316,12 @@ for (const resizeImage of [undefined, (image) => image]) {
   const files = fileParts(gateway.state.chatBodies[1]);
   assert.deepEqual(files, [{ type: "file", mediaType: "image/png", data: { type: "data", data: pngData } }]);
   await restored.close();
+
+  // An oversized restore checkpoint fails with the same error on both backends.
+  await assert.rejects(
+    createAgent(mockGateway(), { model: "sdk/vision-model", checkpoint: new Uint8Array(4 * 1024 * 1024 + 1) }),
+    (error) => error.message === "libfx checkpoint is too large",
+  );
 }
 
 // SDK-side limits reject synchronously with typed errors naming the bound,
@@ -367,8 +401,21 @@ for (const resizeImage of [undefined, (image) => image]) {
     (error) => error instanceof RangeError && /prompt images exceed/.test(error.message),
   );
 
-  // Image bytes travel beside the ACP frame, so only text and resources count
-  // toward the 8 MiB frame bound, on both backends.
+  // The model request carries images base64 encoded, so text and encoded
+  // images share the 8 MiB frame bound on both backends. Exactly 8 MiB of
+  // encoded image data passes the image budgets but not that bound once text
+  // and the envelope are added, as base64 or as raw bytes.
+  const quarter = pngWithEncodedLength(4 * 1024 * 1024);
+  for (const data of [quarter, Buffer.from(quarter, "base64")]) {
+    assert.throws(
+      () => agent.prompt([
+        { type: "text", text: "boundary" },
+        { type: "image", data, mimeType: "image/png" },
+        { type: "image", data, mimeType: "image/png" },
+      ]),
+      (error) => error instanceof RangeError && /frame limit/.test(error.message),
+    );
+  }
   assert.throws(
     () => agent.prompt("x".repeat(9 * 1024 * 1024)),
     (error) => error instanceof RangeError && /frame limit/.test(error.message),
@@ -386,14 +433,15 @@ for (const resizeImage of [undefined, (image) => image]) {
   );
   assert.equal(readMixed, false);
 
-  // Two images just over half the prompt budget fail before any Blob read.
-  const boundaryBlob = new Blob([Buffer.alloc(3.1 * 1024 * 1024)], { type: "image/png" });
+  // Two Blobs that fill the image budget exactly also fill the frame bound
+  // once encoded, so they fail before any Blob read.
+  const boundaryBlob = new Blob([Buffer.alloc(3 * 1024 * 1024)], { type: "image/png" });
   assert.throws(
     () => agent.prompt([
       { type: "image", data: boundaryBlob },
       { type: "image", data: boundaryBlob },
     ]),
-    (error) => error instanceof RangeError && /prompt images exceed/.test(error.message),
+    (error) => error instanceof RangeError && /frame limit/.test(error.message),
   );
 
   class LyingBlob extends Blob {

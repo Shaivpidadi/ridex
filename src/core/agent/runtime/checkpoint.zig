@@ -129,7 +129,8 @@ pub fn decode(alloc: Allocator, bytes: []const u8) Error!Decoded {
     defer alloc.free(blobs);
     for (blobs) |*blob| blob.* = reader.section() orelse return error.CorruptCheckpoint;
     if (reader.remaining() != 0) return error.CorruptCheckpoint;
-    return decodeJson(alloc, json, blobs);
+    var blob_reader: session_codec.ImageBlobReader = .{ .blobs = blobs };
+    return decodeJson(alloc, json, &blob_reader);
 }
 
 /// Reads length-prefixed sections from a version 2 payload. Returned slices
@@ -158,7 +159,7 @@ const PayloadReader = struct {
     }
 };
 
-fn decodeJson(alloc: Allocator, json: []const u8, image_blobs: ?[]const []const u8) Error!Decoded {
+fn decodeJson(alloc: Allocator, json: []const u8, image_blobs: ?*session_codec.ImageBlobReader) Error!Decoded {
     const parsed = std.json.parseFromSlice(
         std.json.Value,
         alloc,
@@ -186,6 +187,9 @@ fn decodeJson(alloc: Allocator, json: []const u8, image_blobs: ?[]const []const 
             else => return error.InvalidCheckpoint,
         };
         decoded_count += 1;
+    }
+    if (image_blobs) |blobs| {
+        if (!blobs.consumedAll()) return error.InvalidCheckpoint;
     }
     const usage = std.json.parseFromValueLeaky(types.Usage, alloc, usage_value, .{}) catch
         return error.InvalidCheckpoint;
@@ -406,4 +410,47 @@ test "kernel checkpoint rejects malformed blob sections" {
     trailing[bytes.len] = 0;
     resealForTest(trailing);
     try std.testing.expectError(error.CorruptCheckpoint, decode(alloc, trailing));
+}
+
+test "kernel checkpoint requires each image blob once, in order" {
+    const alloc = std.testing.allocator;
+    var first: TestImageHistory = undefined;
+    first.init("\x89PNG\r\n\x1a\nfirst-blob");
+    var second: TestImageHistory = undefined;
+    second.init("\x89PNG\r\n\x1a\nsecond-blob");
+    const history = [_]types.HistoryTurn{ first.history[0], second.history[0] };
+    const bytes = try encode(alloc, &history, .{});
+    defer alloc.free(bytes);
+    var decoded = try decode(alloc, bytes);
+    defer decoded.deinit(alloc);
+    try std.testing.expectEqualStrings("\x89PNG\r\n\x1a\nsecond-blob", decoded.history[1].assistant.user.images[0].inline_data.?);
+
+    const reference = "\"inline_blob\":";
+    const first_digit = std.mem.find(u8, bytes, reference ++ "0").? + reference.len;
+    const second_digit = std.mem.find(u8, bytes, reference ++ "1").? + reference.len;
+
+    const swapped = try alloc.dupe(u8, bytes);
+    defer alloc.free(swapped);
+    swapped[first_digit] = '1';
+    swapped[second_digit] = '0';
+    resealForTest(swapped);
+    try std.testing.expectError(error.InvalidCheckpoint, decode(alloc, swapped));
+
+    const duplicated = try alloc.dupe(u8, bytes);
+    defer alloc.free(duplicated);
+    duplicated[second_digit] = '0';
+    resealForTest(duplicated);
+    try std.testing.expectError(error.InvalidCheckpoint, decode(alloc, duplicated));
+
+    const extra_blob = "\x89PNG\r\n\x1a\nunreferenced";
+    const unreferenced = try alloc.alloc(u8, bytes.len + length_bytes + extra_blob.len);
+    defer alloc.free(unreferenced);
+    @memcpy(unreferenced[0..bytes.len], bytes);
+    var offset = bytes.len;
+    writeSection(unreferenced, &offset, extra_blob);
+    const json_len = std.mem.readInt(u32, bytes[header_bytes..][0..length_bytes], .little);
+    const count_at = header_bytes + length_bytes + json_len;
+    std.mem.writeInt(u32, unreferenced[count_at..][0..length_bytes], 3, .little);
+    resealForTest(unreferenced);
+    try std.testing.expectError(error.InvalidCheckpoint, decode(alloc, unreferenced));
 }

@@ -140,7 +140,8 @@ Image bytes reach the agent core beside the prompt message rather than inside
 it, so the only base64 encoding is the one the model request requires. A prompt
 may contain up to 8 images, each with up to 3.75 MiB (3,932,160 bytes), with at
 most 6 MiB of image data per prompt. Once encoded for the model request, those
-limits are 5 MiB per image and 8 MiB per prompt. The SDK checks Blob size
+limits are 5 MiB per image and 8 MiB per prompt, and the prompt's text and
+encoded images must fit in 8 MiB together. The SDK checks Blob size
 before reading it and the actual byte count after reading it, and rejects
 larger input with typed `RangeError`s. Base64 that is not canonical throws a
 `TypeError` from `prompt()`. Raw bytes are copied before `prompt()` returns, so
@@ -168,7 +169,8 @@ const agent = await createFxAgent({
 ```
 
 In a browser, the bytes from `OffscreenCanvas.convertToBlob()` and
-`Blob.arrayBuffer()` can be returned as is. With `resizeImage`, the size limits
+`Blob.arrayBuffer()` can be returned as is. The returned bytes are copied, so
+the hook may reuse its buffer. With `resizeImage`, the size limits
 apply to its output rather than its input, image prompts are prepared
 asynchronously like a Blob prompt, and a failure inside the hook rejects
 `turn.result`.
