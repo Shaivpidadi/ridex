@@ -419,6 +419,12 @@ for (const userHeavy of [false, true]) {
       expect(sent).toContain("PENDING_CHECK=transport-resume");
       expect(sent).not.toContain("Assistant reference 7000:");
       expect(sent).toContain("the whole text is saved in M1");
+      // The user's message stays word for word unless it alone outgrows the
+      // room; then it keeps its start and end.
+      const promptText = (body: string) => JSON.stringify(JSON.parse(body).prompt);
+      const shown = (text: string) => JSON.stringify(text).slice(1, -1);
+      const userShown = shown(userHeavy ? "User 1:\nKeep café and the original constraint unchanged.\n" : `User 1:\n${originalUser}\n`);
+      expect(promptText(sent)).toContain(userShown);
       expect(readFileSync(logPath).subarray(0, before.length).equals(before)).toBe(true);
       const notesCallsBeforeReopen = notesCalls;
 
@@ -430,6 +436,7 @@ for (const userHeavy of [false, true]) {
       expect(JSON.parse(reopened.stdout).output).toBe("CONTINUED_FROM_COMMITTED_MEMORY");
       expect(bodies.at(-1)).toContain("VERIFIED_VALUE=73");
       expect(bodies.at(-1)).not.toContain("Assistant reference 7000:");
+      expect(promptText(bodies.at(-1)!)).toContain(userShown);
       expect(notesCalls).toBe(notesCallsBeforeReopen);
       expect((logLines(fixture, id) as any[]).filter((line) => line.kind === "compacted")).toHaveLength(1);
       expect(readFileSync(logPath).subarray(0, before.length).equals(before)).toBe(true);
