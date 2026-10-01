@@ -48,6 +48,7 @@ const permissions = @import("../core/permissions/permissions.zig");
 const host_tool_runtime = @import("../core/tooling/host_tool_runtime.zig");
 const tool_dispatch = @import("../core/tooling/tool_dispatch.zig");
 const agent_checkpoint = @import("../core/agent/runtime/checkpoint.zig");
+const host_attachments = @import("../core/hosts/host_attachments.zig");
 const libfx_steering = @import("libfx_steering.zig");
 const tool_call_identities = @import("tool_call_identities.zig");
 
@@ -1611,21 +1612,22 @@ fn handleKernelCheckpoint(
             .code = ErrorCode.invalid_params,
             .message = "Unknown libfx session",
         });
+    const unavailable: jsonrpc.RpcError = .{
+        .code = ErrorCode.invalid_request,
+        .message = "libfx checkpoint is unavailable",
+    };
+    const store = state.cfg.host_attachments orelse return state.writer.writeError(alloc, msg.id, unavailable);
     const bytes = active.session_rt.agent.checkpoint(alloc) catch
-        return state.writer.writeError(alloc, msg.id, .{
-            .code = ErrorCode.invalid_request,
-            .message = "libfx checkpoint is unavailable",
-        });
+        return state.writer.writeError(alloc, msg.id, unavailable);
     defer alloc.free(bytes);
-    const encoded = try alloc.alloc(u8, std.base64.standard.Encoder.calcSize(bytes.len));
-    defer alloc.free(encoded);
-    _ = std.base64.standard.Encoder.encode(encoded, bytes);
-    var response: std.Io.Writer.Allocating = .init(alloc);
-    defer response.deinit();
-    try response.writer.writeAll("{\"checkpoint\":");
-    try std.json.Stringify.value(encoded, .{}, &response.writer);
-    try response.writer.writeByte('}');
-    try state.writer.writeResponse(alloc, msg.id, response.written());
+    // The checkpoint leaves as raw bytes beside the response frame.
+    const attachment = store.put(bytes) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.AttachmentStoreFull => return state.writer.writeError(alloc, msg.id, unavailable),
+    };
+    var response: [64]u8 = undefined;
+    const written = std.fmt.bufPrint(&response, "{{\"checkpointAttachment\":{d}}}", .{attachment}) catch unreachable;
+    try state.writer.writeResponse(alloc, msg.id, written);
 }
 
 fn handleKernelRestore(
@@ -1643,33 +1645,27 @@ fn handleKernelRestore(
             .code = ErrorCode.invalid_params,
             .message = "Unknown libfx session",
         });
-    const checkpoint = parsed.value.object.get("checkpoint") orelse
+    const reference = parsed.value.object.get("checkpointAttachment") orelse
         return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_params,
             .message = "Missing libfx checkpoint",
         });
-    if (checkpoint != .string) return state.writer.writeError(alloc, msg.id, .{
+    const invalid: jsonrpc.RpcError = .{
         .code = ErrorCode.invalid_params,
         .message = "Invalid libfx checkpoint",
-    });
-    const decoded_len = std.base64.standard.Decoder.calcSizeForSlice(checkpoint.string) catch
-        return state.writer.writeError(alloc, msg.id, .{
-            .code = ErrorCode.invalid_params,
-            .message = "Invalid libfx checkpoint",
-        });
-    if (decoded_len > agent_checkpoint.max_checkpoint_bytes) {
-        return state.writer.writeError(alloc, msg.id, .{
+    };
+    const attachment = host_attachments.idFromJson(reference) orelse
+        return state.writer.writeError(alloc, msg.id, invalid);
+    const store = state.cfg.host_attachments orelse return state.writer.writeError(alloc, msg.id, invalid);
+    const bytes = store.take(alloc, attachment, agent_checkpoint.max_checkpoint_bytes) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.AttachmentUnavailable => return state.writer.writeError(alloc, msg.id, invalid),
+        error.AttachmentTooLarge => return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_params,
             .message = "libfx checkpoint is too large",
-        });
-    }
-    const bytes = try alloc.alloc(u8, decoded_len);
+        }),
+    };
     defer alloc.free(bytes);
-    std.base64.standard.Decoder.decode(bytes, checkpoint.string) catch
-        return state.writer.writeError(alloc, msg.id, .{
-            .code = ErrorCode.invalid_params,
-            .message = "Invalid libfx checkpoint",
-        });
     active.session_rt.agent.restoreCheckpoint(alloc, bytes) catch
         return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_params,
