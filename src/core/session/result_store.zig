@@ -791,6 +791,10 @@ fn readStoredTextManaged(
     handle: []const u8,
 ) ![]u8 {
     if (capability.holdsBlobs()) {
+        // Every store's blobs share the session, found by hash alone, so
+        // only this store's own handles are its results: a command
+        // replay's is read by its own store (D44).
+        if (!isStoredTextHandle(handle) and !isImageHandle(handle)) return error.ResultHandleNotFound;
         return capability.readBlob(alloc, .tool_results, handle, stored_text_max_bytes) catch |err| switch (err) {
             error.BlobNotFound => error.ResultHandleNotFound,
             error.BlobTooLarge => error.StreamTooLong,
@@ -847,7 +851,7 @@ test "a v2 session stores results and images as blobs named by their hash (D44)"
     const alloc = std.testing.allocator;
     var memory = session_child_store.MemoryBlobsForTesting.init(alloc);
     defer memory.deinit();
-    var capability = try session_child_store.SessionChildCapability.initBlobs(alloc, memory.blobs(), .writable);
+    var capability = try session_child_store.SessionChildCapability.initBlobs(alloc, memory.blobs(), "", .writable);
     defer capability.deinit();
 
     var bytes = [_]u8{'x'} ** (large_result_threshold_bytes + 128);
@@ -886,6 +890,13 @@ test "a v2 session stores results and images as blobs named by their hash (D44)"
     const tail = try reader.readPage(alloc, bytes.len - 2, 10);
     defer alloc.free(tail);
     try std.testing.expectEqualStrings("xx", tail);
+
+    // Every store's blobs share the session: the same blob under a command
+    // replay's handle is not a result, so the caller asks that store.
+    const foreign = try std.mem.concat(alloc, u8, &.{ "fx-command-replay-", artifact_digest.blobHash(handle).?, ".bin" });
+    defer alloc.free(foreign);
+    try std.testing.expectError(error.ResultHandleNotFound, readByRangeManaged(alloc, &capability, foreign, 1, 4));
+    try std.testing.expectError(error.ResultHandleNotFound, searchByQueryManaged(alloc, &capability, foreign, "xxx"));
 
     // A blob stays with the session; an unknown hash is not found.
     try deleteManaged(&capability, handle);

@@ -438,7 +438,7 @@ test "web_fetch on a v2 session keeps a download as a blob the model opens by pa
     defer alloc.free(blob_dir);
     var memory = session_child_store.MemoryBlobsForTesting.initWithFiles(alloc, blob_dir);
     defer memory.deinit();
-    var capability = try session_child_store.SessionChildCapability.initBlobs(alloc, memory.blobs(), .writable);
+    var capability = try session_child_store.SessionChildCapability.initBlobs(alloc, memory.blobs(), "", .writable);
     defer capability.deinit();
 
     var store = try Store.initBlobs(alloc, &capability, "kYIGy8ik0H3K");

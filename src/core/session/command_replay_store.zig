@@ -1050,6 +1050,9 @@ pub const Reader = struct {
         handle: []const u8,
     ) !void {
         if (!hasContentDigest(handle)) return error.ResultHandleNotFound;
+        // Every store's blobs share the session, found by hash alone, so a
+        // v2 replay is only a replay handle; a web-fetch `.bin` is not (D44).
+        if (capability.holdsBlobs() and !isReplayHandle(handle)) return error.ResultHandleNotFound;
         var file = if (capability.holdsBlobs()) ReplayFile{ .blob = capability.openBlobFile(
             alloc,
             .command_artifacts,
@@ -1540,7 +1543,7 @@ test "a v2 session keeps a replay as one blob named by its hash, spooled or inli
     defer alloc.free(blob_dir);
     var memory = session_child_store.MemoryBlobsForTesting.initWithFiles(alloc, blob_dir);
     defer memory.deinit();
-    var capability = try session_child_store.SessionChildCapability.initBlobs(alloc, memory.blobs(), .writable);
+    var capability = try session_child_store.SessionChildCapability.initBlobs(alloc, memory.blobs(), "", .writable);
     defer capability.deinit();
 
     // Past the inline limit the capture spools outside the session.
@@ -1593,6 +1596,11 @@ test "a v2 session keeps a replay as one blob named by its hash, spooled or inli
 
     // A name this session never stored is not found.
     try std.testing.expectError(error.ResultHandleNotFound, Reader.openHandle(alloc, &capability, "fx-command-replay-" ++ "0" ** 64 ++ ".bin"));
+    // Every store's blobs share the session: the same blob under a
+    // web-fetch download's `.bin` handle is not a replay.
+    const foreign = try std.mem.concat(alloc, u8, &.{ "artifact-", handle["fx-command-replay-".len..] });
+    defer alloc.free(foreign);
+    try std.testing.expectError(error.ResultHandleNotFound, Reader.openHandle(alloc, &capability, foreign));
 }
 
 test "required command replay reports unavailable backing instead of dropping output" {

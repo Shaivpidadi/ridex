@@ -223,6 +223,10 @@ const CapabilityImpl = struct {
     /// and has no side folder (D48).
     session_dir: ?io_mod.VerifiedDir,
     blobs: ?Blobs = null,
+    /// A v2 session's terminal folder, `~/.fx/terminal/{id}` (D45), where
+    /// its terminal kinds route; opened on first use and made only by a
+    /// write. `display_session_path` is its path.
+    terminal_dir: ?io_mod.VerifiedDir = null,
     display_session_path: []u8,
     legacy_direct_kind: ?ManagedChildKind = null,
     legacy_background_root: bool = false,
@@ -259,6 +263,7 @@ const CapabilityImpl = struct {
         closeOptionalDir(&self.terminal_parent);
         closeOptionalDir(&self.client_context);
         closeOptionalDir(&self.session_dir);
+        closeOptionalDir(&self.terminal_dir);
         if (self.blobs) |blobs| blobs.vtable.release(blobs.ctx);
         self.alloc.free(self.display_session_path);
         if (self.legacy_display_route) |path| self.alloc.free(path);
@@ -290,11 +295,12 @@ const CapabilityImpl = struct {
                 else => error.SessionChildStoreFailed,
             };
         }
-        // A v2 capability has no side folder: its bodies are blobs (D48).
-        const session_dir = if (self.session_dir) |*dir| dir else return if (create_if_missing)
-            error.SessionChildStoreFailed
-        else
-            null;
+        // A v2 capability has no side folder: its bodies are blobs (D48),
+        // and its terminal state lives in its terminal folder (D45).
+        const session_dir = if (self.session_dir) |*dir| dir else switch (kind) {
+            .terminal_state, .terminal_proofs => try self.terminalDir(create_if_missing) orelse return null,
+            else => return if (create_if_missing) error.SessionChildStoreFailed else null,
+        };
         return switch (kind) {
             .background_records => self.ensureComponent(
                 session_dir,
@@ -384,6 +390,38 @@ const CapabilityImpl = struct {
                 };
             },
         };
+    }
+
+    /// A v2 capability's terminal folder (D45), opened once. Missing, it is
+    /// made only for a write (`create`); a read finds nothing.
+    fn terminalDir(self: *CapabilityImpl, create: bool) !?*io_mod.VerifiedDir {
+        if (self.terminal_dir) |*dir| return dir;
+        const owner_path = self.display_session_path;
+        if (self.blobs == null or owner_path.len == 0) return if (create) error.SessionChildStoreFailed else null;
+        if (create and self.mode != .writable) return error.SessionChildReadOnly;
+        const root_path = std.fs.path.dirname(owner_path) orelse return error.SessionPathUnsafe;
+        const fx_path = std.fs.path.dirname(root_path) orelse return error.SessionPathUnsafe;
+        var fx = io_mod.VerifiedDir{ .dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), fx_path, .{
+            .iterate = true,
+            .follow_symlinks = false,
+        }) catch |err| switch (err) {
+            error.FileNotFound => return if (create) error.SessionChildStoreFailed else null,
+            error.NotDir, error.SymLinkLoop => return error.SessionPathUnsafe,
+            else => return error.SessionChildStoreFailed,
+        } };
+        defer fx.close();
+        const root_name = std.fs.path.basename(root_path);
+        var root = if (create)
+            try io_mod.openOrCreateVerifiedPrivateDir(&fx, root_name)
+        else
+            (try io_mod.openVerifiedPrivateDirIfPresent(&fx, root_name)) orelse return null;
+        defer root.close();
+        const id = std.fs.path.basename(owner_path);
+        self.terminal_dir = if (create)
+            try io_mod.openOrCreateVerifiedPrivateDir(&root, id)
+        else
+            (try io_mod.openVerifiedPrivateDirIfPresent(&root, id)) orelse return null;
+        return &self.terminal_dir.?;
     }
 
     fn directRoute(
@@ -712,7 +750,7 @@ pub const SessionChildCapability = struct {
         self: *const SessionChildCapability,
         alloc: Allocator,
     ) !SessionChildCapability {
-        if (self.impl.blobs) |blobs| return initBlobs(alloc, blobs, self.impl.mode);
+        if (self.impl.blobs) |blobs| return initBlobs(alloc, blobs, self.impl.display_session_path, self.impl.mode);
         return initWithOptions(
             alloc,
             self.impl.session_dir.?.dir,
@@ -722,11 +760,13 @@ pub const SessionChildCapability = struct {
         );
     }
 
-    /// A v2 session's capability: its bodies are that session's blobs, and
-    /// it has no side folder, so every other kind is absent (D44, D48).
-    pub fn initBlobs(alloc: Allocator, blobs: Blobs, mode: Mode) !SessionChildCapability {
+    /// A v2 session's capability: its bodies are that session's blobs, its
+    /// terminal kinds route to `terminal_path`, its `~/.fx/terminal/{id}`
+    /// (D45), and it has no side folder, so every other kind is absent
+    /// (D44, D48). An empty `terminal_path` gives no terminal kinds.
+    pub fn initBlobs(alloc: Allocator, blobs: Blobs, terminal_path: []const u8, mode: Mode) !SessionChildCapability {
         if (mode == .writable) io_mod.e2eFailIfDurableMutationAttempted();
-        const display = try alloc.dupe(u8, "");
+        const display = try alloc.dupe(u8, terminal_path);
         errdefer alloc.free(display);
         const impl = try alloc.create(CapabilityImpl);
         impl.* = .{
@@ -1124,7 +1164,7 @@ pub const SessionChildCapability = struct {
             return error.SessionChildStoreFailed;
         }
         var cloned = if (self.impl.blobs) |blobs|
-            try initBlobs(alloc, blobs, .read_only)
+            try initBlobs(alloc, blobs, self.impl.display_session_path, .read_only)
         else
             try initWithOptions(
                 alloc,
@@ -2076,6 +2116,52 @@ const FailFirstParentSync = struct {
         if (self.calls == 1) return error.InjectedParentSyncFailure;
     }
 };
+
+test "a v2 capability keeps terminal kinds in the terminal folder, made only by a write (D45)" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(io_mod.getIo(), "fx", private_dir_permissions);
+    const fx_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "fx");
+    defer alloc.free(fx_path);
+    const terminal_path = try std.fs.path.join(alloc, &.{ fx_path, "terminal", "kYIGy8ik0H3K" });
+    defer alloc.free(terminal_path);
+
+    var memory = MemoryBlobsForTesting.init(alloc);
+    defer memory.deinit();
+    var capability = try SessionChildCapability.initBlobs(alloc, memory.blobs(), terminal_path, .writable);
+    defer capability.deinit();
+
+    // A read finds nothing and makes nothing.
+    try std.testing.expectError(error.FileNotFound, capability.openFileReadOnly(alloc, .terminal_state, "record.json"));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io_mod.getIo(), "fx/terminal", .{ .follow_symlinks = false }));
+
+    var entry = try capability.atomicReplace(alloc, .terminal_state, "record.json", "{}");
+    entry.deinit(alloc);
+    for ([_][]const u8{ "fx/terminal", "fx/terminal/kYIGy8ik0H3K" }) |sub_path| {
+        const stat = try tmp.dir.statFile(io_mod.getIo(), sub_path, .{ .follow_symlinks = false });
+        try std.testing.expectEqual(std.Io.File.Kind.directory, stat.kind);
+        try std.testing.expectEqual(@as(std.posix.mode_t, 0o700), stat.permissions.toMode() & 0o777);
+    }
+
+    // A read-only clone reads it back; side-folder kinds stay absent.
+    var reader = try capability.cloneReadOnly(alloc);
+    defer reader.deinit();
+    var file = try reader.openFileReadOnly(alloc, .terminal_state, "record.json");
+    defer file.deinit();
+    const bytes = try file.readToEnd(alloc, 16);
+    defer alloc.free(bytes);
+    try std.testing.expectEqualStrings("{}", bytes);
+    try std.testing.expectError(error.SessionChildStoreFailed, capability.atomicReplace(alloc, .background_records, "record.json", "{}"));
+
+    // A read-only capability never makes the folder.
+    const other_path = try std.fs.path.join(alloc, &.{ fx_path, "terminal", "otherSession1" });
+    defer alloc.free(other_path);
+    var read_only = try SessionChildCapability.initBlobs(alloc, memory.blobs(), other_path, .read_only);
+    defer read_only.deinit();
+    try std.testing.expectError(error.FileNotFound, read_only.openFileReadOnly(alloc, .terminal_state, "record.json"));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io_mod.getIo(), "fx/terminal/otherSession1", .{ .follow_symlinks = false }));
+}
 
 test "post rename parent sync failure is indeterminate and next write reopens" {
     const alloc = std.testing.allocator;

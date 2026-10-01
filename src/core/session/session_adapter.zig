@@ -1067,7 +1067,8 @@ pub const Session = struct {
     // -- bodies --------------------------------------------------------------
 
     /// The capability over this session's blobs (D44): it stores and reads
-    /// large bodies, and has no side folder. Borrowed until `close`.
+    /// large bodies, routes terminal state to `~/.fx/terminal/{id}` (D45),
+    /// and has no side folder. Borrowed until `close`.
     pub fn childCapability(self: *Session) !*session_child_store.SessionChildCapability {
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
@@ -1076,7 +1077,9 @@ pub const Session = struct {
 
     fn capabilityLocked(self: *Session) !*session_child_store.SessionChildCapability {
         if (self.capability) |*capability| return capability;
-        self.capability = try session_child_store.SessionChildCapability.initBlobs(self.alloc, self.host.blobs(), .writable);
+        const terminal_path = try std.fs.path.join(self.alloc, &.{ self.store.home, profile_paths.root_dir_name, terminal_dir_name, self.id() });
+        defer self.alloc.free(terminal_path);
+        self.capability = try session_child_store.SessionChildCapability.initBlobs(self.alloc, self.host.blobs(), terminal_path, .writable);
         return &self.capability.?;
     }
 
@@ -3994,6 +3997,42 @@ test "an older session moves off its side folder on its first writable open, and
     defer testing.allocator.free(identities);
     try testing.expect(std.mem.find(u8, identities, "mcp_mini_read") != null);
     try testing.expectEqual(@as(u64, 0), (try t.store.manager.verify(id)).bad_blobs);
+
+    // An image whose blob is lost keeps its old path, as a lost snapshot does.
+    const image_hash = r.host.moved.get("images/" ++ OldSideFolder.image_name).?;
+    const image_blob = try t.store.manager.blobPath(testing.allocator, id, &image_hash);
+    defer testing.allocator.free(image_blob);
+    try std.Io.Dir.deleteFileAbsolute(io_mod.getIo(), image_blob);
+    var without = try r.restore(testing.allocator);
+    defer without.deinit(testing.allocator);
+    const lost = without.history[0].assistant.user.images[0];
+    try testing.expectEqual(@as(?[]u8, null), lost.inline_data);
+    try testing.expect(std.mem.endsWith(u8, lost.snapshot_path.?, "images/" ++ OldSideFolder.image_name));
+}
+
+test "a web-fetch download on v2 is a read-only blob the model opens by its path (D49)" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    defer s.close();
+    try s.beginTurn();
+    var downloads = try @import("web_fetch_artifacts.zig").Store.initBlobs(testing.allocator, try s.childCapability(), s.id());
+    defer downloads.deinit();
+    var artifact = try downloads.write(testing.allocator, "application/pdf", "%PDF-1.7 a download");
+    defer artifact.deinit(testing.allocator);
+    const folder = try s.folderPath(testing.allocator);
+    defer testing.allocator.free(folder);
+    try testing.expect(std.mem.startsWith(u8, artifact.display_path, folder));
+    var file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), artifact.display_path, .{});
+    defer file.close(io_mod.getIo());
+    var buffer: [64]u8 = undefined;
+    const len = try file.readPositionalAll(io_mod.getIo(), &buffer, 0);
+    try testing.expectEqualStrings("%PDF-1.7 a download", buffer[0..len]);
+    const stat = try file.stat(io_mod.getIo());
+    try testing.expectEqual(@as(u32, 0o400), @as(u32, @intCast(stat.permissions.toMode() & 0o777)));
+    try testing.expect(!pathExists(&t, &.{ ".fx", files_dir_name }));
 }
 
 test "a move cut short is redone on the next open, and old names still resolve (D47)" {
