@@ -112,7 +112,7 @@ fn fetchCatalogForProvider(
     if (response.status != .ok) {
         return .{ .failure = model_catalog.failureForHttpStatus(response.status) };
     }
-    var modalities_response = fetchCatalogResponse(
+    var modalities_response: ?FetchResponse = fetchCatalogResponse(
         alloc,
         modalities_url,
         request_auth.credential,
@@ -121,15 +121,19 @@ fn fetchCatalogForProvider(
         null,
         cancel_flag,
         deadline,
-    ) catch |err| {
+    ) catch |err| blk: {
         if (err == error.OutOfMemory) return error.OutOfMemory;
-        return .{ .failure = catalogFetchFailure(err) };
+        if (err == error.Cancelled) return .{ .failure = catalogFetchFailure(err) };
+        debug_trace.logf("catalog", "Grok modality enrichment unavailable err={s}", .{@errorName(err)});
+        break :blk null;
     };
-    defer modalities_response.deinit(alloc);
-    if (modalities_response.status != .ok) {
-        return .{ .failure = model_catalog.failureForHttpStatus(modalities_response.status) };
-    }
-    const catalog = parseCatalog(alloc, response.body, modalities_response.body) catch |err| {
+    defer if (modalities_response) |*metadata| metadata.deinit(alloc);
+    const modalities_json = if (modalities_response) |metadata| blk: {
+        if (metadata.status == .ok) break :blk @as(?[]const u8, metadata.body);
+        debug_trace.logf("catalog", "Grok modality enrichment unavailable status={d}", .{@intFromEnum(metadata.status)});
+        break :blk null;
+    } else null;
+    const catalog = parseCatalog(alloc, response.body, modalities_json) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         return .{ .failure = .{ .category = .malformed_response, .http_status = .ok } };
     };
@@ -282,7 +286,7 @@ fn modalitiesUrl(alloc: std.mem.Allocator) ![]u8 {
 fn parseCatalog(
     alloc: std.mem.Allocator,
     subscription_json: []const u8,
-    modalities_json: []const u8,
+    modalities_json: ?[]const u8,
 ) !std.ArrayList(model_catalog.ModelCatalogEntry) {
     var subscription = try std.json.parseFromSlice(std.json.Value, alloc, subscription_json, .{});
     defer subscription.deinit();
@@ -292,13 +296,19 @@ fn parseCatalog(
     if (subscription_models != .array) return error.InvalidGrokModelCatalog;
     try validateCatalogModelCount(subscription_models.array.items.len);
 
-    var modalities = try std.json.parseFromSlice(std.json.Value, alloc, modalities_json, .{});
-    defer modalities.deinit();
-    if (modalities.value != .object) return error.InvalidGrokModelCatalog;
-    const modality_models = modalities.value.object.get("models") orelse
-        return error.InvalidGrokModelCatalog;
-    if (modality_models != .array) return error.InvalidGrokModelCatalog;
-    try validateCatalogModelCount(modality_models.array.items.len);
+    var modalities: ?std.json.Parsed(std.json.Value) = if (modalities_json) |json|
+        parseModalities(alloc, json) catch |err| blk: {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            debug_trace.logf("catalog", "Grok modality enrichment invalid err={s}", .{@errorName(err)});
+            break :blk null;
+        }
+    else
+        null;
+    defer if (modalities) |*metadata| metadata.deinit();
+    const modality_models: []const std.json.Value = if (modalities) |metadata|
+        metadata.value.object.get("models").?.array.items
+    else
+        &.{};
 
     var catalog: std.ArrayList(model_catalog.ModelCatalogEntry) = .empty;
     errdefer model_catalog.freeModelCatalog(alloc, &catalog);
@@ -309,11 +319,7 @@ fn parseCatalog(
         if (!std.mem.eql(u8, api_backend, "responses")) continue;
         const raw_id = try requiredString(object, "model");
         try validateModelId(raw_id);
-        const modality_object = try findModalityModel(modality_models.array.items, raw_id) orelse {
-            debug_trace.logf("catalog", "Grok model omitted: modality metadata unavailable model={s}", .{raw_id});
-            continue;
-        };
-        if (!try stringArrayContains(modality_object, "output_modalities", "text")) continue;
+        const modality_object = findModalityModel(modality_models, raw_id);
 
         const id = try alloc.dupe(u8, raw_id);
         errdefer alloc.free(id);
@@ -328,7 +334,10 @@ fn parseCatalog(
         }
         const context_window = try requiredPositiveU32(object, "context_window");
         const max_output_tokens = try optionalPositiveU32(object, "max_completion_tokens");
-        const has_vision = try stringArrayContains(modality_object, "input_modalities", "image");
+        const has_vision = if (modality_object) |metadata|
+            try stringArrayContains(metadata, "input_modalities", "image")
+        else
+            false;
 
         try catalog.append(alloc, .{
             .id = id,
@@ -371,14 +380,25 @@ fn appendProviderReasoningEfforts(
     }
 }
 
-fn findModalityModel(
-    models: []const std.json.Value,
-    model_id: []const u8,
-) !?std.json.ObjectMap {
-    for (models) |value| {
+/// Returns owned parsed metadata; the caller releases it with deinit.
+fn parseModalities(alloc: std.mem.Allocator, json: []const u8) !std.json.Parsed(std.json.Value) {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
+    errdefer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidGrokModelCatalog;
+    const models = parsed.value.object.get("models") orelse return error.InvalidGrokModelCatalog;
+    if (models != .array) return error.InvalidGrokModelCatalog;
+    try validateCatalogModelCount(models.array.items.len);
+    for (models.array.items) |value| {
         if (value != .object) return error.InvalidGrokModelCatalog;
-        const candidate = try requiredString(value.object, "id");
-        try validateModelId(candidate);
+        try validateModelId(try requiredString(value.object, "id"));
+        _ = try stringArrayContains(value.object, "input_modalities", "image");
+    }
+    return parsed;
+}
+
+fn findModalityModel(models: []const std.json.Value, model_id: []const u8) ?std.json.ObjectMap {
+    for (models) |value| {
+        const candidate = value.object.get("id").?.string;
         if (std.mem.eql(u8, candidate, model_id)) return value.object;
     }
     return null;
@@ -389,13 +409,14 @@ fn stringArrayContains(
     key: []const u8,
     expected: []const u8,
 ) !bool {
-    const value = object.get(key) orelse return error.InvalidGrokModelCatalog;
+    const value = object.get(key) orelse return false;
     if (value != .array or value.array.items.len > 32) return error.InvalidGrokModelCatalog;
+    var found = false;
     for (value.array.items) |entry| {
         if (entry != .string) return error.InvalidGrokModelCatalog;
-        if (std.mem.eql(u8, entry.string, expected)) return true;
+        found = found or std.mem.eql(u8, entry.string, expected);
     }
-    return false;
+    return found;
 }
 
 fn requiredString(object: std.json.ObjectMap, key: []const u8) ![]const u8 {
@@ -479,7 +500,7 @@ test "Grok catalog parser joins provider-owned subscription capabilities and mod
     try std.testing.expect(!second.has_vision);
 }
 
-test "Grok catalog skips unmatched models without losing matched capabilities" {
+test "Grok catalog retains subscription models without losing provider capabilities" {
     const alloc = std.testing.allocator;
     const first =
         \\{"model":"current-a","api_backend":"responses","context_window":500123,"max_completion_tokens":32768,"supports_reasoning_effort":true,"reasoning_efforts":[{"value":"medium"}]}
@@ -498,15 +519,20 @@ test "Grok catalog skips unmatched models without losing matched capabilities" {
     const modalities =
         \\{"models":[{"id":"current-a","input_modalities":["text","image"],"output_modalities":["text"]},{"id":"current-b","input_modalities":["text"],"output_modalities":["text"]}]}
     ;
-    for (orders) |rows| {
+    for (orders, 0..) |rows, unmatched_index| {
         const subscription = try std.fmt.allocPrint(alloc, "{{\"data\":[{s},{s},{s}]}}", .{ rows[0], rows[1], rows[2] });
         defer alloc.free(subscription);
         var catalog = try parseCatalog(alloc, subscription, modalities);
         defer model_catalog.freeModelCatalog(alloc, &catalog);
 
-        try std.testing.expectEqual(@as(usize, 2), catalog.items.len);
-        const a = catalog.items[0];
-        const b = catalog.items[1];
+        try std.testing.expectEqual(@as(usize, 3), catalog.items.len);
+        const a = catalog.items[if (unmatched_index == 0) 1 else 0];
+        const b = catalog.items[if (unmatched_index == 2) 1 else 2];
+        const unlisted = catalog.items[unmatched_index];
+        try std.testing.expectEqualStrings("subscription-only", unlisted.id);
+        try std.testing.expectEqual(@as(u32, 1_000_000), unlisted.context_window);
+        try std.testing.expect(unlisted.has_tool_use and unlisted.supports_fast_mode);
+        try std.testing.expect(!unlisted.has_vision and !unlisted.has_file_input);
         try std.testing.expectEqualStrings("current-a", a.id);
         try std.testing.expectEqualStrings("current-b", b.id);
         try std.testing.expectEqual(@as(u32, 500_123), a.context_window);
@@ -522,12 +548,13 @@ test "Grok catalog skips unmatched models without losing matched capabilities" {
     }
 }
 
-test "Grok catalog permits an empty usable catalog when all models lack modalities" {
+test "Grok catalog uses the subscription inventory when modality metadata is absent" {
     const alloc = std.testing.allocator;
     const subscription =
         \\{"data":[{"model":"subscription-only","api_backend":"responses","context_window":1000000,"supports_reasoning_effort":false,"reasoning_efforts":[]}]}
     ;
-    const cases = [_][]const u8{
+    const cases = [_]?[]const u8{
+        null,
         \\{"models":[]}
         ,
         \\{"models":[{"id":"other","input_modalities":["text"],"output_modalities":["text"]}]}
@@ -536,11 +563,13 @@ test "Grok catalog permits an empty usable catalog when all models lack modaliti
     for (cases) |modalities| {
         var catalog = try parseCatalog(alloc, subscription, modalities);
         defer model_catalog.freeModelCatalog(alloc, &catalog);
-        try std.testing.expectEqual(@as(usize, 0), catalog.items.len);
+        try std.testing.expectEqual(@as(usize, 1), catalog.items.len);
+        try std.testing.expectEqualStrings("subscription-only", catalog.items[0].id);
+        try std.testing.expect(!catalog.items[0].has_vision);
     }
 }
 
-test "Grok catalog rejects malformed provider-owned capability metadata" {
+test "Grok catalog rejects malformed subscription data without requiring modality enrichment" {
     const modalities =
         \\{"models":[{"id":"current","input_modalities":["text"],"output_modalities":["text"]}]}
     ;
@@ -567,9 +596,15 @@ test "Grok catalog rejects malformed provider-owned capability metadata" {
         ,
         \\{"models":[{"id":"current","input_modalities":[0],"output_modalities":["text"]}]}
         ,
+        \\{"models":[{"id":"current","input_modalities":["image",0]}]}
+        ,
     };
     for (malformed_modalities) |metadata| {
-        try expectCatalogParseError(error.InvalidGrokModelCatalog, valid_subscription, metadata);
+        var catalog = try parseCatalog(std.testing.allocator, valid_subscription, metadata);
+        defer model_catalog.freeModelCatalog(std.testing.allocator, &catalog);
+        try std.testing.expectEqual(@as(usize, 1), catalog.items.len);
+        try std.testing.expectEqualStrings("current", catalog.items[0].id);
+        try std.testing.expect(!catalog.items[0].has_vision);
     }
 }
 
@@ -907,7 +942,7 @@ test "Grok catalog fetch and parser enforce body and model-count bounds" {
     try expectCatalogParseError(error.InvalidGrokModelCatalog, excess_count, modalities);
 }
 
-test "Grok catalog adapter classifies oversized bodies at both provider origins" {
+test "Grok catalog adapter rejects oversized subscription bodies but tolerates unavailable enrichment" {
     const alloc = std.testing.allocator;
     const oversized_subscription = try buildCatalogJson(alloc, 1, 8, max_catalog_bytes + 1);
     defer alloc.free(oversized_subscription);
@@ -954,10 +989,16 @@ test "Grok catalog adapter classifies oversized bodies at both provider origins"
     defer alloc.free(modalities_url);
     const modalities_environment = try CatalogEndpointEnvironment.install(alloc, valid_url, modalities_url);
     defer modalities_environment.deinit();
-    try expectCatalogProviderFailure(
-        try model_catalog_provider.fetch(alloc, .{ .access = access, .endpoint = "" }),
-        .malformed_response,
-    );
+    const enriched_result = try model_catalog_provider.fetch(alloc, .{ .access = access, .endpoint = "" });
+    switch (enriched_result) {
+        .catalog => |loaded| {
+            var catalog = loaded;
+            defer model_catalog.freeModelCatalog(alloc, &catalog);
+            try std.testing.expectEqual(@as(usize, 1), catalog.items.len);
+            try std.testing.expect(!catalog.items[0].has_vision);
+        },
+        .failure => return error.TestExpectedSubscriptionCatalog,
+    }
     valid_fixture.deinit();
     modalities_fixture.deinit();
     if (valid_fixture.failure) |err| return err;

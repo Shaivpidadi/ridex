@@ -176,10 +176,10 @@ describe("host-managed authentication", () => {
       expect(models.code).toBe(0);
       expect(models.stderr).toBe("");
       if (provider === "grok") {
-        expect(JSON.parse(models.stdout).ids).toEqual(["grok-4.20"]);
+        expect(JSON.parse(models.stdout).ids).toEqual(["grok-subscription-only", "grok-4.20"]);
         const settings = JSON.parse(readFileSync(join(home, ".fx", "settings.json"), "utf8"));
         expect(settings.provider).toBe("grok");
-        expect(settings.models.grok).toBe("grok-4.20");
+        expect(settings.models.grok).toBe("grok-subscription-only");
       }
 
       const asked = await runFx(["ask", "--json", "--no-save", "Reply once."], {
