@@ -90,8 +90,11 @@ jobs:
           version: "0.16.0"
           cache-key: ci-build-ReleaseSafe
 
+      # Other runners execute this binary, and their CPUs can differ from this
+      # one. A native build can emit instructions such as AVX-512 that those
+      # runners lack, so target the baseline CPU like the release builds do.
       - name: Build
-        run: zig build -Doptimize=ReleaseSafe
+        run: zig build -Doptimize=ReleaseSafe -Dcpu=baseline
 
       - name: Smoke test fresh binary
         run: scripts/smoke-binary.sh zig-out/bin/fx
