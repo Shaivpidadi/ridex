@@ -1666,6 +1666,18 @@ const App = struct {
         );
     }
 
+    pub fn beginMcpSlackSetup(self: *App) !void {
+        return self.mcp.beginSlackSetup(
+            self.alloc,
+            self.workspace_root,
+            .{ .form = true, .url = true },
+            if (comptime host_target.is_wasm) loadNoMcpRuntime else builtin_mcp.loadRuntime,
+            builtin_mcp.previewNativeWorkspaceAuthority,
+            self.toolRegistry(),
+            @intCast(@max(io_mod.milliTimestamp(), 0)),
+        );
+    }
+
     pub fn beginMcpMenuReload(self: *App, generation: u64) !void {
         return self.mcp.beginMenuReload(
             self.alloc,
@@ -1902,6 +1914,10 @@ const App = struct {
         err: anyerror,
     ) !void {
         return self.mcp.recordMenuEffectFailure(self.alloc, generation, err);
+    }
+
+    pub fn addMcpSlack(self: *App) !void {
+        return app_commands.Handlers(App).addSlack(self);
     }
 
     pub fn saveMcpMenuAdd(
@@ -3729,7 +3745,9 @@ fn needsEarlyThreadedIo(args: []const [:0]const u8) bool {
     const command = effective_args[0];
     if (std.mem.eql(u8, command, "mcp")) {
         if (effective_args.len < 2) return false;
-        return std.mem.eql(u8, effective_args[1], "auth") or
+        return (effective_args.len == 3 and std.mem.eql(u8, effective_args[1], "add") and
+            std.mem.eql(u8, effective_args[2], "slack")) or
+            std.mem.eql(u8, effective_args[1], "auth") or
             std.mem.eql(u8, effective_args[1], "list") or
             std.mem.eql(u8, effective_args[1], "logout");
     }
@@ -3768,6 +3786,8 @@ test "credential-reading commands use early threaded io without full entry confi
 }
 
 test "MCP credential commands use early threaded io" {
+    try std.testing.expect(needsEarlyThreadedIo(&.{ "mcp", "add", "slack" }));
+    try std.testing.expect(!needsEarlyThreadedIo(&.{ "mcp", "add", "slack", "node" }));
     for ([_][:0]const u8{ "auth", "list", "logout" }) |operation| {
         try std.testing.expect(needsEarlyThreadedIo(&.{
             @as([:0]const u8, "mcp"),

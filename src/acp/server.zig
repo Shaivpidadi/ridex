@@ -11,6 +11,7 @@ const prompt_handler = @import("prompt.zig");
 const prompt_test_controls = @import("prompt_test_controls.zig");
 const app_lifecycle = @import("../core/app/app_lifecycle.zig");
 const app_runtime_setup = @import("../core/app/app_runtime_setup.zig");
+const compactor = @import("../core/compactor/compactor.zig");
 const builtin_skills = @import("../builtins/skills.zig");
 const builtin_tools = @import("../builtins/tools.zig");
 const credentials = @import("../core/auth/credentials.zig");
@@ -298,6 +299,7 @@ pub const ServerState = struct {
     permission_rules: types.PermissionRuleSet = .{},
     agent_step_limit: usize = 0,
     max_tool_result_bytes: usize = 64 * 1024,
+    auto_compact_percent: u8 = compactor.default_percent,
     context_limits: config_runtime.context_limits.Values = .{},
     fast_mode: bool = false,
     effort: types.ReasoningEffort = .auto,
@@ -2240,6 +2242,7 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     state.permission_rules = startup.takePermissionRules();
     state.agent_step_limit = startup.agent_step_limit;
     state.max_tool_result_bytes = startup.max_tool_result_bytes;
+    state.auto_compact_percent = startup.auto_compact_percent;
     state.context_limits = startup.context_limits;
     state.context_limits.applyCommandLine(state.cfg.context_limit_overrides);
     state.fast_mode = startup.fast_mode and
