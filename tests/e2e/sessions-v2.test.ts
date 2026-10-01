@@ -370,19 +370,15 @@ for (const userHeavy of [false, true]) {
       Array.from({ length: 14_000 }, (_, n) => `Assistant reference ${n}: group ${n % 19}, historical data, not new completed work.\n`).join("") +
       "PENDING_CHECK=transport-resume\n";
     let phase: "seed" | "continue" = "seed";
-    let summaryCalls = 0;
+    // fx-compactor's notes request. A turn with nothing between its message
+    // and its final reply has nothing to note, so it may need none.
+    let notesCalls = 0;
     const bodies: string[] = [];
     const gateway = startDynamicFakeGateway((body: string) => {
-      const request = JSON.parse(body);
       bodies.push(body);
-      if (request.tools?.length === 0 && request.toolChoice?.type === "none") {
-        summaryCalls += 1;
-        const source = JSON.stringify(request.prompt);
-        const facts = [];
-        if (source.includes("VERIFIED_VALUE=73")) facts.push("The verified value is73.");
-        if (source.includes("PENDING_CHECK=transport-resume")) facts.push("The pending check is transport-resume.");
-        if (source.includes("Keep café")) facts.push("Preserve café and the original constraint.");
-        return fakeGatewayFinalText(facts.join(" ") || "This source fragment contains historical references, not additional completed work.");
+      if (body.includes("Write the compaction notes")) {
+        notesCalls += 1;
+        return fakeGatewayFinalText("none");
       }
       return fakeGatewayFinalText(phase === "seed" ? assistant : "CONTINUED_FROM_COMMITTED_MEMORY");
     }, { models: [{ id: model, type: "language", tags: ["tool-use"], context_window: userHeavy ? 256_000 : 128_000, max_tokens: 8192 }] });
@@ -393,7 +389,7 @@ for (const userHeavy of [false, true]) {
       const seed = await run([], originalUser);
       expect(seed.code).toBe(0);
       expect(seed.stderr).toBe("");
-      expect(summaryCalls).toBe(0);
+      expect(notesCalls).toBe(0);
       const id = JSON.parse(seed.stdout).session_id;
       const logPath = join(v2Root(fixture), id, "log.jsonl");
       const before = readFileSync(logPath);
@@ -403,33 +399,40 @@ for (const userHeavy of [false, true]) {
       expect(continued.code).toBe(0);
       expect(continued.stderr).toBe("");
       expect(JSON.parse(continued.stdout).output).toBe("CONTINUED_FROM_COMMITTED_MEMORY");
-      expect(summaryCalls).toBeGreaterThan(0);
 
-      // One compaction line; its summary names the state file by handle,
-      // size and digest, and every original it summarized is a side file.
+      // One compaction line holding the compacted conversation, and the
+      // turn it compacted saved whole as a side file.
       const compactions = (logLines(fixture, id) as any[]).filter((line) => line.kind === "compacted");
       expect(compactions).toHaveLength(1);
       const data = typeof compactions[0].data === "string" ? JSON.parse(compactions[0].data) : compactions[0].data;
-      const match = /> fx-compaction-state-v1 (\S+) (\d+) ([a-f0-9]{64})\n/.exec(data.summary);
-      expect(match).not.toBeNull();
-      const files = join(fixture.home, ".fx", "session-files", id);
-      const statePath = findFile(files, match![1]);
-      expect(statePath).toBeDefined();
-      const bytes = readFileSync(statePath!);
-      expect(bytes.length).toBe(Number(match![2]));
-      expect(sha256(bytes)).toBe(match![3]);
-      const state = JSON.parse(bytes.toString());
-      expect(state.users.includes(originalUser)).toBe(!userHeavy);
-      expect(state.summary).toContain("verified value is73");
-      expect(state.summary).toContain("transport-resume");
-      expect(state.archives.length).toBeGreaterThan(0);
-      for (const archive of state.archives) {
-        const original = readFileSync(findFile(files, archive.handle)!);
-        expect(original.length).toBe(archive.bytes);
-        expect(sha256(original)).toBe(archive.sha256);
-      }
+      expect(data.summary.startsWith("fx-compactor-v1\n")).toBe(true);
+      const turnPath = findFile(join(fixture.home, ".fx", "session-files", id), "compacted-M1.txt");
+      expect(turnPath).toBeDefined();
+      const savedTurn = readFileSync(turnPath!, "utf8");
+      expect(savedTurn).toContain(originalUser);
+      expect(savedTurn).toContain("Assistant reference 7000:");
+      expect(savedTurn).toContain("PENDING_CHECK=transport-resume");
+      // The model reads both ends of the long reply, and the saved turn's
+      // handle for the rest.
+      const sent = bodies.at(-1)!;
+      expect(sent).toContain("VERIFIED_VALUE=73");
+      expect(sent).toContain("PENDING_CHECK=transport-resume");
+      expect(sent).not.toContain("Assistant reference 7000:");
+      expect(sent).toContain("the whole text is saved in M1");
+      // The user's message stays word for word unless it alone outgrows the
+      // room; then it keeps its start and end.
+      const promptText = (body: string) => JSON.stringify(JSON.parse(body).prompt);
+      const shown = (text: string) => JSON.stringify(text).slice(1, -1);
+      const expectUserShown = (body: string) => {
+        const text = promptText(body);
+        if (!userHeavy) return expect(text).toContain(shown(`User 1:\n${originalUser}\n`));
+        expect(text).toContain(shown("User 1:\nKeep café and the original constraint unchanged.\n"));
+        expect(text).toContain("USER_REFERENCE_END");
+        expect(text).not.toContain(shown(originalUser));
+      };
+      expectUserShown(sent);
       expect(readFileSync(logPath).subarray(0, before.length).equals(before)).toBe(true);
-      const summaryCallsBeforeReopen = summaryCalls;
+      const notesCallsBeforeReopen = notesCalls;
 
       // A fresh process resumes from the summary: it sends the summary, not
       // the turns it replaced, and has nothing left to summarize.
@@ -437,9 +440,10 @@ for (const userHeavy of [false, true]) {
       expect(reopened.code).toBe(0);
       expect(reopened.stderr).toBe("");
       expect(JSON.parse(reopened.stdout).output).toBe("CONTINUED_FROM_COMMITTED_MEMORY");
-      expect(bodies.at(-1)).toContain("verified value is73");
+      expect(bodies.at(-1)).toContain("VERIFIED_VALUE=73");
       expect(bodies.at(-1)).not.toContain("Assistant reference 7000:");
-      expect(summaryCalls).toBe(summaryCallsBeforeReopen);
+      expectUserShown(bodies.at(-1)!);
+      expect(notesCalls).toBe(notesCallsBeforeReopen);
       expect((logLines(fixture, id) as any[]).filter((line) => line.kind === "compacted")).toHaveLength(1);
       expect(readFileSync(logPath).subarray(0, before.length).equals(before)).toBe(true);
       expectWholeLog(fixture, id);
@@ -2029,11 +2033,11 @@ test.skipIf(!tmuxAvailable())("fx session lists a compacted session's every turn
   const shapes: Record<string, unknown[]> = {};
   for (const v2 of [false, true]) {
     const fixture = createFixture(v2 ? "fx-v2-detail-compacted-" : "fx-v1-detail-compacted-");
+    // Plain turns have nothing to note, so `/compact` needs no model call.
     const gateway = startFakeGateway([
       fakeGatewayFinalText("DETAIL_EARLIER"),
       fakeGatewayFinalText("DETAIL_MIDDLE"),
       fakeGatewayFinalText("DETAIL_LATEST"),
-      fakeGatewayFinalText("DETAIL_SUMMARY: the earlier work is done."),
       fakeGatewayFinalText("DETAIL_AFTER"),
     ]);
     let session: TmuxSession | undefined;
@@ -2058,7 +2062,7 @@ test.skipIf(!tmuxAvailable())("fx session lists a compacted session's every turn
         await session.waitForComposer(TIMEOUT);
       }
       await session.sendText("/compact");
-      await waitForSavedText(join(fixture.home, ".fx", "sessions"), "DETAIL_SUMMARY");
+      await waitForSavedText(join(fixture.home, ".fx", "sessions"), "fx-compactor-v1");
       await session.waitForComposer(TIMEOUT);
       await session.sendText("After detail request");
       await scrollbackContains(session, "DETAIL_AFTER");
@@ -2078,7 +2082,7 @@ test.skipIf(!tmuxAvailable())("fx session lists a compacted session's every turn
       // The summary's text carries fx's own handles, so only its marker counts.
       shapes[v2 ? "v2" : "v1"] = shown.history.map((entry: any) =>
         entry.kind === "compacted_summary"
-          ? ["summary", String(entry.summary).includes("DETAIL_SUMMARY"), entry.removed_turn_count, entry.compaction_count]
+          ? ["summary", String(entry.summary).startsWith("fx-compactor-v1\n"), entry.removed_turn_count, entry.compaction_count]
           : [entry.kind, entry.user?.text, entry.assistant],
       );
       if (v2) {
@@ -2366,11 +2370,11 @@ test("fx ask keeps a piece over 256 KB as a blob, and resume sends it whole", as
 
 test.skipIf(!tmuxAvailable())("the app resumes a compacted session from its summary and still shows every turn", async () => {
   const fixture = createFixture("fx-v2-app-compact-resume-");
+  // Plain turns have nothing to note, so `/compact` needs no model call.
   const gateway = startFakeGateway([
     fakeGatewayFinalText("COMPACT_EARLIER_ANSWER"),
     fakeGatewayFinalText("COMPACT_MIDDLE_ANSWER"),
     fakeGatewayFinalText("COMPACT_LATEST_ANSWER"),
-    fakeGatewayFinalText("COMPACT_SUMMARY_HANDOFF: the earlier work is done."),
     fakeGatewayFinalText("AFTER_COMPACT_RESUME"),
   ]);
   try {
@@ -2386,7 +2390,7 @@ test.skipIf(!tmuxAvailable())("the app resumes a compacted session from its summ
     }
     const id = onlySession(fixture);
     await app.session.sendText("/compact");
-    await waitForLog(fixture, id, "COMPACT_SUMMARY_HANDOFF", TIMEOUT);
+    await waitForLog(fixture, id, "fx-compactor-v1", TIMEOUT);
     await app.session.waitForComposer(TIMEOUT);
     await quitApp(app);
     const saved = readFileSync(join(v2Root(fixture), id, "log.jsonl"));
@@ -2394,16 +2398,22 @@ test.skipIf(!tmuxAvailable())("the app resumes a compacted session from its summ
     const resumed = await startApp(fixture, gateway, ["-c"]);
     const shown = await scrollbackContains(resumed.session, "COMPACT_LATEST_ANSWER");
     expect(shown).toContain("COMPACT_EARLIER_ANSWER");
-    expect(shown).not.toContain("COMPACT_SUMMARY_HANDOFF");
+    expect(shown).not.toContain("compacted_conversation");
     await resumed.session.sendText("Continue after the compaction.");
     await resumed.session.waitForText("AFTER_COMPACT_RESUME", TIMEOUT);
     await quitApp(resumed);
 
-    // The model gets the summary in place of the turns it replaced.
-    expect(gateway.requests).toHaveLength(5);
-    const last = gateway.requests.at(-1)!.body;
-    expect(last).toContain("COMPACT_SUMMARY_HANDOFF");
-    expect(last).not.toContain("COMPACT_EARLIER_ANSWER");
+    // The model gets the compacted conversation in place of the turns it
+    // replaced; their messages and replies stay in it word for word.
+    expect(gateway.requests).toHaveLength(4);
+    const prompt = JSON.parse(gateway.requests.at(-1)!.body).prompt as Array<{ role: string; content: unknown }>;
+    const userTexts = prompt
+      .filter((message) => message.role === "user")
+      .map((message) => typeof message.content === "string" ? message.content : JSON.stringify(message.content));
+    const earlier = userTexts.filter((text) => text.includes("Earlier compact request"));
+    expect(earlier).toHaveLength(1);
+    expect(earlier[0]).toContain("compacted_conversation");
+    expect(earlier[0]).toContain("COMPACT_EARLIER_ANSWER");
     expect(readFileSync(join(v2Root(fixture), id, "log.jsonl")).subarray(0, saved.length)).toEqual(saved);
     expect(logLines(fixture, id).filter((line) => line.kind === "compacted")).toHaveLength(1);
     expectWholeLog(fixture, id);
