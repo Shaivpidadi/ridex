@@ -2392,7 +2392,9 @@ fn runTopLevelMcp(
         };
         defer result.deinit(alloc);
         if (result.warning) |warning| try writeMcpProfileWarning(alloc, deps, warning);
+        if (intent == .slack) return authenticateMcpCommand(alloc, "slack", true, cfg, deps);
         const name = switch (intent) {
+            .slack => unreachable,
             .local => |local| local.name,
             .http => |http| http.name,
         };
@@ -2511,56 +2513,7 @@ fn runTopLevelMcp(
             try writeStderr(deps, "usage: fx " ++ command_specs.mcp_auth_usage ++ "\n");
             return .handled_failure;
         }
-        var loaded = loadMcpCommandRuntime(alloc, cfg, deps) catch |err| {
-            try writeMcpOperationFailure(alloc, deps, "auth", err);
-            return .handled_failure;
-        };
-        defer loaded.deinit(alloc);
-        try writeConfigDiagnostics(alloc, deps, loaded.startup.config_diagnostics);
-        const runtime = loaded.runtime orelse {
-            try writeMcpOperationFailure(alloc, deps, "auth", error.McpServerNotFound);
-            return .handled_failure;
-        };
-        var opener = McpCliAuthorization{ .opener = cfg.url_opener, .deps = deps };
-        var result = runtime.authenticateServer(
-            rest[1],
-            &opener,
-            openTopLevelMcpUrl,
-        ) catch |err| {
-            try writeMcpOperationFailure(alloc, deps, "auth", err);
-            return .handled_failure;
-        };
-        defer result.deinit();
-        switch (result) {
-            .authenticated => |authenticated| {
-                var encoded_name = try text_utils.encodeTerminalSafe(alloc, rest[1], 160);
-                defer encoded_name.deinit(alloc);
-                var out: std.Io.Writer.Allocating = .init(alloc);
-                defer out.deinit();
-                try out.writer.print("Authenticated MCP server '{s}'.", .{encoded_name.bytes});
-                if (authenticated.repaired_entries > 0) {
-                    try out.writer.print(
-                        " Removed {d} unreadable MCP credential {s}.",
-                        .{
-                            authenticated.repaired_entries,
-                            if (authenticated.repaired_entries == 1) "entry" else "entries",
-                        },
-                    );
-                }
-                try out.writer.writeByte('\n');
-                try writeStdout(deps, out.written());
-                return .handled_success;
-            },
-            .issuer_mismatch => {
-                try writeMcpOperationFailure(
-                    alloc,
-                    deps,
-                    "auth",
-                    error.McpAuthorizationIssuerMismatch,
-                );
-                return .handled_failure;
-            },
-        }
+        return authenticateMcpCommand(alloc, rest[1], false, cfg, deps);
     }
     if (std.mem.eql(u8, operation, "logout")) {
         if (rest.len != 2 or rest[1].len == 0) {
@@ -2612,6 +2565,85 @@ fn runTopLevelMcp(
 
     try writeTopLevelUsage(cfg.command_catalog, deps, .mcp);
     return .handled_failure;
+}
+
+fn authenticateMcpCommand(
+    alloc: Allocator,
+    name: []const u8,
+    connect_slack: bool,
+    cfg: Config,
+    deps: RunDeps,
+) !RunResult {
+    var loaded = loadMcpCommandRuntime(alloc, cfg, deps) catch |err| {
+        try writeMcpOperationFailure(alloc, deps, "auth", err);
+        return .handled_failure;
+    };
+    defer loaded.deinit(alloc);
+    try writeConfigDiagnostics(alloc, deps, loaded.startup.config_diagnostics);
+    const runtime = loaded.runtime orelse {
+        try writeMcpOperationFailure(alloc, deps, "auth", error.McpServerNotFound);
+        return .handled_failure;
+    };
+    if (connect_slack) {
+        runtime.connectAll(cfg.tool_set.registry);
+        var health = try runtime.snapshotHealth(alloc, @intCast(@max(io_mod.milliTimestamp(), 0)));
+        defer health.deinit(alloc);
+        for (health.servers) |server| {
+            if (std.mem.eql(u8, server.identity(), name) and server.connection == .ready) {
+                try writeStdout(deps, "Slack is already connected.\n");
+                return .handled_success;
+            }
+        }
+        try writeStdout(deps, "Connecting Slack. Keep fx running while you authorize in your browser.\n");
+    }
+    var opener = McpCliAuthorization{ .opener = cfg.url_opener, .deps = deps };
+    var result = runtime.authenticateServer(
+        name,
+        &opener,
+        openTopLevelMcpUrl,
+    ) catch |err| {
+        try writeMcpOperationFailure(alloc, deps, "auth", err);
+        return .handled_failure;
+    };
+    defer result.deinit();
+    switch (result) {
+        .authenticated => |authenticated| {
+            if (connect_slack) {
+                runtime.reconnectAuthenticatedServer(name, null) catch |err| {
+                    try writeMcpOperationFailure(alloc, deps, "connect Slack", err);
+                    return .handled_failure;
+                };
+                try writeStdout(deps, "Slack connected. You can now use Slack.\n");
+                return .handled_success;
+            }
+            var encoded_name = try text_utils.encodeTerminalSafe(alloc, name, 160);
+            defer encoded_name.deinit(alloc);
+            var out: std.Io.Writer.Allocating = .init(alloc);
+            defer out.deinit();
+            try out.writer.print("Authenticated MCP server '{s}'.", .{encoded_name.bytes});
+            if (authenticated.repaired_entries > 0) {
+                try out.writer.print(
+                    " Removed {d} unreadable MCP credential {s}.",
+                    .{
+                        authenticated.repaired_entries,
+                        if (authenticated.repaired_entries == 1) "entry" else "entries",
+                    },
+                );
+            }
+            try out.writer.writeByte('\n');
+            try writeStdout(deps, out.written());
+            return .handled_success;
+        },
+        .issuer_mismatch => {
+            try writeMcpOperationFailure(
+                alloc,
+                deps,
+                "auth",
+                error.McpAuthorizationIssuerMismatch,
+            );
+            return .handled_failure;
+        },
+    }
 }
 
 fn parseTopLevelProjectMcpAction(
@@ -2710,7 +2742,7 @@ fn writeMcpProfileMutationSuccess(
 fn writeMcpAddUsage(deps: RunDeps) !void {
     return writeStderr(
         deps,
-        "usage: fx mcp add NAME COMMAND [ARGS...] | fx mcp add --transport http NAME URL\n",
+        "usage: fx " ++ command_specs.mcp_add_usage ++ "\n",
     );
 }
 
@@ -5946,6 +5978,7 @@ fn captureMcpProfileAddForTest(
 ) anyerror!mcp_command_provider.ProfileAddResult {
     mcp_profile_add_calls_for_test += 1;
     switch (intent) {
+        .slack => return error.TestUnexpectedResult,
         .local => |local| {
             try std.testing.expectEqualStrings("fixture", local.name);
             try std.testing.expectEqualStrings("node", local.command);
