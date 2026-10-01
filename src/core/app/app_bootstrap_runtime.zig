@@ -919,7 +919,7 @@ fn makeStartupState(alloc: Allocator) !app_lifecycle.StartupState {
     state.fast_mode = true;
     state.fast_mode_model_bound = true;
     state.configured_ultrafast_mode = true;
-    state.ultrafast_mode = true;
+    state.ultrafast_mode = false;
     state.ultrafast_process_override = false;
     state.auto_upgrade = false;
     state.update_channel = .dev;
@@ -1202,6 +1202,8 @@ test "app_bootstrap_runtime transfers startup state and starts a fresh session" 
     );
     try std.testing.expect(capture.configured_fast_mode);
     try std.testing.expect(capture.configured_fast_mode_model_bound);
+    try std.testing.expect(capture.configured_ultrafast_mode);
+    try std.testing.expectEqual(@as(?bool, false), capture.ultrafast_process_override);
     try std.testing.expectEqual(
         update_target.Channel.dev,
         app.upgrader.channel(),

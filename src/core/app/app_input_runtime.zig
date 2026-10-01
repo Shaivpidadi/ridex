@@ -6991,7 +6991,7 @@ test "app_input_runtime fast-only model opens the Fast stage while streaming" {
     try std.testing.expectEqualStrings(model, app.selected_model.items);
     try std.testing.expect(app.fast_mode);
     try std.testing.expectEqual(@as(usize, 1), app.preference_commit_count);
-    try std.testing.expectEqualStrings("Next turn will use " ++ model, app.notice_body.items);
+    try std.testing.expectEqualStrings("Next turn will use " ++ model ++ " (effort: default, speed: fast)", app.notice_body.items);
 }
 
 test "app_input_runtime Enter submits a dismissed slash skill query as text" {
