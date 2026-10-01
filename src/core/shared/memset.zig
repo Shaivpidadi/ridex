@@ -9,18 +9,19 @@
 //! Delete this file once the pinned Zig's memset stores more than one byte per
 //! iteration.
 //!
-//! This memset stores 32 bytes at a time. Only native Linux and macOS
-//! executables export it, so the WASM surfaces and the Node-API addon keep the
-//! toolchain's memset. The PGSO pipeline keeps it in its public symbol list,
-//! because its cleanup pass would otherwise delete it.
+//! This memset stores 32 bytes at a time. Only Linux executables export it.
+//! On macOS, system calls dominate the same commands, and the macOS arm64
+//! PGSO build links compiler_rt's object, where a second strong memset is a
+//! duplicate symbol. The WASM surfaces and the Node-API addon also keep the
+//! toolchain's memset.
 
 const std = @import("std");
 const builtin = @import("builtin");
 
 comptime {
-    const native_exe = builtin.output_mode == .Exe and
-        (builtin.os.tag == .linux or builtin.os.tag.isDarwin());
-    if (native_exe) @export(&memset, .{ .name = "memset", .linkage = .strong });
+    if (builtin.output_mode == .Exe and builtin.os.tag == .linux) {
+        @export(&memset, .{ .name = "memset", .linkage = .strong });
+    }
 }
 
 fn memset(dest: ?[*]u8, c: c_int, len: usize) callconv(.c) ?[*]u8 {

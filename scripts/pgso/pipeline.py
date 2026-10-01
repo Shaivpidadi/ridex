@@ -43,11 +43,9 @@ IR_OUTLINER_FLAGS = (
     "-passes=iroutliner",
 )
 
-# Calls that LLVM emits for llvm.memset do not count as uses, so memset must
-# stay public or globaldce deletes fx's own (src/core/shared/memset.zig).
 OUTLINE_CLEANUP_FLAGS = (
     "-passes=internalize,constmerge,globaldce,mergefunc,verify",
-    "-internalize-public-api-list=main,_mh_execute_header,memset",
+    "-internalize-public-api-list=main,_mh_execute_header",
 )
 
 BENCHMARK_USE_FLAGS = (
