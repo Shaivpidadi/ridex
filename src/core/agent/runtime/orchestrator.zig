@@ -7,6 +7,7 @@ const agent_steps = @import("../../config/agent_steps.zig");
 const model_capabilities = @import("../../config/model_capabilities.zig");
 const model_provider = @import("../../config/model_provider.zig");
 const types = @import("../../shared/types.zig");
+const history_range = @import("../../shared/history_range.zig");
 const worker_runtime = @import("../worker_runtime.zig");
 const agent_stream_provider = @import("../stream_provider.zig");
 const session_runtime = @import("../../session/session.zig");
@@ -6612,6 +6613,7 @@ test "compaction activity transaction settles only after publication and preserv
             .failure_provenance = &provenance,
             .compactor = .{
                 .history = &turns,
+                .append_messages = session_runtime.appendHistoryChatMessages,
                 .size = .{ .compact_at_tokens = 5_000, .usable_tokens = 10_000 },
                 .caller = summary_model.caller(),
                 .records = result_store.compactorStore(&capability),
@@ -7389,6 +7391,7 @@ fn processQueuedPromptLoop(
                         .before_summary = source.hook(),
                         .compactor = .{
                             .history = compaction_history,
+                            .append_messages = session_runtime.appendHistoryChatMessages,
                             .active = active_prefix,
                             .size = size,
                             .caller = summary_model.caller(),
@@ -7417,7 +7420,7 @@ fn processQueuedPromptLoop(
                         return err;
                     };
                     if (compacted) |outcome| {
-                        const raw_history_turns = session_runtime.rawHistoryTurnCount(compaction_history);
+                        const raw_history_turns = history_range.rawHistoryTurnCount(compaction_history);
                         const active_cut: runtime_execution_memory.CompactedExecutionBoundary = if (outcome.cut.turns == raw_history_turns) .{
                             .tool_steps = outcome.cut.tool_steps,
                             .steering = outcome.cut.steering,
