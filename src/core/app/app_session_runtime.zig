@@ -7525,6 +7525,10 @@ test "v2 ultrafast resume applies process overrides without persisting them" {
     }
     const home = try TestHome.install(alloc, paths.home);
     defer home.deinit();
+    // fx keeps `.fx` private, and resuming a v2 session verifies that.
+    const fx_dir = try std.fs.path.joinZ(alloc, &.{ paths.home, ".fx" });
+    defer alloc.free(fx_dir);
+    if (std.c.chmod(fx_dir.ptr, 0o700) != 0) return error.TestChmodFailed;
     for ([_]bool{ false, true }) |baseline| {
         var app = try TestApp.init(alloc, paths.workspace);
         defer app.deinit();
