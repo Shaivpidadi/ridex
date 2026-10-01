@@ -127,6 +127,27 @@ ACP clients can keep their MCP tools loaded on every turn, steer a running turn,
 
 The SDK is published to npm as [libfx](https://www.npmjs.com/package/libfx). See the [WebAssembly SDK](sdk/README.md) and the runnable Node.js, browser, Next.js, and Nuxt [examples](examples/README.md). The WebAssembly SDK is experimental.
 
+## Connect your Slack account
+
+Run `/mcp add slack` in an fx session, or `fx mcp add slack` from your terminal.
+The command saves Slack's MCP URL and the public fx Client ID to your profile,
+opens the fx.sh authorization flow, and connects Slack after you consent. Keep
+fx running while you authorize in a browser on the same computer. In an fx
+session, Slack's tools become available without a restart. The **Servers** tab
+in `/mcp` also offers **Add Slack** with the `s` key.
+
+You don't need to edit `~/.fx/mcp.json` or run `fx slack install` to connect your
+personal account. Workspace app approval may still be required. fx reports
+`Slack connected. You can now use Slack.` after the connection succeeds.
+
+Running the command again uses an existing working connection or starts
+missing authorization. It restores a missing fx Client ID and preserves other
+servers, timeouts, and explicit scope overrides. A conflicting Slack endpoint,
+Client ID, or authentication configuration stops setup with guidance instead of
+being overwritten. Use `/mcp auth slack --open` to reauthorize an existing
+configuration. Removing and re-adding the fx preset restores its configuration;
+it does not revoke credentials. Use `/mcp logout slack` to sign out.
+
 ## Slack workspace installation
 
 Run `fx slack install` to install the fx bot in the configured Vercel Slack
@@ -146,7 +167,7 @@ live in the owner-only file `~/.fx/slack/installation.json`; no hosted database
 or background refresh service is created. An expired refresh token requires
 installation again. This workspace operation is separate from each employee's
 MCP user authorization. Employees connect their own account with
-`/mcp auth slack --open` in an fx session (or `fx mcp auth slack` from a terminal).
+`/mcp add slack` in an fx session (or `fx mcp add slack` from a terminal).
 For `https://mcp.slack.com/mcp`, the CLI recognizes the fx app by its public
 Client ID and uses the HTTPS callback for personal login. Changing that Client
 ID requires a CLI update. OAuth uses the canonical form of Slack's advertised
