@@ -1095,7 +1095,7 @@ pub const Session = struct {
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const cut = retained_from orelse types.ContextHistoryCut{ .turns = self.turn_numbers.items.len };
-        const first_kept = @min(cut.turns, self.turn_numbers.items.len);
+        const first_kept = turnSlot(self.turn_numbers.items, cut.turns);
         var keep_from: ?u64 = null;
         for (self.turn_numbers.items[first_kept..]) |number| {
             if (number) |n| {
@@ -1121,6 +1121,19 @@ pub const Session = struct {
         try kept.appendSlice(self.alloc, self.turn_numbers.items[first_kept..]);
         self.turn_numbers.deinit(self.alloc);
         self.turn_numbers = kept;
+    }
+
+    /// Where fx's raw history turn `turn` sits in `numbers`. A compaction cut
+    /// counts only raw turns, while `numbers` also holds the summary's slot.
+    /// Returns `numbers.len` when the history has no such turn.
+    fn turnSlot(numbers: []const ?u64, turn: usize) usize {
+        var seen: usize = 0;
+        for (numbers, 0..) |number, slot| {
+            if (number == null) continue;
+            if (seen == turn) return slot;
+            seen += 1;
+        }
+        return numbers.len;
     }
 
     // -- settings ------------------------------------------------------------
@@ -2800,6 +2813,40 @@ test "resume after a compaction starts with its summary and keeps the retained t
     try testing.expectEqualStrings("turns one and two", restored.history[0].compacted_summary.summary);
     try testing.expectEqualStrings("three", restored.history[1].assistant.user.text);
     try testing.expectEqualStrings("four", restored.history[2].assistant.user.text);
+}
+
+test "each later compaction keeps only the turns after its cut" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    const language = types.ConversationLanguage.default();
+    try s.commitTurn(assistantTurn("one", "1"), language);
+    try s.commitTurn(assistantTurn("two", "2"), language);
+    var first = "turn one".*;
+    try s.commitCompaction(.{ .summary = &first, .removed_turn_count = 1, .compaction_count = 1 }, false, .{ .turns = 1 });
+    // From here fx's history starts with the summary, and each cut counts
+    // only the raw turns after it, so `.turns = 1` keeps the newest turn.
+    try s.commitTurn(assistantTurn("three", "3"), language);
+    var second = "turns one and two".*;
+    try s.commitCompaction(.{ .summary = &second, .removed_turn_count = 2, .compaction_count = 2 }, false, .{ .turns = 1 });
+    try s.commitTurn(assistantTurn("four", "4"), language);
+    var third = "turns one to three".*;
+    try s.commitCompaction(.{ .summary = &third, .removed_turn_count = 3, .compaction_count = 3 }, false, .{ .turns = 1 });
+    try s.commitTurn(assistantTurn("five", "5"), language);
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    s.close();
+
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .ask);
+    defer r.close();
+    var restored = try r.restore(testing.allocator);
+    defer restored.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 3), restored.history.len);
+    try testing.expectEqualStrings("turns one to three", restored.history[0].compacted_summary.summary);
+    try testing.expectEqualStrings("four", restored.history[1].assistant.user.text);
+    try testing.expectEqualStrings("five", restored.history[2].assistant.user.text);
 }
 
 test "resume refuses a session whose compaction line is damaged" {
