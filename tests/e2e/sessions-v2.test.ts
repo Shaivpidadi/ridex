@@ -153,6 +153,13 @@ function assistantTextBeside(body: string, callId: string) {
     .join("");
 }
 
+/// Every title the session's log stores, oldest first.
+function storedTitles(fixture: Fixture, id: string): string[] {
+  return logLines(fixture, id)
+    .filter((line: any) => line.kind === "set" && line.key === "title")
+    .map((line: any) => line.value);
+}
+
 function expectPairedToolCalls(body: string) {
   const { calls, results } = promptToolParts(body);
   expect(calls.length).toBeGreaterThan(0);
@@ -760,6 +767,45 @@ test("a kill while a tool runs keeps the text of the message that issued it", as
     expect(logLines(fixture, id).filter((line) => line.kind === "turn_interrupted").map((line) => line.reason)).toEqual([
       "crash",
     ]);
+    expectWholeLog(fixture, id);
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 3);
+
+test("a session whose first turn was killed takes its first prompt as title", async () => {
+  const fixture = createFixture("fx-v2-first-kill-title-");
+  let slowServed: () => void = () => {};
+  const slowStarted = new Promise<void>((resolve) => (slowServed = resolve));
+  const gateway = startDynamicFakeGateway(async (body) => {
+    if (body.includes("After the first-turn kill.")) return fakeGatewayFinalText("AFTER_FIRST_TURN_KILL");
+    slowServed();
+    return fakeShellRun("v2-first-slow", "sleep 30");
+  });
+  try {
+    const run = spawnAsk(fixture, gateway, ["Why is the sky orange at dusk?"]);
+    await slowStarted;
+    const deadline = Date.now() + 10_000;
+    while (savedSessions(fixture).length === 0 && Date.now() < deadline) await Bun.sleep(50);
+    const id = onlySession(fixture);
+    await waitForLog(fixture, id, "v2-first-slow");
+    run.child.kill("SIGKILL");
+    await run.exited;
+    expect(storedTitles(fixture, id)).toEqual([]);
+
+    const resumed = await ask(fixture, gateway, ["--resume-id", id, "After the first-turn kill."]);
+    expect(resumed.code).toBe(0);
+    expect(resumed.stderr).toBe("");
+    // The title comes from the first prompt, which the crashed turn kept (D52).
+    expect(storedTitles(fixture, id)).toEqual(["Why is the sky orange at dusk?"]);
+    const listed = await command(fixture, gateway, ["sessions", "--json"]);
+    expect(listed.code).toBe(0);
+    const summary = JSON.parse(listed.stdout).sessions.find((entry: any) => entry.id === id);
+    expect(summary.title).toBe("Why is the sky orange at dusk?");
+    // Later turns leave it.
+    expect((await ask(fixture, gateway, ["--resume-id", id, "After the first-turn kill. Again."])).code).toBe(0);
+    expect(storedTitles(fixture, id)).toEqual(["Why is the sky orange at dusk?"]);
     expectWholeLog(fixture, id);
   } finally {
     gateway.stop();
@@ -3468,6 +3514,8 @@ test.skipIf(!tmuxAvailable())("an app killed while a tool runs answers that call
     await resumed.session.waitForText("AFTER_APP_TOOL_KILL", TIMEOUT);
     await quitApp(resumed);
     expectToolKillRepaired(fixture, id, gateway.requests.at(-1)!.body, "APP");
+    // The crash took the first turn, so the next one names the session (D52).
+    expect(storedTitles(fixture, id)).toEqual(["Run two app tools."]);
   } finally {
     gateway.stop();
     rmSync(fixture.root, { recursive: true, force: true });
@@ -3495,6 +3543,8 @@ test("ACP killed while a tool runs answers that call on load and goes on", async
     expect(await client.close()).toBe(0);
     client = undefined;
     expectToolKillRepaired(fixture, id, gateway.requests.at(-1)!.body, "ACP");
+    // The crash took the first turn, so the next one names the session (D52).
+    expect(storedTitles(fixture, id)).toEqual(["Run two ACP tools."]);
   } finally {
     if (client) await client.kill();
     gateway.stop();
