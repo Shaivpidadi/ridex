@@ -206,6 +206,7 @@ pub fn compact(alloc: Allocator, request: Request) !?Result {
         .earlier = earlier,
         .turns = turns,
         .last_turn_open = chosen.splitsLastTurn(),
+        .kept = try turnsFrom(out, chosen.kept, request.append_messages),
         .max_prompt_tokens = request.size.summaryRequestTokens(),
         .conversation_room = if (caller.sends_after_conversation) request.size.roomAfterConversation() else null,
         .max_text_tokens = request.size.compactedTokens(chosen.kept_used),
@@ -305,8 +306,48 @@ fn appendItems(arena: Allocator, items: *std.ArrayList(summarize.Item), message:
             .output = content,
             .saved_output = savedOutputHandle(message.tool_result_memory, content),
             .failed = message.tool_result_status == .failure,
+            .answers = if (std.mem.eql(u8, message.tool_name orelse "", question_tool)) try questionAnswers(arena, content) else &.{},
         } }),
     }
+}
+
+/// The tool that asks the user questions. Its result lists each question
+/// with the user's answer.
+const question_tool = "ask_user_question";
+
+/// The user's answers in a question tool's result. None when the result does
+/// not list answers, as when the question was not answered.
+fn questionAnswers(arena: Allocator, output: []const u8) Allocator.Error![]const []const u8 {
+    const Answered = struct { answer: []const u8 };
+    const answered = std.json.parseFromSliceLeaky([]const Answered, arena, output, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return &.{},
+    };
+    const answers = try arena.alloc([]const u8, answered.len);
+    for (answers, answered) |*answer, item| answer.* = item.answer;
+    return answers;
+}
+
+test "a question's result gives the user's answers, not the questions" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const answers = try questionAnswers(arena, "[{\"question\":\"Which block first?\",\"answer\":\"Block 6 before Block 5\"},{\"question\":\"Push it?\",\"answer\":\"Legitimate, push\"}]");
+    try std.testing.expectEqual(@as(usize, 2), answers.len);
+    try std.testing.expectEqualStrings("Block 6 before Block 5", answers[0]);
+    try std.testing.expectEqualStrings("Legitimate, push", answers[1]);
+    // A result that lists no answers, like an error, gives none.
+    try std.testing.expectEqual(@as(usize, 0), (try questionAnswers(arena, "The user dismissed the question.")).len);
+    try std.testing.expectEqual(@as(usize, 0), (try questionAnswers(arena, "[{\"question\":\"Push it?\"}]")).len);
+
+    // Only the question tool's result carries answers into the turn.
+    const result = "[{\"question\":\"Push it?\",\"answer\":\"Legitimate, push\"}]";
+    var items: std.ArrayList(summarize.Item) = .empty;
+    try appendItems(arena, &items, .{ .role = .tool, .tool_call_id = "q", .tool_name = question_tool, .content = result });
+    try appendItems(arena, &items, .{ .role = .tool, .tool_call_id = "s", .tool_name = "shell", .content = result });
+    try std.testing.expectEqual(@as(usize, 1), items.items[0].tool_result.answers.len);
+    try std.testing.expectEqualStrings("Legitimate, push", items.items[0].tool_result.answers[0]);
+    try std.testing.expectEqual(@as(usize, 0), items.items[1].tool_result.answers.len);
 }
 
 /// The handle of a tool's whole output that fx saved separately, when the
