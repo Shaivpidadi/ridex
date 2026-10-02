@@ -32,7 +32,14 @@ const selectedRow = {
   context_window: 131_072,
   max_tokens: 1234,
 };
+const ultrafastRow = {
+  ...selectedRow,
+  id: "openai/resolved-ultra",
+  owned_by: "openai",
+  pricing: { service_tiers: { ultrafast: { input: "0.00006", output: "0.0003" } } },
+};
 const catalog = { object: "list", data: [
+  ultrafastRow,
   { ...selectedRow, name: "Ignored display name" },
   { id: plainId, type: "language" },
   { id: modelId, type: "image" },
@@ -59,10 +66,17 @@ function mockGateway({ allowCatalog = false, data = catalog, key = apiKey, chatU
     state.post += 1;
     assert.equal(method, "POST");
     assert.equal(url, chatUrl);
-    state.chatBodies.push(JSON.parse(typeof init.body === "string" ? init.body : decoder.decode(init.body)));
+    const body = JSON.parse(typeof init.body === "string" ? init.body : decoder.decode(init.body));
+    state.chatBodies.push(body);
+    const finish = {
+      type: "finish", finishReason: { unified: "stop", raw: "stop" },
+      usage: { inputTokens: { total: 3 }, outputTokens: { total: 2 } },
+      ...(body.providerOptions?.openai?.serviceTier === "ultrafast"
+        ? { providerMetadata: { gateway: { serviceTier: "ultrafast", cost: "0.00036" } } } : {}),
+    };
     return new Response(encoder.encode([
       'data: {"type":"text-delta","delta":"ok"}',
-      'data: {"type":"finish","finishReason":{"unified":"stop","raw":"stop"},"usage":{"inputTokens":{"total":3},"outputTokens":{"total":2}}}',
+      `data: ${JSON.stringify(finish)}`,
       "data: [DONE]",
       "",
     ].join("\n\n")), { headers: { "content-type": "text/event-stream" } });
@@ -114,6 +128,19 @@ async function testDiscovery() {
     assert.ok(!Object.hasOwn(stringDescriptor, "effort"));
     assert.ok(!Object.hasOwn(stringDescriptor, "fast"));
     assert.equal(stringDescriptor.metadata.scope, descriptor.metadata.scope);
+
+    for (const ultrafast of [undefined, false, true]) {
+      const configured = await discover(resolveFn, {
+        id: ultrafastRow.id, ...(ultrafast === undefined ? {} : { ultrafast }),
+      });
+      assert.equal(configured.ultrafast, ultrafast);
+      assert.equal(Object.hasOwn(configured, "ultrafast"), ultrafast !== undefined);
+      assert.equal(configured.metadata.data[0].owned_by, "openai");
+      assert.deepEqual(configured.metadata.data[0].pricing, ultrafastRow.pricing);
+      const renewed = await discover(resolveFn, clone(configured));
+      assert.equal(renewed.ultrafast, ultrafast);
+      assert.equal(Object.hasOwn(renewed, "ultrafast"), ultrafast !== undefined);
+    }
 
     const defaultGateway = mockGateway({ allowCatalog: true });
     const defaultDescriptor = await resolveFn({ apiKey, model: modelId, fetch: defaultGateway.fetch });
@@ -343,11 +370,40 @@ async function testRuntime() {
     await restored?.close();
   }
 
+  const ultraDescriptor = await discover(resolveModel, {
+    id: ultrafastRow.id, effort: "high", fast: true, ultrafast: true,
+  });
+  assert.equal(ultraDescriptor.ultrafast, true);
+  let ultraCheckpoint;
+  for (let index = 0; index < 2; index++) {
+    const ultraGateway = mockGateway();
+    const ultraAgent = await createFxAgent(optionsFor(base, ultraGateway, clone(ultraDescriptor),
+      ultraCheckpoint ? { checkpoint: ultraCheckpoint } : {}));
+    try {
+      assertNoTransport(ultraGateway);
+      await runPrompt(ultraAgent, `resolved Ultra turn ${index}`);
+      assert.equal(ultraGateway.state.get, 0);
+      assert.equal(ultraGateway.state.post, 1);
+      const body = ultraGateway.state.chatBodies[0];
+      assert.equal(body.reasoning, "high");
+      assert.equal(body.maxOutputTokens, selectedRow.max_tokens);
+      assert.equal(body.providerOptions?.openai?.serviceTier, "ultrafast");
+      assert.deepEqual(body.providerOptions?.gateway?.only, ["openai"]);
+      assert.equal(body.providerOptions?.gateway?.speed, undefined);
+      assert.equal(body.providerOptions?.gateway?.fast, undefined);
+      const checkpoints = await Promise.all(Array.from({ length: 16 }, () => ultraAgent.checkpoint()));
+      for (const checkpoint of checkpoints) assert.deepEqual(checkpoint, checkpoints[0]);
+      ultraCheckpoint = checkpoints[0];
+      assert.equal(ultraGateway.state.get, 0, "checkpoint must not introduce discovery");
+    } finally { await ultraAgent.close(); }
+  }
+
   const plainDescriptor = await discover(resolveModel, plainId);
   for (const [model, code, capability] of [
     [{ ...savedDescriptor, effort: "max" }, "LIBFX_MODEL_UNSUPPORTED_EFFORT", "effort"],
     [{ ...plainDescriptor, effort: "high" }, "LIBFX_MODEL_UNSUPPORTED_EFFORT", "effort"],
     [{ ...plainDescriptor, fast: true }, "LIBFX_MODEL_UNSUPPORTED_FAST", "fast"],
+    [{ ...plainDescriptor, ultrafast: true }, "LIBFX_MODEL_UNSUPPORTED_ULTRAFAST", "ultrafast"],
   ]) {
     const rejectedGateway = mockGateway();
     await assert.rejects(createFxAgent(optionsFor(base, rejectedGateway, clone(model))), typedError(code, model.id, capability));

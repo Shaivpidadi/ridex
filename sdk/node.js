@@ -22,7 +22,7 @@ import {
 
 export { encodeXtermKeyEvent, fxSdkApiVersion, listModels, resolveModel, supportsJspi, xtermAdapter };
 export const libfxApiVersion = 2;
-const nativeCoreApiVersion = 3;
+const nativeCoreApiVersion = 4;
 
 const fetchOperationStale = 0;
 const fetchOperationApplied = 1;
@@ -348,7 +348,12 @@ export async function getBackendInfo(value = {}) {
 }
 
 function createNativeCoreRuntime(addon, options) {
-  const { apiKey, model, effort, fast, gatewayChatUrl } = options;
+  const { apiKey, model, effort, fast, ultrafast, gatewayChatUrl } = options;
+  if (ultrafast !== undefined && addon.supportsUltrafast !== true) {
+    const error = new Error("native addon does not support the ultrafast option");
+    error.code = "LIBFX_NATIVE_CAPABILITY_UNAVAILABLE";
+    throw error;
+  }
   const core = addon.createCore({
     apiKey,
     home: options.home ?? homedir(),
@@ -356,6 +361,7 @@ function createNativeCoreRuntime(addon, options) {
     ...(model === undefined ? {} : { model }),
     ...(effort === undefined ? {} : { effort }),
     ...(fast === undefined ? {} : { fast }),
+    ...(ultrafast === undefined ? {} : { ultrafast }),
     ...(gatewayChatUrl === undefined ? {} : { gatewayChatUrl }),
   });
   let readyFd;
@@ -433,7 +439,7 @@ function createNativeCoreRuntime(addon, options) {
       destroy();
     }
   };
-  const pumpFetch = async (request) => {
+  const pumpFetch = async (request, body) => {
     const controller = new AbortController();
     let complete, reader;
     const state = { handle: request.handle, controller, consumed: false, active: true,
@@ -451,7 +457,7 @@ function createNativeCoreRuntime(addon, options) {
       const responseTask = Promise.resolve().then(() => (options.fetch ?? globalThis.fetch)(request.url, {
         method: request.method,
         headers: new Headers(JSON.parse(request.headers).map(({ name, value }) => [name, value])),
-        body: request.body?.length ? Buffer.from(request.body, "base64") : undefined,
+        body: body.length ? body : undefined,
         signal: controller.signal,
       })).then(response => {
         if (controller.signal.aborted) {
@@ -528,8 +534,9 @@ function createNativeCoreRuntime(addon, options) {
         if (action === "drain") beginDrain(fetchState);
         if (action === "abort") fetchState.controller.abort();
       } else {
+        // The core hands over JSON metadata and the raw request body separately.
         const fetchRequest = addon.takeCoreFetch(core);
-        if (fetchRequest) void pumpFetch(JSON.parse(fetchRequest.toString("utf8")));
+        if (fetchRequest) void pumpFetch(JSON.parse(fetchRequest.request.toString("utf8")), fetchRequest.body);
       }
       if (addon.coreExitCode(core) !== 0) {
         finish(1, new Error("native output delivery failed"));
@@ -574,6 +581,12 @@ function createNativeCoreRuntime(addon, options) {
     exited,
     get error() { return outputError; },
     write(data) { addon.writeCore(core, Buffer.from(data)); },
+    // The addon copies attachment bytes before returning.
+    writeAttachment(id, bytes) {
+      addon.writeCoreAttachment(core, id, Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength));
+    },
+    takeAttachment(id) { return addon.takeCoreAttachment(core, id); },
+    discardAttachments() { addon.discardCoreAttachments(core); },
     closeStdin() { addon.closeCore(core); },
     abortHostEffects,
     abort(error) {

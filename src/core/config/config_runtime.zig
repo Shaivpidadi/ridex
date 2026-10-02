@@ -4,6 +4,7 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const tool_result_limits = @import("../tooling/tool_result_limits.zig");
+const compactor = @import("../compactor/compactor.zig");
 const types = @import("../shared/types.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
 const settings_store = @import("settings_store.zig");
@@ -46,10 +47,14 @@ pub const Settings = struct {
     yolo_acknowledged: ?bool = null,
     max_agent_steps: ?usize = null,
     max_tool_result_bytes: ?usize = null,
+    /// Share of usable input, 10 to 80 percent, at which automatic
+    /// compaction starts. Profile-only.
+    auto_compact_percent: ?u8 = null,
     context_limits: context_limits.Overrides = .{},
     first_call_tool_choice: ?types.ToolChoice = null,
     context: ?bool = null,
     fast_mode: ?bool = null,
+    ultrafast_mode: ?bool = null,
     fast_mode_model_bound: ?bool = null,
     /// Owned gateway provider slugs in preference order; null leaves routing
     /// to the gateway. Freed in deinit.
@@ -138,6 +143,7 @@ pub const ConfigSources = struct {
     permission_mode: ConfigSource = .compiled_default,
     effort: ConfigSource = .compiled_default,
     fast_mode: ConfigSource = .compiled_default,
+    ultrafast_mode: ConfigSource = .compiled_default,
     fast_mode_model_bound: ConfigSource = .compiled_default,
     slash_menu_categories: ConfigSource = .compiled_default,
     collapse_tool_calls: ConfigSource = .compiled_default,
@@ -209,6 +215,7 @@ pub const ConfigDiagnosticCause = enum {
     invalid_context_limits,
     invalid_additional_directories,
     invalid_skill_symlink_authorities,
+    invalid_ultrafast_mode_override,
 };
 
 pub const ConfigDiagnostic = struct {
@@ -249,6 +256,9 @@ pub fn writeDiagnosticMetadata(writer: *std.Io.Writer, diagnostic: ConfigDiagnos
             .{max_skill_symlink_authorities},
         );
     }
+    if (diagnostic.cause == .invalid_ultrafast_mode_override) {
+        try writer.writeAll("; FX_ULTRAFAST must be a boolean value");
+    }
 }
 
 /// Upper bound on profile `skill_symlink_authorities` entries.
@@ -259,6 +269,8 @@ pub const DetailedSettings = struct {
     diagnostics: []ConfigDiagnostic = &.{},
     model_source: ?ModelSource = null,
     sources: ConfigSources = .{},
+    /// Process-only override; null leaves the profile preference in effect.
+    ultrafast_mode_env_override: ?bool = null,
     permission_sources: PermissionSourceViews = .{},
     prompt_history_store_allowed: bool = true,
     additional_directories: ?[][]u8 = null,
@@ -662,12 +674,21 @@ fn loadMergedSettingsDetailedWithOptionalHome(
             }
         }
     }
+    const ultrafast_mode_env_override = ultrafastModeEnvOverride() catch |err| blk: {
+        try diagnostics.append(alloc, .{
+            .layer = .user,
+            .cause = .invalid_ultrafast_mode_override,
+        });
+        debug_trace.logf("config", "invalid FX_ULTRAFAST value err={s}", .{@errorName(err)});
+        break :blk null;
+    };
 
     return .{
         .settings = settings,
         .diagnostics = try diagnostics.toOwnedSlice(alloc),
         .model_source = sources.models.get(model_provider.NameKey.fromProvider(settings.provider orelse .gateway)),
         .sources = sources,
+        .ultrafast_mode_env_override = ultrafast_mode_env_override,
         .permission_sources = permission_sources,
         .prompt_history_store_allowed = prompt_history_store_allowed,
         .additional_directories = additional_directories,
@@ -715,6 +736,16 @@ fn parseProviderOrderListInner(alloc: Allocator, raw: []const u8) !?[][]const u8
     }
     if (slugs.items.len == 0) return null;
     return try slugs.toOwnedSlice(alloc);
+}
+
+pub const UltrafastModeEnvError = error{InvalidUltrafastMode};
+
+/// Reads the process-only paid lane override using the repository's standard
+/// environment-boolean vocabulary. A malformed value cannot widen cost.
+pub fn ultrafastModeEnvOverride() UltrafastModeEnvError!?bool {
+    const raw = io_mod.getenv("FX_ULTRAFAST") orelse return null;
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    return parseEnvBool(trimmed) orelse error.InvalidUltrafastMode;
 }
 
 fn parseEnvBool(raw: []const u8) ?bool {
@@ -777,6 +808,7 @@ fn hasLegacyWorkspacePreferences(root: std.json.Value) bool {
             "model",
             "effort",
             "fast_mode",
+            "ultrafast_mode",
             "fast_mode_model_bound",
             "slash_menu_categories",
             "collapse_tool_calls",
@@ -810,6 +842,7 @@ fn isProfileOnlySettingKey(key: []const u8) bool {
         "review_model",
         "effort",
         "fast_mode",
+        "ultrafast_mode",
         "fast_mode_model_bound",
         "slash_menu_categories",
         "collapse_tool_calls",
@@ -902,6 +935,7 @@ fn updateConfigSources(sources: *ConfigSources, settings: Settings, source: Conf
     if (settings.permission_mode != null) sources.permission_mode = source;
     if (settings.effort != null) sources.effort = source;
     if (settings.fast_mode != null) sources.fast_mode = source;
+    if (settings.ultrafast_mode != null) sources.ultrafast_mode = source;
     if (settings.fast_mode_model_bound != null) sources.fast_mode_model_bound = source;
     if (settings.slash_menu_categories != null) sources.slash_menu_categories = source;
     if (settings.collapse_tool_calls != null) sources.collapse_tool_calls = source;
@@ -1600,6 +1634,11 @@ fn parseProfileOnlyFields(
     parse_workspace_statusline: bool,
 ) !void {
     if (root.object.contains("skill_match_fuzzy")) return error.RetiredSkillMatchFuzzy;
+    if (root.object.get("auto_compact_percent")) |value| {
+        if (value != .integer) return error.InvalidAutoCompactPercentType;
+        if (value.integer < 0 or !compactor.isValidPercent(@intCast(value.integer))) return error.InvalidAutoCompactPercentValue;
+        settings.auto_compact_percent = @intCast(value.integer);
+    }
     if (root.object.get("model")) |model_value| {
         const value = model_value;
         if (value != .string) return error.InvalidModelType;
@@ -1686,6 +1725,12 @@ fn parseProfileOnlyFields(
         const value = fast_mode_value;
         if (value != .bool) return error.InvalidFastModeType;
         settings.fast_mode = value.bool;
+    }
+
+    if (root.object.get("ultrafast_mode")) |ultrafast_mode_value| {
+        const value = ultrafast_mode_value;
+        if (value != .bool) return error.InvalidUltrafastModeType;
+        settings.ultrafast_mode = value.bool;
     }
 
     if (root.object.get("fast_mode_model_bound")) |bound_value| {
@@ -1911,10 +1956,12 @@ fn mergeSettings(target: *Settings, incoming: *Settings, alloc: Allocator) !void
     if (incoming.yolo_acknowledged) |value| target.yolo_acknowledged = value;
     if (incoming.max_agent_steps) |value| target.max_agent_steps = value;
     if (incoming.max_tool_result_bytes) |value| target.max_tool_result_bytes = value;
+    if (incoming.auto_compact_percent) |value| target.auto_compact_percent = value;
     target.context_limits.merge(incoming.context_limits);
     if (incoming.first_call_tool_choice) |value| target.first_call_tool_choice = value;
     if (incoming.context) |value| target.context = value;
     if (incoming.fast_mode) |value| target.fast_mode = value;
+    if (incoming.ultrafast_mode) |value| target.ultrafast_mode = value;
     if (incoming.fast_mode_model_bound) |value| target.fast_mode_model_bound = value;
     if (incoming.provider_order) |value| {
         if (target.provider_order) |old| {
@@ -4567,6 +4614,19 @@ test "theme setting rejects non-string values" {
     try std.testing.expectEqualStrings("cursor-light", parsed.theme.?);
 }
 
+test "auto compaction percent is a profile setting between 10 and 80" {
+    var global = try parseSettingsJson(std.testing.allocator, "{\"auto_compact_percent\":50}");
+    defer global.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(?u8, 50), global.auto_compact_percent);
+    try std.testing.expectError(error.InvalidAutoCompactPercentValue, parseSettingsJson(std.testing.allocator, "{\"auto_compact_percent\":90}"));
+    try std.testing.expectError(error.InvalidAutoCompactPercentValue, parseSettingsJson(std.testing.allocator, "{\"auto_compact_percent\":5}"));
+    try std.testing.expectError(error.InvalidAutoCompactPercentValue, parseSettingsJson(std.testing.allocator, "{\"auto_compact_percent\":-1}"));
+    try std.testing.expectError(error.InvalidAutoCompactPercentType, parseSettingsJson(std.testing.allocator, "{\"auto_compact_percent\":\"50\"}"));
+    var project = try parseSettingsJsonForLayer(std.testing.allocator, "{\"auto_compact_percent\":50}", .project);
+    defer project.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(?u8, null), project.auto_compact_percent);
+}
+
 test "selectProviderModel chooses only its provider-scoped model" {
     var gateway_settings = Settings{ .provider = .gateway };
     defer gateway_settings.deinit(std.testing.allocator);
@@ -4652,4 +4712,44 @@ test "modelNotSelectedMessage names the provider and both ways to recover" {
     try std.testing.expect(std.mem.find(u8, modelNotSelectedMessage(error.GrokModelNotSelected).?, "`fx provider grok`") != null);
     try std.testing.expect(std.mem.find(u8, modelNotSelectedMessage(error.ConfiguredModelNotSelected).?, "\"models\" in ~/.fx/settings.json") != null);
     try std.testing.expect(modelNotSelectedMessage(error.OutOfMemory) == null);
+}
+
+test "FX_ULTRAFAST overrides the profile and diagnoses malformed values" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
+    defer std.testing.allocator.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
+    defer std.testing.allocator.free(workspace_root);
+    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", "{\"ultrafast_mode\":true}\n");
+
+    const home = try TestHome.install(std.testing.allocator, home_root);
+    defer home.deinit();
+    try home.map.put("FX_ULTRAFAST", "true");
+    var enabled = try loadMergedSettingsDetailedFromHome(std.testing.allocator, home_root, workspace_root);
+    defer enabled.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(?bool, true), enabled.ultrafast_mode_env_override);
+
+    try home.map.put("FX_ULTRAFAST", "1");
+    var numeric_enabled = try loadMergedSettingsDetailedFromHome(std.testing.allocator, home_root, workspace_root);
+    defer numeric_enabled.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(?bool, true), numeric_enabled.ultrafast_mode_env_override);
+
+    try home.map.put("FX_ULTRAFAST", "0");
+    var disabled = try loadMergedSettingsDetailedFromHome(std.testing.allocator, home_root, workspace_root);
+    defer disabled.deinit(std.testing.allocator);
+    try std.testing.expect(disabled.settings.ultrafast_mode.?);
+    try std.testing.expectEqual(@as(?bool, false), disabled.ultrafast_mode_env_override);
+
+    try home.map.put("FX_ULTRAFAST", "paid");
+    var malformed = try loadMergedSettingsDetailedFromHome(std.testing.allocator, home_root, workspace_root);
+    defer malformed.deinit(std.testing.allocator);
+    try std.testing.expect(malformed.ultrafast_mode_env_override == null);
+    var diagnosed = false;
+    for (malformed.diagnostics) |diagnostic| {
+        if (diagnostic.cause == .invalid_ultrafast_mode_override) diagnosed = true;
+    }
+    try std.testing.expect(diagnosed);
 }

@@ -10,6 +10,7 @@ const permissions = @import("../permissions/permissions.zig");
 const session_codec = @import("../session/session_codec.zig");
 const session_display_metadata = @import("../session/session_display_metadata.zig");
 const session_json = @import("../session/session_json.zig");
+const compactor = @import("../compactor/compactor.zig");
 const session_store = @import("../session/session_store.zig");
 const usage_report = @import("../session/usage_report.zig");
 const text_utils = @import("../shared/text_utils.zig");
@@ -484,6 +485,8 @@ pub const StatusSnapshot = struct {
     history_turns: usize,
     session_permission_grants: usize,
     agent_step_limit: usize,
+    /// Requested Ultra mode. The serving provider may still fall back.
+    ultrafast_requested: bool = false,
 
     pub fn render(self: StatusSnapshot, alloc: Allocator, format: OutputFormat) ![]u8 {
         return switch (format) {
@@ -543,6 +546,7 @@ pub const StatusSnapshot = struct {
         try out.writer.print("[status] history_turns={d}\n", .{self.history_turns});
         try out.writer.print("[status] session_permission_grants={d}\n", .{self.session_permission_grants});
         try out.writer.print("[status] agent_step_limit={d}\n", .{self.agent_step_limit});
+        try out.writer.print("[status] ultrafast_requested={}\n", .{self.ultrafast_requested});
         if (self.mcp) |mcp| try mcp.writeText(&out.writer, alloc, "status");
         return try out.toOwnedSlice();
     }
@@ -575,7 +579,7 @@ pub const StatusSnapshot = struct {
         try out.writer.print("workspace={s}\n", .{self.workspace_root});
         try out.writer.print("history_turns={d}\n", .{self.history_turns});
         try out.writer.print("session_permission_grants={d}\n", .{self.session_permission_grants});
-        try out.writer.print("agent_step_limit={d}", .{self.agent_step_limit});
+        try out.writer.print("agent_step_limit={d}\nultrafast_requested={}", .{ self.agent_step_limit, self.ultrafast_requested });
         return try out.toOwnedSlice();
     }
 
@@ -677,6 +681,7 @@ pub const StatusSnapshot = struct {
         try writer.print(",\"history_turns\":{d}", .{self.history_turns});
         try writer.print(",\"session_permission_grants\":{d}", .{self.session_permission_grants});
         try writer.print(",\"agent_step_limit\":{d}", .{self.agent_step_limit});
+        try writer.print(",\"ultrafast_requested\":{}", .{self.ultrafast_requested});
         if (self.mcp) |mcp| {
             try writer.writeAll(",\"mcp\":");
             try mcp.writeJson(writer);
@@ -1760,7 +1765,10 @@ fn writeSessionHistoryTurnText(writer: *std.Io.Writer, turn: types.HistoryTurn) 
     switch (turn) {
         .compacted_summary => |entry| {
             try writer.print("[compacted] removed_turns={d} compactions={d}\n", .{ entry.removed_turn_count, entry.compaction_count });
-            try writeTextBlock(writer, entry.summary);
+            var arena_state = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+            defer arena_state.deinit();
+            const rendered = compactor.modelText(arena_state.allocator(), entry.summary) catch null;
+            try writeTextBlock(writer, rendered orelse entry.summary);
         },
         .assistant => |entry| {
             try writeSessionUserTurnText(writer, entry.user);
@@ -1944,14 +1952,14 @@ test "core status snapshot text and json stay stable" {
     const text = try snapshot.renderText(std.testing.allocator);
     defer std.testing.allocator.free(text);
     try std.testing.expectEqualStrings(
-        "[status] model=alpha\n[status] update_channel=stable\n[status] build_channel=stable\n[status] auth=missing\n[status] auth_refreshable=false\n[status] auth_help=fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.\n[status] permission_mode=ask\n[status] workspace=/tmp/fx\n[status] history_turns=3\n[status] session_permission_grants=1\n[status] agent_step_limit=24\n",
+        "[status] model=alpha\n[status] update_channel=stable\n[status] build_channel=stable\n[status] auth=missing\n[status] auth_refreshable=false\n[status] auth_help=fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.\n[status] permission_mode=ask\n[status] workspace=/tmp/fx\n[status] history_turns=3\n[status] session_permission_grants=1\n[status] agent_step_limit=24\n[status] ultrafast_requested=false\n",
         text,
     );
 
     const json = try snapshot.renderJson(std.testing.allocator);
     defer std.testing.allocator.free(json);
     try std.testing.expectEqualStrings(
-        "{\"kind\":\"status\",\"model\":\"alpha\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"missing\",\"auth_refreshable\":false,\"auth_help\":\"fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.\",\"permission_mode\":\"ask\",\"workspace\":\"/tmp/fx\",\"history_turns\":3,\"session_permission_grants\":1,\"agent_step_limit\":24}",
+        "{\"kind\":\"status\",\"model\":\"alpha\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"missing\",\"auth_refreshable\":false,\"auth_help\":\"fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.\",\"permission_mode\":\"ask\",\"workspace\":\"/tmp/fx\",\"history_turns\":3,\"session_permission_grants\":1,\"agent_step_limit\":24,\"ultrafast_requested\":false}",
         json,
     );
 }
@@ -1970,14 +1978,14 @@ test "core status snapshot includes selected team when present" {
     const text = try snapshot.renderText(std.testing.allocator);
     defer std.testing.allocator.free(text);
     try std.testing.expectEqualStrings(
-        "[status] model=alpha\n[status] update_channel=stable\n[status] build_channel=stable\n[status] auth=fx login\n[status] auth_refreshable=true\n[status] team=example-team\n[status] permission_mode=ask\n[status] workspace=/tmp/fx\n[status] history_turns=0\n[status] session_permission_grants=0\n[status] agent_step_limit=24\n",
+        "[status] model=alpha\n[status] update_channel=stable\n[status] build_channel=stable\n[status] auth=fx login\n[status] auth_refreshable=true\n[status] team=example-team\n[status] permission_mode=ask\n[status] workspace=/tmp/fx\n[status] history_turns=0\n[status] session_permission_grants=0\n[status] agent_step_limit=24\n[status] ultrafast_requested=false\n",
         text,
     );
 
     const json = try snapshot.renderJson(std.testing.allocator);
     defer std.testing.allocator.free(json);
     try std.testing.expectEqualStrings(
-        "{\"kind\":\"status\",\"model\":\"alpha\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"fx login\",\"auth_refreshable\":true,\"team\":\"example-team\",\"permission_mode\":\"ask\",\"workspace\":\"/tmp/fx\",\"history_turns\":0,\"session_permission_grants\":0,\"agent_step_limit\":24}",
+        "{\"kind\":\"status\",\"model\":\"alpha\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"fx login\",\"auth_refreshable\":true,\"team\":\"example-team\",\"permission_mode\":\"ask\",\"workspace\":\"/tmp/fx\",\"history_turns\":0,\"session_permission_grants\":0,\"agent_step_limit\":24,\"ultrafast_requested\":false}",
         json,
     );
 }

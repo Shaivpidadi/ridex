@@ -211,54 +211,198 @@ try {
     expect(result.state === "unsupported", `unexpected state ${result.state}`);
   });
 
-  const resolvedTarget = await command("Target.createTarget", { url: `http://127.0.0.1:${port}/sdk/index.html?force-unsupported=1` });
+  const resolvedTarget = await command("Target.createTarget", { url: "about:blank" });
   const resolvedSession = await command("Target.attachToTarget", { targetId: resolvedTarget.targetId, flatten: true });
   try {
     await command("Runtime.enable", {}, resolvedSession.sessionId);
-    await waitFor("location.pathname === '/sdk/index.html'", resolvedSession.sessionId);
-    const evaluated = await command("Runtime.evaluate", {
+    await command("Page.enable", {}, resolvedSession.sessionId);
+    await command("Page.navigate", { url: `http://127.0.0.1:${port}/sdk/index.html?force-unsupported=1` }, resolvedSession.sessionId);
+    await waitFor("window.__fxCoreTest?.state === 'unsupported'", resolvedSession.sessionId);
+    const evaluated = await withTimeout(command("Runtime.evaluate", {
       awaitPromise: true, returnByValue: true,
       expression: `(async () => {
-        const {createFxAgent, resolveModel} = await import('/sdk/browser.js');
+        const expect = ${expect.toString()};
+        const { createFxAgent, resolveModel } = await import('/sdk/browser.js');
         const apiKey = 'browser-resolved-fixture';
-        const id = 'browser/resolved-model';
-        let gets = 0, posts = 0;
-        const fetch = async (_, init) => {
-          if (init.method === 'GET') {
+        const id = 'openai/browser-resolved-model';
+        const pngData = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jP0cAAAAASUVORK5CYII=';
+        const pngBytes = Uint8Array.from(atob(pngData), byte => byte.charCodeAt(0));
+        const pricing = { input_cache_read: '0.000001', service_tiers: {
+          ultrafast: { input: '0.00006', output: '0.0003', input_cache_read: '0.000006' },
+        } };
+        let gets = 0, posts = 0, discovering = true, acknowledged = false;
+        const fetch = async (_, init = {}) => {
+          const method = String(init.method ?? 'GET').toUpperCase();
+          if (method === 'GET') {
             gets++;
-            return Response.json({data:[{id,type:'language',max_tokens:2048,tags:['reasoning'],reasoning_options:[{type:'effort',values:['high']}]}]});
+            expect(discovering, 'resolved browser agent fetched a catalog during consumption');
+            return Response.json({ data: [{ id, type: 'language', owned_by: 'openai', pricing,
+              context_window: 131072, max_tokens: 2048, tags: ['reasoning', 'vision', 'file-input'],
+              reasoning_options: [{ type: 'effort', values: ['high'] }], fast_options: [{ type: 'toggle' }] }] });
           }
+          expect(method === 'POST' && acknowledged, 'completion preceded modelMetadata acknowledgment');
           posts++;
           const body = JSON.parse(typeof init.body === 'string' ? init.body : new TextDecoder().decode(init.body));
-          if (body.reasoning !== 'high' || body.maxOutputTokens !== 2048) throw new Error('selected capabilities missing');
+          expect(body.reasoning === 'high' && body.maxOutputTokens === 2048, 'selected capabilities missing');
+          expect(body.providerOptions?.openai?.serviceTier === 'ultrafast', 'resolved model lost Ultrafast');
+          expect(JSON.stringify(body.providerOptions?.gateway?.only) === '["openai"]', 'resolved model lost provider route');
+          expect(body.providerOptions?.gateway?.speed === undefined && body.providerOptions?.gateway?.fast === undefined, 'Fast leaked into Ultrafast');
+          const files = body.prompt.filter(message => message.role === 'user' && Array.isArray(message.content))
+            .flatMap(message => message.content).filter(part => part.type === 'file');
+          expect(files.length === 1 && files[0].mediaType === 'image/png' &&
+            files[0].data?.type === 'data' && files[0].data.data === pngData, 'raw image or restored image missing');
           return new Response('data: {"type":"text-delta","delta":"ok"}\\n\\n' +
-            'data: {"type":"finish","finishReason":{"unified":"stop","raw":"stop"}}\\n\\ndata: [DONE]\\n\\n',
+            'data: {"type":"finish","finishReason":{"unified":"stop","raw":"stop"},"providerMetadata":{"gateway":{"serviceTier":"ultrafast","cost":"0.00036"}}}\\n\\ndata: [DONE]\\n\\n',
             {headers:{'content-type':'text/event-stream'}});
         };
-        const model = await resolveModel({apiKey, model:{id,effort:'high'}, fetch});
+        const model = await resolveModel({ apiKey, model: { id, effort: 'high', fast: true, ultrafast: true }, fetch });
+        expect(model.effort === 'high' && model.fast === true && model.ultrafast === true, 'resolved descriptor dropped model options');
+        expect(model.metadata.data[0].owned_by === 'openai' &&
+          JSON.stringify(model.metadata.data[0].pricing) === JSON.stringify(pricing), 'resolved descriptor dropped tier metadata');
+        expect(gets === 1 && posts === 0, 'explicit discovery must issue one GET and no POST');
+        discovering = false;
         let checkpoint;
         const output = [];
+        const promptFrames = [];
         for (let index = 0; index < 2; index++) {
-          const agent = await createFxAgent({apiKey,model:JSON.parse(JSON.stringify(model)),fetch,
-            wasm:new URL('/zig-out/bin/fx-core.wasm',location.href).href,...(checkpoint ? {checkpoint} : {})});
+          acknowledged = false;
+          const agent = await createFxAgent({ apiKey, model: JSON.parse(JSON.stringify(model)), fetch,
+            wasm: new URL('/zig-out/bin/fx-core.wasm', location.href).href, ...(checkpoint ? { checkpoint } : {}),
+            onEvent(event) {
+              if (event.type === 'acp.receive' && event.message?.result?.agentCapabilities?._meta?.fx?.modelMetadata === true) acknowledged = true;
+              if (event.type === 'acp.send' && event.message?.method === 'session/prompt') {
+                promptFrames.push(event.message.params);
+              }
+            },
+          });
           try {
-            const turn = agent.prompt('say ok');
+            expect(acknowledged && gets === 1 && posts === index, 'creation or restore consumed a catalog or sent a POST');
+            const turn = agent.prompt(index === 0 ? [
+              { type: 'text', text: 'remember this image' },
+              { type: 'image', data: pngBytes, mimeType: 'image/png' },
+            ] : 'describe it again');
             let text = '';
             for await (const event of turn) if (event.type === 'text_delta') text += event.delta;
             if ((await turn.result).stopReason !== 'end_turn') throw new Error('turn did not finish');
             output.push(text);
             checkpoint = await agent.checkpoint();
+            const snapshots = await Promise.all(Array.from({ length: 16 }, () => agent.checkpoint()));
+            expect(snapshots.every(bytes => bytes.length === checkpoint.length &&
+              bytes.every((byte, offset) => byte === checkpoint[offset])), 'serialized checkpoints changed or lost attachments');
+            expect(checkpoint.some((_, offset) => pngBytes.every((byte, index) => checkpoint[offset + index] === byte)), 'checkpoint lost raw image bytes');
           } finally { await agent.close(); }
         }
-        return {gets,posts,output,checkpointBytes:checkpoint.length};
+        expect(promptFrames.length === 2 && promptFrames.every(frame => frame.modelMetadata?.data[0].id === id), 'prompt omitted selected metadata');
+        const images = promptFrames.flatMap(frame => frame.prompt).filter(block => block.type === 'image');
+        expect(images.length === 1 && Number.isSafeInteger(images[0]._meta?.fx?.attachment) &&
+          images[0]._meta.fx.attachment > 0 && images[0].data === undefined && images[0].bytes === undefined,
+          'raw prompt image was not sent as an attachment');
+        expect(!JSON.stringify(promptFrames).includes(pngData), 'ACP frame contained base64 image data');
+        return { gets, posts, output, checkpointBytes: checkpoint.length };
       })()`,
-    }, resolvedSession.sessionId);
+    }, resolvedSession.sessionId), "browser resolved model case timed out", 15000);
     expect(!evaluated.exceptionDetails, JSON.stringify(evaluated.exceptionDetails));
     const value = evaluated.result.value;
     expect(value.gets === 1 && value.posts === 2, 'resolved browser agents fetched a catalog after explicit discovery');
     expect(value.output.join('') === 'okok' && value.checkpointBytes > 0, 'resolved browser restore or output failed');
-    console.log('browser resolved model creation, prompt, and restore passed');
+    console.log('browser resolved model, raw images, Ultrafast, and checkpoint restore passed');
   } finally { await command("Target.closeTarget", { targetId: resolvedTarget.targetId }); }
+
+  // Exercise the public browser SDK without starting the demo's live transport.
+  {
+    const { targetId } = await command("Target.createTarget", { url: "about:blank" });
+    try {
+      const { sessionId } = await command("Target.attachToTarget", { targetId, flatten: true });
+      await command("Runtime.enable", {}, sessionId);
+      await command("Page.enable", {}, sessionId);
+      await command("Page.navigate", { url: `http://127.0.0.1:${port}/sdk/index.html?force-unsupported=1` }, sessionId);
+      await waitFor("window.__fxCoreTest?.state === 'unsupported'", sessionId);
+      const evaluated = await withTimeout(command("Runtime.evaluate", {
+        awaitPromise: true,
+        returnByValue: true,
+        expression: `(async () => {
+          const expect = ${expect.toString()};
+          const { createFxAgent } = await import('/sdk/browser.js');
+          const response = await fetch('/zig-out/bin/fx-core.wasm', { cache: 'no-store' });
+          expect(response.ok, 'local core WASM fetch failed: ' + response.status);
+          const wasm = await response.arrayBuffer();
+          const astra = 'openai/gpt-6-astra';
+          const sol = 'openai/gpt-5.6-sol';
+          const pricing = { input_cache_read: '0.000001', service_tiers: {
+            ultrafast: { input: '0.00006', output: '0.0003', input_cache_read: '0.000006' },
+          } };
+          const cases = [
+            { name: 'priced Sol true', model: sol, ultrafast: true },
+            { name: 'Astra false', model: astra, ultrafast: false },
+            { name: 'unpriced Sol rejection', model: sol, ultrafast: true, reject: true },
+          ];
+          const passed = [];
+          for (const scenario of cases) {
+            let agent;
+            let catalogFetches = 0;
+            const requests = [];
+            const fakeFetch = async (_url, init = {}) => {
+              const method = String(init.method ?? 'GET').toUpperCase();
+              if (method === 'GET') {
+                catalogFetches++;
+                return Response.json({ object: 'list', data: [
+                  { id: astra, type: 'language', owned_by: 'openai', pricing },
+                  { id: sol, type: 'language', owned_by: 'openai', ...(scenario.reject ? {} : { pricing }) },
+                ] });
+              }
+              expect(method === 'POST', scenario.name + ': unexpected method ' + method);
+              requests.push({ body: JSON.parse(new TextDecoder().decode(init.body)),
+                model: new Headers(init.headers).get('ai-language-model-id') });
+              const frames = [
+                { type: 'text-delta', delta: 'ok' },
+                { type: 'finish', finishReason: { unified: 'stop', raw: 'stop' },
+                  usage: { inputTokens: { total: 3 }, outputTokens: { total: 2 } },
+                  providerMetadata: { gateway: { serviceTier: 'ultrafast', cost: '0.00036' } } },
+              ];
+              return new Response(frames.map(frame => 'data: ' + JSON.stringify(frame) + '\\n\\n').join('') + 'data: [DONE]\\n\\n',
+                { headers: { 'content-type': 'text/event-stream' } });
+            };
+            try {
+              try {
+                agent = await createFxAgent({ wasm, apiKey: 'browser-ultrafast-test-key',
+                  model: { id: scenario.model, ultrafast: scenario.ultrafast }, fetch: fakeFetch });
+              } catch (error) {
+                if (!scenario.reject) throw error;
+                expect(error.code === 'LIBFX_MODEL_UNSUPPORTED_ULTRAFAST', 'unexpected rejection code: ' + error.code);
+                expect(error.model === sol && error.capability === 'ultrafast', 'rejection omitted Sol capability');
+                expect(/Ultrafast mode is not available/.test(error.message), 'unexpected rejection: ' + error.message);
+                expect(catalogFetches === 1 && requests.length === 0, 'unpriced Sol sent a completion POST');
+                passed.push(scenario.name);
+                continue;
+              }
+              expect(!scenario.reject, 'unpriced Sol creation unexpectedly succeeded');
+              expect(catalogFetches === (scenario.ultrafast ? 1 : 0), scenario.name + ': wrong creation fetch count');
+              const turn = agent.prompt('say ok');
+              let text = '';
+              for await (const event of turn) if (event.type === 'text_delta') text += event.delta;
+              expect((await turn.result).stopReason === 'end_turn' && text === 'ok', scenario.name + ': unexpected reply ' + text);
+              expect(requests.length === 1 && requests[0].model === scenario.model, scenario.name + ': wrong completion model/count');
+              const options = requests[0].body.providerOptions;
+              expect(options?.openai?.serviceTier === (scenario.ultrafast ? 'ultrafast' : undefined), scenario.name + ': wrong service tier');
+              expect(JSON.stringify(options?.gateway?.only) === (scenario.ultrafast ? '["openai"]' : undefined), scenario.name + ': wrong provider route');
+              expect(options?.gateway?.speed === undefined && options?.gateway?.fast === undefined, scenario.name + ': Fast leaked');
+              passed.push(scenario.name);
+            } finally {
+              await agent?.close();
+            }
+          }
+          return passed;
+        })()`,
+      }, sessionId), "browser Ultrafast case timed out", 15000);
+      expect(!evaluated.exceptionDetails, evaluated.result?.description || evaluated.exceptionDetails?.text || "browser Ultrafast exception");
+      expect(JSON.stringify(evaluated.result.value) === JSON.stringify([
+        "priced Sol true", "Astra false", "unpriced Sol rejection",
+      ]), `unexpected browser Ultrafast cases ${JSON.stringify(evaluated.result.value)}`);
+      console.log("browser core ultrafast routing and eligibility passed");
+    } finally {
+      await command("Target.closeTarget", { targetId });
+    }
+  }
 
   const { targetId } = await command("Target.createTarget", { url: "about:blank" });
   const { sessionId } = await command("Target.attachToTarget", { targetId, flatten: true });

@@ -189,13 +189,17 @@ const max_read_file_line_len: usize = 2000;
 const max_command_output_bytes: usize = 64 * 1024;
 const input_escape_timeout_ms: i64 = 30;
 
+/// The first frame counts as focused work: an idle wait before it would only
+/// delay the launch.
 fn nativeLoopPollTimeoutMs(
     default_timeout_ms: i32,
+    first_frame_pending: bool,
     auth_refresh_active: bool,
     skills_refresh_active: bool,
     transcript_page_work_active: bool,
 ) i32 {
-    return if (auth_refresh_active or
+    return if (first_frame_pending or
+        auth_refresh_active or
         skills_refresh_active or
         transcript_page_work_active)
         @min(default_timeout_ms, focused_ui_worker_poll_timeout_ms)
@@ -686,6 +690,7 @@ const App = struct {
                 .model = launch.modifiers.model_override,
                 .effort = launch.modifiers.effort_override,
                 .fast = launch.modifiers.fast_override,
+                .ultrafast = launch.modifiers.ultrafast_override,
                 .provider_order = launch.modifiers.provider_order_override,
                 .provider_strict = launch.modifiers.provider_strict_override,
             },
@@ -1128,6 +1133,7 @@ const App = struct {
         if (comptime !host_target.is_wasm) {
             return nativeLoopPollTimeoutMs(
                 default_timeout_ms,
+                self.shell.render_requests.hasReason(.first_frame),
                 self.auth.sourceInventoryRefreshActive(),
                 self.skills.refreshActive(),
                 self.fullTranscriptFocusedWorkActive(),
@@ -1666,6 +1672,18 @@ const App = struct {
         );
     }
 
+    pub fn beginMcpSlackSetup(self: *App) !void {
+        return self.mcp.beginSlackSetup(
+            self.alloc,
+            self.workspace_root,
+            .{ .form = true, .url = true },
+            if (comptime host_target.is_wasm) loadNoMcpRuntime else builtin_mcp.loadRuntime,
+            builtin_mcp.previewNativeWorkspaceAuthority,
+            self.toolRegistry(),
+            @intCast(@max(io_mod.milliTimestamp(), 0)),
+        );
+    }
+
     pub fn beginMcpMenuReload(self: *App, generation: u64) !void {
         return self.mcp.beginMenuReload(
             self.alloc,
@@ -1902,6 +1920,10 @@ const App = struct {
         err: anyerror,
     ) !void {
         return self.mcp.recordMenuEffectFailure(self.alloc, generation, err);
+    }
+
+    pub fn addMcpSlack(self: *App) !void {
+        return app_commands.Handlers(App).addSlack(self);
     }
 
     pub fn saveMcpMenuAdd(
@@ -2204,6 +2226,12 @@ const App = struct {
                 self.auth.modelCatalogAccess(),
             );
         } else {
+            // Warming without the launch credential would fetch the catalog
+            // twice; the credential's arrival starts the warmup instead.
+            if (AuthAppRuntime.startupCredentialPending(self)) {
+                debug_trace.logf("auth", "model_cache_warmup_deferred reason=startup_credential_pending", .{});
+                return;
+            }
             self.model_cache.startWarmup(
                 self.providerSet().select(self.provider_selection.selection().provider).model_catalog orelse return,
                 self.auth.modelCatalogAccess(),
@@ -2216,7 +2244,8 @@ const App = struct {
     }
 
     pub fn isModelCacheLoading(self: *App) bool {
-        return self.model_cache.isLoading();
+        // The catalog load waits for a deferred launch credential.
+        return self.model_cache.isLoading() or AuthAppRuntime.startupCredentialPending(self);
     }
 
     pub fn isModelCacheFailed(self: *App) bool {
@@ -3028,6 +3057,11 @@ const App = struct {
             }
             try app_commands.Handlers(App).collectSkillsRefreshFacts(self);
         }
+        if (comptime host_profile.native_auth) {
+            // Settle a deferred launch credential before admitting prompts.
+            try AuthAppRuntime.collectStartupCredentialFacts(self);
+            AuthAppRuntime.collectDeferredStartupInventory(self);
+        }
         InputSubmitRuntime.collectPendingSubmissionFacts(self);
         InputAppRuntime.collectFilePickerFacts(self);
 
@@ -3729,7 +3763,9 @@ fn needsEarlyThreadedIo(args: []const [:0]const u8) bool {
     const command = effective_args[0];
     if (std.mem.eql(u8, command, "mcp")) {
         if (effective_args.len < 2) return false;
-        return std.mem.eql(u8, effective_args[1], "auth") or
+        return (effective_args.len == 3 and std.mem.eql(u8, effective_args[1], "add") and
+            std.mem.eql(u8, effective_args[2], "slack")) or
+            std.mem.eql(u8, effective_args[1], "auth") or
             std.mem.eql(u8, effective_args[1], "list") or
             std.mem.eql(u8, effective_args[1], "logout");
     }
@@ -3768,6 +3804,8 @@ test "credential-reading commands use early threaded io without full entry confi
 }
 
 test "MCP credential commands use early threaded io" {
+    try std.testing.expect(needsEarlyThreadedIo(&.{ "mcp", "add", "slack" }));
+    try std.testing.expect(!needsEarlyThreadedIo(&.{ "mcp", "add", "slack", "node" }));
     for ([_][:0]const u8{ "auth", "list", "logout" }) |operation| {
         try std.testing.expect(needsEarlyThreadedIo(&.{
             @as([:0]const u8, "mcp"),
@@ -3840,11 +3878,12 @@ test "lightweight local commands do not request early threaded io" {
 }
 
 test "focused UI workers retain a bounded native poll timeout" {
-    try std.testing.expectEqual(@as(i32, 8), nativeLoopPollTimeoutMs(8, false, false, false));
-    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, true, false, false));
-    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, false, true, false));
-    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, false, false, true));
-    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, true, true, true));
+    try std.testing.expectEqual(@as(i32, 8), nativeLoopPollTimeoutMs(8, false, false, false, false));
+    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, true, false, false, false));
+    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, false, true, false, false));
+    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, false, false, true, false));
+    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, false, false, false, true));
+    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, true, true, true, true));
 }
 
 test "footer runtime compatibility facade exports composeFooterFrame" {

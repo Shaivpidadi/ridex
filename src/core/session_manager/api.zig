@@ -413,6 +413,17 @@ pub const Manager = struct {
         return session_mod.readBlob(&m.env, gpa, id, hash);
     }
 
+    /// The path of a durable blob of session `id`, for a tool that opens
+    /// files by path, such as a web-fetch download (D49). The file is
+    /// read-only; only `getBlob` checks its bytes. The caller frees it.
+    pub fn blobPath(m: *Manager, gpa: std.mem.Allocator, id: []const u8, hash: []const u8) BlobError![]u8 {
+        try checkId(id);
+        if (!schema.validBlobHash(hash)) return error.InvalidArgument;
+        if (!try readyToRead(m)) return error.NotFound;
+        try session_mod.blobExists(&m.env, id, hash);
+        return std.fs.path.join(gpa, &.{ m.root_path, id, "blobs", hash });
+    }
+
     /// Root sessions, newest first, from the index alone.
     pub fn list(m: *Manager, gpa: std.mem.Allocator, filter: Filter, cursor: ?ListCursor, limit: usize) ListError!ListPage {
         if (!try readyToRead(m)) return .{ .arena = .init(gpa), .items = &.{}, .next = null };
@@ -499,6 +510,12 @@ pub const Session = struct {
     /// Stores a large body and returns its hash, once it is durable (D6).
     pub fn putBlob(s: Session, bytes: []const u8) AppendError!BlobHash {
         return s.inner.putBlob(bytes);
+    }
+
+    /// As `putBlob`, for the first `len` bytes of an open file outside the
+    /// session, copied in chunks (D44). A file shorter than `len` is `Io`.
+    pub fn putBlobFile(s: Session, file: std.Io.File, len: u64) AppendError!BlobHash {
+        return s.inner.putBlobFile(file, len);
     }
 
     /// A page of this session's lines through its own open log: the current
@@ -649,10 +666,13 @@ fn checkEvents(gpa: std.mem.Allocator, events: []const Event, import: bool) Appe
             .cancel, .failed => {},
             .closed, .crash => if (!import) return error.InvalidArgument,
         },
-        .set => |s| switch (s.key) {
-            .title, .workspace => try checkJsonString(gpa, s.value),
-            .language => try checkLanguage(gpa, s.value),
-            .prefs, .permissions, .usage => try checkJson(gpa, s.value),
+        .set => |s| {
+            switch (s.key) {
+                .title, .workspace, .client_prompt => try checkJsonString(gpa, s.value),
+                .language => try checkLanguage(gpa, s.value),
+                .prefs, .permissions, .usage, .tool_identities, .moved_files, .compaction_records => try checkJson(gpa, s.value),
+            }
+            for (s.blobs) |hash| if (!schema.validBlobHash(hash)) return error.InvalidArgument;
         },
         .child_spawned => |c| {
             try checkId(c.child);
@@ -1671,6 +1691,10 @@ const api_tests = struct {
             const path = try std.fmt.allocPrint(gpa, "{s}/blobs/{s}", .{ id, &hash });
             defer gpa.free(path);
             if (overwrite) {
+                // A blob is read-only (D49), so damage replaces the file, as
+                // an editor that renames over it would.
+                try testing.expectError(error.AccessDenied, root.writeFile(io, .{ .sub_path = path, .data = "x" }));
+                try root.deleteFile(io, path);
                 try root.writeFile(io, .{ .sub_path = path, .data = "the body of a long ANSWER" });
             } else {
                 try root.deleteFile(io, path);
@@ -1692,6 +1716,223 @@ const api_tests = struct {
             const early = try m.openFork(.{ .source = id, .at = .{ .turn = 1 }, .workspace = "/w", .host = .app });
             early.release();
         }
+    }
+
+    test "a setting lists blobs outside a turn under the item's rule, and fork, verify and recover follow it (D47)" {
+        var f: Fixture = undefined;
+        try f.init();
+        defer f.deinit();
+        const m = f.manager;
+        const s = try m.openNew(.{ .workspace = "/w", .host = .app });
+        // Held before the first turn: nothing is on disk, so no blob exists.
+        const absent = [_][]const u8{"a" ** 64};
+        try testing.expectError(error.InvalidTransition, s.append(&.{.{ .set = .{ .key = .moved_files, .value = "{}", .blobs = &absent } }}));
+        _ = try s.append(&.{ .turn_started, piece, .turn_committed });
+        // A malformed hash is refused at the boundary, a missing one by the rule.
+        const malformed = [_][]const u8{"../x"};
+        try testing.expectError(error.InvalidArgument, s.append(&.{.{ .set = .{ .key = .moved_files, .value = "{}", .blobs = &malformed } }}));
+        try testing.expectError(error.InvalidTransition, s.append(&.{.{ .set = .{ .key = .moved_files, .value = "{}", .blobs = &absent } }}));
+        const hash = try s.putBlob("a body from the side folder");
+        const refs = [_][]const u8{&hash};
+        const value = try std.fmt.allocPrint(gpa, "{{\"map\":\"{s}\"}}", .{&hash});
+        defer gpa.free(value);
+        _ = try s.append(&.{.{ .set = .{ .key = .moved_files, .value = value, .blobs = &refs } }});
+        _ = try s.append(&.{ .turn_started, piece, .turn_committed });
+        const id = try gpa.dupe(u8, s.id());
+        defer gpa.free(id);
+        s.release();
+
+        const r = try m.openResume(.{ .target = .{ .id = id }, .workspace = "/w", .host = .app });
+        var st = try r.state(gpa);
+        defer st.deinit(gpa);
+        try testing.expectEqualStrings(value, st.moved_files.?);
+        r.release();
+        try testing.expectEqual(@as(u64, 0), (try m.verify(id)).bad_blobs);
+        const fork = try m.openFork(.{ .source = id, .at = .{ .turn = 2 }, .workspace = "/w", .host = .app });
+        const fork_id = try gpa.dupe(u8, fork.id());
+        defer gpa.free(fork_id);
+        fork.release();
+        const body = try m.getBlob(gpa, fork_id, &hash);
+        defer gpa.free(body);
+        try testing.expectEqualStrings("a body from the side folder", body);
+
+        // A lost blob that only the setting names damages the session there.
+        var root = try f.dir();
+        defer root.close(io);
+        const path = try std.fmt.allocPrint(gpa, "{s}/blobs/{s}", .{ id, &hash });
+        defer gpa.free(path);
+        try root.deleteFile(io, path);
+        try testing.expectEqual(@as(u64, 1), (try m.verify(id)).bad_blobs);
+        const copy = try m.openFork(.{ .source = id, .at = .last_good, .workspace = "/w", .host = .app });
+        var copied = try copy.state(gpa);
+        defer copied.deinit(gpa);
+        try testing.expectEqual(@as(u64, 1), copied.last_turn);
+        try testing.expectEqual(@as(?[]u8, null), copied.moved_files);
+        copy.release();
+    }
+
+    test "compactor records are a setting that lists blobs inside a turn, and the newest wins on resume and in a fork (D50)" {
+        var f: Fixture = undefined;
+        try f.init();
+        defer f.deinit();
+        const m = f.manager;
+        const s = try m.openNew(.{ .workspace = "/w", .host = .app });
+        _ = try s.append(&.{ .turn_started, piece });
+        // Mid-turn, as auto compaction runs: the records and their map.
+        const record = try s.putBlob("T1 shell: ls\nResult:\nfirst\n");
+        const first_map = try s.putBlob("{\"compacted-T1.txt\":\"r\"}");
+        const first = try std.fmt.allocPrint(gpa, "{{\"map\":\"{s}\"}}", .{&first_map});
+        defer gpa.free(first);
+        _ = try s.append(&.{.{ .set = .{ .key = .compaction_records, .value = first, .blobs = &.{ &record, &first_map } } }});
+        _ = try s.append(&.{ piece, .turn_committed });
+        // A later compaction rewrites the map; the newest value wins.
+        _ = try s.append(&.{.turn_started});
+        const second_map = try s.putBlob("{\"compacted-T1.txt\":\"r\",\"compacted-M1.txt\":\"m\"}");
+        const second = try std.fmt.allocPrint(gpa, "{{\"map\":\"{s}\"}}", .{&second_map});
+        defer gpa.free(second);
+        _ = try s.append(&.{.{ .set = .{ .key = .compaction_records, .value = second, .blobs = &.{&second_map} } }});
+        _ = try s.append(&.{ piece, .turn_committed });
+        const id = try gpa.dupe(u8, s.id());
+        defer gpa.free(id);
+        s.release();
+
+        const r = try m.openResume(.{ .target = .{ .id = id }, .workspace = "/w", .host = .app });
+        var st = try r.state(gpa);
+        defer st.deinit(gpa);
+        try testing.expectEqualStrings(second, st.compaction_records.?);
+        r.release();
+        try testing.expectEqual(@as(u64, 0), (try m.verify(id)).bad_blobs);
+
+        // A fork at turn 1 keeps the first map and links its records.
+        const fork = try m.openFork(.{ .source = id, .at = .{ .turn = 1 }, .workspace = "/w", .host = .app });
+        const fork_id = try gpa.dupe(u8, fork.id());
+        defer gpa.free(fork_id);
+        var forked = try fork.state(gpa);
+        defer forked.deinit(gpa);
+        try testing.expectEqualStrings(first, forked.compaction_records.?);
+        fork.release();
+        const body = try m.getBlob(gpa, fork_id, &record);
+        defer gpa.free(body);
+        try testing.expectEqualStrings("T1 shell: ls\nResult:\nfirst\n", body);
+    }
+
+    test "a blob is read-only and its path opens to its bytes, in the session and in a fork (D49)" {
+        var f: Fixture = undefined;
+        try f.init();
+        defer f.deinit();
+        const m = f.manager;
+        const s = try m.openNew(.{ .workspace = "/w", .host = .app });
+        _ = try s.append(&.{.turn_started});
+        const hash = try s.putBlob("%PDF-1.7 a download");
+        const refs = [_][]const u8{&hash};
+        _ = try s.append(&.{ .{ .item = .{ .type = "tool", .data = "{}", .blobs = &refs } }, .turn_committed });
+        const id = try gpa.dupe(u8, s.id());
+        defer gpa.free(id);
+        s.release();
+
+        const path = try m.blobPath(gpa, id, &hash);
+        defer gpa.free(path);
+        try testing.expect(std.mem.endsWith(u8, path, &hash));
+        var file = try std.Io.Dir.openFileAbsolute(io, path, .{});
+        var buffer: [64]u8 = undefined;
+        const len = try file.readPositional(io, &.{&buffer}, 0);
+        const st = try file.stat(io);
+        file.close(io);
+        try testing.expectEqualStrings("%PDF-1.7 a download", buffer[0..len]);
+        try testing.expectEqual(@as(std.posix.mode_t, storage.blob_mode), st.permissions.toMode() & 0o777);
+        try testing.expectError(error.AccessDenied, std.Io.Dir.openFileAbsolute(io, path, .{ .mode = .read_write }));
+
+        // A fork's hard link is the same read-only file under the fork's folder.
+        const fork = try m.openFork(.{ .source = id, .at = .{ .turn = 1 }, .workspace = "/w", .host = .app });
+        const fork_id = try gpa.dupe(u8, fork.id());
+        defer gpa.free(fork_id);
+        fork.release();
+        const fork_path = try m.blobPath(gpa, fork_id, &hash);
+        defer gpa.free(fork_path);
+        try testing.expect(std.mem.find(u8, fork_path, fork_id) != null);
+        const fork_st = try std.Io.Dir.cwd().statFile(io, fork_path, .{});
+        try testing.expectEqual(@as(std.posix.mode_t, storage.blob_mode), fork_st.permissions.toMode() & 0o777);
+
+        // Only a well-formed hash this session holds has a path.
+        try testing.expectError(error.NotFound, m.blobPath(gpa, id, "b" ** 64));
+        try testing.expectError(error.InvalidArgument, m.blobPath(gpa, id, "../x"));
+        try testing.expectError(error.NotFound, m.blobPath(gpa, "nosuchsession", &hash));
+    }
+
+    test "a file's bytes become the same blob as the bytes themselves, copied in chunks (D44)" {
+        var f: Fixture = undefined;
+        try f.init();
+        defer f.deinit();
+        const m = f.manager;
+        const s = try m.openNew(.{ .workspace = "/w", .host = .app });
+        defer s.release();
+        var spool_dir = testing.tmpDir(.{});
+        defer spool_dir.cleanup();
+        // Larger than one copy chunk, and not a multiple of it.
+        const body = try gpa.alloc(u8, 600 * 1024 + 7);
+        defer gpa.free(body);
+        for (body, 0..) |*byte, i| byte.* = @truncate(i *% 31);
+        try spool_dir.dir.writeFile(io, .{ .sub_path = "spool", .data = body });
+        var spool = try spool_dir.dir.openFile(io, "spool", .{});
+        defer spool.close(io);
+
+        // A held session has no folder for a blob.
+        try testing.expectError(error.InvalidTransition, s.putBlobFile(spool, body.len));
+        _ = try s.append(&.{.turn_started});
+        const from_file = try s.putBlobFile(spool, body.len);
+        try testing.expectEqualStrings(&schema.blobHash(body), &from_file);
+        try testing.expectEqualStrings(&from_file, &(try s.putBlob(body)));
+        const prefix = try s.putBlobFile(spool, 10);
+        try testing.expectEqualStrings(&schema.blobHash(body[0..10]), &prefix);
+        // A file shorter than claimed stores nothing.
+        try testing.expectError(error.Io, s.putBlobFile(spool, body.len + 1));
+        try testing.expectError(error.TooLarge, s.putBlobFile(spool, max_blob_bytes + 1));
+
+        const refs = [_][]const u8{ &from_file, &prefix };
+        _ = try s.append(&.{ .{ .item = .{ .type = "tool", .data = "{}", .blobs = &refs } }, .turn_committed });
+        const stored = try m.getBlob(gpa, s.id(), &from_file);
+        defer gpa.free(stored);
+        try testing.expectEqualSlices(u8, body, stored);
+        var root = try f.dir();
+        defer root.close(io);
+        const blobs_path = try std.fmt.allocPrint(gpa, "{s}/blobs", .{s.id()});
+        defer gpa.free(blobs_path);
+        var blobs = try root.openDir(io, blobs_path, .{ .iterate = true });
+        defer blobs.close(io);
+        var names = blobs.iterate();
+        var count: usize = 0;
+        while (try names.next(io)) |entry| {
+            try testing.expect(schema.validBlobHash(entry.name));
+            const st = try blobs.statFile(io, entry.name, .{});
+            try testing.expectEqual(@as(std.posix.mode_t, storage.blob_mode), st.permissions.toMode() & 0o777);
+            count += 1;
+        }
+        try testing.expectEqual(@as(usize, 2), count);
+    }
+
+    test "an ACP client's prompt and tool identities are settings that resume keeps (D46)" {
+        var f: Fixture = undefined;
+        try f.init();
+        defer f.deinit();
+        const m = f.manager;
+        const s = try m.openNew(.{ .workspace = "/w", .host = .acp });
+        // The prompt is a JSON string; anything else is refused.
+        try testing.expectError(error.InvalidArgument, s.append(&.{.{ .set = .{ .key = .client_prompt, .value = "{\"text\":1}" } }}));
+        _ = try s.append(&.{
+            .{ .set = .{ .key = .client_prompt, .value = "\"You run inside Mini.\"" } },
+            .{ .set = .{ .key = .tool_identities, .value = "{\"mcp_mini_read\":{\"server\":\"mini\",\"tool\":\"read\"}}" } },
+        });
+        _ = try s.append(&.{ .turn_started, piece, .turn_committed });
+        const id = try gpa.dupe(u8, s.id());
+        defer gpa.free(id);
+        s.release();
+
+        const r = try m.openResume(.{ .target = .{ .id = id }, .workspace = "/w", .host = .acp });
+        defer r.release();
+        var st = try r.state(gpa);
+        defer st.deinit(gpa);
+        try testing.expectEqualStrings("\"You run inside Mini.\"", st.client_prompt.?);
+        try testing.expectEqualStrings("{\"mcp_mini_read\":{\"server\":\"mini\",\"tool\":\"read\"}}", st.tool_identities.?);
     }
 };
 

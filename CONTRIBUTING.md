@@ -39,7 +39,7 @@ zig build run
 
 Keep the local development loop focused: run the narrowest test that covers the changed path, build fx, and exercise the change using `./zig-out/bin/fx`. The installed `fx` on `PATH` is not valid development evidence.
 
-Once the focused checks pass, create a clean checkpoint commit, push the non-`main` feature branch, and open a draft PR immediately. The **Full CI** workflow runs the complete deterministic suite on native Linux x86_64, Linux aarch64, macOS x86_64, and macOS aarch64 runners. The native matrix builds, tests, and smoke-tests ReleaseSafe on every platform; formatting and the public-surface audit run in those ReleaseSafe jobs. Four duration-balanced, isolated ReleaseSafe E2E shards per platform use checked-in weights to assign every Bun test file once; files inside each shard run sequentially in separate Bun processes so terminal fixtures and process state cannot leak between files. A failed file receives one bounded retry after tmux is reset.
+Once the focused checks pass, create a clean checkpoint commit, push the non-`main` feature branch, and open a draft PR immediately. The **Full CI** workflow runs the complete deterministic suite on native Linux x86_64, Linux aarch64, macOS x86_64, and macOS aarch64 runners. The native matrix builds, tests, and smoke-tests ReleaseSafe on every platform; formatting, the public-surface audit, and the compactor boundary check run in those ReleaseSafe jobs. Four duration-balanced, isolated ReleaseSafe E2E shards per platform use checked-in weights to assign every Bun test file once; files inside each shard run sequentially in separate Bun processes so terminal fixtures and process state cannot leak between files. A failed file receives one bounded retry after tmux is reset.
 
 Standard PR CI reports ReleaseSafe Build & Test and deterministic E2E results. Do not mark the draft PR ready until all four Full CI jobs and the final ship gate have succeeded for the exact current commit. Each platform aggregate requires its ReleaseSafe native check and all four ReleaseSafe E2E shards. A result from an older commit does not count. Live model evals are separate from this gate because they require credentials and are not deterministic.
 
@@ -127,7 +127,7 @@ Config precedence (highest wins):
 4. `<workspace>/.fx.json` (committed project defaults)
 5. Built-in defaults
 
-Project `.fx.json` accepts only repo-safe defaults: `sandbox`, `max_agent_steps`, `max_tool_result_bytes`, and `context`. Profile-owned keys such as `provider`, `providers`, `models`, `model`, `effort`, `fast_mode`, `slash_menu_categories`, `startup_scrollback`, `prompt_history`, `statusLine`, `skill_match_fuzzy`, `first_call_tool_choice`, `auto_upgrade`, `update_channel`, `permission_mode`, `permission`, and `skill_symlink_authorities` are ignored from project config before their values are parsed.
+Project `.fx.json` accepts only repo-safe defaults: `sandbox`, `max_agent_steps`, `max_tool_result_bytes`, and `context`. Profile-owned keys such as `provider`, `providers`, `models`, `model`, `effort`, `fast_mode`, `slash_menu_categories`, `startup_scrollback`, `prompt_history`, `statusLine`, `skill_match_fuzzy`, `first_call_tool_choice`, `auto_upgrade`, `auto_compact_percent`, `update_channel`, `permission_mode`, `permission`, and `skill_symlink_authorities` are ignored from project config before their values are parsed.
 
 `skill_symlink_authorities` is an array of absolute directories that symlinked skills may resolve into, such as an app bundle or `/nix/store`. It is read at startup, a workspace override replaces the global list, and its entries are combined with the colon-separated `FX_SKILL_SYMLINK_AUTHORITIES` environment variable.
 
@@ -384,7 +384,10 @@ progress are not delivered to operations yet.
 ## ACP Embedding
 
 `fx acp` extends ACP v1 for clients that embed it. Extensions are read and
-written under `_meta.fx`.
+written under `_meta.fx`. Start the server with `fx acp --ultrafast` or
+`fx acp --no-ultrafast` to set a process-local default request for sessions
+created by that server; the request still requires a model that advertises
+Ultra eligibility.
 
 * **Client MCP tools stay loaded:** tool schemas from servers in `mcpServers`
   are advertised on every turn within the `mcp_selected_schema_bytes` budget.
@@ -600,6 +603,22 @@ brew install hyperfine             # macOS (one-time)
 CI uses `--runs 100` with a reduced warmup and skips the build step because the
 workflow builds ReleaseSafe first. Results are written to
 `benchmarks/results/` (gitignored).
+
+`FX_BENCH` exits before the interactive shell starts, so it does not measure
+the time to the first frame. `benchmarks/first_frame.py` does: it launches fx
+on a pseudo-terminal, answers terminal queries like a fast emulator, and
+reports first byte, first frame, exit latency, CPU time, and peak RSS. Pass
+several binaries to compare them under the same machine load:
+
+```bash
+python3 benchmarks/first_frame.py --binary /tmp/fx-before --binary ./zig-out/bin/fx
+python3 benchmarks/first_frame.py --isolated-home --cwd /tmp   # empty profile
+```
+
+By default it uses your own HOME and working directory, which is what users
+feel. It disables auto-upgrade for the measured processes and fails if a
+binary changes during the run. Add `--no-background-reply` to act like a
+terminal that ignores the background color query.
 
 The libfx runtime job measures cold startup, warm prompts, host-tool calls,
 stream throughput, and Agent cleanup. Its direct Pi comparison uses an external

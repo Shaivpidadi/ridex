@@ -334,7 +334,12 @@ fn join(gpa: std.mem.Allocator, parent: []const u8, name: []const u8) storage.Er
 }
 
 /// Silent damage: flips one bit of a file without the fault layer noticing.
+/// A read-only blob (D49) is made writable for the flip and then restored.
 pub fn flipBit(io: Io, dir: storage.Dir, name: []const u8, offset: u64, bit: u3) !void {
+    const before = try dir.handle.statFile(io, name, .{ .follow_symlinks = false });
+    const read_only = before.permissions.toMode() & 0o200 == 0;
+    if (read_only) try dir.handle.setFilePermissions(io, name, .fromMode(storage.file_mode), .{ .follow_symlinks = false });
+    defer if (read_only) dir.handle.setFilePermissions(io, name, before.permissions, .{ .follow_symlinks = false }) catch {};
     var file = try dir.handle.openFile(io, name, .{ .mode = .read_write, .follow_symlinks = false });
     defer file.close(io);
     var byte: [1]u8 = undefined;
