@@ -302,7 +302,7 @@ pub fn Commands(comptime App: type) type {
                 .permission_mode = app.permission_engine.mode,
                 .workspace_root = app.workspace_root,
                 .history_turns = app.session.historyLen(),
-                .session_permission_grants = app.permission_engine.grants.items.len,
+                .session_permission_grants = permissions.liveSessionGrantCount(app.permission_engine.grants.items),
                 .agent_step_limit = app.agent_step_limit,
                 .ultrafast_requested = app.worker.agent_turn_settings.ultrafast_mode,
             }).renderInteractiveBody(app.alloc);

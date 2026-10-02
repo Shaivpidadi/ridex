@@ -2263,7 +2263,20 @@ fn completeToolCallTransport(
     acp_id: []const u8,
     result: ToolExecutionResult,
 ) ToolExecutionResult {
-    const output_text = toolUpdateContentText(result);
+    var notice_text: ?[]u8 = null;
+    defer if (notice_text) |text| ctx.alloc.free(text);
+    const output_text = blk: {
+        const preview = toolUpdateContentText(result);
+        if (!std.mem.eql(u8, call.name, "shell")) break :blk preview;
+        // The preview is clipped, so a snapshot fallback notice is shown on
+        // its own line beside the command it affected.
+        var buffer: [512]u8 = undefined;
+        const notice = tool_call_presentation.shellResultNotice(result.model_output, &buffer) orelse
+            break :blk preview;
+        notice_text = std.fmt.allocPrint(ctx.alloc, "{s}\n{s}", .{ notice, preview }) catch
+            break :blk preview;
+        break :blk notice_text.?;
+    };
     if (result.status == .failure) {
         ctx.sendToolCallErrorWithCommandResult(
             acp_id,

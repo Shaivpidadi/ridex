@@ -3406,7 +3406,7 @@ function terminalRecords(fixture: Fixture, id: string): Array<Record<string, unk
     .map((name) => JSON.parse(readFileSync(join(root, name), "utf8")));
 }
 
-test.skipIf(!tmuxAvailable())("a hosted terminal survives an app crash, and the resumed app talks to it and stops it", async () => {
+test.skipIf(!tmuxAvailable())("a hosted terminal ends with an app crash, and the resumed app reports it ended", async () => {
   const fixture = createFixture("fx-v2-tty-crash-");
   let shellId = "";
   const gateway = startFakeGateway([
@@ -3427,9 +3427,17 @@ test.skipIf(!tmuxAvailable())("a hosted terminal survives an app crash, and the 
       request: { action: "interact", session_id: shellId, chars: "after the crash\n", yield_time_ms: 2000 },
     }),
     () => fakeGatewayToolCall("tty_stop", "shell", { request: { action: "stop", session_id: shellId, force: true } }),
-    fakeGatewayFinalText("TTY_STOPPED"),
+    fakeGatewayFinalText("TTY_ENDED_REPORTED"),
   ]);
   const appEnv = { FX_PERMISSION_MODE: "full-access", SHELL: "/bin/sh" };
+  const alive = (pid: number) => {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  };
   try {
     const app = await startApp(fixture, gateway, [], true, appEnv);
     await app.session.sendText("Start a terminal.");
@@ -3437,18 +3445,27 @@ test.skipIf(!tmuxAvailable())("a hosted terminal survives an app crash, and the 
     expect(shellId).toMatch(/^shell-[A-Za-z0-9_-]{22}$/);
     const id = onlySession(fixture);
     await waitForLog(fixture, id, "turn_committed");
+    const shellPid = Number(terminalRecords(fixture, id).find((record) => record.session_id === shellId)?.pid);
+    expect(alive(shellPid)).toBe(true);
     Bun.spawnSync(["kill", "-9", String(app.session.processPid())]);
     await app.session.kill();
 
+    // The terminal belonged to the crashed process and ended with it.
+    const deadline = Date.now() + 2_000;
+    while (alive(shellPid) && Date.now() < deadline) await Bun.sleep(10);
+    expect(alive(shellPid)).toBe(false);
+
     const resumed = await startApp(fixture, gateway, ["--resume", id], true, appEnv);
     await resumed.session.sendText("Talk to the terminal, then stop it.");
-    await resumed.session.waitForText("TTY_STOPPED", TIMEOUT);
-    // The terminal kept running through the crash: it echoes a line sent
-    // after it, and the stop finds it.
-    expect(gateway.requests[3]!.body).toContain("TTY_ECHO:after the crash");
-    expect(gateway.requests[4]!.body).toContain('\\"state\\":\\"stopped\\"');
+    await resumed.session.waitForText("TTY_ENDED_REPORTED", TIMEOUT);
+    // Neither interact nor stop reattaches; both report why it is gone.
+    for (const index of [3, 4]) {
+      expect(gateway.requests[index]!.body).toContain("TerminalEnded");
+      expect(gateway.requests[index]!.body).toContain("ended when the fx process that started it exited");
+    }
+    expect(gateway.requests[3]!.body).not.toContain("TTY_ECHO:after the crash");
     await quitApp(resumed);
-    expect(terminalRecords(fixture, id).find((record) => record.session_id === shellId)?.lifecycle).toBe("closed");
+    expect(terminalRecords(fixture, id).find((record) => record.session_id === shellId)?.lifecycle).toBe("lost");
     expectWholeLog(fixture, id);
   } finally {
     gateway.stop();

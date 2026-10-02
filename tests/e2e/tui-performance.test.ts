@@ -710,7 +710,6 @@ test.skipIf(!ENABLED || !tmuxAvailable())(
           FX_SOUND: "0",
           FX_RECORD: fixture.tapePath,
           FX_RECORD_INPUT: "1",
-          FX_TERMINAL_HOST_IDLE_MS: "250",
           NO_COLOR: "1",
         },
         stderrPath: fixture.stderrPath,

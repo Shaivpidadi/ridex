@@ -39,7 +39,6 @@ TRAINING_E2E_TESTS = (
     "mcp-stdio.test.ts",
     "mcp-auth.test.ts",
     "session-recovery.test.ts",
-    "terminal-host.test.ts",
     "tui-startup.test.ts",
     "permission-errors.test.ts",
     "tui-resize.test.ts",
@@ -372,8 +371,8 @@ class PgsoCorpusTests(unittest.TestCase):
             EXCLUDED_E2E_TESTS,
             tuple(test_file for test_file, _ in corpus.intentional_exclusions),
         )
-        self.assertEqual(36, len(corpus.scenarios))
-        self.assertEqual(60, len(corpus.candidate_scenarios))
+        self.assertEqual(35, len(corpus.scenarios))
+        self.assertEqual(59, len(corpus.candidate_scenarios))
         self.assertEqual(
             {
                 "direct-help": 100,
