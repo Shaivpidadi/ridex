@@ -604,6 +604,22 @@ CI uses `--runs 100` with a reduced warmup and skips the build step because the
 workflow builds ReleaseSafe first. Results are written to
 `benchmarks/results/` (gitignored).
 
+`FX_BENCH` exits before the interactive shell starts, so it does not measure
+the time to the first frame. `benchmarks/first_frame.py` does: it launches fx
+on a pseudo-terminal, answers terminal queries like a fast emulator, and
+reports first byte, first frame, exit latency, CPU time, and peak RSS. Pass
+several binaries to compare them under the same machine load:
+
+```bash
+python3 benchmarks/first_frame.py --binary /tmp/fx-before --binary ./zig-out/bin/fx
+python3 benchmarks/first_frame.py --isolated-home --cwd /tmp   # empty profile
+```
+
+By default it uses your own HOME and working directory, which is what users
+feel. It disables auto-upgrade for the measured processes and fails if a
+binary changes during the run. Add `--no-background-reply` to act like a
+terminal that ignores the background color query.
+
 The libfx runtime job measures cold startup, warm prompts, host-tool calls,
 stream throughput, and Agent cleanup. Its direct Pi comparison uses an external
 Zig HTTP server, Pi 0.84.4, and three alternating 100-sample rounds. On Bun,

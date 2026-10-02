@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const io_mod = @import("../shared/io.zig");
 const agent_steps = @import("../config/agent_steps.zig");
 const config_runtime = @import("../config/config_runtime.zig");
@@ -120,6 +121,9 @@ pub const StartupState = struct {
     workspace_root: []u8 = &.{},
     workspace_access: workspace_access.WorkspaceAccess = .{},
     credential: ?credentials.Credential = null,
+    /// Set instead of `credential` when the interactive launch leaves a
+    /// Keychain-backed credential to be resolved after the first frame.
+    deferred_credential: ?auth_runtime.StartupCredentialRequest = null,
     credential_load_failure: ?credentials.LoadFailure = null,
     auth_mode: credentials.AuthMode = .local,
     credential_source_preference: ?credentials.Source = null,
@@ -490,6 +494,22 @@ pub fn loadCatalogStartupStateWithAuthMode(
     return loadStartupStateFromOwnedWorkspace(alloc, oauth_transport.unavailable_provider, secret_store, workspace_root, default_model, default_agent_step_limit, auth_mode, null, .stored, provider_override, model_override);
 }
 
+/// The interactive launch counterpart of `loadCatalogStartupStateWithAuthMode`:
+/// a credential that would be read from the macOS Keychain is left in
+/// `deferred_credential` so the caller can resolve it after the first frame.
+pub fn loadInteractiveStartupState(
+    alloc: Allocator,
+    secret_store: host.SecretStore,
+    default_model: []const u8,
+    default_agent_step_limit: usize,
+    auth_mode: credentials.AuthMode,
+    provider_override: ?model_provider.ProviderId,
+    model_override: ?[]const u8,
+) !StartupState {
+    const workspace_root = try io_mod.realpathAlloc(alloc, ".");
+    return loadStartupStateWithKeychainRead(alloc, oauth_transport.unavailable_provider, secret_store, workspace_root, default_model, default_agent_step_limit, auth_mode, null, .stored, provider_override, model_override, .deferred);
+}
+
 pub fn loadStartupStatus(
     alloc: Allocator,
     secret_store: host.SecretStore,
@@ -582,6 +602,34 @@ fn loadStartupStateForWorkspace(alloc: Allocator, workspace_root: []const u8, de
 
 const CredentialLoadMode = credentials.LoadMode;
 
+/// Whether a launch credential stored in the macOS Keychain is read during
+/// startup or left in `StartupState.deferred_credential` for the caller.
+const KeychainRead = enum { blocking, deferred };
+
+/// Reading the Keychain spawns a helper process that dominates launch time,
+/// so only lookups that can reach it are worth resolving after the first
+/// frame. An environment credential wins precedence without touching the
+/// Keychain, and other providers read profile files.
+fn keychainReadDeferrable(
+    is_macos: bool,
+    keychain_disabled: bool,
+    provider: model_provider.ProviderId,
+    preferred: ?credentials.Source,
+    env_credential_present: bool,
+) bool {
+    if (!is_macos or keychain_disabled or provider != .gateway) return false;
+    const source = preferred orelse return !env_credential_present;
+    return switch (source) {
+        .fx_login, .stored_key => true,
+        .vercel_oidc_token, .ai_gateway_api_key, .chatgpt_subscription, .grok_subscription, .host_managed, .configured => false,
+    };
+}
+
+fn envCredentialPresent(secret_store: host.SecretStore) bool {
+    return credentials.sourcePresence(secret_store, .vercel_oidc_token) == .present or
+        credentials.sourcePresence(secret_store, .ai_gateway_api_key) == .present;
+}
+
 fn loadStartupStateFromOwnedWorkspace(
     alloc: Allocator,
     transport: oauth_transport.Provider,
@@ -594,6 +642,23 @@ fn loadStartupStateFromOwnedWorkspace(
     credential_mode: ?CredentialLoadMode,
     provider_override: ?model_provider.ProviderId,
     model_override: ?[]const u8,
+) !StartupState {
+    return loadStartupStateWithKeychainRead(alloc, transport, secret_store, owned_workspace_root, default_model, default_agent_step_limit, auth_mode, profile_home, credential_mode, provider_override, model_override, .blocking);
+}
+
+fn loadStartupStateWithKeychainRead(
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+    secret_store: host.SecretStore,
+    owned_workspace_root: []u8,
+    default_model: []const u8,
+    default_agent_step_limit: usize,
+    auth_mode: credentials.AuthMode,
+    profile_home: ?[]const u8,
+    credential_mode: ?CredentialLoadMode,
+    provider_override: ?model_provider.ProviderId,
+    model_override: ?[]const u8,
+    keychain_read: KeychainRead,
 ) !StartupState {
     var state = StartupState{
         .agent_step_limit = default_agent_step_limit,
@@ -667,7 +732,20 @@ fn loadStartupStateFromOwnedWorkspace(
     state.prompt_history_store_allowed = detailed.prompt_history_store_allowed;
     state.credential_source_preference = settings.credential_source;
     if (auth_mode == .local and !state.model_requests_blocked) {
-        if (credential_mode) |mode| {
+        if (credential_mode) |mode| defer_or_resolve: {
+            if (keychain_read == .deferred and mode == .stored and keychainReadDeferrable(
+                builtin.os.tag == .macos,
+                secret_store.isDisabled(),
+                state.provider,
+                settings.credential_source,
+                envCredentialPresent(secret_store),
+            )) {
+                state.deferred_credential = .{
+                    .provider = state.provider,
+                    .preferred = settings.credential_source,
+                };
+                break :defer_or_resolve;
+            }
             const resolution = try credentials.resolveForProvider(
                 alloc,
                 transport,
@@ -774,7 +852,7 @@ pub fn bootstrapInteractiveApp(cfg: BootstrapConfig) !StartupState {
     cfg.shell.layout = minimalLayout();
     try cfg.shell.initBacking(cfg.alloc);
 
-    var state = try loadCatalogStartupStateWithAuthMode(
+    var state = try loadInteractiveStartupState(
         cfg.alloc,
         cfg.secret_store,
         cfg.default_model,
@@ -2709,6 +2787,61 @@ test "credential onboarding can be skipped independently from Keychain" {
 
     const onboarding_skipped = credentialOnboardingDisabled();
     try std.testing.expect(onboarding_skipped);
+}
+
+test "only a Keychain-backed Gateway credential is deferred past the first frame" {
+    try std.testing.expect(keychainReadDeferrable(true, false, .gateway, .fx_login, false));
+    try std.testing.expect(keychainReadDeferrable(true, false, .gateway, .stored_key, true));
+    try std.testing.expect(keychainReadDeferrable(true, false, .gateway, null, false));
+    // An environment credential wins automatic precedence without the Keychain.
+    try std.testing.expect(!keychainReadDeferrable(true, false, .gateway, null, true));
+    try std.testing.expect(!keychainReadDeferrable(true, false, .gateway, .ai_gateway_api_key, false));
+    try std.testing.expect(!keychainReadDeferrable(true, false, .gateway, .vercel_oidc_token, false));
+    try std.testing.expect(!keychainReadDeferrable(true, false, .codex, .fx_login, false));
+    try std.testing.expect(!keychainReadDeferrable(true, true, .gateway, .fx_login, false));
+    try std.testing.expect(!keychainReadDeferrable(false, false, .gateway, .fx_login, false));
+}
+
+fn keychainEnabledForTest(_: ?*anyopaque) bool {
+    return false;
+}
+
+test "interactive launch leaves a Keychain credential unresolved for the caller" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", "{\"credential_source\":\"fx_login\"}");
+    const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace_root);
+    // The real Keychain stays off; the fake store below reports it enabled.
+    var env = try TestEnv.install(alloc, &.{
+        .{ .key = "HOME", .value = home_root },
+        .{ .key = "FX_PROVIDER", .value = "" },
+        .{ .key = "FX_DISABLE_KEYCHAIN", .value = "1" },
+    });
+    defer env.deinit();
+
+    var keychain_store = host.unavailable_secret_store;
+    keychain_store.is_disabled_fn = keychainEnabledForTest;
+    for ([_]KeychainRead{ .blocking, .deferred }) |keychain_read| {
+        var state = try loadStartupStateWithKeychainRead(alloc, oauth_transport.unavailable_provider, keychain_store, try alloc.dupe(u8, workspace_root), "default/model", 25, .local, null, .stored, null, null, keychain_read);
+        defer state.deinit(alloc);
+        try std.testing.expect(state.credential == null);
+        if (keychain_read == .deferred and builtin.os.tag == .macos) {
+            const request = state.deferred_credential orelse return error.TestExpectedDeferredCredential;
+            try std.testing.expectEqual(model_provider.ProviderId.gateway, request.provider);
+            try std.testing.expectEqual(@as(?credentials.Source, .fx_login), request.preferred);
+            try std.testing.expectEqual(credentials.FxLoginReadStatus.not_attempted, state.fx_login_status);
+        } else {
+            // Test builds keep the fx login in the profile, where it is absent.
+            try std.testing.expect(state.deferred_credential == null);
+            try std.testing.expectEqual(credentials.FxLoginReadStatus.absent, state.fx_login_status);
+        }
+    }
 }
 
 fn writeFixtureFile(dir: std.Io.Dir, sub_path: []const u8, text: []const u8) !void {

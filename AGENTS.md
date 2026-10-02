@@ -343,6 +343,8 @@ The CI workflow builds a ReleaseSafe binary, measures six CLI paths with hyperfi
 
 The startup benchmark uses `FX_BENCH=1`, an environment variable that runs through arg parsing and CLI dispatch, then exits before TTY initialization. This lives in `src/core/app/app_entry_runtime.zig`.
 
+To measure the interactive launch up to the first frame, use `benchmarks/first_frame.py`. It drives fx on a pseudo-terminal and interleaves several `--binary` arguments for before-and-after comparisons.
+
 Current raw wall-clock contract:
 
 * Linux CI: 2ms for every command
