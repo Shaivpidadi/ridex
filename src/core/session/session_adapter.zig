@@ -911,6 +911,9 @@ pub const Session = struct {
     /// only these.
     root: bool = true,
     titled: bool = false,
+    /// A resumed session with no title: the title its first prompt gives,
+    /// owned, written with its next turn end (D52).
+    first_title: ?[]u8 = null,
     /// A usage-recovery marker protects a checkpoint still waiting for the
     /// profile ledger; it keeps its first time until nothing is pending.
     usage_marked: bool = false,
@@ -1164,6 +1167,7 @@ pub const Session = struct {
         self.turn_numbers.deinit(alloc);
         if (self.language) |value| alloc.free(value);
         if (self.instructions) |value| alloc.free(value);
+        if (self.first_title) |value| alloc.free(value);
         alloc.free(self.files_path);
         alloc.destroy(self);
     }
@@ -1293,7 +1297,16 @@ pub const Session = struct {
         const language_tag = language.view();
         const language_changed = self.language == null or !std.mem.eql(u8, self.language.?, language_tag);
         if (language_changed) try tail.append(a, .{ .set = .{ .key = .language, .value = try jsonString(a, language_tag) } });
-        const derived_title = if (self.fresh and !self.titled) try deriveTitle(a, turn) else null;
+        // A new session's first turn names it, or a resumed one's first
+        // prompt, which a crash may have left in an interrupted turn (D52).
+        const derived_title = if (!self.root or self.titled)
+            null
+        else if (self.first_title) |title|
+            title
+        else if (self.fresh)
+            try deriveTitle(a, &.{turn})
+        else
+            null;
         if (derived_title) |title| try tail.append(a, .{ .set = .{ .key = .title, .value = try jsonString(a, title) } });
 
         try self.writePieces(a, all[start..], encoded[start..], tail.items);
@@ -1760,6 +1773,11 @@ pub const Session = struct {
         self.turn_numbers.clearRetainingCapacity();
         var restored = try restoreFrom(self.source(), alloc, sa, state, .{ .alloc = self.alloc, .list = &self.turn_numbers });
         errdefer restored.deinit(alloc);
+        if (self.first_title) |value| self.alloc.free(value);
+        self.first_title = null;
+        if (self.root and state.title == null) {
+            if (try deriveTitle(sa, restored.history)) |title| self.first_title = try self.alloc.dupe(u8, title);
+        }
         if (state.usage) |raw| {
             const checkpoint = try decodeUsage(sa, raw);
             self.usage_at_ms = checkpoint.at_ms;
@@ -3099,9 +3117,9 @@ fn decodeUsageValue(alloc: Allocator, value: std.json.Value) !UsageCheckpoint {
     return .{ .snapshot = try session_usage.parseSnapshotValue(alloc, snapshot), .at_ms = at.integer };
 }
 
-/// The title v1 derives from a fresh session's first turn, if any.
-fn deriveTitle(arena: Allocator, turn: types.HistoryTurn) !?[]const u8 {
-    const display = session_display_metadata.deriveFromHistory(arena, &.{turn}) catch return null;
+/// The title v1 derives from the first prompt of `history`, if any.
+fn deriveTitle(arena: Allocator, history: []const types.HistoryTurn) !?[]const u8 {
+    const display = session_display_metadata.deriveFromHistory(arena, history) catch return null;
     if (!display.present or std.mem.eql(u8, display.title, session_display_metadata.fallback_title)) return null;
     return display.title;
 }
@@ -3582,6 +3600,74 @@ test "a crash answers only the running calls its turn does not already hold" {
     try testing.expectEqualStrings("call_2", step.tool_calls[0].id);
     try testing.expectEqualStrings("call_2", step.tool_results[0].tool_call_id);
     try testing.expectEqualStrings(unfinished_tool_output, step.tool_results[0].output);
+}
+
+fn countTitleSets(manager: *sm.Manager, id: []const u8) !usize {
+    var page = try manager.read(testing.allocator, id, .start, .forward, 1000);
+    defer page.deinit();
+    var n: usize = 0;
+    for (page.entries) |entry| {
+        const body = entry.body orelse continue;
+        if (body == .set and body.set.key == .title) n += 1;
+    }
+    return n;
+}
+
+fn storedTitle(s: *Session) !?[]u8 {
+    const shown = try s.info(testing.allocator);
+    return shown.title;
+}
+
+test "a session whose first turn never ended takes its first prompt as title at its next turn end (D52)" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    try s.appendProgress(.{ .text = @constCast("Why is the sky orange at dusk?") }, .{}, .{});
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    // The first turn never ends through fx, as when fx is killed.
+    s.close();
+    try testing.expectEqual(@as(usize, 0), try countTitleSets(t.store.manager, id));
+
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .ask);
+    defer r.close();
+    var restored = try r.restore(testing.allocator);
+    defer restored.deinit(testing.allocator);
+    try testing.expect(restored.title == null);
+    try testing.expect(restored.history[0] == .interrupted);
+    try r.commitTurn(.{ .assistant = .{ .user = .{ .text = @constCast("next") }, .assistant = @constCast("ok") } }, types.ConversationLanguage.default());
+    const title = (try storedTitle(r)) orelse return error.TestExpectedTitle;
+    defer testing.allocator.free(title);
+    try testing.expectEqualStrings("Why is the sky orange at dusk?", title);
+    // Written once; later turns leave it.
+    try r.commitTurn(.{ .assistant = .{ .user = .{ .text = @constCast("again") }, .assistant = @constCast("ok") } }, types.ConversationLanguage.default());
+    try testing.expectEqual(@as(usize, 1), try countTitleSets(t.store.manager, id));
+}
+
+test "a resumed session keeps the title it has (D52)" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    try s.commitTurn(.{ .assistant = .{ .user = .{ .text = @constCast("First question") }, .assistant = @constCast("ok") } }, types.ConversationLanguage.default());
+    try s.rename("Mine");
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    s.close();
+    try testing.expectEqual(@as(usize, 2), try countTitleSets(t.store.manager, id));
+
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .ask);
+    defer r.close();
+    var restored = try r.restore(testing.allocator);
+    defer restored.deinit(testing.allocator);
+    try r.commitTurn(.{ .assistant = .{ .user = .{ .text = @constCast("Second question") }, .assistant = @constCast("ok") } }, types.ConversationLanguage.default());
+    const title = (try storedTitle(r)) orelse return error.TestExpectedTitle;
+    defer testing.allocator.free(title);
+    try testing.expectEqualStrings("Mine", title);
+    try testing.expectEqual(@as(usize, 2), try countTitleSets(t.store.manager, id));
 }
 
 test "a finished turn keeps no trace of its running calls" {
