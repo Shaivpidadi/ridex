@@ -1588,6 +1588,11 @@ fn writeUserTurn(writer: *std.Io.Writer, user: session.UserTurn, image_blobs: an
                 try writeDurableBytes(writer, inline_data);
             }
         }
+        if (image.source_ref) |source_ref| {
+            if (!image_data.validSourceRef(source_ref)) return error.InvalidSessionFormat;
+            try writer.writeAll(",\"source_ref\":");
+            try writeJsonString(writer, source_ref);
+        }
         try writer.writeByte('}');
     }
     try writer.writeByte(']');
@@ -1799,16 +1804,11 @@ fn writeExecutionToolResult(
             try writer.writeAll(",\"tool_image_handle\":");
             try writeDurableBytes(writer, handle);
         } else if (result.tool_images.len > 0) {
-            try writer.writeAll(",\"tool_images\":[");
-            for (result.tool_images, 0..) |image, index| {
-                if (index > 0) try writer.writeByte(',');
-                try writer.writeAll("{\"type\":\"image\",\"mimeType\":");
-                try std.json.Stringify.value(image.mime_type, .{}, writer);
-                try writer.writeAll(",\"data\":");
-                try std.json.Stringify.value(image.data, .{}, writer);
-                try writer.writeByte('}');
-            }
-            try writer.writeByte(']');
+            try writer.writeAll(",\"tool_images\":");
+            writePersistedToolImages(writer, result.tool_images) catch |err| switch (err) {
+                error.InvalidSourceRef, error.InvalidImage => return error.InvalidSessionFormat,
+                else => |write_err| return write_err,
+            };
         }
     }
     try writer.writeByte('}');
@@ -2053,6 +2053,12 @@ fn parseUserTurn(alloc: Allocator, value: std.json.Value, image_blobs: ?*ImageBl
         errdefer if (snapshot_sha256) |sha256_bytes| mem_utils.free(alloc, sha256_bytes);
         const inline_data = try parseInlineImageBytes(alloc, image, image_blobs);
         errdefer if (inline_data) |inline_bytes| mem_utils.free(alloc, inline_bytes);
+        const source_ref = if (image.get("source_ref")) |_| source: {
+            const source_bytes = try requireString(image, "source_ref");
+            if (!image_data.validSourceRef(source_bytes)) return error.InvalidSessionFormat;
+            break :source try alloc.dupe(u8, source_bytes);
+        } else null;
+        errdefer if (source_ref) |source_bytes| alloc.free(source_bytes);
         if (inline_data) |inline_bytes| {
             // Inline images carry their own bytes: no snapshot file, but the
             // digest stays so request-time verification is unchanged.
@@ -2066,6 +2072,7 @@ fn parseUserTurn(alloc: Allocator, value: std.json.Value, image_blobs: ?*ImageBl
             .snapshot_path = snapshot_path,
             .snapshot_sha256 = snapshot_sha256,
             .inline_data = inline_data,
+            .source_ref = source_ref,
         };
         parsed_count += 1;
     }
@@ -2103,7 +2110,8 @@ fn imageAttachmentObject(value: std.json.Value) !std.json.ObjectMap {
         } else if (std.mem.eql(u8, entry.key_ptr.*, "snapshot_path") or
             std.mem.eql(u8, entry.key_ptr.*, "snapshot_sha256") or
             std.mem.eql(u8, entry.key_ptr.*, "inline_data") or
-            std.mem.eql(u8, entry.key_ptr.*, "inline_blob"))
+            std.mem.eql(u8, entry.key_ptr.*, "inline_blob") or
+            std.mem.eql(u8, entry.key_ptr.*, "source_ref"))
         {
             continue;
         } else {
@@ -2668,6 +2676,58 @@ fn parseToolResultPresentations(
     };
 }
 
+/// Writes typed image blocks with persistence-owned source_ref spelling.
+pub fn writePersistedToolImages(writer: *std.Io.Writer, images: []const types.ToolImage) !void {
+    try writer.writeByte('[');
+    for (images, 0..) |image, index| {
+        if (index > 0) try writer.writeByte(',');
+        if (image.source_ref) |source_ref| {
+            if (!image_data.validSourceRef(source_ref)) return error.InvalidSourceRef;
+        } else if (image.data.len == 0) return error.InvalidImage;
+        try writer.writeAll("{\"type\":\"image\",\"mimeType\":");
+        try writeJsonString(writer, image.mime_type);
+        try writer.writeAll(",\"data\":");
+        try writeJsonString(writer, image.data);
+        if (image.source_ref) |source_ref| {
+            try writer.writeAll(",\"source_ref\":");
+            try writeJsonString(writer, source_ref);
+        }
+        try writer.writeByte('}');
+    }
+    try writer.writeByte(']');
+}
+
+/// Caller owns the images. Only field spelling is adapted; shared image
+/// admission retains its byte, count, media-type, and source-ref checks.
+pub fn parsePersistedToolImages(alloc: Allocator, content: []const std.json.Value) ![]types.ToolImage {
+    if (content.len > image_data.max_tool_images) return error.ImageLimitExceeded;
+    var has_source_ref = false;
+    for (content) |item| {
+        if (item != .object) return error.InvalidImage;
+        if (item.object.contains("sourceRef")) return error.InvalidSourceRef;
+        if (item.object.get("source_ref")) |value| {
+            if (value != .string or !image_data.validSourceRef(value.string)) return error.InvalidSourceRef;
+            has_source_ref = true;
+        }
+    }
+    if (!has_source_ref) return image_data.parseToolImages(alloc, content);
+
+    var normalized: [image_data.max_tool_images]std.json.Value = undefined;
+    var initialized: usize = 0;
+    defer for (normalized[0..initialized]) |*item| item.object.deinit(alloc);
+    for (content, 0..) |item, index| {
+        var object = try item.object.clone(alloc);
+        errdefer object.deinit(alloc);
+        if (object.get("source_ref")) |value| {
+            try object.put(alloc, "sourceRef", value);
+            _ = object.swapRemove("source_ref");
+        }
+        normalized[index] = .{ .object = object };
+        initialized += 1;
+    }
+    return image_data.parseToolImages(alloc, normalized[0..initialized]);
+}
+
 const ParsedToolResultImages = struct {
     handle: ?[]u8,
     items: []types.ToolImage,
@@ -2691,8 +2751,9 @@ fn parseToolResultImages(
     errdefer if (handle) |owned| mem_utils.free(alloc, owned);
     const items = if (object.get("tool_images")) |images| items: {
         if (images != .array) return error.InvalidSessionFormat;
-        const parsed = image_data.parseToolImages(alloc, images.array.items) catch |err| {
+        const parsed = parsePersistedToolImages(alloc, images.array.items) catch |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
+            if (err == error.InvalidSourceRef) return error.InvalidSessionFormat;
             const notice = try std.fmt.allocPrint(
                 alloc,
                 "{s}\n[Saved tool image unavailable: {s}]",
@@ -3372,6 +3433,31 @@ test "durable byte fields use canonical string or padded base64 representation" 
         var bad = try std.json.parseFromSlice(std.json.Value, alloc, json_text, .{});
         defer bad.deinit();
         try std.testing.expectError(error.InvalidDurableBytes, parseDurableBytes(alloc, bad.value));
+    }
+}
+
+test "durable tool image validation preserves the session format error contract" {
+    const alloc = std.testing.allocator;
+    const invalid_images = [_]types.ToolImage{
+        .{ .data = @constCast(""), .mime_type = @constCast("image/png"), .source_ref = @constCast("bad\nref") },
+        .{ .data = @constCast(""), .mime_type = @constCast("image/png") },
+    };
+    for (invalid_images) |image| {
+        var images = [_]types.ToolImage{image};
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        try std.testing.expectError(error.InvalidSessionFormat, writeExecutionToolResult(&out.writer, .{
+            .tool_call_id = @constCast("call"),
+            .tool_name = @constCast("host_image"),
+            .status = .success,
+            .output = @constCast(""),
+            .output_bytes = 0,
+            .stored_output_bytes = 0,
+            .truncated = false,
+            .provider_native = false,
+            .created_at_ms = 0,
+            .tool_images = &images,
+        }, .durable));
     }
 }
 
@@ -4830,6 +4916,7 @@ fn expectUserTurnEqual(expected: session.UserTurn, actual: session.UserTurn) !vo
         try expectOptionalBytesEqual(image.snapshot_path, got.snapshot_path);
         try expectOptionalBytesEqual(image.snapshot_sha256, got.snapshot_sha256);
         try expectOptionalBytesEqual(image.inline_data, got.inline_data);
+        try expectOptionalBytesEqual(image.source_ref, got.source_ref);
     }
 }
 
@@ -4881,30 +4968,54 @@ test "inline image bytes round trip through the history turn codec" {
     var digest: [Sha256.digest_length]u8 = undefined;
     Sha256.hash(png, &digest, .{});
     const digest_hex = std.fmt.bytesToHex(digest, .lower);
-    var images = [_]session.ImageAttachment{.{
-        .id = 2,
-        .path = @constCast("inline://image-2"),
-        .media_type = @constCast("image/png"),
-        .snapshot_sha256 = @constCast(&digest_hex),
-        .inline_data = @constCast(png),
-    }};
+    var images = [_]session.ImageAttachment{
+        .{
+            .id = 2,
+            .path = @constCast("inline://image-2"),
+            .media_type = @constCast("image/png"),
+            .snapshot_sha256 = @constCast(&digest_hex),
+            .inline_data = @constCast(png),
+            .source_ref = @constCast("host:original"),
+        },
+        .{
+            .id = 3,
+            .path = @constCast("inline://image-3"),
+            .media_type = @constCast("image/png"),
+            .source_ref = @constCast("host:deferred"),
+        },
+    };
     const turn: session.HistoryTurn = .{ .assistant = .{
-        .user = .{ .text = @constCast("look [Image #2]"), .images = &images },
+        .user = .{ .text = @constCast("look [Image #2]\n[Image #3]"), .images = &images },
         .assistant = @constCast("done"),
     } };
-    var encoded: std.Io.Writer.Allocating = .init(alloc);
-    defer encoded.deinit();
+    for ([_]bool{ false, true }) |raw| {
+        var encoded: std.Io.Writer.Allocating = .init(alloc);
+        defer encoded.deinit();
+        var blobs: std.ArrayList([]const u8) = .empty;
+        defer blobs.deinit(alloc);
+        if (raw) {
+            try writeHistoryTurnWithImageBlobs(&encoded.writer, turn, .{ .alloc = alloc, .items = &blobs });
+            try std.testing.expect(std.mem.find(u8, encoded.written(), "\"inline_blob\":0") != null);
+            try std.testing.expect(std.mem.find(u8, encoded.written(), "\"inline_data\"") == null);
+            try std.testing.expectEqual(@as(usize, 1), blobs.items.len);
+            try std.testing.expectEqualStrings(png, blobs.items[0]);
+        } else {
+            try writeHistoryTurn(&encoded.writer, turn);
+            try std.testing.expect(std.mem.find(u8, encoded.written(), "\"inline_data\":{") != null);
+        }
+        try std.testing.expect(std.mem.find(u8, encoded.written(), "\"snapshot_path\":null") != null);
+        try std.testing.expect(std.mem.find(u8, encoded.written(), "\"source_ref\":\"host:original\"") != null);
 
-    try writeHistoryTurn(&encoded.writer, turn);
-    // Inline bytes are embedded base64; no filesystem locator appears.
-    try std.testing.expect(std.mem.find(u8, encoded.written(), "\"inline_data\":{") != null);
-    try std.testing.expect(std.mem.find(u8, encoded.written(), "\"snapshot_path\":null") != null);
-
-    var parsed_value = try std.json.parseFromSlice(std.json.Value, alloc, encoded.written(), .{});
-    defer parsed_value.deinit();
-    const decoded = try parseHistoryTurn(alloc, parsed_value.value);
-    defer types.freeHistoryTurn(alloc, decoded);
-    try expectUserTurnEqual(turn.assistant.user, decoded.assistant.user);
+        var parsed_value = try std.json.parseFromSlice(std.json.Value, alloc, encoded.written(), .{});
+        defer parsed_value.deinit();
+        var reader = ImageBlobReader{ .blobs = blobs.items };
+        const decoded = try parseHistoryTurnWithImageBlobs(alloc, parsed_value.value, if (raw) &reader else null);
+        defer types.freeHistoryTurn(alloc, decoded);
+        try expectUserTurnEqual(turn.assistant.user, decoded.assistant.user);
+        try std.testing.expect(decoded.assistant.user.images[0].inline_data.?.ptr != images[0].inline_data.?.ptr);
+        try std.testing.expect(decoded.assistant.user.images[0].source_ref.?.ptr != images[0].source_ref.?.ptr);
+        try std.testing.expect(reader.consumedAll());
+    }
 }
 
 test "inline image parsing rejects missing digest and mismatched bytes" {
@@ -4940,21 +5051,31 @@ test "inline image parsing rejects missing digest and mismatched bytes" {
             .media_type = @constCast(case.media_type),
             .snapshot_sha256 = if (case.snapshot_sha256) |value| @constCast(value) else null,
             .inline_data = @constCast(case.bytes),
+            .source_ref = @constCast("host:original"),
         }};
         const turn: session.HistoryTurn = .{ .assistant = .{
             .user = .{ .text = @constCast("[Image #1]"), .images = &images },
             .assistant = @constCast("done"),
         } };
-        var encoded: std.Io.Writer.Allocating = .init(alloc);
-        defer encoded.deinit();
-        try writeHistoryTurn(&encoded.writer, turn);
-        var parsed_value = try std.json.parseFromSlice(std.json.Value, alloc, encoded.written(), .{});
-        defer parsed_value.deinit();
-        if (should_fail) {
-            try std.testing.expectError(error.InvalidSessionFormat, parseHistoryTurn(alloc, parsed_value.value));
-        } else {
-            const decoded = try parseHistoryTurn(alloc, parsed_value.value);
-            types.freeHistoryTurn(alloc, decoded);
+        for ([_]bool{ false, true }) |raw| {
+            var encoded: std.Io.Writer.Allocating = .init(alloc);
+            defer encoded.deinit();
+            var blobs: std.ArrayList([]const u8) = .empty;
+            defer blobs.deinit(alloc);
+            if (raw) {
+                try writeHistoryTurnWithImageBlobs(&encoded.writer, turn, .{ .alloc = alloc, .items = &blobs });
+            } else {
+                try writeHistoryTurn(&encoded.writer, turn);
+            }
+            var parsed_value = try std.json.parseFromSlice(std.json.Value, alloc, encoded.written(), .{});
+            defer parsed_value.deinit();
+            var reader = ImageBlobReader{ .blobs = blobs.items };
+            if (should_fail) {
+                try std.testing.expectError(error.InvalidSessionFormat, parseHistoryTurnWithImageBlobs(alloc, parsed_value.value, if (raw) &reader else null));
+            } else {
+                const decoded = try parseHistoryTurnWithImageBlobs(alloc, parsed_value.value, if (raw) &reader else null);
+                types.freeHistoryTurn(alloc, decoded);
+            }
         }
     }
 }
@@ -5345,6 +5466,119 @@ fn fuzzDurableSessionOptionalFields(_: void, smith: *std.testing.Smith) !void {
         .max_value_bytes = buffer.len,
     }) catch return;
     state.deinit(std.testing.allocator);
+}
+
+test "recovery checkpoint image and tool source refs round trip with independent ownership" {
+    const alloc = std.testing.allocator;
+    const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jP0cAAAAASUVORK5CYII=";
+    const pixels = image_data.testPngHeader(1, 1);
+    var attachments = [_]types.ImageAttachment{
+        .{
+            .id = 1,
+            .path = @constCast("inline://image-1"),
+            .media_type = @constCast("image/png"),
+            .inline_data = @constCast(&pixels),
+            .snapshot_sha256 = @constCast("digest"),
+            .source_ref = @constCast("host:original"),
+        },
+        .{
+            .id = 2,
+            .path = @constCast("inline://image-2"),
+            .media_type = @constCast("image/jpeg"),
+            .source_ref = @constCast("host:large"),
+        },
+    };
+    var tool_images = [_]types.ToolImage{
+        .{ .data = @constCast(png), .mime_type = @constCast("image/png"), .source_ref = @constCast("host:copy") },
+        .{ .data = @constCast(""), .mime_type = @constCast("image/jpeg"), .source_ref = @constCast("host:large") },
+    };
+    var results = [_]types.PersistedToolResult{.{
+        .tool_call_id = @constCast("recover"),
+        .tool_name = @constCast("host_image"),
+        .status = .success,
+        .output = @constCast("image result"),
+        .output_bytes = 12,
+        .stored_output_bytes = 12,
+        .tool_images = &tool_images,
+    }};
+    var calls = [_]types.ToolCall{.{ .id = "recover", .name = "host_image", .arguments_json = @constCast("{}") }};
+    var steps = [_]types.ToolExecutionStep{.{ .tool_calls = &calls, .tool_results = &results }};
+    const checkpoint: RecoveryCheckpoint = .{
+        .turn_id = 1,
+        .user = .{ .text = @constCast("inspect"), .images = &attachments },
+        .assistant_source = @constCast("partial"),
+        .execution = .{ .tool_steps = &steps },
+        .cause = .response_interrupted,
+        .action = .continuing_response,
+        .authority = .{ .provider = .gateway, .model = @constCast("test/model") },
+        .requested_fast_mode = false,
+        .fast_mode = false,
+        .max_provider_attempts = 3,
+        .consumed_provider_attempts = 1,
+    };
+    const bytes = try encodeRecoveryCheckpoint(alloc, checkpoint);
+    defer alloc.free(bytes);
+    try std.testing.expect(std.mem.find(u8, bytes, "\"sourceRef\"") == null);
+    try std.testing.checkAllAllocationFailures(alloc, struct {
+        fn check(a: Allocator, encoded: []const u8) !void {
+            var parsed = try std.json.parseFromSlice(std.json.Value, a, encoded, .{});
+            defer parsed.deinit();
+            var decoded = try parseRecoveryCheckpoint(a, parsed.value);
+            defer decoded.deinit(a);
+            var copy = try decoded.dupe(a);
+            defer copy.deinit(a);
+            decoded.user.images[0].source_ref.?[0] = 'X';
+            decoded.execution.tool_steps[0].tool_results[0].tool_images[0].source_ref.?[0] = 'X';
+            try std.testing.expectEqualStrings("host:original", copy.user.images[0].source_ref.?);
+            try std.testing.expectEqualStrings("host:large", copy.user.images[1].source_ref.?);
+            try std.testing.expectEqualStrings("inline://image-2", copy.user.images[1].path);
+            try std.testing.expect(copy.user.images[1].inline_data == null);
+            try std.testing.expect(copy.user.images[1].snapshot_path == null);
+            try std.testing.expect(copy.user.images[1].snapshot_sha256 == null);
+            const images = copy.execution.tool_steps[0].tool_results[0].tool_images;
+            try std.testing.expectEqualStrings("host:copy", images[0].source_ref.?);
+            try std.testing.expectEqualStrings("host:large", images[1].source_ref.?);
+            try std.testing.expectEqualStrings("", images[1].data);
+            try std.testing.expectEqual(@as(u8, 2), copy.version);
+        }
+    }.check, .{bytes});
+}
+
+test "persisted image source refs reject malformed metadata and preserve the byte bound" {
+    const alloc = std.testing.allocator;
+    var user = try std.json.parseFromSlice(std.json.Value, alloc, "{\"text\":\"inspect\",\"images\":[{\"id\":1,\"path\":\"inline://image-1\",\"media_type\":\"image/png\",\"source_ref\":\"host:original\"}]}", .{});
+    defer user.deinit();
+    var tools = try std.json.parseFromSlice(std.json.Value, alloc, "[{\"type\":\"image\",\"mimeType\":\"image/png\",\"source_ref\":\"host:original\"}]", .{});
+    defer tools.deinit();
+    const invalid = [_]std.json.Value{
+        .null,
+        .{ .integer = 7 },
+        .{ .string = "" },
+        .{ .string = "host\x00bad" },
+        .{ .string = "host\nbad" },
+        .{ .string = "host\x1fbad" },
+        .{ .string = "host\x7fbad" },
+        .{ .string = "\xff" },
+        .{ .string = "r" ** 513 },
+    };
+    const user_ref = user.value.object.getPtr("images").?.array.items[0].object.getPtr("source_ref").?;
+    const tool_ref = tools.value.array.items[0].object.getPtr("source_ref").?;
+    for (invalid) |value| {
+        user_ref.* = value;
+        tool_ref.* = value;
+        try std.testing.expectError(error.InvalidSessionFormat, parseUserTurn(alloc, user.value, null));
+        try std.testing.expectError(error.InvalidSourceRef, parsePersistedToolImages(alloc, tools.value.array.items));
+    }
+    const boundary = "é" ** 256;
+    user_ref.* = .{ .string = boundary };
+    tool_ref.* = .{ .string = boundary };
+    const decoded_user = try parseUserTurn(alloc, user.value, null);
+    defer session.freeUserTurn(alloc, decoded_user);
+    const decoded_tools = try parsePersistedToolImages(alloc, tools.value.array.items);
+    defer types.freeToolImages(alloc, decoded_tools);
+    try std.testing.expectEqualStrings(boundary, decoded_user.images[0].source_ref.?);
+    try std.testing.expectEqualStrings(boundary, decoded_tools[0].source_ref.?);
+    try std.testing.expectEqualStrings("", decoded_tools[0].data);
 }
 
 test "session metadata round trips without conversation or control state" {

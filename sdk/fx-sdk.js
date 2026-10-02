@@ -24,8 +24,10 @@ const maxUnreadEvents = 256;
 // request data, and a prompt's images 8 MiB, so the raw limits are 3/4 of that.
 // The kernel still validates content and media type.
 const maxPromptImages = 8;
-const maxPromptImageBytes = (5 * 1024 * 1024 / 4) * 3;
-const maxPromptImagesBytes = (8 * 1024 * 1024 / 4) * 3;
+const maxPromptImageDataBytes = 5 * 1024 * 1024;
+const maxPromptImagesDataBytes = 8 * 1024 * 1024;
+const maxPromptImageBytes = (maxPromptImageDataBytes / 4) * 3;
+const maxPromptImagesBytes = (maxPromptImagesDataBytes / 4) * 3;
 // Matches the native attachment table: one prompt's images or one checkpoint.
 const maxPendingAttachments = 8;
 const maxOutboundAttachments = 4;
@@ -1367,6 +1369,31 @@ function blobByteLength(value) {
   }
 }
 
+function normalizeImageSourceRef(value, name) {
+  boundedString(value, `${name} sourceRef`, 512, false);
+  if (value !== undefined && /[\x00-\x1f\x7f\uD800-\uDFFF]/u.test(value)) {
+    throw new TypeError(`${name} sourceRef must be valid UTF-8 without ASCII controls`);
+  }
+  return value;
+}
+
+function omitReferencedImageData(blocks) {
+  return blocks.map((block) => block.type !== "image" || block.sourceRef === undefined ? block : {
+    type: "image",
+    mimeType: block.mimeType,
+    sourceRef: block.sourceRef,
+  });
+}
+
+function promptImageDataBytes(prompt) {
+  return prompt.reduce((total, block) => {
+    if (block.type !== "image") return total;
+    if (typeof block.data === "string") return total + block.data.length;
+    const byteLength = block.bytes?.byteLength ?? block.byteLength ?? blobByteLength(block.data) ?? 0;
+    return total + Math.ceil(byteLength / 3) * 4;
+  }, 0);
+}
+
 // Returns a Uint8Array view of an ArrayBuffer or typed array, or null.
 function byteView(value) {
   if (value instanceof ArrayBuffer) return new Uint8Array(value);
@@ -1407,9 +1434,15 @@ function checkPromptImagesByteLength(byteLength) {
   }
 }
 
-// Normalizes one image block to { type, source, data, mimeType, byteLength },
-// where source is "blob", "base64", or "bytes".
+// Pixel inputs carry a private source and byteLength until preparation;
+// reference-only inputs remain public image descriptors without pixel data.
 function normalizePromptImage(block, index) {
+  const sourceRef = normalizeImageSourceRef(block.sourceRef, `image prompt block ${index}`);
+  const reference = sourceRef === undefined ? {} : { sourceRef };
+  if (block.data === undefined && sourceRef !== undefined) {
+    requireImageMimeType(block.mimeType, index);
+    return { type: "image", mimeType: block.mimeType, ...reference };
+  }
   const size = blobByteLength(block.data);
   if (size !== null) {
     const mimeType = block.data.type;
@@ -1420,20 +1453,20 @@ function normalizePromptImage(block, index) {
     if (!Number.isSafeInteger(size) || size <= 0) {
       throw new TypeError(`image prompt block ${index} requires a non-empty Blob with a valid size`);
     }
-    return { type: "image", source: "blob", data: block.data, mimeType, byteLength: size };
+    return { type: "image", source: "blob", data: block.data, mimeType, byteLength: size, ...reference };
   }
   if (typeof block.data === "string" && block.data.length > 0) {
     requireImageMimeType(block.mimeType, index);
     const byteLength = canonicalBase64ByteLength(block.data);
     if (byteLength <= 0) throw new TypeError(`image prompt block ${index} requires canonical base64 data`);
-    return { type: "image", source: "base64", data: block.data, mimeType: block.mimeType, byteLength };
+    return { type: "image", source: "base64", data: block.data, mimeType: block.mimeType, byteLength, ...reference };
   }
   const bytes = typeof block.data === "string" ? null : byteView(block.data);
   if (!bytes || bytes.byteLength === 0) {
     throw new TypeError(`image prompt block ${index} requires base64 data, bytes, or a Blob`);
   }
   requireImageMimeType(block.mimeType, index);
-  return { type: "image", source: "bytes", data: bytes, mimeType: block.mimeType, byteLength: bytes.byteLength };
+  return { type: "image", source: "bytes", data: bytes, mimeType: block.mimeType, byteLength: bytes.byteLength, ...reference };
 }
 
 // With deferImageLimits, byte limits apply after resizeImage instead.
@@ -1442,7 +1475,7 @@ function normalizePromptInput(input, { deferImageLimits = false } = {}) {
   if (!Array.isArray(input)) throw new TypeError("prompt input must be a string or an array of prompt blocks");
   let imageCount = 0;
   let imageBytes = 0;
-  return input.map((block, index) => {
+  let prompt = input.map((block, index) => {
     if (!block || typeof block !== "object") throw new TypeError(`prompt block ${index} must be an object`);
     if (block.type === "image") {
       const image = normalizePromptImage(block, index);
@@ -1451,9 +1484,11 @@ function normalizePromptInput(input, { deferImageLimits = false } = {}) {
         throw new RangeError(`prompt cannot contain more than ${maxPromptImages} images`);
       }
       if (!deferImageLimits) {
-        checkImageByteLength(image.byteLength, index);
-        imageBytes += image.byteLength;
-        checkPromptImagesByteLength(imageBytes);
+        if (image.byteLength > maxPromptImageBytes && image.sourceRef !== undefined) {
+          return omitReferencedImageData([image])[0];
+        }
+        checkImageByteLength(image.byteLength ?? 0, index);
+        imageBytes += image.byteLength ?? 0;
       }
       return image;
     }
@@ -1469,6 +1504,15 @@ function normalizePromptInput(input, { deferImageLimits = false } = {}) {
     }
     throw new TypeError(`unsupported prompt block type: ${String(block.type)}`);
   });
+  if (!deferImageLimits) {
+    if (imageBytes > maxPromptImagesBytes) {
+      prompt = omitReferencedImageData(prompt);
+      imageBytes = prompt.reduce((total, block) => total + (block.type === "image" ? block.byteLength ?? 0 : 0), 0);
+    }
+    checkPromptImagesByteLength(imageBytes);
+    if (promptFrameSize(prompt) > maxPromptFrameBytes) prompt = omitReferencedImageData(prompt);
+  }
+  return prompt;
 }
 
 // Image bytes travel beside the frame as attachment references, but the model
@@ -1476,11 +1520,12 @@ function normalizePromptInput(input, { deferImageLimits = false } = {}) {
 // 8 MiB. Images therefore count at their encoded size, the same budget they
 // had inside the frame. With countImages false, only the frame counts.
 function promptFrameSize(prompt, countImages = true) {
-  let encodedImageBytes = 0;
-  const projected = prompt.map((block) => {
-    if (block.type !== "image") return block;
-    if (countImages) encodedImageBytes += Math.ceil((block.bytes?.byteLength ?? block.byteLength) / 3) * 4;
-    return { type: "image", mimeType: block.mimeType, _meta: { fx: { attachment: 0xffffffff } } };
+  const encodedImageBytes = countImages ? promptImageDataBytes(prompt) : 0;
+  const projected = prompt.map((block) => block.type !== "image" ? block : {
+    type: "image",
+    mimeType: block.mimeType,
+    ...(block.sourceRef === undefined ? {} : { sourceRef: block.sourceRef }),
+    ...(block.data === undefined && block.bytes === undefined ? {} : { _meta: { fx: { attachment: 0xffffffff } } }),
   });
   return encoder.encode(JSON.stringify({ sessionId: "", prompt: projected })).length +
     encodedImageBytes + promptFrameEnvelopeBytes;
@@ -1495,10 +1540,11 @@ function checkPromptFrameSize(prompt, countImages) {
 // Returns prompt blocks whose images carry { mimeType, bytes }. Synchronous
 // sources only: base64 is decoded and caller bytes are used in place.
 function preparePromptImages(blocks) {
-  return blocks.map((block) => block.type !== "image" ? block : {
+  return blocks.map((block) => block.type !== "image" || block.data === undefined ? block : {
     type: "image",
     mimeType: block.mimeType,
     bytes: block.source === "base64" ? base64ToBytes(block.data) : block.data,
+    ...(block.sourceRef === undefined ? {} : { sourceRef: block.sourceRef }),
   });
 }
 
@@ -1515,11 +1561,12 @@ function resizedPromptImage(value, index) {
 // Reads Blob images and applies resizeImage, then checks the final byte and
 // frame limits. Returns null when the turn is cancelled first.
 async function materializePromptImages(blocks, isCancelled, resizeImage) {
-  const prepared = [];
+  let prepared = [];
   let imageBytes = 0;
-  for (const [index, block] of blocks.entries()) {
+  for (let index = 0; index < blocks.length; index++) {
     if (isCancelled()) return null;
-    if (block.type !== "image") {
+    const block = blocks[index];
+    if (block.type !== "image" || block.data === undefined) {
       prepared.push(block);
       continue;
     }
@@ -1531,11 +1578,27 @@ async function materializePromptImages(blocks, isCancelled, resizeImage) {
       image = resizedPromptImage(await resizeImage({ bytes: image.bytes, mimeType: image.mimeType }), index);
       if (isCancelled()) return null;
     }
-    checkImageByteLength(image.bytes.byteLength, index);
-    imageBytes += image.bytes.byteLength;
+    image = {
+      type: "image",
+      mimeType: image.mimeType,
+      bytes: image.bytes,
+      ...(block.sourceRef === undefined ? {} : { sourceRef: block.sourceRef }),
+    };
+    if (image.bytes.byteLength > maxPromptImageBytes && image.sourceRef !== undefined) {
+      image = omitReferencedImageData([image])[0];
+    }
+    checkImageByteLength(image.bytes?.byteLength ?? 0, index);
+    imageBytes += image.bytes?.byteLength ?? 0;
+    prepared.push(image);
+    if (imageBytes > maxPromptImagesBytes) {
+      prepared = omitReferencedImageData(prepared);
+      // Do not read more referenced Blobs after the actual aggregate overflows.
+      blocks = omitReferencedImageData(blocks);
+      imageBytes = prepared.reduce((total, entry) => total + (entry.bytes?.byteLength ?? 0), 0);
+    }
     checkPromptImagesByteLength(imageBytes);
-    prepared.push({ type: "image", mimeType: image.mimeType, bytes: image.bytes });
   }
+  if (promptFrameSize(prepared) > maxPromptFrameBytes) prepared = omitReferencedImageData(prepared);
   checkPromptFrameSize(prepared, true);
   return prepared;
 }
@@ -1612,17 +1675,28 @@ function hostToolContent(value) {
     if (typeof value.text !== "string" || !Array.isArray(value.images) || value.images.length > 8) {
       throw new TypeError("invalid typed tool result");
     }
-    let imageBytes = 0;
-    const images = value.images.map((image) => {
-      if (image?.type !== "image" || typeof image.data !== "string" || typeof image.mimeType !== "string" || image.mimeType.length > 128 || image.data.length > 5 * 1024 * 1024) {
+    let images = value.images.map((image) => {
+      if (image?.type !== "image") throw new TypeError("invalid tool image");
+      const sourceRef = normalizeImageSourceRef(image.sourceRef, "tool image");
+      const referenceOnly = image.data === undefined && sourceRef !== undefined;
+      if ((!referenceOnly && typeof image.data !== "string") || typeof image.mimeType !== "string" || image.mimeType.length === 0 || image.mimeType.length > 128 || (image.data?.length > maxPromptImageDataBytes && sourceRef === undefined)) {
         throw new TypeError("invalid tool image");
       }
-      imageBytes += image.data.length;
-      if (imageBytes > 8 * 1024 * 1024) throw new RangeError("tool images exceed the result limit");
-      return { type: "image", data: image.data, mimeType: image.mimeType };
+      return {
+        type: "image",
+        ...(!referenceOnly && image.data.length <= maxPromptImageDataBytes ? { data: image.data } : {}),
+        mimeType: image.mimeType,
+        ...(sourceRef === undefined ? {} : { sourceRef }),
+      };
     });
-    const content = JSON.stringify({ text: value.text, images });
-    if (new TextEncoder().encode(content).length > 8 * 1024 * 1024) throw new RangeError("typed tool result exceeds the result limit");
+    if (promptImageDataBytes(images) > maxPromptImagesDataBytes) images = omitReferencedImageData(images);
+    if (promptImageDataBytes(images) > maxPromptImagesDataBytes) throw new RangeError("tool images exceed the result limit");
+    let content = JSON.stringify({ text: value.text, images });
+    if (encoder.encode(content).length > maxPromptImagesDataBytes) {
+      images = omitReferencedImageData(images);
+      content = JSON.stringify({ text: value.text, images });
+    }
+    if (encoder.encode(content).length > maxPromptImagesDataBytes) throw new RangeError("typed tool result exceeds the result limit");
     return { content, rich: true, isError: value.isError === true };
   }
   if (typeof value === "string") return { content: value, rich: false };
@@ -1827,13 +1901,14 @@ export async function createFxAgent(options = {}) {
     return new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   }
   const sendPrompt = (blocks) => {
-    const images = blocks.filter((block) => block.type === "image");
+    const images = blocks.filter((block) => block.type === "image" && block.bytes !== undefined);
     const ids = images.length ? attachBytes(images.map((block) => block.bytes)) : [];
     let next = 0;
     const prompt = blocks.map((block) => block.type !== "image" ? block : {
       type: "image",
       mimeType: block.mimeType,
-      _meta: { fx: { attachment: ids[next++] } },
+      ...(block.sourceRef === undefined ? {} : { sourceRef: block.sourceRef }),
+      ...(block.bytes === undefined ? {} : { _meta: { fx: { attachment: ids[next++] } } }),
     });
     return request("session/prompt", { sessionId, prompt });
   };
@@ -1876,6 +1951,10 @@ export async function createFxAgent(options = {}) {
       );
       if (cancelled || closing) return;
       const response = { jsonrpc: "2.0", id: message.id, result: { content, isError, ...(rich ? { contentType: "rich" } : {}) } };
+      if (rich && encoder.encode(JSON.stringify(response)).length + 1 > maxPromptFrameBytes) {
+        const result = JSON.parse(content);
+        response.result.content = JSON.stringify({ ...result, images: omitReferencedImageData(result.images) });
+      }
       if (encoder.encode(JSON.stringify(response)).length + 1 > 8 * 1024 * 1024) {
         response.result = { content: "Host tool result exceeded the response frame limit", isError: true };
       }
@@ -2033,9 +2112,9 @@ export async function createFxAgent(options = {}) {
   function startTurn(input, promptOptions) {
     const resizeImage = options.resizeImage;
     const normalized = normalizePromptInput(input, { deferImageLimits: resizeImage !== undefined });
-    const hasImages = normalized.some((block) => block.type === "image");
+    const hasPixels = normalized.some((block) => block.type === "image" && block.data !== undefined);
     // Blob reads and resizeImage run before the prompt frame is sent.
-    const asyncImages = hasImages && (resizeImage !== undefined ||
+    const asyncImages = hasPixels && (resizeImage !== undefined ||
       normalized.some((block) => block.type === "image" && block.source === "blob"));
     // resizeImage decides the final image sizes, so they are counted after it runs.
     checkPromptFrameSize(normalized, resizeImage === undefined);

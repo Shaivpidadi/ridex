@@ -136,35 +136,57 @@ answer-size limit or a bound on retained conversation history.
 Image blocks accept a `Blob` or `File` with a non-empty `type`, raw bytes
 (`Uint8Array`, `Buffer`, `ArrayBuffer`, or another typed array) with an
 explicit `mimeType`, or canonical base64 (no line wrapping) with an explicit
-`mimeType`. The payload must be PNG, JPEG, GIF, or WebP:
+`mimeType`. The payload must be PNG, JPEG, GIF, or WebP. For a Blob, the MIME
+type is inferred from `Blob.type`; an empty type or a conflicting explicit
+`mimeType` rejects the input:
 
 ```js
 const turn = agent.prompt([
   { type: "text", text: "What does this screenshot show?" },
-  { type: "image", data: file }, // File or Blob, with file.type
+  { type: "image", data: file, sourceRef: "uploads:screenshot-1" }, // File or Blob, with file.type
   // Or: { type: "image", data: pngBytes, mimeType: "image/png" }
   // Or: { type: "image", data: base64Png, mimeType: "image/png" }
 ]);
 ```
 
-Image bytes reach the agent core beside the prompt message rather than inside
-it, so the only base64 encoding is the one the model request requires. A prompt
-may contain up to 8 images, each with up to 3.75 MiB (3,932,160 bytes), with at
-most 6 MiB of image data per prompt. Once encoded for the model request, those
-limits are 5 MiB per image and 8 MiB per prompt, and the prompt's text and
-encoded images must fit in 8 MiB together. The SDK checks Blob size
-before reading it and the actual byte count after reading it, and rejects
-larger input with typed `RangeError`s. Base64 that is not canonical throws a
-`TypeError` from `prompt()`. Raw bytes are copied before `prompt()` returns, so
-the caller can reuse its buffer. Blob reads are asynchronous: `prompt()`
-returns a turn, and read failures reject `turn.result`. Cancelling or closing
-while a Blob is being read settles the turn without sending its prompt. For
-base64 and byte input, size errors still throw synchronously from `prompt()`.
+An optional `sourceRef` identifies a host-owned original. It must be a non-empty
+UTF-8 string of at most 512 bytes, without ASCII control characters (0–31 or
+DEL). With a reference, you may omit `data` entirely:
 
-To downscale or convert images before they are sent, pass `resizeImage` when
-creating the agent. It receives `{ bytes, mimeType }`, where `bytes` is a
-`Uint8Array`, and returns `{ bytes, mimeType }` directly or as a promise.
-`bytes` may be any typed array or `ArrayBuffer`:
+```js
+agent.prompt([
+  { type: "image", mimeType: "image/png", sourceRef: "uploads:screenshot-1" },
+]);
+```
+
+Image bytes reach the agent core beside the ACP prompt message rather than
+inside it. Base64 input is decoded before transfer; prompt image bytes are
+encoded as base64 only for the model request. A prompt may contain up to
+8 images, including reference-only blocks. Each image may contain up to
+3.75 MiB (3,932,160 bytes) of raw data, with at most 6 MiB of raw image data
+per prompt. Once encoded for the model request, those limits are 5 MiB per
+image and 8 MiB per prompt. The prompt's text, encoded images, and metadata
+must fit within the same 8 MiB frame budget.
+
+Without `resizeImage`, the SDK checks Blob size before reading it and the actual
+byte count after reading it. If referenced image data would exceed a per-image,
+aggregate image, or combined frame limit, the SDK sends its MIME type and
+reference without image data. Referenced Blobs known to exceed those limits
+remain unread and host-owned. A reference does not increase the limits;
+unreferenced oversized input rejects with typed `RangeError`s.
+
+Base64 that is not canonical throws a `TypeError` from `prompt()`. Raw bytes
+are copied before `prompt()` returns, so the caller can reuse its buffer. Blob
+reads are asynchronous: `prompt()` returns a turn, and read failures reject
+`turn.result`. Cancelling or closing during a Blob read settles the turn without
+sending its prompt. Without `resizeImage`, size errors for unreferenced base64
+and raw-byte input throw synchronously from `prompt()`.
+
+To downscale or convert prompt images before they are sent, pass the optional
+`resizeImage` hook when creating the agent. It receives `{ bytes, mimeType }`,
+where `bytes` is a `Uint8Array`, and returns `{ bytes, mimeType }` directly or
+as a promise. Returned `bytes` may be any typed array or `ArrayBuffer`.
+For a Node.js host that already uses `sharp`:
 
 ```js
 import sharp from "sharp";
@@ -179,21 +201,69 @@ const agent = await createFxAgent({
 });
 ```
 
-In a browser, the bytes from `OffscreenCanvas.convertToBlob()` and
-`Blob.arrayBuffer()` can be returned as is. The returned bytes are copied, so
-the hook may reuse its buffer. With `resizeImage`, the size limits
-apply to its output rather than its input, image prompts are prepared
-asynchronously like a Blob prompt, and a failure inside the hook rejects
-`turn.result`.
+In a browser, return the `ArrayBuffer` from `Blob.arrayBuffer()`, including a
+Blob produced by `OffscreenCanvas.convertToBlob()`. The returned bytes are
+copied, so the hook may reuse its buffer. With `resizeImage`, image size limits
+apply to its output rather than its input; image count and frame metadata
+limits still apply. Image prompts with data are prepared asynchronously like
+a Blob prompt, and a failure inside the hook rejects `turn.result`. This
+opt-in preprocessing reads supplied Blob data even when its original size
+exceeds the limits. Reference-only blocks have no bytes and do not call the
+hook or fetch the original. The hook is host-provided, not a built-in image
+converter or a libfx runtime dependency.
 
 The kernel sniffs the final bytes and compares them with the claimed MIME type
-for every input form; a mismatch fails the turn with
-`Invalid image prompt block`. Images are routed only to models that advertise
-image input; for any other model the turn fails with
+for every input form that carries data; a mismatch fails the turn with
+`Invalid image prompt block`. Eligible images reach the model unchanged unless
+your hook changes them. Images are routed only to models that advertise image
+input; for any other model the turn fails with
 `Image prompts are unavailable for the selected model` and no image bytes
-leave the process. Prompt images are retained in checkpoints as raw bytes
-within the existing 4 MiB checkpoint bound, so a restored agent can refer to
-earlier images on either backend.
+leave the process. Images outside the request's pixel or encoded-size limits,
+and reference-only originals, are withheld with model-visible recovery feedback
+that includes their `sourceRef` when supplied.
+
+A source reference is metadata, not an access grant or an automatic fetch.
+Your host owns the original's lifetime, reference resolution, and authorization.
+Expose preparation or retrieval through your existing tools' `execute()`
+callbacks if the agent needs a smaller copy. libfx has no built-in image resizer,
+shell, global converter, or source store, and a reference grants no native
+filesystem authority. If a tool is absent or fails, the original remains
+withheld rather than being sent anyway.
+
+For example, a tool can delegate to your app's authorized image store:
+
+```js
+const prepareImage = {
+  name: "prepare_image",
+  description: "Return a new smaller copy of a host-owned image. Use the request limit for maxSide.",
+  inputSchema: {
+    type: "object",
+    properties: { sourceRef: { type: "string" }, maxSide: { type: "integer" } },
+    required: ["sourceRef", "maxSide"],
+  },
+  async execute({ sourceRef, maxSide }, { signal }) {
+    const copy = await imageStore.prepareCopy(sourceRef, { maxSide, signal });
+    return {
+      type: "libfx.tool-result",
+      text: "Prepared a new copy; original unchanged.",
+      images: [{ type: "image", data: copy.base64, mimeType: copy.mimeType, sourceRef }],
+    };
+  },
+};
+// Supply prepareImage in createFxAgent({ tools: [prepareImage], ... }).
+```
+
+`imageStore` is application code, not a libfx API. It must authorize references,
+validate the requested dimensions, and stop conversion when `signal` aborts.
+The returned copy is checked again by the kernel before model submission.
+Typed host-tool images still use base64 `data`; `resizeImage` prepares prompt
+images only.
+
+Version 2 checkpoints retain prompt images as raw image blobs and preserve
+source refs within the existing 4 MiB checkpoint bound on both backends. A
+checkpoint does not store a source file or host-owned original for a
+reference-only block. On restoration, resupply your tools and restore the
+sources those refs identify.
 
 Only one top-level prompt may run at a time. While it runs,
 `await turn.steer(text)` appends guidance at the next safe model boundary
@@ -306,6 +376,29 @@ A host tool may use any name, including the kernel's builtin names such as
 `write_file` and `edit_file`: the kernel routes by the registered executor, so
 a host-defined `write_file` calls the host's `execute()` rather than the
 builtin file mutation.
+
+Ordinary objects returned by tools are JSON text. To return rich image content,
+use the typed result:
+
+```js
+return {
+  type: "libfx.tool-result",
+  text: "Original is available through the host image tools.",
+  images: [
+    { type: "image", mimeType: "image/png", sourceRef: "uploads:screenshot-1" },
+    // A prepared copy may also include data: base64Png.
+  ],
+};
+```
+
+Tool images require `mimeType` and accept base64 `data`, or a `sourceRef` with no
+`data`. They do not accept raw bytes or Blobs and do not run `resizeImage`.
+References use the same validation, ownership, recovery feedback, and checkpoint
+rules as prompt images. A result may contain up to 8 images, each with up to
+5 MiB of base64-encoded data. Its text, encoded images, and metadata must fit
+within the 8 MiB result/frame bound. Referenced data is omitted if those bounds
+would overflow; an unreferenced oversized result remains a tool error.
+
 Instructions are limited to 64 KiB of UTF-8 text, including text assembled by
 the MCP and skills adapters. They are the complete host-owned system context:
 libfx adds no hidden base prompt, and omitting `instructions` sends no system

@@ -26,6 +26,7 @@ const sm = @import("session_manager");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const types = @import("../shared/types.zig");
+const image_data = @import("../images/image_data.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const session_event = @import("session_event.zig");
 const result_store = @import("result_store.zig");
@@ -2948,6 +2949,18 @@ const WireUser = struct {
         snapshot_path: ?[]const u8 = null,
         snapshot_sha256: ?[]const u8 = null,
         inline_data: ?[]const u8 = null,
+        source_ref: ?[]const u8 = null,
+
+        pub fn jsonStringify(self: WireImage, writer: *std.json.Stringify) !void {
+            try writer.beginObject();
+            inline for (std.meta.fields(WireImage)) |field| {
+                if (!std.mem.eql(u8, field.name, "source_ref") or self.source_ref != null) {
+                    try writer.objectField(field.name);
+                    try writer.write(@field(self, field.name));
+                }
+            }
+            try writer.endObject();
+        }
     };
 
     const codec = std.base64.standard;
@@ -2955,6 +2968,9 @@ const WireUser = struct {
     fn of(a: Allocator, user: session_event.ConversationUser) !WireUser {
         const images = try a.alloc(WireImage, user.images.len);
         for (user.images, images) |image, *wire| {
+            if (image.source_ref) |value| {
+                if (!image_data.validSourceRef(value)) return error.InvalidSessionFormat;
+            }
             wire.* = .{
                 .id = image.id,
                 .path = image.path,
@@ -2965,6 +2981,7 @@ const WireUser = struct {
                     const encoded = try a.alloc(u8, codec.Encoder.calcSize(bytes.len));
                     break :blk codec.Encoder.encode(encoded, bytes);
                 } else null,
+                .source_ref = image.source_ref,
             };
         }
         return .{ .text = user.text, .images = images, .work_id = user.work_id };
@@ -2973,6 +2990,9 @@ const WireUser = struct {
     fn toUser(wire: WireUser, a: Allocator) !session_event.ConversationUser {
         const images = try a.alloc(types.ImageAttachment, wire.images.len);
         for (wire.images, images) |image, *out| {
+            if (image.source_ref) |value| {
+                if (!image_data.validSourceRef(value)) return error.InvalidSessionFormat;
+            }
             out.* = .{
                 .id = image.id,
                 .path = try a.dupe(u8, image.path),
@@ -2985,6 +3005,7 @@ const WireUser = struct {
                     codec.Decoder.decode(bytes, encoded) catch return error.InvalidSessionFormat;
                     break :blk bytes;
                 } else null,
+                .source_ref = if (image.source_ref) |value| try a.dupe(u8, value) else null,
             };
         }
         return .{ .text = wire.text, .images = images, .work_id = wire.work_id };
@@ -4569,29 +4590,69 @@ test "a prompt image's bytes ride inside the user's item, and an image without t
         .snapshot_sha256 = &digest_hex,
         .inline_data = @constCast(&bytes),
     }};
-    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
-    var turn = assistantTurn("look", "a png");
-    turn.assistant.user.images = &images;
-    try s.commitTurn(turn, types.ConversationLanguage.default());
-    const id = try testing.allocator.dupe(u8, s.id());
-    defer testing.allocator.free(id);
-    s.close();
+    const v1_image_prefix = "{\"text\":\"look\",\"images\":[{\"id\":1,\"path\":\"/Users/me/shot.png\",\"media_type\":\"image/png\"," ++
+        "\"snapshot_path\":\"/tmp/fx-snapshots/image-1.png\"," ++
+        "\"snapshot_sha256\":\"5a84b42e05f3301948f95fb3f8255a8f5c2c51c70551b1726afd8e435def96d0\",\"inline_data\":null";
+    for ([_]?[]const u8{ null, "host:original" }) |source_ref| {
+        images[0].inline_data = @constCast(&bytes);
+        images[0].source_ref = if (source_ref) |value| @constCast(value) else null;
+        const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+        var turn = assistantTurn("look", "a png");
+        turn.assistant.user.images = &images;
+        try s.commitTurn(turn, types.ConversationLanguage.default());
+        const id = try testing.allocator.dupe(u8, s.id());
+        defer testing.allocator.free(id);
+        s.close();
 
-    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .app);
-    defer r.close();
-    var restored = try r.restore(testing.allocator);
-    defer restored.deinit(testing.allocator);
-    try testing.expectEqualSlices(u8, &bytes, restored.history[0].assistant.user.images[0].inline_data.?);
-    try testing.expectEqualStrings(&digest_hex, restored.history[0].assistant.user.images[0].snapshot_sha256.?);
+        const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .app);
+        defer r.close();
+        var restored = try r.restore(testing.allocator);
+        defer restored.deinit(testing.allocator);
+        const image = restored.history[0].assistant.user.images[0];
+        try testing.expectEqualSlices(u8, &bytes, image.inline_data.?);
+        try testing.expectEqualStrings(&digest_hex, image.snapshot_sha256.?);
+        try testing.expectEqualStrings(images[0].path, image.path);
+        try testing.expectEqualStrings(images[0].snapshot_path.?, image.snapshot_path.?);
+        if (source_ref) |value| {
+            try testing.expectEqualStrings(value, image.source_ref.?);
+        } else try testing.expectEqual(@as(?[]u8, null), image.source_ref);
 
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        images[0].inline_data = null;
+        const user: session_event.ConversationUser = .{ .text = "look", .images = &images };
+        const ours = try encodePiece(arena.allocator(), .{ .user = user });
+        const v1 = if (source_ref != null)
+            v1_image_prefix ++ ",\"source_ref\":\"host:original\"}],\"work_id\":null}"
+        else
+            v1_image_prefix ++ "}],\"work_id\":null}";
+        try testing.expectEqualStrings(v1, ours);
+        const decoded = (try decodePiece(arena.allocator(), .user, v1, .alloc_always)).user.images[0];
+        try testing.expectEqual(@as(?[]u8, null), decoded.inline_data);
+        try testing.expectEqualStrings(&digest_hex, decoded.snapshot_sha256.?);
+        try testing.expectEqualStrings(images[0].snapshot_path.?, decoded.snapshot_path.?);
+        if (source_ref) |value| {
+            try testing.expectEqualStrings(value, decoded.source_ref.?);
+        } else try testing.expectEqual(@as(?[]u8, null), decoded.source_ref);
+    }
+}
+
+test "v2 image source refs reject malformed metadata" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    images[0].inline_data = null;
-    const user: session_event.ConversationUser = .{ .text = "look", .images = &images };
-    const ours = try encodePiece(arena.allocator(), .{ .user = user });
-    var v1: std.Io.Writer.Allocating = .init(arena.allocator());
-    try std.json.Stringify.value(user, .{}, &v1.writer);
-    try testing.expectEqualStrings(v1.written(), ours);
+    const alloc = arena.allocator();
+    for ([_][]const u8{ "", "bad\nref", "x" ** 513 }) |source_ref| {
+        const images = [_]types.ImageAttachment{.{
+            .id = 1,
+            .path = @constCast("image.png"),
+            .media_type = @constCast("image/png"),
+            .source_ref = @constCast(source_ref),
+        }};
+        try testing.expectError(error.InvalidSessionFormat, WireUser.of(alloc, .{ .text = "look", .images = &images }));
+        const wire_images = [_]WireUser.WireImage{.{ .id = 1, .path = "image.png", .media_type = "image/png", .source_ref = source_ref }};
+        const wire = WireUser{ .text = "look", .images = &wire_images };
+        try testing.expectError(error.InvalidSessionFormat, wire.toUser(alloc));
+    }
 }
 
 test "only the adapter imports the session manager" {
