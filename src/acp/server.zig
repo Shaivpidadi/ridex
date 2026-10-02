@@ -48,6 +48,7 @@ const host_tool_runtime = @import("../core/tooling/host_tool_runtime.zig");
 const tool_dispatch = @import("../core/tooling/tool_dispatch.zig");
 const agent_checkpoint = @import("../core/agent/runtime/checkpoint.zig");
 const libfx_steering = @import("libfx_steering.zig");
+const host_model_metadata = @import("model_metadata.zig");
 const tool_call_identities = @import("tool_call_identities.zig");
 
 const Allocator = std.mem.Allocator;
@@ -322,6 +323,8 @@ pub const ServerState = struct {
     /// than on v1, as one process uses one backend.
     sessions_v2_requested: bool = false,
     capability_resolver: gateway_provider.CapabilityResolver = .{},
+    host_metadata_enabled: bool = false,
+    host_metadata: host_model_metadata.Snapshot = .{},
     terminate_connection: bool = false,
     web_fetch_runtime: web_fetch_runtime.Runtime = web_fetch_runtime.Runtime.init(.{}),
     web_search_runtime: web_search_runtime.Runtime = web_search_runtime.Runtime.init(.{}),
@@ -367,6 +370,7 @@ pub const ServerState = struct {
         self.host_tools.deinit();
         if (self.host_instructions.len > 0) self.alloc.free(self.host_instructions);
         self.capability_resolver.deinit(self.alloc);
+        self.host_metadata.deinit(self.alloc);
         var pending = self.pending_outbound.valueIterator();
         while (pending.next()) |entry| {
             if (entry.response) |*response| response.deinit(self.alloc);
@@ -531,6 +535,46 @@ pub fn catalogProviderFor(
     provider: model_provider.ProviderId,
 ) ?@import("../core/gateway/model_catalog.zig").Provider {
     return state.cfg.provider_set.select(provider).model_catalog;
+}
+
+pub fn hostModelCapabilities(
+    state: *const ServerState,
+    model: []const u8,
+    fallback: model_capabilities.Capabilities,
+) host_model_metadata.ValidationError!?model_capabilities.Capabilities {
+    if (!state.host_metadata_enabled or !state.cfg.minimal_kernel) return null;
+    return try state.host_metadata.resolve(model, fallback, io_mod.milliTimestamp());
+}
+
+pub fn availableModelCapabilities(
+    state: *const ServerState,
+    model: []const u8,
+    fallback: model_capabilities.Capabilities,
+) host_model_metadata.ValidationError!model_capabilities.Capabilities {
+    if (try hostModelCapabilities(state, model, fallback)) |provided| return provided;
+    return state.capability_resolver.available(model, fallback);
+}
+
+/// Refreshes only this connection's selected-model lease. No catalog or auth fallback.
+/// Callers stop the prior prompt before replacing its borrowed metadata.
+pub fn applyHostModelMetadata(
+    state: *ServerState,
+    params: ?[]const u8,
+    model: []const u8,
+) (Allocator.Error || host_model_metadata.ValidationError)!void {
+    if (!state.host_metadata_enabled or !state.cfg.minimal_kernel) return;
+    var update = try host_model_metadata.parseUpdate(state.alloc, params, io_mod.milliTimestamp());
+    defer if (update) |*snapshot| snapshot.deinit(state.alloc);
+    if (update) |*snapshot| {
+        if (!std.mem.eql(u8, snapshot.model, state.selected_model)) return error.InvalidModelMetadata;
+        _ = try snapshot.resolve(model, .{}, io_mod.milliTimestamp());
+        debug_trace.logf("catalog", "replacing selected model metadata model={s}", .{state.host_metadata.model});
+        state.host_metadata.deinit(state.alloc);
+        state.host_metadata = snapshot.*;
+        snapshot.* = .{};
+    } else {
+        _ = try state.host_metadata.resolve(model, .{}, io_mod.milliTimestamp());
+    }
 }
 
 pub fn refreshModelCredential(
@@ -1641,6 +1685,10 @@ fn handleKernelRestore(
             .code = ErrorCode.invalid_params,
             .message = "Unknown libfx session",
         });
+    applyHostModelMetadata(state, msg.params_raw, active.model) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InvalidModelMetadata, error.ModelMetadataExpired => return state.writer.writeError(alloc, msg.id, host_model_metadata.rpcError(@errorCast(err), active.model)),
+    };
     const checkpoint = parsed.value.object.get("checkpoint") orelse
         return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_params,
@@ -1958,10 +2006,13 @@ const InitializeRequest = struct {
     client_elicitation: elicitation.Capabilities = .{},
     host_tools: host_tool_runtime.Runtime = .{},
     host_instructions: []u8 = &.{},
+    host_metadata_enabled: bool = false,
+    host_metadata: host_model_metadata.Snapshot = .{},
 
     fn deinit(self: *InitializeRequest, alloc: Allocator) void {
         self.host_tools.deinit();
         if (self.host_instructions.len > 0) alloc.free(self.host_instructions);
+        self.host_metadata.deinit(alloc);
         self.* = .{};
     }
 };
@@ -1972,8 +2023,10 @@ fn parseInitializeRequest(
     allow_libfx: bool,
 ) !InitializeRequest {
     const raw = params orelse return error.InvalidInitializeParams;
-    const parsed = std.json.parseFromSlice(std.json.Value, alloc, raw, .{}) catch
-        return error.InvalidInitializeParams;
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, raw, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidInitializeParams,
+    };
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidInitializeParams;
 
@@ -1986,6 +2039,7 @@ fn parseInitializeRequest(
     var request = InitializeRequest{
         .terminal_ui = acp_types.fxMetaBool(parsed.value.object, "terminal") orelse true,
     };
+    errdefer request.deinit(alloc);
     const capabilities = parsed.value.object.get("clientCapabilities") orelse
         return request;
     if (capabilities != .object) return request;
@@ -2011,7 +2065,14 @@ fn parseInitializeRequest(
                 libfx.object.get("tools"),
                 libfx_provider_tool_registry,
             );
-            errdefer request.host_tools.deinit();
+            if (libfx.object.get("modelMetadata")) |supported| {
+                if (supported != .bool) return error.InvalidModelMetadata;
+                request.host_metadata_enabled = supported.bool;
+            }
+            if (request.host_metadata_enabled) {
+                const initial = libfx.object.get("initialModelMetadata") orelse return error.InvalidModelMetadata;
+                request.host_metadata = try host_model_metadata.Snapshot.parse(alloc, initial, io_mod.milliTimestamp());
+            }
             if (libfx.object.get("instructions")) |instructions| {
                 if (instructions != .string or instructions.string.len > 64 * 1024) {
                     return error.InvalidInitializeParams;
@@ -2021,6 +2082,145 @@ fn parseInitializeRequest(
         }
     }
     return request;
+}
+
+test "selected metadata initialize opt-in is private to the minimal kernel" {
+    const alloc = std.testing.allocator;
+    const raw =
+        \\{"protocolVersion":1,"clientCapabilities":{"libfx":{"modelMetadata":true,"initialModelMetadata":{"model":"one","revision":"1","validForMs":1000,"data":[{"id":"one","context_window":4096}]}}}}
+    ;
+    var request = try parseInitializeRequest(alloc, raw, true);
+    defer request.deinit(alloc);
+    try std.testing.expect(request.host_metadata_enabled);
+    try std.testing.expectEqualStrings("one", request.host_metadata.model);
+    var ordinary = try parseInitializeRequest(alloc, raw, false);
+    defer ordinary.deinit(alloc);
+    try std.testing.expect(!ordinary.host_metadata_enabled);
+    try std.testing.expectEqual(@as(usize, 0), ordinary.host_metadata.entries.items.len);
+    var legacy = try parseInitializeRequest(alloc,
+        \\{"protocolVersion":1,"clientCapabilities":{"libfx":{"modelMetadata":false,"initialModelMetadata":null}}}
+    , true);
+    defer legacy.deinit(alloc);
+    try std.testing.expect(!legacy.host_metadata_enabled);
+    for ([_][]const u8{
+        \\{"protocolVersion":1,"clientCapabilities":{"libfx":{"modelMetadata":true}}}
+        ,
+        \\{"protocolVersion":1,"clientCapabilities":{"libfx":{"modelMetadata":"true"}}}
+        ,
+        \\{"protocolVersion":1,"clientCapabilities":{"libfx":{"modelMetadata":true,"initialModelMetadata":null}}}
+        ,
+    }) |invalid| {
+        try std.testing.expectError(error.InvalidModelMetadata, parseInitializeRequest(alloc, invalid, true));
+    }
+}
+
+test "selected metadata initialize returns the precise invalid params error before startup" {
+    const alloc = std.testing.allocator;
+    const Capture = struct {
+        output: std.Io.Writer.Allocating,
+        fn write(raw: ?*anyopaque, frame: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try self.output.writer.writeAll(frame);
+        }
+    };
+    var capture = Capture{ .output = .init(alloc) };
+    defer capture.output.deinit();
+    var state = ServerState{ .alloc = alloc, .cfg = undefined, .writer = jsonrpc.Writer.initCallback(&capture, Capture.write) };
+    state.cfg.minimal_kernel = true;
+    state.cfg.model_override = "one";
+    var msg = jsonrpc.Message{ .id = .{ .integer = 1 }, .params_raw =
+        \\{"protocolVersion":1,"clientCapabilities":{"libfx":{"modelMetadata":true}}}
+    };
+    try handleInitialize(&state, alloc, &msg);
+    try std.testing.expect(!state.initialized);
+    try std.testing.expect(std.mem.find(u8, capture.output.written(), "LIBFX_MODEL_METADATA_INVALID") != null);
+    try std.testing.expect(std.mem.find(u8, capture.output.written(), "-32602") != null);
+}
+
+test "selected metadata initialize cleans up before rejecting later fields" {
+    try std.testing.expectError(error.InvalidInitializeParams, parseInitializeRequest(std.testing.allocator,
+        \\{"protocolVersion":1,"clientCapabilities":{"libfx":{"modelMetadata":true,"initialModelMetadata":{"model":"one","revision":"1","validForMs":1000,"data":[{"id":"one"}]} ,"instructions":false}}}
+    , true));
+}
+
+fn initializeMetadataAllocationCase(alloc: Allocator) !void {
+    var request = try parseInitializeRequest(alloc,
+        \\{"protocolVersion":1,"clientCapabilities":{"libfx":{"modelMetadata":true,"initialModelMetadata":{"model":"one","revision":"1","validForMs":1000,"data":[{"id":"one"}]},"instructions":"hello"}}}
+    , true);
+    defer request.deinit(alloc);
+}
+
+test "selected metadata initialize propagates allocation failures and frees partial ownership" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, initializeMetadataAllocationCase, .{});
+}
+
+test "selected metadata connection refresh rejects model changes and never uses legacy fallback" {
+    const alloc = std.testing.allocator;
+    var state = ServerState{ .alloc = alloc, .cfg = undefined, .writer = undefined };
+    state.cfg.minimal_kernel = true;
+    state.host_metadata_enabled = true;
+    state.selected_model = @constCast("one");
+    defer state.host_metadata.deinit(alloc);
+    try std.testing.expectError(error.InvalidModelMetadata, availableModelCapabilities(&state, "one", .{ .context_window = 999 }));
+    try applyHostModelMetadata(&state,
+        \\{"modelMetadata":{"model":"one","revision":"1","validForMs":3600000,"data":[{"id":"one","context_window":4096}]}}
+    , "one");
+    try std.testing.expectEqual(@as(?u32, 4096), (try availableModelCapabilities(&state, "one", .{})).context_window);
+    try std.testing.expectError(error.InvalidModelMetadata, applyHostModelMetadata(&state,
+        \\{"modelMetadata":{"model":"other","revision":"2","validForMs":1000,"data":[{"id":"other"}]}}
+    , "other"));
+    try std.testing.expectEqualStrings("1", state.host_metadata.revision);
+    try std.testing.expectError(error.InvalidModelMetadata, applyHostModelMetadata(&state, null, "other"));
+    try applyHostModelMetadata(&state,
+        \\{"modelMetadata":{"model":"one","revision":"2","validForMs":3600000,"data":[{"id":"one","context_window":8192}]}}
+    , "one");
+    try std.testing.expectEqual(@as(?u32, 8192), (try availableModelCapabilities(&state, "one", .{})).context_window);
+    state.host_metadata.expires_at_ms = 0;
+    try std.testing.expectError(error.ModelMetadataExpired, availableModelCapabilities(&state, "one", .{ .context_window = 999 }));
+    state.cfg.minimal_kernel = false;
+    try std.testing.expectEqual(@as(?u32, 999), (try availableModelCapabilities(&state, "one", .{ .context_window = 999 })).context_window);
+}
+
+test "selected metadata creation gates preserve effort and fast errors without catalog fetches" {
+    const alloc = std.testing.allocator;
+    const Capture = struct {
+        output: std.Io.Writer.Allocating,
+        fetches: usize = 0,
+        fn write(raw: ?*anyopaque, frame: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try self.output.writer.writeAll(frame);
+        }
+        fn fetch(raw: ?*anyopaque, _: Allocator, _: model_catalog.FetchInput) Allocator.Error!model_catalog.ProviderResult {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.fetches += 1;
+            return .{ .failure = .{ .category = .runtime } };
+        }
+    };
+    var capture = Capture{ .output = .init(alloc) };
+    defer capture.output.deinit();
+    var state = ServerState{ .alloc = alloc, .cfg = undefined, .writer = jsonrpc.Writer.initCallback(&capture, Capture.write) };
+    state.cfg.minimal_kernel = true;
+    state.cfg.provider_set = @import("../core/gateway/provider_set.zig").gateway_only(.{ .model_catalog = .{ .context = &capture, .fetch_fn = Capture.fetch } });
+    state.selected_model = @constCast("one");
+    state.host_metadata_enabled = true;
+    defer state.host_metadata.deinit(alloc);
+    var msg = jsonrpc.Message{ .id = .{ .integer = 1 } };
+    try std.testing.expect(!try applyEffortOverride(&state, alloc, &msg, .literal("high")));
+    try std.testing.expect(std.mem.find(u8, capture.output.written(), "LIBFX_MODEL_METADATA_INVALID") != null);
+    try applyHostModelMetadata(&state,
+        \\{"modelMetadata":{"model":"one","revision":"1","validForMs":3600000,"data":[{"id":"one","reasoning_options":[{"type":"effort","values":["high"]}]}]}}
+    , "one");
+    try std.testing.expect(try applyEffortOverride(&state, alloc, &msg, .literal("high")));
+    try std.testing.expect(!try applyEffortOverride(&state, alloc, &msg, .literal("max")));
+    try std.testing.expect(std.mem.find(u8, capture.output.written(), "LIBFX_MODEL_UNSUPPORTED_EFFORT") != null);
+    try std.testing.expect(std.mem.find(u8, capture.output.written(), "available: high") != null);
+    try std.testing.expect(!try applyFastOverride(&state, alloc, &msg, true));
+    try std.testing.expect(std.mem.find(u8, capture.output.written(), "LIBFX_MODEL_UNSUPPORTED_FAST") != null);
+    try std.testing.expect(try applyFastOverride(&state, alloc, &msg, false));
+    state.host_metadata.expires_at_ms = 0;
+    try std.testing.expect(!try applyFastOverride(&state, alloc, &msg, true));
+    try std.testing.expect(std.mem.find(u8, capture.output.written(), "LIBFX_MODEL_METADATA_EXPIRED") != null);
+    try std.testing.expectEqual(@as(usize, 0), capture.fetches);
 }
 
 test "ACP initialize owns libfx tools and instructions" {
@@ -2111,11 +2311,13 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
         alloc,
         msg.params_raw,
         state.cfg.minimal_kernel,
-    ) catch {
-        return state.writer.writeError(alloc, msg.id, .{
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        error.InvalidModelMetadata => return state.writer.writeError(alloc, msg.id, host_model_metadata.rpcError(error.InvalidModelMetadata, state.cfg.model_override orelse "")),
+        else => return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_params,
             .message = "Invalid initialize params",
-        });
+        }),
     };
     defer request.deinit(alloc);
 
@@ -2287,6 +2489,17 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
         );
     }
 
+    state.host_metadata_enabled = request.host_metadata_enabled;
+    if (request.host_metadata_enabled) {
+        _ = request.host_metadata.resolve(state.selected_model, .{}, io_mod.milliTimestamp()) catch |err|
+            return state.writer.writeError(alloc, msg.id, host_model_metadata.rpcError(err, state.selected_model));
+        state.host_metadata.deinit(alloc);
+        state.host_metadata = request.host_metadata;
+        request.host_metadata = .{};
+    } else {
+        state.host_metadata.deinit(alloc);
+    }
+
     if (state.cfg.effort_override) |raw| {
         const effort = types.ReasoningEffort.parse(raw) orelse
             return state.writer.writeError(alloc, msg.id, .{
@@ -2325,6 +2538,7 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
         .steering = !host_target.is_wasm and !state.cfg.minimal_kernel,
         .system_prompt = !host_target.is_wasm and !state.cfg.minimal_kernel,
         .mcp_over_acp = state.cfg.allow_acp_mcp and !host_target.is_wasm,
+        .model_metadata = state.cfg.minimal_kernel and state.host_metadata_enabled,
     });
     try state.writer.writeResponse(alloc, msg.id, out.writer.buffered());
 }
@@ -2341,7 +2555,13 @@ fn applyEffortOverride(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Mess
     const bundle = state.cfg.provider_set.select(state.provider);
     const fallback = bundle.fallbackModelCapabilities(state.selected_model);
     var capabilities: model_capabilities.Capabilities = undefined;
-    if (state.cfg.minimal_kernel and state.capability_resolver.state == .idle) {
+    const provided = hostModelCapabilities(state, state.selected_model, fallback) catch |err| {
+        try state.writer.writeError(alloc, msg.id, host_model_metadata.rpcError(err, state.selected_model));
+        return false;
+    };
+    if (provided) |selected| {
+        capabilities = selected;
+    } else if (state.cfg.minimal_kernel and state.capability_resolver.state == .idle) {
         // libfx cores skip the startup catalog resolve; explicit effort and
         // fast overrides are the creation-time consumers that need it.
         const catalog_provider = catalogProviderFor(state, state.provider) orelse return true;
@@ -2362,9 +2582,9 @@ fn applyEffortOverride(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Mess
     } else {
         capabilities = state.capability_resolver.available(state.selected_model, fallback);
     }
-    // A failed catalog lookup cannot name the supported set; the turn-time
-    // capability check remains the backstop.
-    if (state.capability_resolver.state == .failed) return true;
+    // Legacy catalog outages retain the turn-time fallback. Host descriptions
+    // are already resolved and must still enforce their advertised efforts.
+    if (provided == null and state.capability_resolver.state == .failed) return true;
 
     const rejection = effortOverrideRejection(alloc, capabilities, effort, state.selected_model) catch {
         try state.writer.writeError(alloc, msg.id, .{
@@ -2461,7 +2681,13 @@ fn applyFastOverride(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Messag
     const bundle = state.cfg.provider_set.select(state.provider);
     const fallback = bundle.fallbackModelCapabilities(state.selected_model);
     var capabilities: model_capabilities.Capabilities = undefined;
-    if (state.cfg.minimal_kernel and state.capability_resolver.state == .idle) {
+    const provided = hostModelCapabilities(state, state.selected_model, fallback) catch |err| {
+        try state.writer.writeError(alloc, msg.id, host_model_metadata.rpcError(err, state.selected_model));
+        return false;
+    };
+    if (provided) |selected| {
+        capabilities = selected;
+    } else if (state.cfg.minimal_kernel and state.capability_resolver.state == .idle) {
         // Shares the effort override's one-shot catalog resolve: creation is
         // the only point that can reject before any turn runs.
         const catalog_provider = catalogProviderFor(state, state.provider) orelse return true;
@@ -2482,9 +2708,8 @@ fn applyFastOverride(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Messag
     } else {
         capabilities = state.capability_resolver.available(state.selected_model, fallback);
     }
-    // A failed catalog lookup cannot confirm a fast path; the turn-time
-    // capability gate remains the backstop.
-    if (state.capability_resolver.state == .failed) return true;
+    // Legacy catalog outages retain the turn-time fallback, not host metadata.
+    if (provided == null and state.capability_resolver.state == .failed) return true;
 
     const rejection = fastOverrideRejection(alloc, capabilities, state.selected_model) catch {
         try state.writer.writeError(alloc, msg.id, .{
@@ -2626,6 +2851,19 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
         }
         return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "Missing value" });
     };
+
+    if (state.cfg.minimal_kernel and state.host_metadata_enabled) {
+        const active = &state.active_session.?;
+        applyHostModelMetadata(state, msg.params_raw, active.model) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InvalidModelMetadata, error.ModelMetadataExpired => return state.writer.writeError(alloc, msg.id, host_model_metadata.rpcError(@errorCast(err), active.model)),
+        };
+        if ((std.mem.eql(u8, config_id, "model") and !std.mem.eql(u8, value, state.selected_model)) or
+            (std.mem.eql(u8, config_id, "provider") and !std.mem.eql(u8, value, active.provider.label())))
+        {
+            return state.writer.writeError(alloc, msg.id, host_model_metadata.rpcError(error.InvalidModelMetadata, active.model));
+        }
+    }
 
     if (std.mem.eql(u8, config_id, "model")) {
         const session = if (state.active_session) |*active| active else return state.writer.writeError(alloc, msg.id, .{
@@ -2845,7 +3083,9 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                 .code = ErrorCode.invalid_params,
                 .message = "Invalid reasoning effort",
             });
-        const config = sessions.effortConfigState(state) orelse
+        const effort_config = sessions.effortConfigState(state) catch |err|
+            return state.writer.writeError(alloc, msg.id, host_model_metadata.rpcError(err, session.model));
+        const config = effort_config orelse
             return state.writer.writeError(alloc, msg.id, .{
                 .code = ErrorCode.invalid_params,
                 .message = "Reasoning effort is unavailable for the active model",
@@ -2886,7 +3126,9 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
     );
     try out.writer.writeAll(",");
     try sessions.writeModeConfigOption(&out.writer, state.cfg.mode_registry, current_mode);
-    if (sessions.effortConfigState(state)) |config| {
+    const effort_config = sessions.effortConfigState(state) catch |err|
+        return state.writer.writeError(alloc, msg.id, host_model_metadata.rpcError(err, current_model));
+    if (effort_config) |config| {
         try out.writer.writeAll(",");
         try sessions.writeEffortConfigOption(&out.writer, config.efforts, config.current);
     }

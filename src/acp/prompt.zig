@@ -21,6 +21,7 @@ const image_attachments = @import("../core/images/image_attachments.zig");
 const jsonrpc = @import("jsonrpc.zig");
 const acp_types = @import("types.zig");
 const server = @import("server.zig");
+const host_model_metadata = @import("model_metadata.zig");
 const sessions = @import("sessions.zig");
 const client_instructions = @import("client_instructions.zig");
 const agent_runtime = @import("../core/agent/agent_runtime.zig");
@@ -167,6 +168,9 @@ const AcpContext = struct {
     captured_mode: ?[]const u8 = null,
     captured_permission_mode: ?PermissionMode = null,
     current_prompt_input: ?*ParsedPromptInput = null,
+    /// Capability callbacks have a cancellation-only error contract. Retain the
+    /// strict host error here so the ACP boundary reports it without fetching.
+    model_metadata_error: ?host_model_metadata.ValidationError = null,
 
     fn deinitPublishedToolCalls(self: *AcpContext) void {
         var keys = self.published_tool_calls.keyIterator();
@@ -692,6 +696,10 @@ pub fn handlePrompt(
     const session = if (state.active_session) |*active| active else return .{
         .rpc_error = no_active_session_rpc_error,
     };
+    server.applyHostModelMetadata(state, msg.params_raw, session.model) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InvalidModelMetadata, error.ModelMetadataExpired => return .{ .rpc_error = host_model_metadata.rpcError(@errorCast(err), session.model) },
+    };
     {
         session.session_write_mutex.lockUncancelable(io_mod.getIo());
         defer session.session_write_mutex.unlock(io_mod.getIo());
@@ -938,6 +946,9 @@ pub fn handlePrompt(
         },
         .outcome_allocator = alloc,
     }, agent_config, job) catch |err| {
+        if (ctx.model_metadata_error) |metadata_error| {
+            if (err == error.Cancelled) return .{ .rpc_error = host_model_metadata.rpcError(metadata_error, session.model) };
+        }
         if (err == error.NonInteractivePermissionRequired) {
             ctx.stop_reason = .refused;
         } else {
@@ -945,9 +956,13 @@ pub fn handlePrompt(
         }
     };
     prompt_input.retainImageSnapshots();
+    if (ctx.model_metadata_error) |metadata_error| return .{ .rpc_error = host_model_metadata.rpcError(metadata_error, session.model) };
     completeAcpTitleTask(state, session, alloc);
     try sessions.sendActiveSessionInfoUpdate(state, alloc);
-    try sessions.sendActiveSessionUsageUpdate(state, alloc);
+    sessions.sendActiveSessionUsageUpdate(state, alloc) catch |err| switch (err) {
+        error.InvalidModelMetadata, error.ModelMetadataExpired => return .{ .rpc_error = host_model_metadata.rpcError(@errorCast(err), session.model) },
+        else => return err,
+    };
 
     if (session.cancel_flag.load(.seq_cst)) {
         ctx.stop_reason = .cancelled;
@@ -1686,6 +1701,7 @@ fn persistUsageCheckpoint(
 
 fn modelCatalogUnavailable(raw_ctx: *anyopaque) bool {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    if (ctx.state.host_metadata_enabled and ctx.state.cfg.minimal_kernel) return false;
     return ctx.state.capability_resolver.state == .failed;
 }
 
@@ -1697,6 +1713,10 @@ fn resolveModelCapabilities(
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     const session = if (ctx.state.active_session) |*active| active else return .{};
     const bundle = ctx.state.cfg.provider_set.select(session.provider);
+    if (server.hostModelCapabilities(ctx.state, model, bundle.fallbackModelCapabilities(model)) catch |err| {
+        ctx.model_metadata_error = err;
+        return error.Cancelled;
+    }) |provided| return provided;
     return ctx.state.capability_resolver.resolve(
         ctx.state.alloc,
         bundle.model_catalog orelse return bundle.fallbackModelCapabilities(model),
@@ -1724,6 +1744,7 @@ fn resolveModelOverride(
     raw_model: []const u8,
 ) Allocator.Error!subagent_model_contract.ModelCatalogMatch {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx.?));
+    if (ctx.state.host_metadata_enabled and ctx.state.cfg.minimal_kernel) return .no_catalog;
     const session = if (ctx.state.active_session) |*active| active else return .no_catalog;
     const bundle = ctx.state.cfg.provider_set.select(session.provider);
     const catalog_provider = bundle.model_catalog orelse return .no_catalog;
@@ -1758,10 +1779,74 @@ fn availableModelCapabilities(
 ) model_capabilities.Capabilities {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     const session = if (ctx.state.active_session) |*active| active else return .{};
-    return ctx.state.capability_resolver.available(
+    return server.availableModelCapabilities(
+        ctx.state,
         model,
         ctx.state.cfg.provider_set.select(session.provider).fallbackModelCapabilities(model),
-    );
+    ) catch |err| {
+        ctx.model_metadata_error = err;
+        return .{};
+    };
+}
+
+test "selected metadata prompt rejects an expired lease before credentials or generation" {
+    const alloc = std.testing.allocator;
+    var state = server.ServerState{ .alloc = alloc, .cfg = undefined, .writer = undefined };
+    state.cfg.minimal_kernel = true;
+    state.selected_model = @constCast("one");
+    state.host_metadata_enabled = true;
+    state.active_session = @as(server.ActiveSessionState, undefined);
+    state.active_session.?.model = @constCast("one");
+    defer state.host_metadata.deinit(alloc);
+    try server.applyHostModelMetadata(&state,
+        \\{"modelMetadata":{"model":"one","revision":"1","validForMs":3600000,"data":[{"id":"one"}]}}
+    , "one");
+    state.host_metadata.expires_at_ms = 0;
+    var msg = jsonrpc.Message{ .params_raw = "{\"sessionId\":\"test\",\"prompt\":[{\"type\":\"text\",\"text\":\"hello\"}]}" };
+    const outcome = try handlePrompt(&state, alloc, &msg, "default", .ask);
+    try std.testing.expect(outcome == .rpc_error);
+    try std.testing.expectEqual(ErrorCode.invalid_params, outcome.rpc_error.code);
+    try std.testing.expectEqualStrings("LIBFX_MODEL_METADATA_EXPIRED", outcome.rpc_error.data.?.code);
+}
+
+test "selected metadata turn resolver and usage callbacks never fetch the catalog" {
+    const alloc = std.testing.allocator;
+    const Fixture = struct {
+        fetches: usize = 0,
+        fn fetch(raw: ?*anyopaque, _: Allocator, _: gateway_model_catalog.FetchInput) Allocator.Error!gateway_model_catalog.ProviderResult {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.fetches += 1;
+            return .{ .failure = .{ .category = .runtime } };
+        }
+    };
+    var fixture: Fixture = .{};
+    var state = server.ServerState{ .alloc = alloc, .cfg = undefined, .writer = undefined };
+    state.cfg.minimal_kernel = true;
+    state.cfg.provider_set = provider_set.gateway_only(.{ .model_catalog = .{ .context = &fixture, .fetch_fn = Fixture.fetch } });
+    state.selected_model = @constCast("one");
+    state.host_metadata_enabled = true;
+    state.active_session = @as(server.ActiveSessionState, undefined);
+    state.active_session.?.provider = .gateway;
+    defer state.host_metadata.deinit(alloc);
+    var ctx = AcpContext{ .alloc = alloc, .state = &state, .session_id = "test" };
+    try std.testing.expectError(error.Cancelled, resolveModelCapabilities(@ptrCast(&ctx), alloc, "one"));
+    try std.testing.expectEqual(error.InvalidModelMetadata, ctx.model_metadata_error.?);
+    try server.applyHostModelMetadata(&state,
+        \\{"modelMetadata":{"model":"one","revision":"1","validForMs":3600000,"data":[{"id":"one","tags":["vision","file-input"],"context_window":128000,"max_tokens":8192}]}}
+    , "one");
+    ctx.model_metadata_error = null;
+    const resolved = try resolveModelCapabilities(@ptrCast(&ctx), alloc, "one");
+    try std.testing.expectEqual(@as(?u32, 8192), resolved.max_output_tokens);
+    try std.testing.expectEqual(model_capabilities.ImageInputSupport.native, resolved.image_input_support);
+    try std.testing.expectEqual(@as(?u32, 128000), availableModelCapabilities(@ptrCast(&ctx), "one").context_window);
+    try std.testing.expectError(error.Cancelled, resolveModelCapabilities(@ptrCast(&ctx), alloc, "other"));
+    try std.testing.expectEqual(error.InvalidModelMetadata, ctx.model_metadata_error.?);
+    state.host_metadata.expires_at_ms = 0;
+    try std.testing.expectError(error.Cancelled, resolveModelCapabilities(@ptrCast(&ctx), alloc, "one"));
+    try std.testing.expectEqual(error.ModelMetadataExpired, ctx.model_metadata_error.?);
+    try std.testing.expectEqual(@as(?u32, null), availableModelCapabilities(@ptrCast(&ctx), "one").context_window);
+    try std.testing.expect(!modelCatalogUnavailable(@ptrCast(&ctx)));
+    try std.testing.expectEqual(@as(usize, 0), fixture.fetches);
 }
 
 fn finalizeTurn(raw_ctx: *anyopaque, turn_id: u64, outcome: types.TurnPresentationOutcome, disposition: ?types.ProviderCompletionDisposition) !void {

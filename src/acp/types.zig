@@ -278,6 +278,7 @@ pub const AgentCapabilities = struct {
     system_prompt: bool = false,
     /// Serves `type: "acp"` MCP servers over this connection.
     mcp_over_acp: bool = false,
+    model_metadata: bool = false,
 };
 
 pub fn writeInitializeResponse(w: *std.Io.Writer, capabilities: AgentCapabilities) !void {
@@ -295,11 +296,30 @@ pub fn writeInitializeResponse(w: *std.Io.Writer, capabilities: AgentCapabilitie
     try w.writeAll("\"sessionCapabilities\":{\"list\":{},\"resume\":{},\"close\":{}");
     if (capabilities.system_prompt) try w.writeAll(",\"systemPrompt\":{}");
     try w.writeByte('}');
-    try w.print(",\"_meta\":{{\"fx\":{{\"steering\":{s}}}}}", .{if (capabilities.steering) "true" else "false"});
+    try w.print(",\"_meta\":{{\"fx\":{{\"steering\":{s}", .{if (capabilities.steering) "true" else "false"});
+    if (capabilities.model_metadata) try w.writeAll(",\"modelMetadata\":true");
+    try w.writeAll("}}");
     try w.writeAll("},\"agentInfo\":{\"name\":\"fx\",\"title\":\"fx\",\"version\":");
     try writeJsonStr(build_options.app_version, w);
     try w.writeAll("},");
     try w.writeAll("\"authMethods\":[]}");
+}
+
+test "selected metadata initialize response acknowledges opt-in only" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |enabled| {
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        try writeInitializeResponse(&out.writer, .{ .image_prompts = false, .model_metadata = enabled });
+        const parsed = try std.json.parseFromSlice(std.json.Value, alloc, out.written(), .{});
+        defer parsed.deinit();
+        const fx = parsed.value.object.get("agentCapabilities").?.object.get("_meta").?.object.get("fx").?.object;
+        if (enabled) {
+            try std.testing.expect(fx.get("modelMetadata").?.bool);
+        } else {
+            try std.testing.expect(fx.get("modelMetadata") == null);
+        }
+    }
 }
 
 pub fn writePromptResponse(w: *std.Io.Writer, reason: StopReason) !void {

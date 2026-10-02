@@ -211,6 +211,55 @@ try {
     expect(result.state === "unsupported", `unexpected state ${result.state}`);
   });
 
+  const resolvedTarget = await command("Target.createTarget", { url: `http://127.0.0.1:${port}/sdk/index.html?force-unsupported=1` });
+  const resolvedSession = await command("Target.attachToTarget", { targetId: resolvedTarget.targetId, flatten: true });
+  try {
+    await command("Runtime.enable", {}, resolvedSession.sessionId);
+    await waitFor("location.pathname === '/sdk/index.html'", resolvedSession.sessionId);
+    const evaluated = await command("Runtime.evaluate", {
+      awaitPromise: true, returnByValue: true,
+      expression: `(async () => {
+        const {createFxAgent, resolveModel} = await import('/sdk/browser.js');
+        const apiKey = 'browser-resolved-fixture';
+        const id = 'browser/resolved-model';
+        let gets = 0, posts = 0;
+        const fetch = async (_, init) => {
+          if (init.method === 'GET') {
+            gets++;
+            return Response.json({data:[{id,type:'language',max_tokens:2048,tags:['reasoning'],reasoning_options:[{type:'effort',values:['high']}]}]});
+          }
+          posts++;
+          const body = JSON.parse(typeof init.body === 'string' ? init.body : new TextDecoder().decode(init.body));
+          if (body.reasoning !== 'high' || body.maxOutputTokens !== 2048) throw new Error('selected capabilities missing');
+          return new Response('data: {"type":"text-delta","delta":"ok"}\\n\\n' +
+            'data: {"type":"finish","finishReason":{"unified":"stop","raw":"stop"}}\\n\\ndata: [DONE]\\n\\n',
+            {headers:{'content-type':'text/event-stream'}});
+        };
+        const model = await resolveModel({apiKey, model:{id,effort:'high'}, fetch});
+        let checkpoint;
+        const output = [];
+        for (let index = 0; index < 2; index++) {
+          const agent = await createFxAgent({apiKey,model:JSON.parse(JSON.stringify(model)),fetch,
+            wasm:new URL('/zig-out/bin/fx-core.wasm',location.href).href,...(checkpoint ? {checkpoint} : {})});
+          try {
+            const turn = agent.prompt('say ok');
+            let text = '';
+            for await (const event of turn) if (event.type === 'text_delta') text += event.delta;
+            if ((await turn.result).stopReason !== 'end_turn') throw new Error('turn did not finish');
+            output.push(text);
+            checkpoint = await agent.checkpoint();
+          } finally { await agent.close(); }
+        }
+        return {gets,posts,output,checkpointBytes:checkpoint.length};
+      })()`,
+    }, resolvedSession.sessionId);
+    expect(!evaluated.exceptionDetails, JSON.stringify(evaluated.exceptionDetails));
+    const value = evaluated.result.value;
+    expect(value.gets === 1 && value.posts === 2, 'resolved browser agents fetched a catalog after explicit discovery');
+    expect(value.output.join('') === 'okok' && value.checkpointBytes > 0, 'resolved browser restore or output failed');
+    console.log('browser resolved model creation, prompt, and restore passed');
+  } finally { await command("Target.closeTarget", { targetId: resolvedTarget.targetId }); }
+
   const { targetId } = await command("Target.createTarget", { url: "about:blank" });
   const { sessionId } = await command("Target.attachToTarget", { targetId, flatten: true });
   try {

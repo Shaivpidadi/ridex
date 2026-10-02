@@ -619,6 +619,31 @@ node benchmarks/libfx/bench-competitive.mjs --server /tmp/libfx-bench-server --p
 Build the SDK artifacts and install the pinned Pi package first, as shown in
 `.github/workflows/bench.yml`. Raw per-prompt samples remain in the output directory.
 
+### Resolved-model cold processes
+
+`benchmarks/libfx/bench-resolved-model.mjs` compares a clean baseline worktree
+with the current SDK. Each sample creates a separate Node process and restores
+the same checkpoint. Three unmeasured warmups per mode warm OS caches, not an
+agent or catalog cache. Paired alternating samples retain stage timings, request
+counts, failures, asset hashes, and raw JSONL. Use at least 30 samples for p95;
+p99 is reported only at 100 samples.
+
+Build native and core Wasm artifacts in both worktrees first. For a deterministic
+run, set `BASELINE` to the untouched checkout and `OUT` to an absolute new or
+empty directory:
+
+```sh
+node benchmarks/libfx/bench-resolved-model.mjs --baseline "$BASELINE" --candidate "$PWD" --backend native --samples 50 --model benchmark/model --effort high --fast --output "$OUT"
+```
+
+Use `--backend wasm` to measure the JSPI surface. An optional
+`--catalog-delay-ms` sets a synthetic delay. Live runs require `--live`, an
+explicit sample count, a real model ID, and equal nonempty
+`AI_GATEWAY_API_KEY` and `AI_GATEWAY_TEST_API_KEY`. Select the test billing lane
+before launching the command. Live samples include catalog and provider latency;
+local fresh processes are not measurements of deployed Vercel function startup.
+The output never includes credential values.
+
 ## Before Marking a PR Ready
 
 Minimum checklist:

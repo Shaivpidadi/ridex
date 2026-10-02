@@ -4,11 +4,12 @@ import {
   encodeXtermKeyEvent,
   fxSdkApiVersion,
   listModels,
+  resolveModel,
   supportsJspi,
   xtermAdapter,
 } from "./fx-sdk.js";
 
-export { encodeXtermKeyEvent, fxSdkApiVersion, listModels, supportsJspi, xtermAdapter };
+export { encodeXtermKeyEvent, fxSdkApiVersion, listModels, resolveModel, supportsJspi, xtermAdapter };
 export const libfxApiVersion = 2;
 
 const defaultCoreWasm = new URL("./fx-core.wasm", import.meta.url).href;

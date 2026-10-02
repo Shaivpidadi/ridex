@@ -70,10 +70,12 @@ The new codes replace `LIBFX_UNSUPPORTED_EFFORT` and `LIBFX_UNSUPPORTED_FAST`
 for both nested and legacy top-level settings. Callers that check the old codes
 must update their error handling.
 
-The host selects the model. Agent creation does not fetch the Gateway model
-catalog unless effort requests a named level or fast is enabled. Prompting
-can resolve model capabilities and context capacity through the supplied
-`fetch`; fx caches that metadata for the agent.
+The host selects the model. With a string model or an ordinary model object,
+agent creation does not fetch the Gateway model catalog unless effort requests
+a named level or fast is enabled. Prompting can resolve model capabilities and
+context capacity through the supplied `fetch`; fx caches that metadata for the
+agent. To avoid catalog requests from fresh agents, pass a model returned by
+`resolveModel()`, as described under [Models](#models).
 
 `onEvent` receives runtime diagnostics separately from model output. Transport
 events report request start, response status and elapsed time, safe Gateway
@@ -209,6 +211,70 @@ const models = await listModels({
 `listModels()` performs one bounded Gateway request and returns sorted, unique
 language-model IDs. It accepts the same optional `fetch` override as the Agent
 API.
+
+### Resolve before handling messages
+
+`resolveModel()` obtains the selected model's capability metadata without
+creating an agent. It returns a JSON-serializable model object that you can
+store in server-owned configuration and pass to a fresh agent on any function
+instance. A valid resolved model makes no catalog request during creation,
+checkpoint restoration, or prompting on native and Wasm backends.
+
+```js
+import { createFxAgent, resolveModel } from "libfx";
+
+// During setup or model selection, outside the message handler:
+const configuredModel = await resolveModel({
+  apiKey,
+  model: { id: "moonshotai/kimi-k3-fast", effort: "low" },
+});
+const serializedModel = JSON.stringify(configuredModel);
+
+// In each message handler, load this with your existing server-owned settings:
+const agent = await createFxAgent({
+  apiKey,
+  model: JSON.parse(serializedModel),
+  checkpoint,
+  tools,
+});
+try {
+  const turn = agent.prompt(message);
+  for await (const event of turn) {
+    if (event.type === "text_delta") process.stdout.write(event.delta);
+  }
+  await turn.result;
+} finally {
+  await agent.close();
+}
+```
+
+Resolution makes one explicit, bounded catalog GET through the optional `fetch`
+callback. Its options are `apiKey`, a required string `model` or model object,
+optional `fetch`, `signal`, and `gatewayChatUrl`. The returned object has `id`,
+any requested `effort` and `fast` values, and a versioned `metadata` object.
+Capability controls are validated by the kernel when you create the agent.
+
+Metadata is usable for one hour from resolution. Its absolute `resolvedAt` and
+`expiresAt` timestamps survive JSON serialization; recreating an agent does not
+renew them. Resolve again outside message handling before expiry, or call
+`resolveModel({ apiKey, model: configuredModel })` to renew the descriptor.
+There is no background task or implicit catalog fetch in the resolved-model
+agent. Expired metadata rejects with `LIBFX_MODEL_METADATA_EXPIRED`; malformed,
+missing-model, or wrong-connection data rejects with
+`LIBFX_MODEL_METADATA_INVALID`. A core that does not acknowledge this feature
+rejects with `LIBFX_MODEL_METADATA_UNSUPPORTED` before any model POST; use
+matching SDK and core artifacts. These errors carry `model` and
+`capability: "modelMetadata"`. Unsupported effort or fast controls keep their
+existing model-specific error codes.
+
+The descriptor contains only selected capability fields, not the API key or
+conversation. It is bounded to 64 KiB and 64 selected rows, and its scope binds
+the explicit API key and Gateway chat endpoint. A scope is not a signature or
+an authorization grant. Keep descriptors in trusted server-owned settings;
+do not accept client-supplied capability data. When a custom `fetch` uses
+additional tenant or connection state, the host must preserve that scope as
+well. Checkpoints remain conversation and usage only. Ordinary model strings
+retain automatic discovery and do not share data between agents.
 
 ## JavaScript tools and instructions
 

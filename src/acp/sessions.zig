@@ -7,6 +7,7 @@ const jsonrpc = @import("jsonrpc.zig");
 const acp_types = @import("types.zig");
 const mcp_servers = @import("mcp_servers.zig");
 const client_instructions = @import("client_instructions.zig");
+const host_model_metadata = @import("model_metadata.zig");
 const tool_call_identities = @import("tool_call_identities.zig");
 const workspace_binding = @import("workspace_binding.zig");
 const mcp_carrier = @import("mcp_carrier.zig");
@@ -57,7 +58,12 @@ pub fn handleNewLibfxSession(
     alloc: Allocator,
     msg: *jsonrpc.Message,
 ) !void {
+    if (state.host_metadata_enabled and state.cfg.minimal_kernel and state.active_prompt != null) server.cancelAndReapActivePrompt(state);
     try server.releaseActiveSession(state);
+    server.applyHostModelMetadata(state, msg.params_raw, state.selected_model) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InvalidModelMetadata, error.ModelMetadataExpired => return state.writer.writeError(alloc, msg.id, host_model_metadata.rpcError(@errorCast(err), state.selected_model)),
+    };
     const session_id = try session_store.generateSessionId(alloc);
     var session_id_owned = true;
     defer if (session_id_owned) alloc.free(session_id);
@@ -99,6 +105,10 @@ pub fn handleNewLibfxSession(
 
 pub fn handleNewWasmSession(state: *server.ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void {
     try server.releaseActiveSession(state);
+    server.applyHostModelMetadata(state, msg.params_raw, state.selected_model) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InvalidModelMetadata, error.ModelMetadataExpired => return state.writer.writeError(alloc, msg.id, host_model_metadata.rpcError(@errorCast(err), state.selected_model)),
+    };
 
     var durable = try freshAcpState(state, alloc, state.workspace_root);
     var durable_owned = true;
@@ -202,6 +212,14 @@ pub fn handleNewSession(state: *server.ServerState, alloc: Allocator, msg: *json
         }),
     };
     defer if (client_system_prompt) |text| alloc.free(text);
+    if (state.host_metadata_enabled and state.cfg.minimal_kernel) {
+        if (state.active_prompt != null) server.cancelAndReapActivePrompt(state);
+        try server.releaseActiveSession(state);
+        server.applyHostModelMetadata(state, msg.params_raw, state.selected_model) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InvalidModelMetadata, error.ModelMetadataExpired => return state.writer.writeError(alloc, msg.id, host_model_metadata.rpcError(@errorCast(err), state.selected_model)),
+        };
+    }
     var workspace = workspace_binding.prepare(state, alloc, msg.params_raw) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return state.writer.writeError(alloc, msg.id, .{
@@ -482,7 +500,9 @@ fn writeNewSessionResponse(
         state.cfg.mode_registry,
         state.cfg.mode_registry.default_mode_id,
     );
-    if (effortConfigState(state)) |config| {
+    const effort_config = effortConfigState(state) catch |err|
+        return state.writer.writeError(alloc, msg.id, host_model_metadata.rpcError(err, state.active_session.?.model));
+    if (effort_config) |config| {
         try out.writer.writeAll(",");
         try writeEffortConfigOption(&out.writer, config.efforts, config.current);
     }
@@ -1134,7 +1154,9 @@ fn writeLoadSessionResponse(
         state.cfg.mode_registry,
         state.cfg.mode_registry.default_mode_id,
     );
-    if (effortConfigState(state)) |config| {
+    const effort_config = effortConfigState(state) catch |err|
+        return state.writer.writeError(alloc, msg.id, host_model_metadata.rpcError(err, model));
+    if (effort_config) |config| {
         try out.writer.writeAll(",");
         try writeEffortConfigOption(&out.writer, config.efforts, config.current);
     }
@@ -2080,7 +2102,8 @@ pub fn sendActiveSessionUsageUpdate(state: *server.ServerState, alloc: Allocator
     const active = if (state.active_session) |*session| session else return;
     const usage = active.session_rt.usage.liveContextSnapshot() orelse return;
     const provider_bundle = state.cfg.provider_set.select(active.provider);
-    const capabilities = state.capability_resolver.available(
+    const capabilities = try server.availableModelCapabilities(
+        state,
         active.model,
         provider_bundle.fallbackModelCapabilities(active.model),
     );
@@ -2216,10 +2239,11 @@ pub const EffortConfigState = struct {
 /// Reasoning-effort selector state for the active session, or null when the
 /// active model advertises no effort options (matching the TUI, which hides
 /// the effort picker for those models).
-pub fn effortConfigState(state: *server.ServerState) ?EffortConfigState {
+pub fn effortConfigState(state: *server.ServerState) host_model_metadata.ValidationError!?EffortConfigState {
     const active = if (state.active_session) |*session| session else return null;
     const bundle = state.cfg.provider_set.select(active.provider);
-    const capabilities = state.capability_resolver.available(
+    const capabilities = try server.availableModelCapabilities(
+        state,
         active.model,
         bundle.fallbackModelCapabilities(active.model),
     );
