@@ -766,8 +766,10 @@ pub fn withholdRequestToolImages(arena: Allocator, messages: []const ChatMessage
 }
 
 fn prependImageNotice(alloc: Allocator, notice: []const u8, content: []const u8, limit: usize) Allocator.Error![]u8 {
-    const keep = @import("../../config/context_limits.zig").utf8PrefixLength(content, limit -| notice.len);
-    return std.mem.concat(alloc, u8, &.{ notice[0..@min(notice.len, limit)], content[0..keep] });
+    const utf8_prefix_length = @import("../../config/context_limits.zig").utf8PrefixLength;
+    const notice_keep = utf8_prefix_length(notice, limit);
+    const keep = utf8_prefix_length(content, limit -| notice.len);
+    return std.mem.concat(alloc, u8, &.{ notice[0..notice_keep], content[0..keep] });
 }
 
 fn testEncodedToolImage(arena: Allocator, bytes: []const u8, mime_type: []const u8) !types.ToolImage {
@@ -839,6 +841,52 @@ test "request image notices remain bounded without mutating retained text" {
     try std.testing.expect(std.mem.startsWith(u8, projected[0].content.?, "[Image not sent:"));
     try std.testing.expectEqual(@as(usize, 0), projected[0].tool_result_memory.?.tool_images.len);
     try std.testing.expectEqual(@as(usize, 2048), messages[0].content.?.len);
+}
+
+test "request image notices preserve UTF-8 at every byte limit" {
+    const alloc = std.testing.allocator;
+    const content = "é界𐐀 tail";
+    for ([_][]const u8{ "", "ASCII ", "é", "界", "𐐀" }) |notice| {
+        const full = try std.mem.concat(alloc, u8, &.{ notice, content });
+        defer alloc.free(full);
+        for (0..full.len + 1) |limit| {
+            const output = try prependImageNotice(alloc, notice, content, limit);
+            defer alloc.free(output);
+            try std.testing.expect(output.len <= limit);
+            try std.testing.expect(std.unicode.utf8ValidateSlice(output));
+            if (limit == full.len) try std.testing.expectEqualStrings(full, output);
+        }
+    }
+}
+
+test "request image notices keep clipped source references as JSON text" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const source_ref = "é" ** 256;
+    var image = try testPngHeaderToolImage(arena, 8001, 1);
+    image.source_ref = try arena.dupe(u8, source_ref);
+    const images = [_]types.ToolImage{ image, image };
+    const content = "original tool output";
+    const messages = [_]ChatMessage{.{ .role = .tool, .content = content, .tool_result_memory = .{ .tool_images = &images } }};
+    const projected = try withholdRequestToolImages(arena, &messages, 8000, 1079);
+    const output = projected[0].content.?;
+    try std.testing.expect(output.len <= 1079);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(output));
+    try std.testing.expect(std.mem.find(u8, output, source_ref) != null);
+    try std.testing.expectEqual(@as(usize, 0), projected[0].tool_result_memory.?.tool_images.len);
+    try std.testing.expectEqual(@as(usize, 2), messages[0].tool_result_memory.?.tool_images.len);
+    try std.testing.expectEqualStrings(content, messages[0].content.?);
+    for (messages[0].tool_result_memory.?.tool_images) |retained| {
+        try std.testing.expectEqualStrings(source_ref, retained.source_ref.?);
+        try std.testing.expectEqualStrings(image.data, retained.data);
+    }
+
+    var writer: std.Io.Writer.Allocating = .init(arena);
+    try std.json.Stringify.value(output, .{}, &writer.writer);
+    const parsed = try std.json.parseFromSlice(std.json.Value, arena, writer.written(), .{});
+    try std.testing.expect(parsed.value == .string);
+    try std.testing.expectEqualStrings(output, parsed.value.string);
 }
 
 pub fn applyToolResultMemory(
