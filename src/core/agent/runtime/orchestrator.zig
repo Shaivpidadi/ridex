@@ -7,6 +7,7 @@ const agent_steps = @import("../../config/agent_steps.zig");
 const model_capabilities = @import("../../config/model_capabilities.zig");
 const model_provider = @import("../../config/model_provider.zig");
 const types = @import("../../shared/types.zig");
+const history_range = @import("../../shared/history_range.zig");
 const worker_runtime = @import("../worker_runtime.zig");
 const agent_stream_provider = @import("../stream_provider.zig");
 const session_runtime = @import("../../session/session.zig");
@@ -3296,7 +3297,7 @@ fn finishPendingParallelCancelled(
             // parallel run is deinitialized after this scope, while history
             // keeps prepared.memory.
             prepared.memory = try types.dupeToolResultMemory(arena, prepared.memory);
-            try runtime_execution_memory.retainToolImages(arena, provisional_alloc, config, call, &prepared);
+            try runtime_execution_memory.retainToolImages(arena, config, call, &prepared);
             _ = try provisional_statuses.finishExecutedCall(
                 deps,
                 provisional_alloc,
@@ -3733,12 +3734,14 @@ fn recoverySelectionChanged(
     selected_provider: model_provider.ProviderId,
     selected_model: []const u8,
     selected_fast_mode: bool,
+    selected_ultrafast_mode: bool,
 ) bool {
     return !checkpoint.authority.provider.same_authority(selected_provider) or !std.mem.eql(
         u8,
         checkpoint.authority.model,
         selected_model,
-    ) or checkpoint.requested_fast_mode != selected_fast_mode;
+    ) or checkpoint.requested_fast_mode != selected_fast_mode or
+        checkpoint.requested_ultrafast_mode != selected_ultrafast_mode;
 }
 
 fn recoveryCredentialAuthorityMatches(
@@ -3908,7 +3911,8 @@ noinline fn pausedRequiredAction(
 
 /// Hands the model's tool calls to `append_turn_piece` before any of them
 /// runs (D28). Execution memory holds only finished exchanges, so the calls
-/// travel apart, in the form a finished step saves them.
+/// travel apart, in the form a finished step saves them, with the text of
+/// the message that issued them, the newest one (D51).
 fn appendRunningToolCalls(
     deps: *const AgentRuntimeDeps,
     finalization: *const TurnFinalizationGuard,
@@ -3924,10 +3928,13 @@ fn appendRunningToolCalls(
     const execution = try runtime_execution_memory.buildExecutionMemory(arena, current_turn_messages);
     const running = try arena.alloc(types.ToolCall, calls.len);
     for (calls, running) |call, *saved| saved.* = try execution_memory_helpers.dupePersistedToolCall(arena, call);
+    const issuing = current_turn_messages[current_turn_messages.len - 1];
+    std.debug.assert(issuing.role == .assistant and issuing.tool_calls.len == calls.len);
     try append(deps.ctx, .{
         .user = .{ .text = @constCast(job.prompt), .images = job.images },
         .execution = try finalization.compacted_execution.project(arena, execution),
         .running_calls = running,
+        .running_assistant = issuing.content,
     });
 }
 
@@ -3985,6 +3992,8 @@ fn persistRecoveryCheckpoint(
         },
         .requested_fast_mode = requested_fast_mode,
         .fast_mode = fast_mode,
+        .requested_ultrafast_mode = job.agent_settings.ultrafast_mode,
+        .ultrafast_mode = job.agent_settings.ultrafast_mode,
         .max_provider_attempts = attempt_limit,
         .consumed_provider_attempts = consumed_attempts,
         .outstanding_reservation = outstanding_reservation,
@@ -4119,11 +4128,14 @@ test "running tool calls reach append_turn_piece before they run" {
         appends: usize = 0,
         finished_steps: usize = 0,
         running: std.ArrayList([]u8) = .empty,
+        running_text: ?[]u8 = null,
 
         fn append(raw: *anyopaque, progress: runtime_deps.TurnProgress) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.appends += 1;
             self.finished_steps = progress.execution.tool_steps.len;
+            if (self.running_text) |text| std.testing.allocator.free(text);
+            self.running_text = if (progress.running_assistant) |text| try std.testing.allocator.dupe(u8, text) else null;
             for (progress.running_calls) |call| {
                 try self.running.append(std.testing.allocator, try std.testing.allocator.dupe(u8, call.id));
             }
@@ -4133,6 +4145,7 @@ test "running tool calls reach append_turn_piece before they run" {
     defer {
         for (sink.running.items) |id| std.testing.allocator.free(id);
         sink.running.deinit(std.testing.allocator);
+        if (sink.running_text) |text| std.testing.allocator.free(text);
     }
     var fake = support.FakeAgentRuntimeDeps.init(std.testing.allocator);
     defer fake.deinit();
@@ -4150,9 +4163,9 @@ test "running tool calls reach append_turn_piece before they run" {
         .{ .id = "run_2", .name = "read_file", .arguments_json = "{\"path\":\"a\"}" },
     };
     const messages = [_]ChatMessage{
-        .{ .role = .assistant, .tool_calls = &finished },
+        .{ .role = .assistant, .content = "Reading b first.", .tool_calls = &finished },
         .{ .role = .tool, .tool_call_id = "read_0", .tool_name = "read_file", .tool_result_status = .success, .content = "done" },
-        .{ .role = .assistant, .tool_calls = &running },
+        .{ .role = .assistant, .content = "Running both now.", .tool_calls = &running },
     };
 
     // Without the hook, as on v1, nothing is built or sent.
@@ -4168,6 +4181,8 @@ test "running tool calls reach append_turn_piece before they run" {
     try std.testing.expectEqual(@as(usize, 2), sink.running.items.len);
     try std.testing.expectEqualStrings("run_1", sink.running.items[0]);
     try std.testing.expectEqualStrings("run_2", sink.running.items[1]);
+    // With the text of the message that issued them, not an earlier one (D51).
+    try std.testing.expectEqualStrings("Running both now.", sink.running_text.?);
 
     // A step with no calls sends nothing.
     try appendRunningToolCalls(&deps, &finalization, fixture.job(), &messages, &.{});
@@ -5534,7 +5549,7 @@ fn processQueuedPromptInner(
     const vision_fallback_available = config.provider_capabilities.vision_fallback and
         deps.tool_registry.lookup("vision") != null;
     var request_capabilities = deps.available_model_capabilities(deps.ctx, job.model);
-    if (requiresResolvedRequestCapabilities(
+    if (config.ultrafast_mode or requiresResolvedRequestCapabilities(
         job.images.len > 0 or job.authorized_image_catalog.len > 0,
         vision_fallback_available,
         config.effort,
@@ -6612,6 +6627,7 @@ test "compaction activity transaction settles only after publication and preserv
             .failure_provenance = &provenance,
             .compactor = .{
                 .history = &turns,
+                .append_messages = session_runtime.appendHistoryChatMessages,
                 .size = .{ .compact_at_tokens = 5_000, .usable_tokens = 10_000 },
                 .caller = summary_model.caller(),
                 .records = result_store.compactorStore(&capability),
@@ -6784,9 +6800,16 @@ fn processQueuedPromptLoop(
         restoredConsumedAttempts(checkpoint)
     else
         0;
-    const selected_fast_mode = config.fast_mode;
+    const selected_fast_mode = config.fast_mode and !config.ultrafast_mode;
+    const selected_ultrafast_mode = job.agent_settings.ultrafast_mode;
     const selection_changed = if (job.recovery_checkpoint) |checkpoint|
-        recoverySelectionChanged(checkpoint, job.provider, job.model, selected_fast_mode)
+        recoverySelectionChanged(
+            checkpoint,
+            job.provider,
+            job.model,
+            selected_fast_mode,
+            selected_ultrafast_mode,
+        )
     else
         false;
     if (job.recovery_checkpoint) |checkpoint| {
@@ -6815,8 +6838,8 @@ fn processQueuedPromptLoop(
     else
         selected_fast_mode;
     var fast_unavailable_notified = false;
+    var ultrafast_unconfirmed_notified = false;
     var tool_image_strip_notified = false;
-    var attachment_withheld_notified = false;
     // Attachment pixel sizes probed during this turn, so each step does not
     // reread every attachment snapshot. Entries live in the turn arena.
     var attachment_dimensions: image_attachments.AttachmentDimensionCache = .empty;
@@ -7190,29 +7213,16 @@ fn processQueuedPromptLoop(
                 }
             }
             const materialized_messages = if (request_capabilities.image_input_support == .native) native: {
+                const loaded_messages = try runtime_execution_memory.materializeToolImages(overlay_arena, config, result_request_messages);
+                const max_dimension = image_data.requestMaxDimension(image_data.countRequestImages(loaded_messages));
+                const safe_tool_messages = try runtime_execution_memory.withholdRequestToolImages(overlay_arena, loaded_messages, max_dimension, config.max_tool_result_bytes);
                 const projection = try image_attachments.withholdOversizedAttachments(
                     overlay_arena,
                     arena,
                     &attachment_dimensions,
-                    try runtime_execution_memory.materializeToolImages(overlay_arena, config, result_request_messages),
+                    safe_tool_messages,
+                    max_dimension,
                 );
-                // The model gets a note for each withheld attachment. The user
-                // hears about ones attached this turn, once per turn.
-                var withheld_now: usize = 0;
-                for (projection.withheld_ids) |id| {
-                    for (job.images) |image| {
-                        if (image.id == id) withheld_now += 1;
-                    }
-                }
-                if (withheld_now > 0 and !attachment_withheld_notified) {
-                    attachment_withheld_notified = true;
-                    const limit = image_data.max_image_dimension;
-                    try deps.push_text(deps.ctx, .{ .operational = if (withheld_now == 1)
-                        std.fmt.comptimePrint("An attached image is over {d} pixels per side and fx can't downscale it here, so the model gets a note about it instead of the image.", .{limit})
-                    else
-                        std.fmt.comptimePrint("Some attached images are over {d} pixels per side and fx can't downscale them here, so the model gets a note about them instead of the images.", .{limit}) });
-                    try deps.push_text(deps.ctx, .{ .operational = "\n" });
-                }
                 break :native projection.messages;
             } else result_request_messages;
             const image_projection = try runtime_gateway_step.projectToolImageMessages(overlay_arena, materialized_messages, request_capabilities.image_input_support, vision_policy.route == .fallback, config.max_tool_result_bytes);
@@ -7234,7 +7244,7 @@ fn processQueuedPromptLoop(
                 try deps.push_text(deps.ctx, .{ .operational = "\n" });
             }
             last_gateway_message_count = gateway_instructions.items.len + request_messages.len;
-            var provider_opts = model_capabilities.resolveProviderOptionsForCapabilities(request_capabilities, config.effort, route_fast_mode);
+            var provider_opts = try model_capabilities.resolveUltrafastProviderOptions(request_capabilities, job.provider, gateway_model, config.effort, route_fast_mode, config.ultrafast_mode);
             provider_opts.prompt_caching = config.provider_capabilities.gateway_prompt_caching;
             provider_opts.provider_order = config.provider_order;
             provider_opts.provider_strict = config.provider_strict;
@@ -7389,6 +7399,7 @@ fn processQueuedPromptLoop(
                         .before_summary = source.hook(),
                         .compactor = .{
                             .history = compaction_history,
+                            .append_messages = session_runtime.appendHistoryChatMessages,
                             .active = active_prefix,
                             .size = size,
                             .caller = summary_model.caller(),
@@ -7417,7 +7428,7 @@ fn processQueuedPromptLoop(
                         return err;
                     };
                     if (compacted) |outcome| {
-                        const raw_history_turns = session_runtime.rawHistoryTurnCount(compaction_history);
+                        const raw_history_turns = history_range.rawHistoryTurnCount(compaction_history);
                         const active_cut: runtime_execution_memory.CompactedExecutionBoundary = if (outcome.cut.turns == raw_history_turns) .{
                             .tool_steps = outcome.cut.tool_steps,
                             .steering = outcome.cut.steering,
@@ -8002,6 +8013,13 @@ fn processQueuedPromptLoop(
                 }
             }
             if (streamCompletionPtr(&stream_result)) |completion| {
+                if (config.ultrafast_mode) {
+                    debug_trace.eventf("gateway", "ultrafast_served_tier", step_ctx, "requested=ultrafast served={s}", .{if (completion.service_tier) |tier| @tagName(tier) else "unconfirmed"});
+                    if (completion.service_tier != .ultrafast and !ultrafast_unconfirmed_notified) {
+                        ultrafast_unconfirmed_notified = true;
+                        try deps.push_text(deps.ctx, .{ .operational = "Ultrafast was requested, but Gateway did not confirm it was served; this response may have used a standard or lower tier.\n" });
+                    }
+                }
                 agent.observeUsage(completion.usage);
                 // The completion buffer is step-scoped, so no cross-step
                 // dedupe: each completion reports its serving provider once.
@@ -11776,7 +11794,7 @@ fn processQueuedPromptLoop(
                 &prepared.memory,
                 execution.tool_result_memory,
             );
-            try runtime_execution_memory.retainToolImages(arena, stream_ctx.alloc, config, tool_call, &prepared);
+            try runtime_execution_memory.retainToolImages(arena, config, tool_call, &prepared);
             runtime_execution_memory.finalizeCommandReplay(
                 arena,
                 tool_call,

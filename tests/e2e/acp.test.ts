@@ -215,10 +215,10 @@ function fakeGatewayEnv(
 }
 
 // The session backends a test runs on. v2 sits behind FX_SESSIONS_V2 and
-// keeps a session's side files in ~/.fx/session-files/{id}.
+// keeps a session in one folder, ~/.fx/sessions/v2/{id} (D48).
 const SESSION_BACKENDS = [
-  { suffix: "", env: { FX_SESSIONS_V2: undefined }, sideFiles: "sessions" },
-  { suffix: " on sessions v2", env: { FX_SESSIONS_V2: "1" }, sideFiles: "session-files" },
+  { suffix: "", env: { FX_SESSIONS_V2: undefined }, v2: false },
+  { suffix: " on sessions v2", env: { FX_SESSIONS_V2: "1" }, v2: true },
 ] as const;
 
 function acpContentText(content: unknown): string {
@@ -3319,33 +3319,44 @@ describe("acp: model-independent", () => {
           expect(client.stderr).toBe("");
           await client.close();
 
-          // A stored prompt that cannot be read fails the load instead of
-          // running the session without the client's instructions. A fresh
-          // process reads it from disk; an already active session keeps its own.
-          writeFileSync(
-            join(root.home, ".fx", backend.sideFiles, sessionId, "client", "system-prompt.txt"),
-            "corrupt\u0000prompt",
-          );
-          client = await AcpClient.create({
-            cwd: root.workspace,
-            env: { ...fakeGatewayEnv(root, gateway), ...backend.env },
-          });
-          await client.request("initialize", { protocolVersion: 1 }, 10);
-          const other = await client.request("session/new", { cwd: root.workspace, mcpServers: [] }, 11) as any;
-          expect(other.error).toBeUndefined();
-          await client.readLine();
-          const unreadable = await client.request("session/load", {
-            sessionId,
-            cwd: root.workspace,
-            mcpServers: [],
-          }, 12) as any;
-          expect(unreadable.error.code).toBe(-32603);
-          expect(unreadable.error.message).toBe("Session client system prompt could not be restored");
-          // The session that was active before the failed load still runs.
-          const third = await runPrompt(client, "Still there?", TIMEOUT);
-          expect(third.promptResult.result.stopReason).toBe("end_turn");
-          expect(gateway.requests).toHaveLength(3);
-          expect(client.stderr).toBe("");
+          if (backend.v2) {
+            // v2 keeps the prompt as one setting in the session's own log
+            // (D46): nothing beside the log can go bad on its own.
+            const log = readFileSync(join(root.home, ".fx", "sessions", "v2", sessionId, "log.jsonl"), "utf8");
+            const prompts = log.trimEnd().split("\n").map((line) => JSON.parse(line))
+              .filter((line) => line.kind === "set" && line.key === "client_prompt");
+            expect(prompts).toHaveLength(1);
+            expect(JSON.stringify(prompts[0].value)).toContain(marker);
+            expect(existsSync(join(root.home, ".fx", "session-files"))).toBe(false);
+          } else {
+            // A stored prompt that cannot be read fails the load instead of
+            // running the session without the client's instructions. A fresh
+            // process reads it from disk; an already active session keeps its own.
+            writeFileSync(
+              join(root.home, ".fx", "sessions", sessionId, "client", "system-prompt.txt"),
+              "corrupt\u0000prompt",
+            );
+            client = await AcpClient.create({
+              cwd: root.workspace,
+              env: { ...fakeGatewayEnv(root, gateway), ...backend.env },
+            });
+            await client.request("initialize", { protocolVersion: 1 }, 10);
+            const other = await client.request("session/new", { cwd: root.workspace, mcpServers: [] }, 11) as any;
+            expect(other.error).toBeUndefined();
+            await client.readLine();
+            const unreadable = await client.request("session/load", {
+              sessionId,
+              cwd: root.workspace,
+              mcpServers: [],
+            }, 12) as any;
+            expect(unreadable.error.code).toBe(-32603);
+            expect(unreadable.error.message).toBe("Session client system prompt could not be restored");
+            // The session that was active before the failed load still runs.
+            const third = await runPrompt(client, "Still there?", TIMEOUT);
+            expect(third.promptResult.result.stopReason).toBe("end_turn");
+            expect(gateway.requests).toHaveLength(3);
+            expect(client.stderr).toBe("");
+          }
         } finally {
           await client?.close();
           gateway.stop();
@@ -6799,7 +6810,7 @@ describe("acp: model-independent", () => {
   );
 
   test(
-    "image prompts over both the byte and pixel limits are downscaled",
+    "ACP retains an oversized image and gives the model recovery guidance",
     async () => {
       const root = createIsolatedRoot("fx-acp-image-oversized-");
       const image = paddedPng(solidPng(3420, 2224), 6_000_000);
@@ -6818,7 +6829,7 @@ describe("acp: model-independent", () => {
           cwd: root.workspace,
           env: fakeGatewayEnv(root, gateway),
         });
-        await startCodeSession(client);
+        const sessionId = await startCodeSession(client);
         const prompted = await runPromptBlocks(
           client,
           [{ type: "image", data: image.toString("base64"), mimeType: "image/png" }],
@@ -6826,12 +6837,18 @@ describe("acp: model-independent", () => {
         );
         expect(prompted.promptResult.result.stopReason).toBe("end_turn");
         expect(gateway.requests).toHaveLength(1);
-        const files = acpGatewayRequest(gateway.requests[0]!.body).prompt
+        const body = gateway.requests[0]!.body;
+        const files = acpGatewayRequest(body).prompt
           .flatMap((message) => Array.isArray(message.content) ? message.content as Array<Record<string, any>> : [])
           .filter((part) => part.type === "file");
-        expect(files).toHaveLength(1);
-        expect(files[0]!.mediaType).toBe("image/png");
-        expect(pngPixelSize(Buffer.from(files[0]!.data.data, "base64"))).toEqual({ width: 2000, height: 1301 });
+        expect(files).toHaveLength(0);
+        expect(body).toContain("3420x2224 pixels");
+        expect(body).toContain("5 MiB encoded per image");
+        expect(body).toContain("The original is saved at ");
+        const imageDir = join(root.home, ".fx", "sessions", sessionId, "images");
+        const snapshots = readdirSync(imageDir).filter((name) => name.endsWith(".bin"));
+        expect(snapshots).toHaveLength(1);
+        expect(readFileSync(join(imageDir, snapshots[0]!))).toEqual(image);
       } finally {
         await client?.close();
         gateway.stop();
@@ -6917,7 +6934,7 @@ describe("acp: model-independent", () => {
   );
 
   test(
-    "inline image above the portable encoded limit fails before effects",
+    "inline image above the encoded limit is withheld and ACP stays usable",
     async () => {
       const root = createIsolatedRoot("fx-acp-inline-image-limit-");
       const maxEncodedImageBytes = 5 * 1024 * 1024;
@@ -6927,7 +6944,7 @@ describe("acp: model-independent", () => {
       const imageData = oversized.toString("base64");
       expect(Buffer.byteLength(imageData)).toBe(maxEncodedImageBytes + 4);
       const gateway = startFakeGateway(
-        [finalText("ACP image size recovery complete")],
+        [finalText("ACP image deferred"), finalText("ACP image size recovery complete")],
         {
           models: [{
             id: FAKE_GATEWAY_MODEL,
@@ -6955,22 +6972,28 @@ describe("acp: model-independent", () => {
           },
         });
 
-        const rejected = await readResponse(client, 99, LIVE_TIMEOUT);
-        expect(rejected.error).toEqual({
-          code: -32602,
-          message: "Image prompt exceeds size limit",
-        });
-        expect(gateway.requests).toHaveLength(0);
+        const prompted = await readResponse(client, 99, LIVE_TIMEOUT);
+        expect(prompted.result?.stopReason).toBe("end_turn");
+        expect(gateway.requests).toHaveLength(1);
+        const body = gateway.requests[0]!.body;
+        expect(body).toContain("dimensions could not be verified");
+        expect(body).toContain("The original is saved at ");
+        const files = acpGatewayRequest(body).prompt
+          .flatMap((message) => Array.isArray(message.content) ? message.content as Array<Record<string, any>> : [])
+          .filter((part) => part.type === "file");
+        expect(files).toHaveLength(0);
         const imageDir = join(root.home, ".fx", "sessions", sessionId, "images");
-        if (existsSync(imageDir)) expect(readdirSync(imageDir)).toEqual([]);
+        const snapshots = readdirSync(imageDir).filter((name) => name.endsWith(".bin"));
+        expect(snapshots).toHaveLength(1);
+        expect(readFileSync(join(imageDir, snapshots[0]!))).toEqual(oversized);
 
         const recovered = await runPrompt(
           client,
-          "Confirm the ACP connection remains usable after image size rejection.",
+          "Confirm the ACP connection remains usable after image deferral.",
           TIMEOUT,
         );
         expect(recovered.promptResult.result.stopReason).toBe("end_turn");
-        expect(gateway.requests).toHaveLength(1);
+        expect(gateway.requests).toHaveLength(2);
         expect(client.stderr).toBe("");
       } finally {
         await client?.close();

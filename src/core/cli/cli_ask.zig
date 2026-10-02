@@ -90,6 +90,7 @@ const tool_specs = @import("../tooling/tool_specs.zig");
 const web_fetch_runtime = @import("../tooling/web_fetch_runtime.zig");
 const web_search_runtime = @import("../tooling/web_search_runtime.zig");
 const types = @import("../shared/types.zig");
+const history_range = @import("../shared/history_range.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const ask_presentation = @import("../../ui/ask_presentation.zig");
 const url_opener = @import("../hosts/url_opener.zig");
@@ -353,6 +354,7 @@ const AskOptions = struct {
     model_override: ?[]u8 = null,
     effort_override: ?types.ReasoningEffort = null,
     fast_override: ?bool = null,
+    ultrafast_override: ?bool = null,
     provider_order_override: ?[][]const u8 = null,
     provider_strict_override: ?bool = null,
     image_paths: std.ArrayList([]u8) = .empty,
@@ -498,6 +500,7 @@ const RunOptions = struct {
     model_override: ?[]const u8 = null,
     effort_override: ?types.ReasoningEffort = null,
     fast_override: ?bool = null,
+    ultrafast_override: ?bool = null,
     provider_order_override: ?[]const []const u8 = null,
     provider_strict_override: ?bool = null,
     deps: RunDeps,
@@ -584,6 +587,10 @@ const AskContext = struct {
     auto_compact_percent: u8 = compactor.default_percent,
     context_limits: config_runtime.context_limits.Values = .{},
     fast_mode: bool = false,
+    /// Profile preference used only when creating a new durable session.
+    /// Process and CLI overrides remain per-run and never rewrite this value.
+    persisted_ultrafast_mode: bool = false,
+    ultrafast_mode: bool = false,
     effort: types.ReasoningEffort = .auto,
     /// Borrowed gateway provider routing for this run; startup state owns the
     /// backing memory.
@@ -892,10 +899,10 @@ const AskContext = struct {
     }
 
     fn imageSnapshotStorageDir(self: *AskContext) ![]u8 {
-        const sessions_dir = if (self.v2) |v2|
-            std.fs.path.dirname(try v2.ensureFilesPath())
-        else if (self.store) |*store| store.sessions_dir else null;
-        const session_id = self.activeSessionId();
+        // A v2 session captures into the process's temporary folder, then
+        // keeps the bytes inside the turn (D44).
+        const sessions_dir = if (self.v2 != null) null else if (self.store) |*store| store.sessions_dir else null;
+        const session_id = if (self.v2 != null) null else self.activeSessionId();
         return session_store.imageSnapshotStorageDir(
             self.alloc,
             sessions_dir,
@@ -913,6 +920,7 @@ const AskContext = struct {
             snapshot_dir,
             .{ .cancel_flag = self.cancelFlag() },
         );
+        if (self.v2 != null) try image_attachments.inlineCapturedSnapshot(self.alloc, attachment);
     }
 
     fn captureImageAttachments(self: *AskContext, attachments: []ImageAttachment) !void {
@@ -924,6 +932,7 @@ const AskContext = struct {
             snapshot_dir,
             .{ .cancel_flag = self.cancelFlag() },
         );
+        if (self.v2 != null) try image_attachments.inlineCapturedSnapshots(self.alloc, attachments);
     }
 
     /// Record whether restored history references shell execution handles this
@@ -966,6 +975,7 @@ const AskContext = struct {
             .model = @constCast(self.seed_model),
             .effort = self.effort,
             .fast_mode = self.fast_mode,
+            .ultrafast_mode = self.persisted_ultrafast_mode,
         };
         var writable = if (self.requested_resume) |target|
             try subagent_resume_admission.resumeForExternalPrompt(
@@ -1024,6 +1034,7 @@ const AskContext = struct {
             self.model = preferences.model;
             self.effort = preferences.effort;
             self.fast_mode = preferences.fast_mode;
+            self.ultrafast_mode = preferences.ultrafast_mode;
         }
         self.subagent_host = subagent_tool_host.Runtime.create(
             self.alloc,
@@ -1089,6 +1100,7 @@ const AskContext = struct {
             .model = @constCast(self.seed_model),
             .effort = self.effort,
             .fast_mode = self.fast_mode,
+            .ultrafast_mode = self.persisted_ultrafast_mode,
         };
         const v2 = if (self.requested_resume) |target|
             try session_adapter.Session.resumeSession(self.alloc, store, switch (target) {
@@ -1128,9 +1140,10 @@ const AskContext = struct {
                 self.model = preferences.model;
                 self.effort = preferences.effort;
                 self.fast_mode = preferences.fast_mode;
+                self.ultrafast_mode = preferences.ultrafast_mode;
             }
         }
-        self.session.configureWebFetchArtifacts(self.alloc, v2.filesPath());
+        self.session.configureWebFetchArtifactBlobs(self.alloc, try v2.childCapability(), v2.id());
         self.v2 = v2;
         try self.startV2SubagentHost(v2);
     }
@@ -1198,6 +1211,7 @@ const AskContext = struct {
             .gateway_models_path = self.cfg.gateway_models_path,
             .agent_step_limit = self.agent_step_limit,
             .fast_mode = self.fast_mode,
+            .ultrafast_mode = self.ultrafast_mode,
             .effort = self.effort,
             .provider_order = if (self.provider == .gateway) self.provider_order else &.{},
             .provider_strict = self.provider == .gateway and self.provider_strict,
@@ -1507,6 +1521,7 @@ fn runWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: 
         .model_override = options.model_override,
         .effort_override = options.effort_override,
         .fast_override = options.fast_override,
+        .ultrafast_override = options.ultrafast_override,
         .provider_order_override = options.provider_order_override,
         .provider_strict_override = options.provider_strict_override,
         .deps = deps,
@@ -1757,6 +1772,8 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     ctx.context_limits = startup.context_limits;
     ctx.context_limits.applyCommandLine(cfg.context_limit_overrides);
     ctx.fast_mode = startup.fast_mode;
+    ctx.persisted_ultrafast_mode = startup.configured_ultrafast_mode;
+    ctx.ultrafast_mode = startup.ultrafast_mode;
     ctx.provider_order = startup.provider_order;
     ctx.provider_strict = startup.provider_strict;
     ctx.effort = toCoreReasoningEffort(startup.effort);
@@ -1792,6 +1809,9 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
             owned_resumed_model = try alloc.dupe(u8, ctx.model);
             ctx.model = owned_resumed_model.?;
         }
+        // Environment precedence survives resume without rewriting the saved
+        // profile preference. CLI flags below remain the final per-run layer.
+        if (startup.ultrafast_process_override) |ultrafast| ctx.ultrafast_mode = ultrafast;
         ctx.session.setConversationLanguageFromUserMessage(owned_prompt);
     }
 
@@ -1805,12 +1825,22 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     }
     if (options.fast_override) |fast| {
         ctx.fast_mode = fast;
+        if (fast) ctx.ultrafast_mode = false;
     } else if (options.model_override != null and ctx.requested_resume == null and
         startup.fast_mode_source == .compiled_default)
     {
         // Default fast mode applies to the compiled default model only; an
         // explicit model override drops it unless --fast restores it.
         ctx.fast_mode = false;
+    }
+    if (options.ultrafast_override) |ultrafast| {
+        ctx.ultrafast_mode = ultrafast;
+        if (ultrafast) ctx.fast_mode = false;
+    } else if (options.model_override != null and ctx.requested_resume == null and
+        startup.ultrafast_mode_source == .compiled_default)
+    {
+        // Ultra mode must never follow an explicit model override by default.
+        ctx.ultrafast_mode = false;
     }
     if (options.provider_order_override) |order| {
         ctx.provider_order = order;
@@ -2078,6 +2108,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         .auto_compact_percent = startup.auto_compact_percent,
         .cancel_flag = ctx.cancelFlag(),
         .fast_mode = ctx.fast_mode,
+        .ultrafast_mode = ctx.ultrafast_mode,
         .effort = ctx.effort,
         .provider_order = if (ctx.provider == .gateway) ctx.provider_order else &.{},
         .provider_strict = ctx.provider == .gateway and ctx.provider_strict,
@@ -3329,7 +3360,7 @@ fn commitContextCompaction(
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     ctx.session_write_mutex.lockUncancelable(io_mod.getIo());
     defer ctx.session_write_mutex.unlock(io_mod.getIo());
-    const prepared = try session_runtime.prepareCompactedHistory(ctx.alloc, ctx.session.agent.history.items, summary, retained_from orelse .{ .turns = session_runtime.rawHistoryTurnCount(ctx.session.agent.history.items) });
+    const prepared = try session_runtime.prepareCompactedHistory(ctx.alloc, ctx.session.agent.history.items, summary, retained_from orelse .{ .turns = history_range.rawHistoryTurnCount(ctx.session.agent.history.items) });
     errdefer types.freeHistoryTurnSlice(ctx.alloc, prepared);
     if (ctx.v2) |v2| {
         try v2.commitCompaction(summary, active_prefix != null, retained_from);
@@ -3372,7 +3403,7 @@ fn appendTurnPiece(raw_ctx: *anyopaque, progress: agent_runtime.TurnProgress) !v
     ctx.session_write_mutex.lockUncancelable(io_mod.getIo());
     defer ctx.session_write_mutex.unlock(io_mod.getIo());
     const v2 = ctx.v2 orelse return;
-    v2.appendProgress(progress.user, progress.execution, progress.running_calls) catch |err| {
+    v2.appendProgress(progress.user, progress.execution, .{ .calls = progress.running_calls, .assistant = progress.running_assistant }) catch |err| {
         debug_trace.logf("session", "event=sessions_v2_stream_failed session={s} err={s} deferred=commit", .{ v2.id(), @errorName(err) });
         return;
     };
@@ -4146,6 +4177,13 @@ fn parseOptionsWithStdin(alloc: Allocator, args: []const [:0]const u8, stdin: St
             if (opts.fast_override != null and opts.fast_override.? != enabled)
                 return error.InvalidAskArgs;
             opts.fast_override = enabled;
+            if (enabled) opts.ultrafast_override = false;
+        } else if (std.mem.eql(u8, arg, "--ultrafast") or std.mem.eql(u8, arg, "--no-ultrafast")) {
+            const enabled = std.mem.eql(u8, arg, "--ultrafast");
+            if (opts.ultrafast_override != null and opts.ultrafast_override.? != enabled)
+                return error.InvalidAskArgs;
+            opts.ultrafast_override = enabled;
+            if (enabled) opts.fast_override = false;
         } else if (std.mem.eql(u8, arg, "--provider-order")) {
             i += 1;
             if (i >= args.len) return error.InvalidAskArgs;

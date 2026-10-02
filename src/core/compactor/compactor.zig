@@ -31,7 +31,6 @@ const checkpoint = @import("checkpoint.zig");
 const records = @import("records.zig");
 const settings = @import("settings.zig");
 const trace = @import("trace.zig");
-const session_runtime = @import("../session/session.zig");
 const model_provider = @import("../config/model_provider.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const types = @import("../shared/types.zig");
@@ -103,9 +102,23 @@ pub const Progress = struct {
     }
 };
 
+/// Appends the chat messages the model saw for `history`. The session owns
+/// that projection, so the caller hands it in.
+const AppendMessages = *const fn (
+    alloc: Allocator,
+    messages: *std.ArrayList(types.ChatMessage),
+    history: []const types.HistoryTurn,
+) AppendMessagesError!void;
+
+/// The errors the session's projection declares.
+const AppendMessagesError = Allocator.Error || error{InvalidReplayHandle};
+
 pub const Request = struct {
     /// The saved conversation, oldest first, including earlier checkpoints.
     history: []const types.HistoryTurn,
+    /// The session's projection of saved turns into the messages the model
+    /// saw.
+    append_messages: AppendMessages,
     /// The turn still running when compaction happens in the middle of it.
     active: ?types.AssistantHistoryTurn = null,
     size: Size,
@@ -182,7 +195,7 @@ pub fn compact(alloc: Allocator, request: Request) !?Result {
     trace.log(false, "room after compaction after_tokens={d} fixed_tokens={any} kept_tokens={d} kept_used={d} compacted_tokens={d}", .{ request.size.afterTokens(), request.size.fixed_tokens, chosen.kept_tokens, chosen.kept_used, request.size.compactedTokens(chosen.kept_used) });
 
     const earlier = try earlierFrom(out, request.records, chosen.earlier);
-    const turns = try turnsFrom(out, chosen.older);
+    const turns = try turnsFrom(out, chosen.older, request.append_messages);
     if (turns.len == 0) return error.NothingToCompact;
     var summarizer: model.Summarizer = .{ .caller = caller, .cancel_flag = request.cancel_flag, .trace_ctx = trace_ctx };
     trace.info(trace_ctx, .provider_start, "model={s} turns={d} earlier={} store={}", .{ caller.model, turns.len, chosen.earlier != null, request.records != null });
@@ -239,13 +252,13 @@ fn earlierFrom(arena: Allocator, store: ?Store, earlier: ?[]const u8) !?summariz
 /// The first user message starts each turn; later ones are messages the user
 /// added while it ran. Notes that fx itself added stay notes, so they never
 /// count as user messages.
-fn turnsFrom(arena: Allocator, history: []const types.HistoryTurn) ![]const summarize.Turn {
+fn turnsFrom(arena: Allocator, history: []const types.HistoryTurn, append_messages: AppendMessages) ![]const summarize.Turn {
     var turns: std.ArrayList(summarize.Turn) = .empty;
     var messages: std.ArrayList(types.ChatMessage) = .empty;
     for (history, 0..) |turn, index| {
         if (turn == .compacted_summary) continue;
         messages.clearRetainingCapacity();
-        try session_runtime.appendHistoryChatMessages(arena, &messages, history[index .. index + 1]);
+        try append_messages(arena, &messages, history[index .. index + 1]);
         var projected = messages.items;
         var user: []const u8 = "";
         if (projected.len > 0 and projected[0].role == .user and projected[0].context_origin == .user_turn and !projected[0].restored_steering) {
@@ -337,6 +350,14 @@ test "an unreadable checkpoint numbers new turns, tool calls and ledgers after t
     try std.testing.expectEqual(@as(usize, 2), earlier.ledger_count);
     // Without a store nothing was saved, so numbering starts at one.
     try std.testing.expectEqual(@as(usize, 0), (try earlierFrom(arena, null, broken)).?.turn_count);
+
+    // A count no session reaches is damage too, as is a record numbered past
+    // it; numbering on from either would overflow.
+    const impossible = std.fmt.comptimePrint("fx-compactor-v1\n{{\"tool_count\":{d}}}", .{std.math.maxInt(usize)});
+    try store.write(arena, std.fmt.comptimePrint("compacted-T{d}.txt", .{std.math.maxInt(usize)}), "damaged");
+    const recovered = (try earlierFrom(arena, store, impossible)).?;
+    try std.testing.expectEqualStrings(impossible, recovered.earlier);
+    try std.testing.expectEqual(@as(usize, 7), recovered.tool_count);
 }
 
 test {
