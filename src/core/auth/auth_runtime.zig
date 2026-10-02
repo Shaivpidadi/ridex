@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const api_key_validator = @import("api_key_validator.zig");
 const auth_transition = @import("auth_transition.zig");
 const credentials = @import("credentials.zig");
@@ -2889,6 +2890,8 @@ pub const Runtime = struct {
     /// Starts resolving the launch credential on a worker. Returns false when
     /// the worker cannot start; the caller then resolves the credential inline.
     pub fn beginStartupCredentialLoad(self: *Self, request: StartupCredentialRequest) bool {
+        // Single-threaded builds have no worker; the caller resolves inline.
+        if (comptime builtin.single_threaded) return false;
         std.debug.assert(self.startup_credential_task == null);
         self.startup_credential_task = StartupCredentialTask.start(self.secret_store, request) catch |err| {
             debug_trace.logf("auth", "startup credential worker unavailable err={s}", .{@errorName(err)});
