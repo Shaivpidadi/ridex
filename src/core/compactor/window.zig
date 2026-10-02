@@ -6,7 +6,7 @@
 
 const std = @import("std");
 const settings = @import("settings.zig");
-const session_runtime = @import("../session/session.zig");
+const history_range = @import("../shared/history_range.zig");
 const token_estimate = @import("../shared/token_estimate.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const model_provider = @import("../config/model_provider.zig");
@@ -173,7 +173,7 @@ fn selectRecentContext(
     provider: ?model_provider.ProviderSelection,
     max_turns: usize,
 ) Recent {
-    var raw_count = session_runtime.rawHistoryTurnCount(history);
+    var raw_count = history_range.rawHistoryTurnCount(history);
     var selected = Recent{ .cut = .{ .turns = raw_count } };
     var total: usize = 0;
     var selected_any = false;
@@ -328,14 +328,14 @@ fn split(
     try combined.appendSlice(arena, history);
     if (active) |turn| try combined.append(arena, .{ .assistant = turn });
     const recent: Recent = if (kept_tokens == 0)
-        .{ .cut = .{ .turns = session_runtime.rawHistoryTurnCount(combined.items) } }
+        .{ .cut = .{ .turns = history_range.rawHistoryTurnCount(combined.items) } }
     else
         selectRecentContext(combined.items, kept_tokens, input_capacity, route, max_kept_turns);
     var cut = recent.cut;
     if (active) |turn| {
         // The unfinished turn lives outside `history`; compacting all of it
         // means cutting after its last completed exchange.
-        const active_index = session_runtime.rawHistoryTurnCount(history);
+        const active_index = history_range.rawHistoryTurnCount(history);
         if (cut.turns > active_index) cut = .{
             .turns = active_index,
             .tool_steps = turn.execution.tool_steps.len,
@@ -348,8 +348,8 @@ fn split(
     }
     return .{
         .earlier = earlier,
-        .older = try session_runtime.contextHistoryRange(arena, combined.items, .{}, cut),
-        .retained_history = try session_runtime.contextHistoryRange(arena, history, cut, null),
+        .older = try history_range.contextHistoryRange(arena, combined.items, .{}, cut),
+        .retained_history = try history_range.contextHistoryRange(arena, history, cut, null),
         .cut = cut,
         .kept_tokens = kept_tokens,
         .kept_used = recent.tokens,

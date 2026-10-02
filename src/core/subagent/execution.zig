@@ -20,6 +20,7 @@ const session_store = @import("../session/session_store.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const tool_dispatch = @import("../tooling/tool_dispatch.zig");
 const types = @import("../shared/types.zig");
+const history_range = @import("../shared/history_range.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -156,6 +157,9 @@ pub const TurnPreferences = struct {
     provider: @import("../config/model_provider.zig").ProviderId = .gateway,
     model: []const u8,
     effort: types.ReasoningEffort,
+    /// The durable child preference wins when work resumes. Parent defaults are
+    /// used only while creating a new child session.
+    ultrafast_mode: bool = false,
 };
 
 pub const CaptureRequest = struct {
@@ -339,6 +343,16 @@ pub const TurnContext = struct {
             }
         }
         return try checkpoint.dupe(alloc);
+    }
+
+    /// Opens a v2 child's turn on disk as its work starts, so a body its
+    /// tools store is a blob of a session on disk (D44). A v1 child keeps
+    /// side files and has nothing to open.
+    pub fn beginTurn(self: *TurnContext) !void {
+        switch (self.loaded) {
+            .v1 => {},
+            .v2 => |child| try child.beginTurn(),
+        }
     }
 
     pub fn childCapability(
@@ -632,7 +646,7 @@ pub const TurnContext = struct {
         if (prefix) |*value| {
             try session.copyWorkIdToTurn(self.alloc, value, self.active_work_id orelse return error.InvalidWorkId);
         }
-        const prepared = try session.prepareCompactedHistory(self.alloc, self.runtime.agent.history.items, summary, retained_from orelse .{ .turns = session.rawHistoryTurnCount(self.runtime.agent.history.items) });
+        const prepared = try session.prepareCompactedHistory(self.alloc, self.runtime.agent.history.items, summary, retained_from orelse .{ .turns = history_range.rawHistoryTurnCount(self.runtime.agent.history.items) });
         errdefer types.freeHistoryTurnSlice(self.alloc, prepared);
         switch (self.loaded) {
             .v1 => |loaded| _ = try loaded.commitContextCompaction(

@@ -17,6 +17,7 @@ const js_host_steering = if (host_target.is_wasm)
 else
     struct {};
 const io_mod = @import("../core/shared/io.zig");
+const host_attachments = @import("../core/hosts/host_attachments.zig");
 const image_attachments = @import("../core/images/image_attachments.zig");
 const image_data = @import("../core/images/image_data.zig");
 const jsonrpc = @import("jsonrpc.zig");
@@ -24,6 +25,7 @@ const acp_types = @import("types.zig");
 const server = @import("server.zig");
 const sessions = @import("sessions.zig");
 const client_instructions = @import("client_instructions.zig");
+const tool_call_identities = @import("tool_call_identities.zig");
 const agent_runtime = @import("../core/agent/agent_runtime.zig");
 const agent_execution_memory = @import("../core/agent/execution_memory.zig");
 const diff_mod = @import("../core/output/diff.zig");
@@ -78,6 +80,7 @@ const test_builtin_gateway = if (std_builtin.is_test)
 else
     struct {};
 const types = @import("../core/shared/types.zig");
+const history_range = @import("../core/shared/history_range.zig");
 const worker_runtime = @import("../core/agent/worker_runtime.zig");
 const agent_stream_provider = @import("../core/agent/stream_provider.zig");
 const runtime_gateway_step = @import("../core/agent/runtime/gateway_step.zig");
@@ -144,6 +147,42 @@ const ProviderTerminalPublication = enum {
     pending,
     published,
 };
+
+/// Pure final admission for every ACP model request. A persisted or
+/// reconfigured session cannot issue an ultrafast request unless the current
+/// Gateway catalog still verifies the selected model capability.
+fn ultrafastPromptAllowed(
+    state: *const server.ServerState,
+    session: *const server.ActiveSessionState,
+) bool {
+    if (!session.ultrafast_mode) return true;
+    const catalog_ready = state.capability_resolver.catalogEntries() != null;
+    const bundle = state.cfg.provider_set.select(session.provider);
+    const capabilities = state.capability_resolver.available(
+        session.model,
+        bundle.fallbackModelCapabilities(session.model),
+    );
+    return ultrafastCapabilityAllowed(
+        session.provider,
+        catalog_ready,
+        capabilities.supports_ultrafast_mode,
+    );
+}
+
+fn ultrafastCapabilityAllowed(
+    provider: model_provider.ProviderId,
+    catalog_ready: bool,
+    supports_ultrafast: bool,
+) bool {
+    return provider == .gateway and catalog_ready and supports_ultrafast;
+}
+
+test "ultrafastPromptAllowed requires a verified Gateway capability" {
+    try std.testing.expect(ultrafastCapabilityAllowed(.gateway, true, true));
+    try std.testing.expect(!ultrafastCapabilityAllowed(.codex, true, true));
+    try std.testing.expect(!ultrafastCapabilityAllowed(.gateway, false, true));
+    try std.testing.expect(!ultrafastCapabilityAllowed(.gateway, true, false));
+}
 
 const AgentMessageKind = enum {
     assistant,
@@ -241,19 +280,16 @@ const AcpContext = struct {
     /// before its server reconnects. A failure costs only replay detail.
     fn rememberToolIdentity(self: *AcpContext, name: []const u8, identity: mcp_runtime.McpRuntime.ToolIdentity) void {
         const session = if (self.state.active_session) |*active| active else return;
-        const capability: ?*session_child_store.SessionChildCapability = blk: {
-            const found = if (session.writable) |*writable|
-                writable.childCapability()
-            else if (session.v2) |v2|
-                v2.childCapability()
-            else
-                break :blk null;
-            break :blk found catch |err| {
+        // A v2 session keeps the record as a setting (D46).
+        const target: tool_call_identities.Target = if (session.v2) |v2| .{ .v2 = v2 } else blk: {
+            const writable = if (session.writable) |*value| value else break :blk .none;
+            const capability = writable.childCapability() catch |err| {
                 debug_trace.logf("acp", "tool identity kept in memory only tool={s} err={s}", .{ name, @errorName(err) });
-                break :blk null;
+                break :blk .none;
             };
+            break :blk .{ .capability = capability };
         };
-        session.tool_identities.remember(self.state.alloc, capability, name, identity) catch |err| {
+        session.tool_identities.remember(self.state.alloc, target, name, identity) catch |err| {
             debug_trace.logf("acp", "tool identity not recorded for replay tool={s} err={s}", .{ name, @errorName(err) });
         };
     }
@@ -403,6 +439,7 @@ const AcpContext = struct {
             .gateway_models_path = self.state.cfg.gateway_models_path,
             .agent_step_limit = session.agent_step_limit,
             .fast_mode = session.fast_mode,
+            .ultrafast_mode = session.ultrafast_mode,
             .effort = session.effort,
             .first_call_tool_choice = session.first_call_tool_choice,
             .permission_mode = self.captured_permission_mode orelse session.permission_mode,
@@ -710,6 +747,12 @@ pub fn handlePrompt(
                 credentials.missing_credential_message,
         } };
     }
+    if (!ultrafastPromptAllowed(state, session)) {
+        return .{ .rpc_error = .{
+            .code = ErrorCode.invalid_request,
+            .message = "Ultrafast mode requires a verified compatible Gateway model",
+        } };
+    }
 
     const params = msg.params_raw orelse return .{
         .rpc_error = .{
@@ -728,8 +771,12 @@ pub fn handlePrompt(
         }
     }
     const next_image_id = (try image_attachments.calculate_next_image_id(prior_image_catalog)).next_id;
-    var prompt_input = parsePromptInputWithFirstImageId(alloc, params, next_image_id) catch |err|
-        return promptInputFailure(err);
+    var prompt_input = parsePromptInputWithFirstImageId(
+        alloc,
+        params,
+        next_image_id,
+        state.cfg.host_attachments,
+    ) catch |err| return promptInputFailure(err);
     defer prompt_input.deinit(alloc);
     if (prompt_input.pending_images.len > 0) {
         if (session.store == null and session.wasm_state == null and session.v2 == null) {
@@ -741,15 +788,18 @@ pub fn handlePrompt(
             if (comptime host_target.is_wasm) return promptInputFailure(error.UnsupportedPromptImage);
             var temporary_snapshot_dir: ?[]u8 = null;
             defer if (temporary_snapshot_dir) |path| alloc.free(path);
-            // A v2 session keeps them in its side folder, like v1's.
+            // A v2 session captures into a temporary folder, then keeps the
+            // bytes inside the turn (D44).
             const snapshot_dir = try session_store.imageSnapshotStorageDir(
                 alloc,
-                if (session.v2) |v2| std.fs.path.dirname(try v2.ensureFilesPath()) else if (session.store) |store| store.sessions_dir else null,
-                if (session.store != null or session.v2 != null) session.session_id else null,
+                if (session.v2 != null) null else if (session.store) |store| store.sessions_dir else null,
+                if (session.v2 == null and session.store != null) session.session_id else null,
                 &temporary_snapshot_dir,
             );
             defer alloc.free(snapshot_dir);
             prompt_input.captureImages(alloc, snapshot_dir) catch |err|
+                return promptInputFailure(err);
+            if (session.v2 != null) image_attachments.inlineCapturedSnapshots(alloc, prompt_input.images) catch |err|
                 return promptInputFailure(err);
         }
     }
@@ -1189,6 +1239,7 @@ fn buildAgentConfig(
         .auto_compact_percent = state.auto_compact_percent,
         .cancel_flag = &session.cancel_flag,
         .fast_mode = session.fast_mode,
+        .ultrafast_mode = session.ultrafast_mode,
         .effort = session.effort,
         .first_call_tool_choice = session.first_call_tool_choice,
         .workspace_root = state.workspace_root,
@@ -1227,6 +1278,15 @@ test "libfx inline prompt source references survive capture without a filesystem
     try std.testing.expectEqualStrings("[Image #1]", parsed.text);
 
     try std.testing.expectError(error.InvalidPromptImage, parsePromptInput(alloc, "{\"prompt\":[{\"type\":\"image\",\"mimeType\":\"image/png\",\"sourceRef\":\"bad\\nref\"}]}"));
+    try std.testing.expectError(error.InvalidPromptImage, parsePromptInput(alloc, "{\"prompt\":[{\"type\":\"image\",\"mimeType\":\"text/plain\",\"sourceRef\":\"host:original\"}]}"));
+    try std.testing.expectError(error.InvalidPromptImage, parsePromptInput(alloc, "{\"prompt\":[{\"type\":\"image\",\"mimeType\":\"image/png\",\"sourceRef\":\"host:original\",\"data\":\"Zh==\"}]}"));
+
+    var attachments = TestAttachmentStore{ .id = 3, .bytes = "unused" };
+    var with_store = try parsePromptInputWithFirstImageId(alloc, "{\"prompt\":[{\"type\":\"image\",\"mimeType\":\"image/png\",\"sourceRef\":\"host:original\"}]}", 1, attachments.store());
+    defer with_store.deinit(alloc);
+    try with_store.captureImagesInline(alloc);
+    try std.testing.expectEqualStrings("host:original", with_store.images[0].source_ref.?);
+    try std.testing.expectEqual(@as(usize, 0), attachments.taken);
 }
 
 const PendingPromptImage = struct {
@@ -1338,13 +1398,58 @@ const ParsedPromptInput = struct {
 };
 
 fn parsePromptInput(alloc: Allocator, params_json: []const u8) !ParsedPromptInput {
-    return parsePromptInputWithFirstImageId(alloc, params_json, 1);
+    return parsePromptInputWithFirstImageId(alloc, params_json, 1, null);
+}
+
+/// Decodes a standard ACP image block's canonical base64 `data`. Caller owns
+/// the returned bytes.
+fn decodePromptImageData(alloc: Allocator, data_value: std.json.Value) ![]u8 {
+    if (data_value != .string) return error.InvalidPromptImage;
+    const decoded_len = std.base64.standard.Decoder.calcSizeForSlice(data_value.string) catch
+        return error.InvalidPromptImage;
+    if (decoded_len == 0) return error.InvalidPromptImage;
+    if (decoded_len > image_attachments.max_image_bytes) {
+        return error.ImageTooLarge;
+    }
+    if (std.base64.standard.Encoder.calcSize(decoded_len) != data_value.string.len) {
+        return error.InvalidPromptImage;
+    }
+    const decoded = try alloc.alloc(u8, decoded_len);
+    errdefer alloc.free(decoded);
+    // The standard decoder rejects non-zero padding bits, so canonical
+    // validation needs no second encoded buffer.
+    std.base64.standard.Decoder.decode(decoded, data_value.string) catch
+        return error.InvalidPromptImage;
+    return decoded;
+}
+
+/// Takes the raw image bytes a libfx host attached beside the prompt frame.
+/// Hosts without an attachment store cannot reference one. Caller owns the
+/// returned bytes.
+fn takePromptImageAttachment(
+    alloc: Allocator,
+    attachments: ?host_attachments.Store,
+    value: std.json.Value,
+) ![]u8 {
+    const store = attachments orelse return error.UnsupportedPromptImage;
+    const id = host_attachments.idFromJson(value) orelse return error.InvalidPromptImage;
+    const bytes = store.take(alloc, id, image_attachments.max_image_bytes) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.AttachmentTooLarge => error.ImageTooLarge,
+        error.AttachmentUnavailable => error.InvalidPromptImage,
+    };
+    if (bytes.len == 0) {
+        alloc.free(bytes);
+        return error.InvalidPromptImage;
+    }
+    return bytes;
 }
 
 fn parsePromptInputWithFirstImageId(
     alloc: Allocator,
     params_json: []const u8,
     first_image_id: usize,
+    attachments: ?host_attachments.Store,
 ) !ParsedPromptInput {
     if (first_image_id == 0) return error.InvalidImageId;
     const parsed = std.json.parseFromSlice(std.json.Value, alloc, params_json, .{}) catch
@@ -1392,28 +1497,19 @@ fn parsePromptInputWithFirstImageId(
             }
         } else if (std.mem.eql(u8, block_type.string, "image")) {
             const media_type_value = block.object.get("mimeType") orelse return error.InvalidPromptImage;
-            if (media_type_value != .string or media_type_value.string.len == 0) return error.InvalidPromptImage;
+            if (media_type_value != .string or media_type_value.string.len == 0) {
+                return error.InvalidPromptImage;
+            }
             const source_ref_value: ?[]const u8 = if (block.object.get("sourceRef")) |value| ref: {
                 if (value != .string or !image_data.validSourceRef(value.string)) return error.InvalidPromptImage;
                 break :ref value.string;
             } else null;
-            const decoded = if (block.object.get("data")) |data_value| bytes: {
-                if (data_value != .string) return error.InvalidPromptImage;
-                const decoded_len = std.base64.standard.Decoder.calcSizeForSlice(data_value.string) catch
-                    return error.InvalidPromptImage;
-                if (decoded_len == 0) return error.InvalidPromptImage;
-                if (decoded_len > image_attachments.max_image_bytes) return error.ImageTooLarge;
-                const result = try alloc.alloc(u8, decoded_len);
-                errdefer alloc.free(result);
-                std.base64.standard.Decoder.decode(result, data_value.string) catch return error.InvalidPromptImage;
-                const canonical_len = std.base64.standard.Encoder.calcSize(result.len);
-                if (canonical_len != data_value.string.len) return error.InvalidPromptImage;
-                const canonical = try alloc.alloc(u8, canonical_len);
-                defer alloc.free(canonical);
-                const encoded = std.base64.standard.Encoder.encode(canonical, result);
-                if (!std.mem.eql(u8, encoded, data_value.string)) return error.InvalidPromptImage;
-                break :bytes result;
-            } else bytes: {
+            const decoded = if (acp_types.fxMetaField(block.object, "attachment")) |attachment| bytes: {
+                if (block.object.get("data") != null) return error.InvalidPromptImage;
+                break :bytes try takePromptImageAttachment(alloc, attachments, attachment);
+            } else if (block.object.get("data")) |data_value|
+                try decodePromptImageData(alloc, data_value)
+            else bytes: {
                 if (source_ref_value == null or !image_data.supportedMediaType(media_type_value.string)) return error.InvalidPromptImage;
                 break :bytes try alloc.alloc(u8, 0);
             };
@@ -2395,7 +2491,7 @@ fn commitContextCompaction(
     const session = if (ctx.state.active_session) |*value| value else return error.SessionPersistenceUnavailable;
     session.session_write_mutex.lockUncancelable(io_mod.getIo());
     defer session.session_write_mutex.unlock(io_mod.getIo());
-    const prepared = try session_runtime.prepareCompactedHistory(ctx.alloc, session.session_rt.agent.history.items, summary, retained_from orelse .{ .turns = session_runtime.rawHistoryTurnCount(session.session_rt.agent.history.items) });
+    const prepared = try session_runtime.prepareCompactedHistory(ctx.alloc, session.session_rt.agent.history.items, summary, retained_from orelse .{ .turns = history_range.rawHistoryTurnCount(session.session_rt.agent.history.items) });
     var prepared_owned = true;
     defer if (prepared_owned) types.freeHistoryTurnSlice(ctx.alloc, prepared);
     if (session.v2) |v2| {
@@ -2440,6 +2536,7 @@ fn commitContextCompaction(
             next.preferences.provider = session.provider;
             next.preferences.effort = session.effort;
             next.preferences.fast_mode = session.fast_mode;
+            next.preferences.ultrafast_mode = session.ultrafast_mode;
             const usage = try session.session_rt.usage.snapshot(ctx.alloc);
             if (next.usage) |*old| old.deinit(ctx.alloc);
             next.usage = usage;
@@ -3491,7 +3588,7 @@ test "parsePromptInput accepts explicit recovery continuation metadata" {
 test "parsePromptInput accepts image blocks as owned pending images" {
     const alloc = std.testing.allocator;
     const params = "{\"sessionId\":\"s1\",\"prompt\":[{\"type\":\"text\",\"text\":\"Only text\"},{\"type\":\"image\",\"data\":\"aGVsbG8=\",\"mimeType\":\"image/png\"}]}";
-    var parsed = try parsePromptInputWithFirstImageId(alloc, params, 7);
+    var parsed = try parsePromptInputWithFirstImageId(alloc, params, 7, null);
     defer parsed.deinit(alloc);
 
     try std.testing.expectEqualStrings("Only text\n[Image #7]", parsed.text);
@@ -3505,7 +3602,7 @@ test "captureImagesInline retains validated bytes on the attachment" {
     const alloc = std.testing.allocator;
     const png_b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAAAAAA6fptVAAAACklEQVR42mNkAAAAAgAB4iG8MwAAAABJRU5ErkJggg==";
     const params = "{\"sessionId\":\"s1\",\"prompt\":[{\"type\":\"text\",\"text\":\"describe\"},{\"type\":\"image\",\"data\":\"" ++ png_b64 ++ "\",\"mimeType\":\"image/png\"}]}";
-    var parsed = try parsePromptInputWithFirstImageId(alloc, params, 4);
+    var parsed = try parsePromptInputWithFirstImageId(alloc, params, 4, null);
     defer parsed.deinit(alloc);
 
     try parsed.captureImagesInline(alloc);
@@ -3535,6 +3632,34 @@ test "captureImagesInline rejects a declared media type that contradicts the byt
     try std.testing.expectEqual(@as(usize, 0), parsed.images.len);
 }
 
+test "prompt image decoding uses only decoded storage" {
+    var storage: [5]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&storage);
+    const alloc = fixed.allocator();
+    const decoded = try decodePromptImageData(alloc, .{ .string = "aGVsbG8=" });
+    defer alloc.free(decoded);
+    try std.testing.expectEqualStrings("hello", decoded);
+}
+
+test "prompt image decoding requires canonical standard base64" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { encoded: []const u8, bytes: []const u8 }{
+        .{ .encoded = "Zg==", .bytes = "f" },
+        .{ .encoded = "Zm8=", .bytes = "fo" },
+        .{ .encoded = "Zm9v", .bytes = "foo" },
+        .{ .encoded = "/w==", .bytes = "\xff" },
+        .{ .encoded = "//8=", .bytes = "\xff\xff" },
+    };
+    for (cases) |case| {
+        const decoded = try decodePromptImageData(alloc, .{ .string = case.encoded });
+        defer alloc.free(decoded);
+        try std.testing.expectEqualSlices(u8, case.bytes, decoded);
+    }
+    for ([_][]const u8{ "", "Zh==", "Zm9=", "///=", "Zg", "Zg=", "Zg===", "Zm9v=", "Zg==\n", "Zg== ", " Zg==", "Z g=", "AA=A", "__8=" }) |encoded| {
+        try std.testing.expectError(error.InvalidPromptImage, decodePromptImageData(alloc, .{ .string = encoded }));
+    }
+}
+
 test "parsePromptInput rejects malformed base64 image data" {
     const alloc = std.testing.allocator;
     const params = "{\"sessionId\":\"s1\",\"prompt\":[{\"type\":\"image\",\"data\":\"not-base64\",\"mimeType\":\"image/png\"}]}";
@@ -3545,6 +3670,92 @@ test "parsePromptInput rejects empty image data" {
     const alloc = std.testing.allocator;
     const params = "{\"sessionId\":\"s1\",\"prompt\":[{\"type\":\"image\",\"data\":\"\",\"mimeType\":\"image/png\"}]}";
     try std.testing.expectError(error.InvalidPromptImage, parsePromptInput(alloc, params));
+}
+
+const TestAttachmentStore = struct {
+    id: host_attachments.Id,
+    bytes: ?[]const u8,
+    too_large: bool = false,
+    taken: usize = 0,
+
+    fn store(self: *TestAttachmentStore) host_attachments.Store {
+        return .{ .context = self, .take_fn = take, .put_fn = put };
+    }
+
+    fn take(
+        raw: ?*anyopaque,
+        alloc: Allocator,
+        id: host_attachments.Id,
+        max_bytes: usize,
+    ) host_attachments.TakeError![]u8 {
+        const self: *TestAttachmentStore = @ptrCast(@alignCast(raw.?));
+        if (id != self.id) return error.AttachmentUnavailable;
+        const bytes = self.bytes orelse return error.AttachmentUnavailable;
+        self.bytes = null;
+        self.taken += 1;
+        if (self.too_large or bytes.len > max_bytes) return error.AttachmentTooLarge;
+        return alloc.dupe(u8, bytes);
+    }
+
+    fn put(_: ?*anyopaque, _: []const u8) host_attachments.PutError!host_attachments.Id {
+        return error.AttachmentStoreFull;
+    }
+};
+
+test "parsePromptInput takes raw image bytes from a host attachment" {
+    const alloc = std.testing.allocator;
+    const cases = [_][]const u8{
+        "{\"sessionId\":\"s1\",\"prompt\":[{\"type\":\"text\",\"text\":\"look\"},{\"type\":\"image\",\"mimeType\":\"image/png\",\"_meta\":{\"fx\":{\"attachment\":3}}}]}",
+        "{\"sessionId\":\"s1\",\"prompt\":[{\"type\":\"text\",\"text\":\"look\"},{\"type\":\"image\",\"mimeType\":\"image/png\",\"sourceRef\":\"host:raw\",\"_meta\":{\"fx\":{\"attachment\":3}}}]}",
+    };
+    for (cases, 0..) |params, index| {
+        var attachments = TestAttachmentStore{ .id = 3, .bytes = "\x89PNG\r\n\x1a\nraw" };
+        var parsed = try parsePromptInputWithFirstImageId(alloc, params, 2, attachments.store());
+        defer parsed.deinit(alloc);
+
+        try std.testing.expectEqualStrings("look\n[Image #2]", parsed.text);
+        try std.testing.expectEqual(@as(usize, 1), parsed.pending_images.len);
+        try std.testing.expectEqual(@as(usize, 2), parsed.pending_images[0].id);
+        try std.testing.expectEqualStrings("\x89PNG\r\n\x1a\nraw", parsed.pending_images[0].bytes);
+        try std.testing.expectEqualStrings("image/png", parsed.pending_images[0].media_type);
+        if (index == 0) {
+            try std.testing.expect(parsed.pending_images[0].source_ref == null);
+        } else {
+            try std.testing.expectEqualStrings("host:raw", parsed.pending_images[0].source_ref.?);
+        }
+        try std.testing.expectEqual(@as(usize, 1), attachments.taken);
+    }
+}
+
+test "parsePromptInput rejects unusable image attachment references" {
+    const alloc = std.testing.allocator;
+    const reference = "{\"sessionId\":\"s1\",\"prompt\":[{\"type\":\"image\",\"mimeType\":\"image/png\",\"sourceRef\":\"host:original\",\"_meta\":{\"fx\":{\"attachment\":3}}}]}";
+
+    // Standard ACP hosts have no attachment store.
+    try std.testing.expectError(error.UnsupportedPromptImage, parsePromptInput(alloc, reference));
+
+    var missing = TestAttachmentStore{ .id = 4, .bytes = "x" };
+    try std.testing.expectError(error.InvalidPromptImage, parsePromptInputWithFirstImageId(alloc, reference, 1, missing.store()));
+
+    var empty = TestAttachmentStore{ .id = 3, .bytes = "" };
+    try std.testing.expectError(error.InvalidPromptImage, parsePromptInputWithFirstImageId(alloc, reference, 1, empty.store()));
+
+    var oversized = TestAttachmentStore{ .id = 3, .bytes = "x", .too_large = true };
+    try std.testing.expectError(error.ImageTooLarge, parsePromptInputWithFirstImageId(alloc, reference, 1, oversized.store()));
+
+    const zero_id = "{\"sessionId\":\"s1\",\"prompt\":[{\"type\":\"image\",\"mimeType\":\"image/png\",\"_meta\":{\"fx\":{\"attachment\":0}}}]}";
+    var unused = TestAttachmentStore{ .id = 0, .bytes = "x" };
+    try std.testing.expectError(error.InvalidPromptImage, parsePromptInputWithFirstImageId(alloc, zero_id, 1, unused.store()));
+    try std.testing.expectEqual(@as(usize, 0), unused.taken);
+
+    const ambiguous = "{\"sessionId\":\"s1\",\"prompt\":[{\"type\":\"image\",\"mimeType\":\"image/png\",\"sourceRef\":\"host:original\",\"data\":\"aGVsbG8=\",\"_meta\":{\"fx\":{\"attachment\":3}}}]}";
+    var stored = TestAttachmentStore{ .id = 3, .bytes = "x" };
+    try std.testing.expectError(error.InvalidPromptImage, parsePromptInputWithFirstImageId(alloc, ambiguous, 1, stored.store()));
+    try std.testing.expectEqual(@as(usize, 0), stored.taken);
+
+    const invalid_ref = "{\"sessionId\":\"s1\",\"prompt\":[{\"type\":\"image\",\"mimeType\":\"image/png\",\"sourceRef\":\"bad\\nref\",\"_meta\":{\"fx\":{\"attachment\":3}}}]}";
+    try std.testing.expectError(error.InvalidPromptImage, parsePromptInputWithFirstImageId(alloc, invalid_ref, 1, stored.store()));
+    try std.testing.expectEqual(@as(usize, 0), stored.taken);
 }
 
 test "parsePromptInput preserves resource text and accepts only local absolute file targets" {
@@ -5077,6 +5288,7 @@ test "ACP prompt agent config carries request options from active session" {
         .source = .command_line,
     };
     state.active_session.?.fast_mode = true;
+    state.active_session.?.ultrafast_mode = true;
     state.active_session.?.effort = types.ReasoningEffort.literal("high");
 
     const session = &state.active_session.?;
@@ -5087,6 +5299,7 @@ test "ACP prompt agent config carries request options from active session" {
     }, true);
 
     try std.testing.expect(config.fast_mode);
+    try std.testing.expect(config.ultrafast_mode);
     try std.testing.expectEqual(types.ReasoningEffort.literal("high"), config.effort);
     try std.testing.expectEqual(@as(usize, 17), config.context_limits.project_instruction_file_bytes.effectiveBytes());
     try std.testing.expectEqual(config_runtime.context_limits.Source.command_line, config.context_limits.project_instruction_file_bytes.source);
@@ -5106,4 +5319,5 @@ test "ACP prompt agent config carries request options from active session" {
     try std.testing.expectEqual(state.cfg.gateway_retry_count, state.web_search_runtime.gateway_retry_count);
     try std.testing.expectEqualStrings(state.cfg.gateway_chat_url, state.web_search_runtime.gateway_chat_url);
     try std.testing.expectEqualStrings("/models", tool_ctx.gateway_models_path);
+    try std.testing.expect(tool_ctx.ultrafast_mode);
 }

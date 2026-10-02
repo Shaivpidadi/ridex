@@ -7,6 +7,7 @@ const agent_steps = @import("../../config/agent_steps.zig");
 const model_capabilities = @import("../../config/model_capabilities.zig");
 const model_provider = @import("../../config/model_provider.zig");
 const types = @import("../../shared/types.zig");
+const history_range = @import("../../shared/history_range.zig");
 const worker_runtime = @import("../worker_runtime.zig");
 const agent_stream_provider = @import("../stream_provider.zig");
 const session_runtime = @import("../../session/session.zig");
@@ -3733,12 +3734,14 @@ fn recoverySelectionChanged(
     selected_provider: model_provider.ProviderId,
     selected_model: []const u8,
     selected_fast_mode: bool,
+    selected_ultrafast_mode: bool,
 ) bool {
     return !checkpoint.authority.provider.same_authority(selected_provider) or !std.mem.eql(
         u8,
         checkpoint.authority.model,
         selected_model,
-    ) or checkpoint.requested_fast_mode != selected_fast_mode;
+    ) or checkpoint.requested_fast_mode != selected_fast_mode or
+        checkpoint.requested_ultrafast_mode != selected_ultrafast_mode;
 }
 
 fn recoveryCredentialAuthorityMatches(
@@ -3985,6 +3988,8 @@ fn persistRecoveryCheckpoint(
         },
         .requested_fast_mode = requested_fast_mode,
         .fast_mode = fast_mode,
+        .requested_ultrafast_mode = job.agent_settings.ultrafast_mode,
+        .ultrafast_mode = job.agent_settings.ultrafast_mode,
         .max_provider_attempts = attempt_limit,
         .consumed_provider_attempts = consumed_attempts,
         .outstanding_reservation = outstanding_reservation,
@@ -5534,7 +5539,7 @@ fn processQueuedPromptInner(
     const vision_fallback_available = config.provider_capabilities.vision_fallback and
         deps.tool_registry.lookup("vision") != null;
     var request_capabilities = deps.available_model_capabilities(deps.ctx, job.model);
-    if (requiresResolvedRequestCapabilities(
+    if (config.ultrafast_mode or requiresResolvedRequestCapabilities(
         job.images.len > 0 or job.authorized_image_catalog.len > 0,
         vision_fallback_available,
         config.effort,
@@ -6612,6 +6617,7 @@ test "compaction activity transaction settles only after publication and preserv
             .failure_provenance = &provenance,
             .compactor = .{
                 .history = &turns,
+                .append_messages = session_runtime.appendHistoryChatMessages,
                 .size = .{ .compact_at_tokens = 5_000, .usable_tokens = 10_000 },
                 .caller = summary_model.caller(),
                 .records = result_store.compactorStore(&capability),
@@ -6784,9 +6790,16 @@ fn processQueuedPromptLoop(
         restoredConsumedAttempts(checkpoint)
     else
         0;
-    const selected_fast_mode = config.fast_mode;
+    const selected_fast_mode = config.fast_mode and !config.ultrafast_mode;
+    const selected_ultrafast_mode = job.agent_settings.ultrafast_mode;
     const selection_changed = if (job.recovery_checkpoint) |checkpoint|
-        recoverySelectionChanged(checkpoint, job.provider, job.model, selected_fast_mode)
+        recoverySelectionChanged(
+            checkpoint,
+            job.provider,
+            job.model,
+            selected_fast_mode,
+            selected_ultrafast_mode,
+        )
     else
         false;
     if (job.recovery_checkpoint) |checkpoint| {
@@ -6815,6 +6828,7 @@ fn processQueuedPromptLoop(
     else
         selected_fast_mode;
     var fast_unavailable_notified = false;
+    var ultrafast_unconfirmed_notified = false;
     var tool_image_strip_notified = false;
     // Attachment pixel sizes probed during this turn, so each step does not
     // reread every attachment snapshot. Entries live in the turn arena.
@@ -7220,7 +7234,7 @@ fn processQueuedPromptLoop(
                 try deps.push_text(deps.ctx, .{ .operational = "\n" });
             }
             last_gateway_message_count = gateway_instructions.items.len + request_messages.len;
-            var provider_opts = model_capabilities.resolveProviderOptionsForCapabilities(request_capabilities, config.effort, route_fast_mode);
+            var provider_opts = try model_capabilities.resolveUltrafastProviderOptions(request_capabilities, job.provider, gateway_model, config.effort, route_fast_mode, config.ultrafast_mode);
             provider_opts.prompt_caching = config.provider_capabilities.gateway_prompt_caching;
             provider_opts.provider_order = config.provider_order;
             provider_opts.provider_strict = config.provider_strict;
@@ -7375,6 +7389,7 @@ fn processQueuedPromptLoop(
                         .before_summary = source.hook(),
                         .compactor = .{
                             .history = compaction_history,
+                            .append_messages = session_runtime.appendHistoryChatMessages,
                             .active = active_prefix,
                             .size = size,
                             .caller = summary_model.caller(),
@@ -7403,7 +7418,7 @@ fn processQueuedPromptLoop(
                         return err;
                     };
                     if (compacted) |outcome| {
-                        const raw_history_turns = session_runtime.rawHistoryTurnCount(compaction_history);
+                        const raw_history_turns = history_range.rawHistoryTurnCount(compaction_history);
                         const active_cut: runtime_execution_memory.CompactedExecutionBoundary = if (outcome.cut.turns == raw_history_turns) .{
                             .tool_steps = outcome.cut.tool_steps,
                             .steering = outcome.cut.steering,
@@ -7988,6 +8003,13 @@ fn processQueuedPromptLoop(
                 }
             }
             if (streamCompletionPtr(&stream_result)) |completion| {
+                if (config.ultrafast_mode) {
+                    debug_trace.eventf("gateway", "ultrafast_served_tier", step_ctx, "requested=ultrafast served={s}", .{if (completion.service_tier) |tier| @tagName(tier) else "unconfirmed"});
+                    if (completion.service_tier != .ultrafast and !ultrafast_unconfirmed_notified) {
+                        ultrafast_unconfirmed_notified = true;
+                        try deps.push_text(deps.ctx, .{ .operational = "Ultrafast was requested, but Gateway did not confirm it was served; this response may have used a standard or lower tier.\n" });
+                    }
+                }
                 agent.observeUsage(completion.usage);
                 // The completion buffer is step-scoped, so no cross-step
                 // dedupe: each completion reports its serving provider once.
