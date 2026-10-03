@@ -596,7 +596,7 @@ pub const Runtime = struct {
 
         const pid = std.c.getpid();
         var pid_buffer: [32]u8 = undefined;
-        const pid_text = std.fmt.bufPrint(&pid_buffer, "{d}", .{pid}) catch unreachable;
+        const pid_text = try std.fmt.bufPrint(&pid_buffer, "{d}", .{pid});
         const token = try self.process_provider.captureToken(alloc, pid_text);
         var instance_bytes: [16]u8 = undefined;
         zio.random(&instance_bytes);
