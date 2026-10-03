@@ -73,7 +73,7 @@ const natural_completion_live_ms: i64 = 10_000;
 /// own output is done and a detached process is still writing.
 const natural_completion_drain_max_bytes: usize = 2 * 1024 * 1024;
 pub const termination_settle_timeout_ms: i64 = 5_000;
-const supports_foreground_session = builtin.link_libc and
+pub const supports_foreground_session = builtin.link_libc and
     std.process.can_spawn and
     std.process.can_replace and
     builtin.os.tag != .windows and

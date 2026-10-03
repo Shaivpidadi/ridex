@@ -966,8 +966,9 @@ test.skipIf(!ENABLED || !tmuxAvailable())(
       await session.waitForComposer(TIMEOUT);
       const resourcesBefore = await waitForResourceStability(pid);
       expect(resourcesBefore.threads - preFeatureResources.threads).toBeLessThanOrEqual(2);
-      // Three terminal routes plus command-replay logs, commands, and tool-results routes.
-      expect(resourcesBefore.descriptors - preFeatureResources.descriptors).toBeLessThanOrEqual(6);
+      // Three terminal routes, the in-process terminal store's profile and
+      // sessions folders, plus command-replay logs, commands, and tool-results routes.
+      expect(resourcesBefore.descriptors - preFeatureResources.descriptors).toBeLessThanOrEqual(8);
       expect(resourcesBefore.rssKib - preFeatureResources.rssKib).toBeLessThan(16 * 1024);
 
       const peakResources = await peakResourcesWhile(pid, async () => {

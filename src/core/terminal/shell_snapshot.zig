@@ -736,6 +736,9 @@ fn captureWithShell(request: CaptureRequest) CaptureOutcome {
 }
 
 fn captureWithShellChecked(request: CaptureRequest) !CaptureOutcome {
+    // Targets without detached process sessions, such as WASI, cannot run
+    // the capture shell.
+    if (comptime !command_runner.supports_foreground_session) return .{ .failed = .spawn_failed };
     const kind = shell_resolver.shellKind(request.shell_path) orelse
         return .{ .failed = .unsupported_shell };
     var scratch_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);

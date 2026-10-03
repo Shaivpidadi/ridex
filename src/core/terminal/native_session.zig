@@ -716,7 +716,9 @@ const SupportedRegistry = struct {
         }
         if (hung_up != 0) {
             const grace_deadline = io_mod.milliTimestamp() + exit_grace_ms;
-            while (anyLive(&pinned) and io_mod.milliTimestamp() < grace_deadline) {
+            while ((anyLive(&pinned) or anyExitTreeAlive(&pinned)) and
+                io_mod.milliTimestamp() < grace_deadline)
+            {
                 io_mod.sleep(wait_poll_ns);
             }
             for (pinned) |maybe_session| {
@@ -742,6 +744,14 @@ const SupportedRegistry = struct {
         for (pinned) |maybe_session| {
             const session = maybe_session orelse continue;
             if (session.isLive()) return true;
+        }
+        return false;
+    }
+
+    fn anyExitTreeAlive(pinned: *const [max_sessions]?*Session) bool {
+        for (pinned) |maybe_session| {
+            const session = maybe_session orelse continue;
+            if (session.exitTreeAlive()) return true;
         }
         return false;
     }
@@ -1489,6 +1499,10 @@ const Session = struct {
     /// is then marked lost instead of exited, which a resume reports as
     /// ended when fx exited.
     ending_with_owner: bool = false,
+    /// The process tree recorded when the owner's exit hangs this terminal
+    /// up, so processes outside the shell's process group can be killed
+    /// after the shell itself exits. Used only by the exit path.
+    exit_tree: ?process_tree.Tracker = null,
     engine: terminal_engine.Grid,
     screen_available: bool = true,
     durable: terminal_store.DurableSession,
@@ -1777,6 +1791,10 @@ const Session = struct {
 
     fn deinit(self: *Session) void {
         self.shutdown();
+        if (self.exit_tree) |*tree| {
+            tree.deinit();
+            self.exit_tree = null;
+        }
         self.stopTimeoutWatcher();
         if (self.backend_started) {
             self.finalizeBackend();
@@ -1854,7 +1872,9 @@ const Session = struct {
     }
 
     /// First step of ending a terminal with its owner: marks it and hangs up
-    /// its process group. Returns whether it was live.
+    /// its process group. Job control can run the shell's commands in their
+    /// own process groups, so the process tree is recorded first and those
+    /// processes are hung up too. Returns whether it was live.
     fn hangUpForExit(self: *Session) bool {
         const zio = io_mod.getIo();
         self.timeout_done.set(zio);
@@ -1862,17 +1882,52 @@ const Session = struct {
         const live = self.lifecycle == .starting or self.lifecycle == .running;
         if (live) self.ending_with_owner = true;
         self.mutex.unlock(zio);
-        if (live) _ = self.signalProcess(.hangup);
-        return live;
+        if (!live) return false;
+        self.exit_tree = self.recordProcessTreeForExit();
+        _ = self.signalProcess(.hangup);
+        if (self.exit_tree) |*tree| {
+            if (tree.root) |root| {
+                _ = tree.signalOutsideProcessGroupChecked(signalValue(.hangup), root.pid);
+            }
+        }
+        return true;
+    }
+
+    fn recordProcessTreeForExit(self: *Session) ?process_tree.Tracker {
+        const target = self.signalTarget() orelse return null;
+        if (!self.matchesSignalTarget(target)) return null;
+        var tree = process_tree.Tracker.init(self.alloc) catch |err| {
+            debug_trace.logf("terminal", "exit process tree unavailable id={s} err={s}", .{ self.id, @errorName(err) });
+            return null;
+        };
+        tree.refresh(target.pid) catch |err| {
+            debug_trace.logf("terminal", "exit process tree unavailable id={s} err={s}", .{ self.id, @errorName(err) });
+            tree.deinit();
+            return null;
+        };
+        return tree;
+    }
+
+    fn exitTreeAlive(self: *Session) bool {
+        if (self.exit_tree) |*tree| return tree.anyAlive();
+        return false;
     }
 
     /// Last step of ending a terminal with its owner: kills what the hangup
-    /// left and records the terminal as lost. Closing the liveness pipe also
-    /// makes the launcher kill the process group if the signal missed it.
+    /// left, including processes outside the shell's process group after the
+    /// shell exited, and records a terminal still running as lost. Closing
+    /// the liveness pipe also makes the launcher kill the process group if
+    /// the signal missed it.
     fn killForExit(self: *Session) void {
-        if (!self.isLive()) return;
-        _ = self.signalProcess(.kill);
-        self.markLost();
+        if (self.isLive()) {
+            _ = self.signalProcess(.kill);
+            self.markLost();
+        }
+        if (self.exit_tree) |*tree| {
+            _ = tree.signalAll(signalValue(.kill));
+            tree.deinit();
+            self.exit_tree = null;
+        }
     }
 
     fn markLive(self: *Session) void {

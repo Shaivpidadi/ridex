@@ -2019,6 +2019,10 @@ test "isToolAllowed remains exact match only" {
 }
 
 test "sessionGrantAllowed maps tool categories and matches command grants exactly" {
+    // Command grants are current only in the snapshot epoch they were made
+    // in, so start from a fresh process owner.
+    shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    defer shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
     const grants = [_]types.PermissionGrant{
         .{ .tool_name = @constCast("bash"), .target_path = @constCast("git status") },
         .{ .tool_name = @constCast("edit"), .target_path = @constCast("/tmp/workspace/src/*") },
@@ -2034,6 +2038,8 @@ test "sessionGrantAllowed maps tool categories and matches command grants exactl
 }
 
 test "session command grants treat wildcard bytes literally" {
+    shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    defer shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
     const grants = [_]types.PermissionGrant{
         .{ .tool_name = @constCast("bash"), .target_path = @constCast("printf '*?'") },
     };

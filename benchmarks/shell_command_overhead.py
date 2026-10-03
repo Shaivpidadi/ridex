@@ -132,6 +132,9 @@ def main():
 
     class Handler(http.server.BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
+        # Headers and body go out in separate writes. With Nagle on, the body
+        # waits for the client's delayed ACK, about 40 ms per reply on Linux.
+        disable_nagle_algorithm = True
 
         def log_message(self, *_):
             pass

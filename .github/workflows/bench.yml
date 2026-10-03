@@ -129,8 +129,8 @@ jobs:
       - name: Run shell command overhead benchmark
         run: python3 benchmarks/shell_command_overhead.py --binary ./zig-out/bin/fx --output ${{ runner.temp }}/shell-command-overhead --calls 100 --timeout 480
 
-      # The 60 ms per-call budget is provisional, set from the first measured
-      # Linux baseline.
+      # The 60 ms per-call median budget is provisional, set from local macOS
+      # runs. Linux runners use bash as the login shell, so this job measures bash.
       - name: Enforce shell command overhead budget
         run: jq -e '.completed == true and .rc_loads == 1 and .per_call_ms.median <= 60 and .total_ms <= (.rc_delay_ms + 100*60 + 1000)' ${{ runner.temp }}/shell-command-overhead/measurements.json
 
