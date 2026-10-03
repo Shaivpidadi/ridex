@@ -15,11 +15,6 @@ const maxEffortBytes = 64;
 const maxUrlBytes = 16 * 1024;
 const maxModelCatalogBytes = 4 * 1024 * 1024;
 const maxModelCatalogEntries = 10_000;
-const maxSelectedModelBytes = 64 * 1024;
-const modelMetadataLeaseMs = 60 * 60 * 1000;
-const modelMetadataKey = Symbol("resolved model metadata");
-const catalogUrl = "https://ai-gateway.vercel.sh/coding-agent/v1/models";
-const defaultGatewayChatUrl = "https://ai-gateway.vercel.sh/v4/ai/language-model";
 const streamReadsPerTaskYield = 32;
 const transportActivityIntervalMs = 250;
 const maxUnreadEventBytes = 1024 * 1024;
@@ -98,53 +93,6 @@ function normalizeFast(value) {
   return value;
 }
 
-function modelMetadataError(code, model, message) {
-  const error = new Error(message);
-  error.code = code;
-  error.model = model;
-  error.capability = "modelMetadata";
-  return error;
-}
-
-function normalizeModelMetadata(value, model, now) {
-  const invalid = () => modelMetadataError("LIBFX_MODEL_METADATA_INVALID", model, "Model metadata is invalid; resolve the model again");
-  if (!value || typeof value !== "object" || Array.isArray(value) || value.version !== 1 ||
-      !Number.isSafeInteger(value.resolvedAt) || !Number.isSafeInteger(value.expiresAt) ||
-      value.resolvedAt < 0 || value.expiresAt <= value.resolvedAt ||
-      value.expiresAt - value.resolvedAt > modelMetadataLeaseMs || now < value.resolvedAt ||
-      typeof value.scope !== "string" || !/^[a-f0-9]{64}$/.test(value.scope) ||
-      !Array.isArray(value.data) || value.data.length === 0 || value.data.length > 64) throw invalid();
-  if (now >= value.expiresAt) {
-    throw modelMetadataError("LIBFX_MODEL_METADATA_EXPIRED", model, "Model metadata has expired; resolve the model again before creating an agent");
-  }
-  for (const row of value.data) {
-    if (!row || typeof row !== "object" || Array.isArray(row) || row.id !== model ||
-        (row.type !== undefined && (typeof row.type !== "string" || row.type.toLowerCase() !== "language"))) throw invalid();
-  }
-  const metadata = { version: 1, resolvedAt: value.resolvedAt, expiresAt: value.expiresAt, scope: value.scope, data: value.data };
-  let json;
-  try { json = JSON.stringify(metadata); } catch { throw invalid(); }
-  const snapshot = JSON.parse(json);
-  const envelope = selectedModelEnvelope(model, snapshot, now);
-  if (encoder.encode(json).length > maxSelectedModelBytes || encoder.encode(JSON.stringify(envelope)).length > maxSelectedModelBytes) {
-    throw new RangeError(`model metadata exceeds the ${maxSelectedModelBytes} byte libfx limit`);
-  }
-  return snapshot;
-}
-
-async function modelMetadataScope(apiKey, gatewayChatUrl) {
-  const bytes = encoder.encode(JSON.stringify([catalogUrl, gatewayChatUrl ?? defaultGatewayChatUrl, apiKey]));
-  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
-  return Array.from(digest, byte => byte.toString(16).padStart(2, "0")).join("");
-}
-
-function selectedModelEnvelope(model, metadata, now) {
-  if (now < metadata.resolvedAt || now >= metadata.expiresAt) {
-    throw modelMetadataError("LIBFX_MODEL_METADATA_EXPIRED", model, "Model metadata has expired; resolve the model again before prompting");
-  }
-  return { model, revision: String(metadata.resolvedAt), validForMs: metadata.expiresAt - now, data: metadata.data };
-}
-
 function normalizeUltrafast(value) {
   if (value === undefined) return undefined;
   if (typeof value !== "boolean") {
@@ -168,12 +116,11 @@ export function normalizeAgentOptions(value) {
     }
     const model = options.model;
     for (const name of Object.keys(model)) {
-      if (name !== "id" && name !== "effort" && name !== "fast" && name !== "ultrafast" && name !== "metadata") {
+      if (name !== "id" && name !== "effort" && name !== "fast" && name !== "ultrafast") {
         throw new TypeError(`unsupported model option: ${name}`);
       }
     }
     options.model = boundedString(model.id, "model.id", maxModelBytes, true);
-    if (Object.hasOwn(model, "metadata")) options[modelMetadataKey] = normalizeModelMetadata(model.metadata, options.model, Date.now());
     options.effort = normalizeEffort(model.effort);
     options.fast = normalizeFast(model.fast);
     options.ultrafast = normalizeUltrafast(model.ultrafast);
@@ -204,9 +151,9 @@ function agentEnvironment(options) {
 function agentRpcError(response) {
   const error = new Error(response.message);
   const data = response.data;
-  if (data && ["LIBFX_MODEL_UNSUPPORTED_EFFORT", "LIBFX_MODEL_UNSUPPORTED_FAST", "LIBFX_MODEL_UNSUPPORTED_ULTRAFAST", "LIBFX_MODEL_METADATA_INVALID", "LIBFX_MODEL_METADATA_EXPIRED"].includes(data.code) &&
+  if (data && ["LIBFX_MODEL_UNSUPPORTED_EFFORT", "LIBFX_MODEL_UNSUPPORTED_FAST", "LIBFX_MODEL_UNSUPPORTED_ULTRAFAST"].includes(data.code) &&
     typeof data.model === "string" &&
-    data.capability === (data.code.startsWith("LIBFX_MODEL_METADATA_") ? "modelMetadata" : data.code === "LIBFX_MODEL_UNSUPPORTED_FAST" ? "fast" : data.code === "LIBFX_MODEL_UNSUPPORTED_ULTRAFAST" ? "ultrafast" : "effort")) {
+    data.capability === (data.code === "LIBFX_MODEL_UNSUPPORTED_FAST" ? "fast" : data.code === "LIBFX_MODEL_UNSUPPORTED_ULTRAFAST" ? "ultrafast" : "effort")) {
     error.code = data.code;
     error.model = data.model;
     error.capability = data.capability;
@@ -257,14 +204,16 @@ async function readBoundedResponseText(response, limit) {
   return strictDecoder.decode(bytes);
 }
 
-async function fetchModelCatalog(options) {
+export async function listModels(options = {}) {
+  if (!options || typeof options !== "object" || Array.isArray(options)) {
+    throw new TypeError("listModels() options must be an object");
+  }
   const apiKey = boundedString(options.apiKey, "apiKey", maxApiKeyBytes, true);
   const fetchModels = options.fetch ?? globalThis.fetch?.bind(globalThis);
   if (typeof fetchModels !== "function") throw new TypeError("fetch is unavailable");
-  const response = await fetchModels(catalogUrl, {
+  const response = await fetchModels("https://ai-gateway.vercel.sh/coding-agent/v1/models", {
     method: "GET",
     headers: { authorization: `Bearer ${apiKey}` },
-    ...(options.signal === undefined ? {} : { signal: options.signal }),
   });
   if (!response.ok) {
     await cancelResponseBody(response);
@@ -284,46 +233,9 @@ async function fetchModelCatalog(options) {
   if (catalog.data.length > maxModelCatalogEntries) {
     throw new RangeError(`model catalog exceeds the ${maxModelCatalogEntries} entry libfx limit`);
   }
-  return catalog.data;
-}
 
-export async function resolveModel(options = {}) {
-  // Explicit resolution can renew an expired descriptor; consumption cannot.
-  if (options?.model && typeof options.model === "object" && !Array.isArray(options.model)) {
-    const model = { ...options.model };
-    delete model.metadata;
-    options = { ...options, model };
-  }
-  const normalized = normalizeAgentOptions(options);
-  const id = boundedString(normalized.model, "model", maxModelBytes, true);
-  const rows = (await fetchModelCatalog(normalized)).filter(row => row?.id === id &&
-    (row.type === undefined || typeof row.type === "string" && row.type.toLowerCase() === "language"));
-  if (rows.length === 0) {
-    throw modelMetadataError("LIBFX_MODEL_METADATA_INVALID", id, `Model ${id} is not present in the model catalog`);
-  }
-  // Keep only fields consumed by the core's catalog capability parser.
-  const data = rows.map(row => {
-    const selected = { id: row.id, type: "language" };
-    for (const key of ["tags", "context_window", "max_tokens", "reasoning_options", "fast_options", "owned_by", "pricing"]) {
-      if (row[key] !== undefined) selected[key] = row[key];
-    }
-    return selected;
-  });
-  const resolvedAt = Date.now();
-  const metadata = normalizeModelMetadata({ version: 1, resolvedAt, expiresAt: resolvedAt + modelMetadataLeaseMs,
-    scope: await modelMetadataScope(normalized.apiKey, normalized.gatewayChatUrl), data }, id, resolvedAt);
-  return { id, ...(normalized.effort === undefined ? {} : { effort: normalized.effort }),
-    ...(normalized.fast === undefined ? {} : { fast: normalized.fast }),
-    ...(normalized.ultrafast === undefined ? {} : { ultrafast: normalized.ultrafast }), metadata };
-}
-
-export async function listModels(options = {}) {
-  if (!options || typeof options !== "object" || Array.isArray(options)) {
-    throw new TypeError("listModels() options must be an object");
-  }
-  const data = await fetchModelCatalog(options);
   const ids = new Set();
-  for (const entry of data) {
+  for (const entry of catalog.data) {
     if (!entry || typeof entry !== "object") continue;
     if (typeof entry.type === "string" && entry.type.toLowerCase() !== "language") continue;
     if (typeof entry.id !== "string" || entry.id.length === 0) continue;
@@ -1812,13 +1724,6 @@ function base64ToBytes(value) {
 
 export async function createFxAgent(options = {}) {
   options = normalizeAgentOptions(options);
-  const metadata = options[modelMetadataKey];
-  if (metadata) {
-    selectedModelEnvelope(options.model, metadata, Date.now());
-    if (metadata.scope !== await modelMetadataScope(options.apiKey, options.gatewayChatUrl)) {
-      throw modelMetadataError("LIBFX_MODEL_METADATA_INVALID", options.model, "Model metadata belongs to a different Gateway connection; resolve the model with this connection");
-    }
-  }
   const hostTools = normalizeHostTools(options.tools);
   const instructions = normalizeInstructions(options.instructions);
   const initialCheckpoint = checkpointBytes(options.checkpoint);
@@ -1845,9 +1750,6 @@ export async function createFxAgent(options = {}) {
       const url = new URL(endpoint);
       endpoint = `${url.origin}${url.pathname}`;
     } catch {}
-    if (metadata && method === "GET" && endpoint === catalogUrl) {
-      throw modelMetadataError("LIBFX_MODEL_METADATA_INVALID", options.model, "Resolved-model agents cannot fetch the model catalog; resolve the model explicitly before creating an agent");
-    }
     for (let attemptIndex = 0; attemptIndex < 2; attemptIndex++) {
       const startedAt = performance.now();
       const attempt = activeTurn ? ++activeTurn.transportAttempts : attemptIndex + 1;
@@ -1964,9 +1866,6 @@ export async function createFxAgent(options = {}) {
   emit("runtime.ready");
   const send = (message) => {
     if (closing) throw new Error("fx agent is closing");
-    if (metadata && message.method === "session/prompt") {
-      message.params.modelMetadata = selectedModelEnvelope(options.model, metadata, Date.now());
-    }
     emit("acp.send", { message });
     if (message.method === "session/prompt" && activeTurn?.cancelled) throw new Error("Cancelled");
     runtime.write(`${JSON.stringify(message)}\n`);
@@ -2066,18 +1965,14 @@ export async function createFxAgent(options = {}) {
     if (message.error) waiter.reject(agentRpcError(message.error)); else waiter.resolve(message.result);
   }
   try {
-    const initialized = await request("initialize", {
+    await request("initialize", {
       protocolVersion: 1,
       clientCapabilities: {
-        ...(hostTools.descriptors.length || instructions || metadata
-          ? { libfx: { tools: hostTools.descriptors, instructions,
-            ...(metadata ? { modelMetadata: true, initialModelMetadata: selectedModelEnvelope(options.model, metadata, Date.now()) } : {}) } }
+        ...(hostTools.descriptors.length || instructions
+          ? { libfx: { tools: hostTools.descriptors, instructions } }
           : {}),
       },
     });
-    if (metadata && initialized?.agentCapabilities?._meta?.fx?.modelMetadata !== true) {
-      throw modelMetadataError("LIBFX_MODEL_METADATA_UNSUPPORTED", options.model, "This libfx core does not support resolved model metadata; use matching SDK and core artifacts");
-    }
 
     const sessionResult = await request("libfx/new");
     sessionId = sessionResult.sessionId;

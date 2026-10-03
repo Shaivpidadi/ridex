@@ -14,13 +14,12 @@ import {
   encodeXtermKeyEvent,
   fxSdkApiVersion,
   listModels,
-  resolveModel,
   normalizeAgentOptions,
   supportsJspi,
   xtermAdapter,
 } from "./fx-sdk.js";
 
-export { encodeXtermKeyEvent, fxSdkApiVersion, listModels, resolveModel, supportsJspi, xtermAdapter };
+export { encodeXtermKeyEvent, fxSdkApiVersion, listModels, supportsJspi, xtermAdapter };
 export const libfxApiVersion = 2;
 const nativeCoreApiVersion = 4;
 

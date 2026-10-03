@@ -71,10 +71,6 @@ When a file-backed image cannot be sent, the model receives its source path and 
 
 Visit [fx.sh/docs](https://fx.sh/docs) for the full manual: sessions, models, custom model connections, permissions, configuration, skills, MCP, subagents, embedding, and the complete CLI and slash command references. Agents can read any page as Markdown by appending `.md` to its URL, or fetch [llms-full.txt](https://fx.sh/llms-full.txt) for everything in one file.
 
-Server-side libfx hosts can resolve model capabilities during setup and pass
-that metadata to fresh agents without a catalog request on each message. See
-[Resolve before handling messages](sdk/README.md#resolve-before-handling-messages).
-
 ## Custom model connections
 
 Add named connections for any OpenAI Chat Completions endpoint, including local servers such as Ollama and gateways such as OpenRouter, in `~/.fx/settings.json`, then select one for the profile or a single invocation:
