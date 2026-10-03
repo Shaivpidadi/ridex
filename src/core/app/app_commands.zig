@@ -5,6 +5,7 @@ const app_session_runtime = @import("app_session_runtime.zig");
 const app_lifecycle = @import("app_lifecycle.zig");
 const app_bootstrap_runtime = @import("app_bootstrap_runtime.zig");
 const io_mod = @import("../shared/io.zig");
+const shell_snapshot = @import("../terminal/shell_snapshot.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
 const gateway_provider = @import("../gateway/gateway_provider.zig");
@@ -228,6 +229,19 @@ fn refreshWorkspaceAvailabilityForList(app: anytype) !void {
     }
 }
 
+fn handleShellCommand(app: anytype, rest: []const u8) !void {
+    if (!std.mem.eql(u8, std.mem.trim(u8, rest, " \t"), "reload")) {
+        try app.writeDomainNotice(.{ .topic = "", .tone = .@"error", .body = "usage: /shell reload" }, true);
+        return;
+    }
+    shell_snapshot.processOwner().markDirty(.user_reload);
+    try app.writeDomainNotice(.{
+        .topic = "shell",
+        .tone = .neutral,
+        .body = "The next command reloads your shell startup files. Remembered command approvals were reset.",
+    }, true);
+}
+
 fn handleWorkspaceCommand(app: anytype, rest: []const u8) !void {
     const maybe_action = parseWorkspaceCommand(rest) catch {
         try app.writeDomainNotice(.{
@@ -392,6 +406,7 @@ pub fn Handlers(comptime App: type) type {
                 .rename_session = commandRenameSession,
                 .handle_notifications = commandHandleNotifications,
                 .handle_workspace = commandHandleWorkspace,
+                .handle_shell = commandHandleShell,
                 .show_version = commandShowVersion,
                 .unknown = commandUnknown,
             };
@@ -402,6 +417,12 @@ pub fn Handlers(comptime App: type) type {
             const notice = (try app.takeMcpStartupHealthNotice()) orelse return;
             defer app.alloc.free(notice);
             try app.writeDomainNotice(.{ .topic = "mcp", .tone = .warning, .body = notice }, true);
+        }
+
+        pub fn collectShellSnapshotFacts(app: *App) !void {
+            var buffer: [shell_snapshot.max_notice_bytes]u8 = undefined;
+            const notice = shell_snapshot.processOwner().takeUiNotice(&buffer) orelse return;
+            try app.writeDomainNotice(.{ .topic = "shell", .tone = .warning, .body = notice }, true);
         }
 
         pub fn collectMcpReloadFacts(app: *App) !void {
@@ -2088,6 +2109,11 @@ pub fn Handlers(comptime App: type) type {
         fn commandHandleNotifications(ctx: *anyopaque, rest: []const u8) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             try handleNotificationsCommand(app, rest);
+        }
+
+        fn commandHandleShell(ctx: *anyopaque, rest: []const u8) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            try handleShellCommand(app, rest);
         }
 
         fn commandHandleWorkspace(ctx: *anyopaque, rest: []const u8) !void {

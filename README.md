@@ -67,6 +67,16 @@ Paste an image, attach one with `fx ask --image PATH`, or ask fx to `read_file` 
 
 When a file-backed image cannot be sent, the model receives its source path and the reason. It can use an image tool already on your system, such as `sips` on macOS or `ffmpeg` on Linux, to save a smaller **new** file and read that copy. fx does not automatically install image tools or overwrite the original. If no usable file or tool is available, the model should ask you for a smaller copy or permission before installing software.
 
+## Shell commands
+
+Commands run in your login shell, zsh or bash, with your startup files applied, so your aliases, functions, and `PATH` work as they do in your terminal. fx runs the startup files once and restores their result for each command, so a slow `.zshrc` does not slow down every call.
+
+- fx reloads automatically when your zsh or bash startup files change, such as `.zshrc`, `.zprofile`, `.bash_profile`, or `.bashrc`. After changing a file they source, run `/shell reload`.
+- Each command starts fresh: `cd`, `export`, and alias changes do not carry over to the next one.
+- Tools that switch the environment by directory, such as direnv or mise hooks, apply the environment of the directory where fx captured the startup files, usually your workspace.
+- If the startup files cannot be captured, fx says so once and runs them for every command instead.
+- Terminals opened with `tty: true` run your full login shell and end when fx exits.
+
 ## Documentation
 
 Visit [fx.sh/docs](https://fx.sh/docs) for the full manual: sessions, models, custom model connections, permissions, configuration, skills, MCP, subagents, embedding, and the complete CLI and slash command references. Agents can read any page as Markdown by appending `.md` to its URL, or fetch [llms-full.txt](https://fx.sh/llms-full.txt) for everything in one file.

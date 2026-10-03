@@ -92,6 +92,22 @@ pub fn activeToolRegistry(state: *const server.ServerState) tool_dispatch.Regist
     return activeToolSet(state).registry;
 }
 
+/// Returns the shell snapshot fallback notice that a shell result carries as
+/// its last field, unescaped into `buffer`. Command output is a JSON string,
+/// so an unescaped `,"notice":` key can only be the result's own field.
+pub fn shellResultNotice(output: []const u8, buffer: []u8) ?[]const u8 {
+    const key = ",\"notice\":";
+    if (output.len == 0 or output[output.len - 1] != '}') return null;
+    const start = std.mem.findLast(u8, output, key) orelse return null;
+    var fixed: std.heap.FixedBufferAllocator = .init(buffer);
+    return std.json.parseFromSliceLeaky(
+        []const u8,
+        fixed.allocator(),
+        output[start + key.len .. output.len - 1],
+        .{},
+    ) catch null;
+}
+
 /// Applies the live path's tool_call_update content contract: unsafe bytes are
 /// replaced with a notice, permission-denied and review-held failures keep
 /// their full text, and everything else is clipped to the 200-byte preview.
@@ -156,4 +172,21 @@ test "toolUpdateContentText clips long output and guards unsafe bytes" {
     const denied_json = "{\"error\":{\"type\":\"tool_permission_denied\",\"tool_name\":\"run_command\",\"message\":\"Permission denied by user\",\"reason\":\"user_denied\"}}";
     const denied = toolUpdateContentText(true, denied_json);
     try std.testing.expectEqualStrings(denied_json, denied);
+}
+
+test "shell result notice is read only from the result's own field" {
+    var buffer: [512]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "shell snapshot unavailable (x); startup files run for every command",
+        shellResultNotice(
+            "{\"state\":\"completed\",\"notice\":\"shell snapshot unavailable (x); startup files run for every command\"}",
+            &buffer,
+        ).?,
+    );
+    // Output that merely prints the key stays escaped inside its string.
+    try std.testing.expect(shellResultNotice(
+        "{\"output_delta\":\",\\\"notice\\\":\\\"x\\\"\"}",
+        &buffer,
+    ) == null);
+    try std.testing.expect(shellResultNotice("shell result is unavailable", &buffer) == null);
 }

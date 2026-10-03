@@ -105,9 +105,7 @@ const compiled_update_channel = update_target.Channel.parse(build_options.update
 const shell_process_provider = @import("tools/shell/process_provider.zig");
 const process_provider = @import("core/execution/process_provider.zig");
 const terminal_client_runtime = @import("core/terminal/client.zig");
-const terminal_host = @import("core/terminal/host.zig");
 const terminal_native_session = @import("core/terminal/native_session.zig");
-const terminal_tmux_session = @import("core/terminal/tmux_session.zig");
 const session_runtime = @import("core/session/session.zig");
 const session_codec = @import("core/session/session_codec.zig");
 const session_child_store = @import("core/session/session_child_store.zig");
@@ -882,6 +880,11 @@ const App = struct {
         WorkspaceAppRuntime.requestStop(self);
         self.managed_executions.terminateForProcessExit();
         shutdown_trace.mark("background_stops_requested");
+        // Terminals belong to this process and end with it, with no prompt.
+        // Subagents share this client, so theirs end here too. Ending them
+        // also releases a worker waiting on one.
+        self.terminal_client.closeOwnedTerminals();
+        shutdown_trace.mark("terminals_ended");
 
         // The worker mutates session state, so it stops before persistence.
         if (self.worker_thread) |thread| thread.join();
@@ -943,6 +946,7 @@ const App = struct {
         self.worker.requestShutdown();
         SessionAppRuntime.requestPersistenceShutdown(self);
         self.managed_executions.shutdown();
+        self.terminal_client.closeOwnedTerminals();
         self.upgrader.stop();
         self.file_index.requestStop();
         WorkspaceAppRuntime.requestStop(self);
@@ -3088,6 +3092,7 @@ const App = struct {
         try app_commands.Handlers(App).collectMcpAuthenticationFacts(self);
         try app_commands.Handlers(App).collectMcpReloadFacts(self);
         try app_commands.Handlers(App).collectMcpStartupHealthFacts(self);
+        try app_commands.Handlers(App).collectShellSnapshotFacts(self);
         if (try self.mcp.refreshMenuHealth(self.alloc, @intCast(@max(io_mod.milliTimestamp(), 0)))) {
             RenderAppRuntime.requestActiveSurfaceFrame(self, .footer);
         }
@@ -3418,35 +3423,7 @@ fn mainC(c_argc: c_int, c_argv: [*][*:0]c_char, c_envp: [*:null]?[*:0]c_char) !v
     const raw_args = rawArgs(c_argc, c_argv);
     const raw_env: RawEnviron = @ptrCast(c_envp);
 
-    if (comptime terminal_host.isSupported()) {
-        if (terminal_tmux_session.isCaptureModeRaw(raw_args)) {
-            io_mod.setRawEnviron(raw_env);
-            const process_args = argsFromRaw(raw_args);
-            var threaded = std.Io.Threaded.init(processAllocator(), .{
-                .argv0 = .init(process_args),
-                .environ = .{ .block = environBlockFromRaw(raw_env) },
-            });
-            defer threaded.deinit();
-            io_mod.setIo(threaded.io());
-            try terminal_tmux_session.runCapture(raw_args);
-            return;
-        }
-        if (terminal_tmux_session.isLauncherModeRaw(raw_args)) {
-            io_mod.setRawEnviron(raw_env);
-            const process_args = argsFromRaw(raw_args);
-            var threaded = std.Io.Threaded.init(processAllocator(), .{
-                .argv0 = .init(process_args),
-                .environ = .{ .block = environBlockFromRaw(raw_env) },
-            });
-            defer threaded.deinit();
-            io_mod.setIo(threaded.io());
-            try terminal_tmux_session.runLauncher(
-                processAllocator(),
-                shell_process_provider.provider,
-                raw_args,
-            );
-            return;
-        }
+    if (comptime terminal_native_session.isSupported()) {
         if (terminal_native_session.isControlModeRaw(raw_args)) {
             io_mod.setRawEnviron(raw_env);
             const process_args = argsFromRaw(raw_args);
@@ -3469,25 +3446,6 @@ fn mainC(c_argc: c_int, c_argv: [*][*:0]c_char, c_envp: [*:null]?[*:0]c_char) !v
             defer threaded.deinit();
             io_mod.setIo(threaded.io());
             try terminal_native_session.runLauncher(processAllocator());
-            return;
-        }
-        if (terminal_host.isInternalModeRaw(raw_args)) {
-            io_mod.setRawEnviron(raw_env);
-            const process_args = argsFromRaw(raw_args);
-            var threaded = std.Io.Threaded.init(processAllocator(), .{
-                .argv0 = .init(process_args),
-                .environ = .{ .block = environBlockFromRaw(raw_env) },
-            });
-            defer threaded.deinit();
-            io_mod.setIo(threaded.io());
-            defer debug_trace.shutdown();
-            debug_trace.configureFromEnv(processAllocator(), ".");
-            try terminal_host.run(
-                processAllocator(),
-                try terminal_host.Config.fromEnvironment(
-                    shell_process_provider.provider,
-                ),
-            );
             return;
         }
     }
@@ -4892,6 +4850,7 @@ test {
     _ = @import("core/shared/token_estimate.zig");
     _ = @import("core/shell_command/command_effect.zig");
     _ = @import("core/execution/router.zig");
+    _ = @import("core/execution/command_runner.zig");
     _ = @import("core/permissions/direct_command.zig");
     _ = @import("core/permissions/auto_classifier.zig");
     _ = @import("core/permissions/command_admission.zig");
@@ -4942,14 +4901,11 @@ test {
     _ = @import("core/subagent/approval_registry.zig");
     _ = @import("core/terminal/contracts.zig");
     _ = @import("core/terminal/operation.zig");
-    _ = @import("core/terminal/protocol.zig");
-    _ = @import("core/terminal/host_policy.zig");
     _ = @import("core/terminal/shell_resolver.zig");
+    _ = @import("core/terminal/shell_snapshot.zig");
     _ = @import("core/terminal/native_session.zig");
     _ = @import("core/terminal/recovery.zig");
     _ = @import("core/terminal/store.zig");
-    _ = @import("core/terminal/host.zig");
-    _ = @import("core/terminal/tmux_session.zig");
     _ = @import("core/terminal/client.zig");
     _ = @import("core/terminal/managed_observer.zig");
     _ = @import("tools/shell/shell.zig");

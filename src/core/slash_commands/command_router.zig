@@ -39,6 +39,7 @@ pub const ParsedCommand = union(enum) {
     statusline: []const u8,
     notifications: []const u8,
     workspace: []const u8,
+    shell: []const u8,
     version,
     unknown,
 };
@@ -79,6 +80,7 @@ pub const CommandHandlers = struct {
     rename_session: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     handle_notifications: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     handle_workspace: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
+    handle_shell: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     show_version: *const fn (ctx: *anyopaque) anyerror!void,
     unknown: *const fn (ctx: *anyopaque, cmd: []const u8) anyerror!void,
 };
@@ -123,6 +125,7 @@ fn parsedCommand(kind: SlashKind, payload: []const u8) ParsedCommand {
         .statusline => .{ .statusline = payload },
         .notifications => .{ .notifications = payload },
         .workspace => .{ .workspace = payload },
+        .shell => .{ .shell = payload },
         .version => .version,
     };
 }
@@ -176,6 +179,7 @@ pub fn route(registry: SlashRegistry, handlers: *const CommandHandlers, cmd: []c
         .statusline => |rest| try handlers.handle_statusline(handlers.ctx, rest),
         .notifications => |rest| try handlers.handle_notifications(handlers.ctx, rest),
         .workspace => |rest| try handlers.handle_workspace(handlers.ctx, rest),
+        .shell => |rest| try handlers.handle_shell(handlers.ctx, rest),
         .version => try handlers.show_version(handlers.ctx),
         .unknown => try handlers.unknown(handlers.ctx, cmd),
     }
@@ -416,6 +420,11 @@ fn unexpectedPayload(ctx: *anyopaque, value: []const u8) anyerror!void {
     return error.UnexpectedCallback;
 }
 
+fn recordShell(ctx: *anyopaque, value: []const u8) anyerror!void {
+    testContext(ctx).called = "shell";
+    testContext(ctx).payload = value;
+}
+
 fn recordCopy(ctx: *anyopaque) anyerror!void {
     testContext(ctx).called = "copy";
 }
@@ -496,9 +505,21 @@ fn testHandlers(ctx: *TestContext) CommandHandlers {
         .rename_session = unexpectedPayload,
         .handle_notifications = unexpectedPayload,
         .handle_workspace = unexpectedPayload,
+        .handle_shell = unexpectedPayload,
         .show_version = unexpectedNoPayload,
         .unknown = unexpectedPayload,
     };
+}
+
+test "route passes shell payload" {
+    var ctx: TestContext = .{};
+    var handlers = testHandlers(&ctx);
+    handlers.handle_shell = recordShell;
+
+    try route(testSlashRegistry(), &handlers, "/shell reload");
+
+    try std.testing.expectEqualStrings("shell", ctx.called);
+    try std.testing.expectEqualStrings("reload", ctx.payload);
 }
 
 test "route calls expected no-payload handler" {
