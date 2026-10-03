@@ -1357,6 +1357,16 @@ pub const Persistence = struct {
     }
 
     pub fn deinit(self: *Persistence, alloc: Allocator) void {
+        self.deinitWithCatalog(alloc, .free);
+    }
+
+    /// Process exit leaves the session picker catalog to the exiting process;
+    /// freeing thousands of cached sessions one by one only delays exit.
+    pub fn deinitForProcessExit(self: *Persistence, alloc: Allocator) void {
+        self.deinitWithCatalog(alloc, .abandon);
+    }
+
+    fn deinitWithCatalog(self: *Persistence, alloc: Allocator, catalog: enum { free, abandon }) void {
         if (self.pending_live_session_policy) |policy| {
             debug_trace.logf(
                 "session",
@@ -1383,7 +1393,7 @@ pub const Persistence = struct {
         if (self.process_model_override) |model| alloc.free(model);
         self.session_picker.deinit(alloc);
         self.session_picker_load.deinit();
-        self.session_picker_cache.deinit();
+        if (catalog == .free) self.session_picker_cache.deinit();
         self.title_generation.deinit();
         // After the picker thread, which lists through it, has joined.
         if (self.v2_store) |*store| store.deinit(alloc);
@@ -3928,6 +3938,11 @@ pub fn Runtime(comptime App: type) type {
         pub fn deinitPersistence(app: *App) void {
             closeWritableSession(app);
             app.session_persistence.deinit(app.alloc);
+        }
+
+        pub fn deinitPersistenceForProcessExit(app: *App) void {
+            closeWritableSession(app);
+            app.session_persistence.deinitForProcessExit(app.alloc);
         }
 
         pub fn requestPersistenceShutdown(app: *App) void {
