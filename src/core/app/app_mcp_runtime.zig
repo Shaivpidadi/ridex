@@ -2587,7 +2587,17 @@ pub const State = struct {
     /// Teardown immediately followed by process exit: stdio servers are
     /// killed without grace and remote sessions are left to expire.
     pub fn deinitForProcessExit(self: *State, alloc: Allocator) void {
-        self.deinitWithMode(alloc, .process_exit);
+        // A reload still in flight must see this before its children die.
+        self.process_exiting.store(true, .release);
+        if (!mcp_runtime.killAllStdioChildrenForProcessExit()) {
+            return self.deinitWithMode(alloc, .process_exit);
+        }
+        // Every stdio child is dead. Work the user started is still cancelled
+        // and logged, but runtimes, pending reloads, and their threads are
+        // left to the exiting process: joining them would only wait for each
+        // killed child to be reaped.
+        self.cancelPendingAuthentication("shutdown");
+        self.cancelPendingMenuOperation("shutdown");
     }
 
     fn deinitWithMode(self: *State, alloc: Allocator, mode: RuntimeTeardown) void {

@@ -898,7 +898,7 @@ const App = struct {
         // These delete image snapshots and log discarded drafts.
         self.worker.deinit(std.heap.c_allocator);
         self.clearPendingImages();
-        SessionAppRuntime.deinitPersistence(self);
+        SessionAppRuntime.deinitPersistenceForProcessExit(self);
         self.question_prompt.deinit(self.alloc);
         shutdown_trace.mark("persistence_finalized");
 
