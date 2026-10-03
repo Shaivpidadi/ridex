@@ -22,15 +22,22 @@ const Allocator = std.mem.Allocator;
 const Environ = std.process.Environ;
 
 /// Longest time the login shell may take to report its state.
-pub const capture_timeout_ms: i64 = 10_000;
+const capture_timeout_ms: i64 = 10_000;
 /// Largest captured payload accepted; larger states fall back to full startup.
-pub const max_capture_bytes: usize = 8 * 1024 * 1024;
+const max_capture_bytes: usize = 8 * 1024 * 1024;
 
 const wait_poll_ns: u64 = 2 * std.time.ns_per_ms;
 const read_poll_ms: i64 = 100;
 pub const max_notice_bytes = 256;
-const max_stamps = 16;
 const nonce_bytes = 16;
+
+/// zsh reads its user files from up to three directories: an inherited
+/// ZDOTDIR, HOME, and a ZDOTDIR the startup files set.
+const max_user_dirs = 3;
+const max_stamps = @max(
+    zsh_system_files.len + max_user_dirs * zsh_user_files.len,
+    bash_system_files.len + max_user_dirs * bash_user_files.len,
+);
 
 /// Environment entries a clean shell must set for itself instead of
 /// inheriting them from the capture shell.
@@ -68,7 +75,7 @@ pub const Fingerprint = struct {
     }
 
     fn add(self: *Fingerprint, path: []const u8) void {
-        if (self.len == max_stamps) return;
+        std.debug.assert(self.len < max_stamps);
         self.stamps[self.len] = stampFile(path);
         self.len += 1;
     }
@@ -95,7 +102,8 @@ const bash_system_files = [_][]const u8{ "/etc/profile", "/etc/bash.bashrc", "/e
 
 /// Stamps the startup files `kind` reads. User files come from each distinct
 /// directory in `user_dirs` (HOME and any ZDOTDIR), in order.
-pub fn fingerprintFor(kind: shell_resolver.ShellKind, user_dirs: []const ?[]const u8) Fingerprint {
+fn fingerprintFor(kind: shell_resolver.ShellKind, user_dirs: []const ?[]const u8) Fingerprint {
+    std.debug.assert(user_dirs.len <= max_user_dirs);
     var result: Fingerprint = .{};
     const system_files: []const []const u8 = switch (kind) {
         .zsh => &zsh_system_files,
@@ -121,6 +129,16 @@ pub fn fingerprintFor(kind: shell_resolver.ShellKind, user_dirs: []const ?[]cons
             result.add(path);
         }
     }
+    return result;
+}
+
+/// Adds the stamps of a ZDOTDIR the startup files set to the stamps taken
+/// before the capture. The earlier stamps stay, so an edit made while the
+/// capture ran still marks the snapshot dirty.
+fn withMovedZdotdir(before: Fingerprint, extended: Fingerprint) Fingerprint {
+    if (extended.len <= before.len) return before;
+    var result = extended;
+    @memcpy(result.stamps[0..before.len], before.stamps[0..before.len]);
     return result;
 }
 
@@ -163,7 +181,7 @@ pub const Generation = struct {
     }
 };
 
-pub const CaptureFailure = enum {
+const CaptureFailure = enum {
     unsupported_shell,
     spawn_failed,
     timed_out,
@@ -176,8 +194,14 @@ pub const CaptureFailure = enum {
         return switch (self) {
             .unsupported_shell => "the login shell is not bash or zsh",
             .spawn_failed => "the login shell could not start",
-            .timed_out => "the login shell did not finish within 10 s",
-            .too_large => "the captured state exceeded 8 MiB",
+            .timed_out => std.fmt.comptimePrint(
+                "the login shell did not finish within {d} s",
+                .{capture_timeout_ms / std.time.ms_per_s},
+            ),
+            .too_large => std.fmt.comptimePrint(
+                "the captured state exceeded {d} MiB",
+                .{max_capture_bytes / (1024 * 1024)},
+            ),
             .incomplete => "the login shell exited before reporting its state",
             .out_of_memory => "fx ran out of memory",
             .replay_failed => "the captured state could not be restored",
@@ -197,16 +221,16 @@ pub const CaptureOutcome = union(enum) {
     failed: CaptureFailure,
 };
 
-pub const CaptureFn = *const fn (request: CaptureRequest) CaptureOutcome;
+const CaptureFn = *const fn (request: CaptureRequest) CaptureOutcome;
 
-pub const DirtyReason = enum { startup_files_changed, user_reload, agent_reload };
+const DirtyReason = enum { startup_files_changed, user_reload, agent_reload };
 
-pub const WaitControl = struct {
+const WaitControl = struct {
     cancel_flag: ?*std.atomic.Value(bool) = null,
     deadline_ms: ?i64 = null,
 };
 
-pub const AcquireError = error{ Cancelled, TimeoutExpired };
+const AcquireError = error{ Cancelled, TimeoutExpired };
 
 pub const Lease = struct {
     owner: *Owner,
@@ -217,7 +241,7 @@ pub const Lease = struct {
     }
 };
 
-pub const Acquired = union(enum) {
+const Acquired = union(enum) {
     snapshot: Lease,
     /// No usable snapshot: run the command with today's full startup.
     full_startup,
@@ -405,15 +429,6 @@ pub const Owner = struct {
         return false;
     }
 
-    /// Reports whether the current snapshot defines an alias or function.
-    pub fn definesName(self: *Owner, name: []const u8) bool {
-        const io = io_mod.getIo();
-        self.mutex.lockUncancelable(io);
-        defer self.mutex.unlock(io);
-        const generation = self.active orelse return false;
-        return self.state == .ready and generation.defines(name);
-    }
-
     /// Takes the pending fallback notice for a user-facing surface. The
     /// returned slice borrows `buffer`.
     pub fn takeUiNotice(self: *Owner, buffer: []u8) ?[]const u8 {
@@ -547,8 +562,10 @@ pub const Owner = struct {
                 generation.fingerprint = pending.fingerprint;
                 if (generation.zdotdir) |zdotdir| {
                     // The startup files moved ZDOTDIR; watch its files too.
-                    const extended = currentFingerprint(pending.shell_path, zdotdir);
-                    if (extended.len > generation.fingerprint.len) generation.fingerprint = extended;
+                    generation.fingerprint = withMovedZdotdir(
+                        pending.fingerprint,
+                        currentFingerprint(pending.shell_path, zdotdir),
+                    );
                 }
                 self.retireLocked(self.active);
                 self.active = generation;
@@ -1086,6 +1103,50 @@ test "snapshot fingerprint changes when a startup file changes" {
     const after = fingerprintFor(.zsh, &dirs);
     try testing.expect(!before.eql(&after));
     try testing.expectEqual(zsh_system_files.len + zsh_user_files.len, after.len);
+}
+
+test "snapshot fingerprint stamps every startup directory zsh can read" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var scratch_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer scratch_state.deinit();
+    const scratch = scratch_state.allocator();
+    for ([_][]const u8{ "inherited", "home", "moved" }) |name| try tmp.dir.createDir(io_mod.getIo(), name, .default_dir);
+    const dirs = [_]?[]const u8{
+        try io_mod.dirRealpathAlloc(scratch, tmp.dir, "inherited"),
+        try io_mod.dirRealpathAlloc(scratch, tmp.dir, "home"),
+        try io_mod.dirRealpathAlloc(scratch, tmp.dir, "moved"),
+    };
+
+    const before = fingerprintFor(.zsh, &dirs);
+    try testing.expectEqual(zsh_system_files.len + max_user_dirs * zsh_user_files.len, before.len);
+    // The last directory's files are watched like the first's.
+    try writeTestFile(tmp.dir, "moved/.zshrc", "alias ll='ls -l'\n");
+    try testing.expect(!before.eql(&fingerprintFor(.zsh, &dirs)));
+}
+
+test "a moved ZDOTDIR keeps the stamps taken before the capture" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var scratch_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer scratch_state.deinit();
+    const scratch = scratch_state.allocator();
+    for ([_][]const u8{ "home", "moved" }) |name| try tmp.dir.createDir(io_mod.getIo(), name, .default_dir);
+    const home = try io_mod.dirRealpathAlloc(scratch, tmp.dir, "home");
+    const moved = try io_mod.dirRealpathAlloc(scratch, tmp.dir, "moved");
+    const now = [_]?[]const u8{ null, home, moved };
+
+    const before_capture = fingerprintFor(.zsh, &[_]?[]const u8{ null, home, null });
+    // An edit while the capture runs, then the capture reports the move.
+    try writeTestFile(tmp.dir, "home/.zshrc", "export ZDOTDIR=moved\n");
+    const merged = withMovedZdotdir(before_capture, fingerprintFor(.zsh, &now));
+    try testing.expectEqual(before_capture.len + zsh_user_files.len, merged.len);
+    try testing.expect(!merged.eql(&fingerprintFor(.zsh, &now)));
+
+    // Without an edit during the capture, the merged stamps match.
+    const after_edit = fingerprintFor(.zsh, &[_]?[]const u8{ null, home, null });
+    const clean = withMovedZdotdir(after_edit, fingerprintFor(.zsh, &now));
+    try testing.expect(clean.eql(&fingerprintFor(.zsh, &now)));
 }
 
 fn writeTestFile(dir: std.Io.Dir, path: []const u8, data: []const u8) !void {
