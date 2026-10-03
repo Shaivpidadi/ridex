@@ -226,6 +226,23 @@ function terminalRecord(home: string, sessionId: string): Record<string, unknown
   return record;
 }
 
+/** The shell pid in a terminal record, or null before its launcher reports it. */
+function recordedPid(home: string, sessionId: string): number | null {
+  const pid = Number(terminalRecord(home, sessionId).pid);
+  return Number.isInteger(pid) && pid > 0 ? pid : null;
+}
+
+/** A running handle can return before the launcher records the shell pid. */
+async function waitForRecordedPid(home: string, sessionId: string): Promise<number> {
+  const started = Date.now();
+  while (Date.now() - started < TIMEOUT) {
+    const pid = recordedPid(home, sessionId);
+    if (pid !== null) return pid;
+    await Bun.sleep(10);
+  }
+  throw new Error(`terminal ${sessionId} never recorded its shell pid`);
+}
+
 function ttyRun(id: string, command: string, extra: Record<string, unknown> = {}) {
   return fakeGatewayToolCall(id, "shell", {
     request: { action: "run", command, profile: "clean", tty: true, ...extra },
@@ -968,7 +985,7 @@ test.skipIf(!tmuxAvailable())(
     await first.sendText("Start the managed TTY.");
     await first.waitForText("SHELL_TTY_RESUME_STARTED", TIMEOUT);
     expect(sessionId).toMatch(/^shell-[A-Za-z0-9_-]{22}$/);
-    const shellPid = Number(terminalRecord(fixture.home, sessionId).pid);
+    const shellPid = await waitForRecordedPid(fixture.home, sessionId);
     expect(processAlive(shellPid)).toBe(true);
     await first.sendText("/quit");
     expect(await first.waitForSessionEnd(TIMEOUT)).toBe(true);
@@ -1026,11 +1043,12 @@ test("fx ask exit ends its TTY terminal within one second", async () => {
   expect(JSON.parse(result.stdout).output).toBe("ASK_TTY_STARTED");
   expect(sessionId).toMatch(/^shell-[A-Za-z0-9_-]{22}$/);
 
-  const shellPid = Number(terminalRecord(fixture.home, sessionId).pid);
+  // fx may exit before the launcher records the shell pid.
+  const shellPid = recordedPid(fixture.home, sessionId);
   // Match the exact command line of a duration nothing else uses, so other
   // processes that merely mention it do not count.
   const sleepers = processesMatching("sleep 37.25", { exact: true });
-  for (const pid of [shellPid, ...sleepers]) {
+  for (const pid of [...(shellPid === null ? [] : [shellPid]), ...sleepers]) {
     if (!processAlive(pid)) continue;
     await waitUntilGone([pid], Math.max(0, 1_000 - (Date.now() - exitedAt)));
   }
@@ -1088,7 +1106,7 @@ test.skipIf(!tmuxAvailable())(
     const owner = await launch(fixture, ownerGateway);
     await owner.sendText("Start the owned TTY.");
     await owner.waitForText("OWNER_TTY_STARTED", TIMEOUT);
-    const shellPid = Number(terminalRecord(fixture.home, ownerTerminal).pid);
+    const shellPid = await waitForRecordedPid(fixture.home, ownerTerminal);
 
     const intruderGateway = startFakeGateway([
       () => fakeGatewayToolCall("intruder_interact", "shell", {
