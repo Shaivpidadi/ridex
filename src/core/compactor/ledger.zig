@@ -97,7 +97,7 @@ pub fn writeRequest(alloc: Allocator, text: *std.ArrayList(u8), asked: Asked) Al
     });
     try text.appendSlice(alloc, "Facts:\nF1, F2, ...: facts the work depends on, from these turns: names, paths, values, results, causes.\n\n" ++
         "Decisions:\nD1, D2, ...: each decision and why. When it changes an earlier entry, end with \"replaces\" and that entry's ID.\n\n" ++
-        "Status:\nS1, S2, ...: where each part of the work stands now. When it updates an earlier entry, end with \"replaces\" and that entry's ID.\n\n" ++
+        "Status:\nS1, S2, ...: where each part of the work stands now. When it updates an earlier entry, or answers or finishes an earlier open entry, end with \"replaces\" and that entry's ID.\n\n" ++
         "Open:\nO1, O2, ...: questions waiting on the user, and next steps the user asked for.\n\n");
     if (asked.fold > 0) try writeEarlierSection(alloc, text, asked.fold, asked.after_conversation);
     try text.appendSlice(alloc, "Never repeat or rewrite an entry that already exists; add a new one that replaces it. Write \"none\" under a section with nothing new.");
@@ -1106,6 +1106,9 @@ test "the request asks only for the new turns and numbers entries after the high
         try testing.expect(std.mem.find(u8, text.items, part) != null);
     }
     try testing.expect(std.mem.find(u8, text.items, " The highest IDs so far: R2, F7, S1. Number new entries after them.") != null);
+    // A status closes an open entry the turns answered or finished, which
+    // otherwise stays in force for good.
+    try testing.expect(std.mem.find(u8, text.items, "or answers or finishes an earlier open entry, end with \"replaces\" and that entry's ID.") != null);
     // No example ID the model could copy as a real one.
     for ([_][]const u8{ "T40", "M2", "replaces D", "replaces S" }) |example| try testing.expect(std.mem.find(u8, text.items, example) == null);
     text.clearRetainingCapacity();
