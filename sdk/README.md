@@ -583,6 +583,11 @@ const runtime = await createFxTerminal({
 await runtime.interactive;
 ```
 
+Pass `args: ["--fast"]` to request Fast mode. The terminal loads model
+capabilities when its first Fast or Ultra turn starts, without adding catalog
+requests to startup. After the catalog loads, `/fast` toggles Fast for later
+turns. Models without Fast support use their normal routing.
+
 The xterm adapter preserves browser-style composer editing for Shift+Enter,
 Command+A, Command+C, Command+X, Command+Z, and Command+Shift+Z. Shift+Enter
 inserts a newline without submitting. A click inside the visible composer moves

@@ -269,5 +269,215 @@ async function runUltrafastTerminal(scenario) {
   }
 }
 
+function createFastSessionStore() {
+  const records = new Map();
+  let nextRevision = 0;
+  return {
+    load(id) {
+      const record = records.get(id);
+      return record ? { bytes: record.bytes.slice(), revision: record.revision } : null;
+    },
+    commit(id, bytes, expectedRevision) {
+      if (records.get(id)?.revision !== expectedRevision) {
+        throw Object.assign(new Error("session revision conflict"), { code: "FX_SESSION_REVISION_CONFLICT" });
+      }
+      const revision = String(++nextRevision);
+      records.set(id, { bytes: bytes.slice(), revision, updatedAtMs: nextRevision });
+      return { revision };
+    },
+    list() {
+      return [...records].map(([id, record]) => ({ id, updatedAtMs: record.updatedAtMs }));
+    },
+    remove(id) { records.delete(id); },
+  };
+}
+
+async function runFastTerminal(scenario, sessionStore = createFastSessionStore()) {
+  const terminal = new Terminal({ cols: 100, rows: 32, allowProposedApi: true, scrollback: 2000 });
+  const host = xtermAdapter(terminal);
+  const released = { data: 0, resize: 0, key: 0 };
+  const decoder = new TextDecoder();
+  let output = "";
+  let stderr = "";
+  const adapter = {
+    ...host,
+    write(bytes) {
+      output += typeof bytes === "string" ? bytes : decoder.decode(bytes, { stream: true });
+      host.write(bytes);
+    },
+    onData(callback) {
+      const unsubscribe = host.onData(callback);
+      return () => { released.data += 1; unsubscribe(); };
+    },
+    onResize(callback) {
+      const unsubscribe = host.onResize(callback);
+      return () => { released.resize += 1; unsubscribe(); };
+    },
+    ...(host.onKeyData ? { onKeyData(callback) {
+      const unsubscribe = host.onKeyData(callback);
+      return () => { released.key += 1; unsubscribe(); };
+    } } : {}),
+  };
+  const model = "openai/gpt-6-luna";
+  const posts = [];
+  const requestOrder = [];
+  const configReads = [];
+  let gets = 0;
+  let catalogSignal;
+  let catalogAborted = 0;
+  const fetch = async (url, init = {}) => {
+    const method = String(init.method ?? "GET").toUpperCase();
+    requestOrder.push(method);
+    if (method === "GET") {
+      assert.equal(new URL(url).pathname, "/coding-agent/v1/models");
+      gets += 1;
+      if (scenario === "cancel") {
+        catalogSignal = init.signal;
+        return new Promise((_, reject) => {
+          const abort = () => {
+            catalogAborted += 1;
+            reject(new DOMException("catalog cancelled", "AbortError"));
+          };
+          if (init.signal.aborted) abort();
+          else init.signal.addEventListener("abort", abort, { once: true });
+        });
+      }
+      if (scenario === "catalog-failure") return Response.json({}, { status: 503 });
+      return Response.json({ data: [{
+        id: model,
+        type: "language",
+        owned_by: "openai",
+        tags: ["tool-use"],
+        fast_options: scenario === "unsupported" ? [] : [{ type: "toggle" }],
+      }] });
+    }
+    assert.equal(method, "POST");
+    assert.equal(new URL(url).origin, "http://127.0.0.1:44888");
+    assert.equal(new Headers(init.headers).get("ai-language-model-id"), model);
+    const body = JSON.parse(new TextDecoder().decode(init.body));
+    posts.push(body);
+    const frames = [
+      { type: "text-delta", delta: `${scenario} fast answer ${posts.length}` },
+      { type: "finish", finishReason: { unified: "stop", raw: "stop" }, usage: { inputTokens: { total: 1 }, outputTokens: { total: 1 } } },
+    ];
+    return new Response(frames.map(frame => `data: ${JSON.stringify(frame)}\n\n`).join("") + "data: [DONE]\n\n", { headers: { "content-type": "text/event-stream" } });
+  };
+  const resumed = scenario.startsWith("resume-");
+  const args = [...(resumed ? [] : [scenario === "no-fast" ? "--no-fast" : "--fast"]), "--resume", "last"];
+  const runtime = await createFxTerminal({
+    backend: "wasm",
+    wasm: await readFile(wasmPath),
+    args,
+    terminal: adapter,
+    env: { AI_GATEWAY_API_KEY: "term-fast-fake-key", FX_PROVIDER: "gateway", FX_SOUND: "0", FX_AUTO_UPGRADE: "0", FX_GATEWAY_CHAT_URL: "http://127.0.0.1:44888/v4/ai/language-model" },
+    fetch,
+    configStore: {
+      get(id) { configReads.push(id); return id === "model" ? model : null; },
+      set() { throw new Error("Fast must not write a host config preference"); },
+    },
+    sessionStore,
+    stderr(bytes) { stderr += new TextDecoder().decode(bytes); },
+  });
+  const grid = () => {
+    const lines = [];
+    for (let row = 0; row < terminal.buffer.active.length; row++) lines.push(terminal.buffer.active.getLine(row)?.translateToString(true) ?? "");
+    return lines.join("\n");
+  };
+  async function waitFor(predicate, label) {
+    const deadline = performance.now() + 5000;
+    while (!predicate()) {
+      await new Promise(resolve => terminal.write("", resolve));
+      if (performance.now() >= deadline) {
+        throw new Error(`${scenario}: timed out waiting for ${label}; requests=${JSON.stringify(requestOrder)}:\n${stderr}\n${grid()}`);
+      }
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+  }
+  async function prompt(text) {
+    const count = posts.length + 1;
+    runtime.write(`${text}\r`);
+    await waitFor(() => posts.length === count && grid().includes(`${scenario} fast answer ${count}`) && !grid().includes("Thinking"), "completed reply");
+    assert.equal(posts.length, count);
+    assert.ok(JSON.stringify(posts.at(-1).prompt).includes(text), "the reply must belong to the submitted prompt");
+    return posts.at(-1);
+  }
+  async function toggle(enabled) {
+    const start = output.length;
+    runtime.write("/fast\r");
+    const label = `fast: ${enabled ? "on" : "off"}`;
+    await waitFor(() => output.slice(start).includes(label) && grid().includes(label), label);
+  }
+  function assertFast(body, enabled) {
+    assert.equal(body.providerOptions?.gateway?.speed, enabled ? "fast" : undefined);
+    assert.equal(body.providerOptions?.openai?.serviceTier, undefined);
+  }
+  try {
+    await runtime.interactive;
+    await waitFor(() => grid().includes(resumed ? "session resumed" : "Run /help for commands"), "startup frame");
+    assert.equal(gets, 0, "Fast must not add synchronous catalog I/O to startup");
+    assert.equal(posts.length, 0);
+    assert.deepEqual(configReads, ["model", "mode"]);
+    if (scenario === "cancel") {
+      runtime.write("cancel pending Fast catalog\r");
+      await waitFor(() => gets === 1, "pending catalog request");
+      assert.equal(posts.length, 0);
+      runtime.write("\x03");
+      await waitFor(() => catalogSignal.aborted && (grid().includes("Cancelled") || grid().includes("cancelled")), "cancelled turn");
+      assert.equal(catalogAborted, 1);
+      assert.equal(posts.length, 0, "cancelled metadata resolution must not send a model request");
+      await toggle(false);
+      assertFast(await prompt("follow up after Fast cancellation"), false);
+      assert.equal(gets, 1);
+      assert.deepEqual(requestOrder, ["GET", "POST"]);
+    } else if (scenario === "no-fast") {
+      assertFast(await prompt("ordinary first"), false);
+      assert.equal(gets, 0, "explicit off must not resolve the catalog before an ordinary prompt");
+      assert.deepEqual(requestOrder, ["POST"]);
+    } else if (scenario === "resume-off") {
+      assertFast(await prompt("resumed ordinary turn"), false);
+      assert.equal(gets, 0, "resuming saved Fast off must not warm the catalog");
+      assert.deepEqual(requestOrder, ["POST"]);
+    } else {
+      const first = await prompt("Fast first");
+      assert.deepEqual(requestOrder, ["GET", "POST"], "cold Fast must resolve the catalog before its first model request");
+      assert.equal(gets, 1);
+      if (scenario === "unsupported" || scenario === "catalog-failure") {
+        assertFast(first, false);
+      } else {
+        assertFast(first, true);
+        if (scenario === "supported") {
+          await toggle(false);
+          const ordinary = await prompt("ordinary after Fast off");
+          assertFast(ordinary, false);
+          assert.equal(gets, 1);
+          assert.ok(JSON.stringify(ordinary.prompt).includes("Fast first"));
+          assert.ok(JSON.stringify(ordinary.prompt).includes("fast answer 1"));
+          await toggle(true);
+          assertFast(await prompt("Fast restored"), true);
+          assert.equal(gets, 1, "the validated Fast catalog must be reused");
+        }
+      }
+    }
+    assert.equal(stderr, "");
+    runtime.write("/exit\r");
+    assert.equal(await runtime.exited, 0);
+    await new Promise(resolve => setTimeout(resolve, 0));
+    assert.deepEqual(released, { data: 1, resize: 1, key: host.onKeyData ? 1 : 0 });
+    console.log(`Fast terminal ${scenario} passed: catalog=${gets}, posts=${posts.length}`);
+  } finally {
+    runtime.abort();
+    terminal.dispose();
+  }
+}
+
+const fastOnSessionStore = createFastSessionStore();
+const fastOffSessionStore = createFastSessionStore();
+await runFastTerminal("supported", fastOnSessionStore);
+await runFastTerminal("no-fast", fastOffSessionStore);
+for (const scenario of ["unsupported", "catalog-failure", "cancel"]) await runFastTerminal(scenario);
+await runFastTerminal("resume-on", fastOnSessionStore);
+await runFastTerminal("resume-off", fastOffSessionStore);
+console.log("Fast terminal regressions passed: cold catalog ordering, slash controls, reuse, degradation, cancellation, follow-up, session state, cleanup");
+
 for (const scenario of ["supported", "unsupported", "cancel"]) await runUltrafastTerminal(scenario);
 console.log("Ultrafast terminal regressions passed: lazy catalog, exclusive routing, slash controls, rejection, cancellation, follow-up, cleanup");
