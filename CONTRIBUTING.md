@@ -74,7 +74,9 @@ Every PR must carry exactly one label that describes its primary intent:
 
 * `type: security`: fixes or hardens a security boundary
 
-If you cannot manage labels, a maintainer or repository agent will apply the label before review. For a mixed PR, choose the label that best describes why the PR exists. Keep the title as a clean imperative sentence and do not add bracketed type prefixes such as `[bug]` or `[improvement]`.
+If you can manage labels on `vercel-labs/fx`, which takes triage access or higher, apply the label when you open the PR. For a mixed PR, choose the label that best describes why the PR exists. If you contribute from outside the organization, you cannot add labels and do not need to: a maintainer applies the label during review, so open your PR and mark it ready as usual. Keep the title as a clean imperative sentence and do not add bracketed type prefixes such as `[bug]` or `[improvement]`.
+
+Requesting extra CI also needs access: the `ci:macos` label takes triage access, and `gh workflow run` takes write access. If you need the macOS checks, a PGSO run, or another on-request run and cannot start it yourself, ask in your PR and a maintainer will start it.
 
 If an AI coding agent writes any of your contribution's prose, including the PR title and description, commit messages, documentation, and issues, it must use the `technical-writer` skill in `.fx/skills/technical-writer/`.
 
