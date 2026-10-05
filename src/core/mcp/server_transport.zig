@@ -921,6 +921,10 @@ fn connectionAttemptControl(control: ConnectionControl, configured_timeout_ms: u
 }
 
 fn spawnStdioServer(alloc: Allocator, server: *McpServer, argv: []const []const u8) !void {
+    // Process exit waits for this launch to register its child, including any
+    // docker cleanup, before it kills every child.
+    try stdio_dispatcher.beginChildLaunch();
+    defer stdio_dispatcher.endChildLaunch();
     const generation = allocateGeneration();
     var prepared = try docker_run.prepare(alloc, argv);
     defer prepared.deinit(alloc);

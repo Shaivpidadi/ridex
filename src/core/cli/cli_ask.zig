@@ -32,6 +32,7 @@ const image_attachments = @import("../images/image_attachments.zig");
 const hooks = @import("../hooks/hooks.zig");
 const notification_sound = @import("../notifications/sound.zig");
 const io_mod = @import("../shared/io.zig");
+const shell_snapshot = @import("../terminal/shell_snapshot.zig");
 const session_title_generation = @import("../session/session_title_generation.zig");
 const compactor = @import("../compactor/compactor.zig");
 const config_runtime = @import("../config/config_runtime.zig");
@@ -770,6 +771,9 @@ const AskContext = struct {
     }
 
     fn deinit(self: *AskContext) void {
+        // Terminals end with this process. Ending them first also releases
+        // any subagent still waiting on one.
+        self.terminal_client.closeOwnedTerminals();
         if (self.subagent_host) |subagent_host| subagent_host.deinit();
         self.subagent_host = null;
         if (self.v2_children) |children| {
@@ -2239,7 +2243,17 @@ fn completeAskTitleTask(ctx: *AskContext, task: *session_title_generation.Task) 
     }
 }
 
+/// Reports a pending shell snapshot fallback once, on stderr.
+fn writeShellSnapshotNotice(ctx: *AskContext) void {
+    var buffer: [shell_snapshot.max_notice_bytes]u8 = undefined;
+    const notice = shell_snapshot.processOwner().takeUiNotice(&buffer) orelse return;
+    ctx.writeStderr("fx ask: warning: ") catch return;
+    ctx.writeStderr(notice) catch return;
+    ctx.writeStderr("\n") catch return;
+}
+
 fn takePromptRunResult(ctx: *AskContext, alloc: Allocator) !PromptRunResult {
+    writeShellSnapshotNotice(ctx);
     const assistant_output = try alloc.dupe(u8, ctx.assistant_output.items);
     errdefer alloc.free(assistant_output);
     const final_output: []u8 = if (ctx.final_output.items.len > 0)
@@ -3572,8 +3586,13 @@ fn pushToolLifecycle(raw_ctx: *anyopaque, event: types.ToolLifecycleEvent) !void
             try publishPendingToolProgress(ctx, progress.id.call_id, progress.text);
         },
         .turn_finished => if (!ctx.output_mode.isTerminal()) clearPendingToolProgress(ctx),
-        .terminal => |value| if (!ctx.output_mode.isTerminal()) {
-            try settlePendingToolProgress(ctx, value.id.call_id, value.outcome);
+        .terminal => |value| {
+            if (!ctx.output_mode.isTerminal()) {
+                try settlePendingToolProgress(ctx, value.id.call_id, value.outcome);
+            }
+            // Report a fallback right after the command it affected; a later
+            // recapture in the same run would otherwise clear it unseen.
+            writeShellSnapshotNotice(ctx);
         },
     }
 }

@@ -723,7 +723,9 @@ pub fn Runtime(comptime App: type) type {
                 .pending_prompt_activity = pendingPromptActivityVisible(app),
                 .completed_assistant_presentation_tail = app.pacer.hasCompletedAssistantPresentationTail(),
                 .writing_response = app.pacer.hasPending(),
-                .has_api_key = app.auth.credentialSource() != null,
+                // A launch credential still loading must not flash "run /login".
+                .has_api_key = app.auth.credentialSource() != null or
+                    (if (comptime @hasDecl(@TypeOf(app.auth), "startupCredentialPending")) app.auth.startupCredentialPending() else false),
                 .model = visible_model,
                 .pending_images = app.pending_images.items,
                 .permission_mode = if (comptime @hasField(App, "permission_engine"))

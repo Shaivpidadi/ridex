@@ -1896,10 +1896,12 @@ pub const RefreshAction = union(enum) {
     list,
     show: []u8,
     notice: []u8,
+    /// Reports discovery issues once the launch catalog lands.
+    startup_notice,
 
     pub fn deinit(self: *RefreshAction, alloc: Allocator) void {
         switch (self.*) {
-            .list => {},
+            .list, .startup_notice => {},
             .show => |value| alloc.free(value),
             .notice => |value| alloc.free(value),
         }
@@ -2356,10 +2358,12 @@ pub const Runtime = struct {
             list,
             show: []const u8,
             notice: []const u8,
+            startup_notice,
         },
     ) !void {
         const owned: RefreshAction = switch (action) {
             .list => .list,
+            .startup_notice => .startup_notice,
             .show => |value| .{ .show = try alloc.dupe(u8, value) },
             .notice => |value| .{ .notice = try alloc.dupe(u8, value) },
         };
@@ -3758,6 +3762,44 @@ test "skill refresh publishes one generation and coalesces one latest request" {
     }
     try std.testing.expectEqual(RefreshCompletion.adopted, terminal);
     try std.testing.expectEqual(@as(usize, 2), runtime.items.len);
+}
+
+test "an empty launch catalog fills from a refresh before its startup notice is due" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTempFile(
+        &tmp,
+        "home/.fx/skills/launch/SKILL.md",
+        "---\nname: launch\ndescription: discovered after the first frame\n---\nbody\n",
+    );
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    var runtime = Runtime{};
+    defer runtime.deinit(alloc);
+    const policy: skill_contract.RootPolicy = .{ .managed_root_source = .global_fx };
+
+    // The launch records only the managed directory, then refreshes into it.
+    try runtime.replaceLoaded(alloc, try std.fs.path.join(alloc, &.{ home, ".fx", "skills" }), &.{}, &.{});
+    const generation = try runtime.requestRefresh(alloc, home, home, policy);
+    try runtime.queueRefreshAction(alloc, generation, .startup_notice);
+    try std.testing.expectEqual(@as(usize, 0), runtime.items.len);
+    try std.testing.expect(runtime.takeReadyRefreshAction() == null);
+
+    var adopted = false;
+    for (0..100_000) |_| {
+        if (try runtime.pollRefresh(alloc, home, policy) == .adopted) adopted = true;
+        if (adopted and runtime.refresh_task == null) break;
+        std.Thread.yield() catch std.atomic.spinLoopHint();
+    }
+    try std.testing.expect(adopted);
+    try std.testing.expectEqual(@as(usize, 1), runtime.items.len);
+    try std.testing.expectEqualStrings("launch", runtime.items[0].name);
+
+    var ready = runtime.takeReadyRefreshAction() orelse return error.MissingStartupNotice;
+    defer ready.deinit(alloc);
+    try std.testing.expect(ready.succeeded);
+    try std.testing.expect(ready.action == .startup_notice);
 }
 
 test "overlapping skill refresh actions retain only the latest bounded action" {

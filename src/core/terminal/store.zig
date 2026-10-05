@@ -1011,237 +1011,234 @@ pub const ProfileStore = struct {
         return list;
     }
 
-    pub fn recover(
+    /// Reconciles the terminal records of the single owner session named by
+    /// `claim`, after authorizing it. A record owned by a running fx process
+    /// instance, including this one, is never modified. A record whose owner
+    /// instance is gone is repaired and, if it still claims to be live,
+    /// recorded as lost: nothing can reach its terminal any more. Other
+    /// owners' records are never scanned.
+    ///
+    /// The caller owns the returned list and must finish any pending close in
+    /// it before releasing it.
+    pub fn reconcileOwner(
         self: *ProfileStore,
-        host_identity: []const u8,
+        claim: contracts.OwnerCatalogAuthorityClaim,
         now_ms: i64,
     ) !RecoveredList {
+        {
+            const zio = io_mod.getIo();
+            self.mutex.lockUncancelable(zio);
+            defer self.mutex.unlock(zio);
+            try verify_owner_catalog_claim(self.alloc, self, claim);
+        }
         var recovered = RecoveredList{ .profile = self };
         errdefer recovered.deinit();
-        var owners = try self.owner_iterator();
-        defer owners.deinit();
-        while (try owners.next()) |owner_id| {
-            var capability = self.open_capability(owner_id, false, false) catch continue;
-            defer capability.deinit();
-            var names = capability.iterate(self.alloc, .terminal_state) catch continue;
-            defer names.deinit();
-            var terminal_ids: std.ArrayList([]u8) = .empty;
-            defer {
-                for (terminal_ids.items) |terminal_id| self.alloc.free(terminal_id);
-                terminal_ids.deinit(self.alloc);
-            }
-            try collect_artifact_ids(self.alloc, &terminal_ids, names.names);
-            var proof_capability = self.open_capability(owner_id, true, false) catch null;
-            defer if (proof_capability) |*proofs| proofs.deinit();
-            if (proof_capability) |*proofs| {
-                var proof_names = proofs.iterate(
-                    self.alloc,
-                    .terminal_proofs,
-                ) catch null;
-                defer if (proof_names) |*items| items.deinit();
-                if (proof_names) |items| {
-                    try collect_artifact_ids(
-                        self.alloc,
-                        &terminal_ids,
-                        items.names,
-                    );
-                }
-            }
-            for (terminal_ids.items) |terminal_id| {
-                var session = self.open_existing(owner_id, terminal_id) catch |err| {
-                    if (err == error.TerminalRecordNotFound) {
-                        cleanup_session_artifacts(
-                            self.alloc,
-                            &capability,
-                            if (proof_capability) |*proofs| proofs else null,
-                            terminal_id,
-                        );
-                    }
-                    try recovered.append_diagnostic(
-                        self.alloc,
-                        owner_id,
-                        terminal_id,
-                        if (err == error.TerminalRecordNotFound)
-                            "PartialStartArtifacts"
-                        else
-                            @errorName(err),
-                    );
-                    continue;
-                };
-                var keep = false;
-                defer if (!keep) session.deinit();
-                const repaired_close = session.reconcile_close_transaction(now_ms) catch |err| switch (classify_close_recovery_error(err)) {
-                    .isolate => blk: {
-                        try session.isolate_invalid_close_transaction(now_ms);
-                        try recovered.append_diagnostic(
-                            self.alloc,
-                            owner_id,
-                            terminal_id,
-                            "InvalidCloseTransaction",
-                        );
-                        break :blk false;
-                    },
-                    .propagate => return err,
-                };
-                if (repaired_close) {
-                    try recovered.append_diagnostic(
-                        self.alloc,
-                        owner_id,
-                        terminal_id,
-                        "CloseTransactionReconciled",
-                    );
-                }
-                const removed_orphans = session.reconcile_unreferenced_artifacts() catch |err| blk: {
-                    try recovered.append_diagnostic(
-                        self.alloc,
-                        owner_id,
-                        terminal_id,
-                        @errorName(err),
-                    );
-                    break :blk false;
-                };
-                if (removed_orphans) {
-                    try recovered.append_diagnostic(
-                        self.alloc,
-                        owner_id,
-                        terminal_id,
-                        "UnreferencedArtifacts",
-                    );
-                }
-                var authority_recoverable = true;
-                const repaired_authority = session.reconcile_authority() catch |err| blk: {
-                    if (!is_definitive_recovery_authority_error(err)) return err;
-                    try recovered.append_diagnostic(
-                        self.alloc,
-                        owner_id,
-                        terminal_id,
-                        @errorName(err),
-                    );
-                    authority_recoverable = false;
-                    break :blk false;
-                };
-                if (repaired_authority) {
-                    try recovered.append_diagnostic(
-                        self.alloc,
-                        owner_id,
-                        terminal_id,
-                        "AuthorityRecordReconciled",
-                    );
-                }
-                const repaired_journal = session.reconcile_journals() catch |err| blk: {
-                    try recovered.append_diagnostic(
-                        self.alloc,
-                        owner_id,
-                        terminal_id,
-                        @errorName(err),
-                    );
-                    break :blk false;
-                };
-                if (repaired_journal) {
-                    try recovered.append_diagnostic(
-                        self.alloc,
-                        owner_id,
-                        terminal_id,
-                        "CorruptJournalChain",
-                    );
-                }
-                session.reconcile_checkpoint() catch |err| {
-                    try recovered.append_diagnostic(
-                        self.alloc,
-                        owner_id,
-                        terminal_id,
-                        @errorName(err),
-                    );
-                };
-                const repaired_events = session.reconcile_events() catch |err| blk: {
-                    try recovered.append_diagnostic(
-                        self.alloc,
-                        owner_id,
-                        terminal_id,
-                        @errorName(err),
-                    );
-                    break :blk false;
-                };
-                if (repaired_events) {
-                    try recovered.append_diagnostic(
-                        self.alloc,
-                        owner_id,
-                        terminal_id,
-                        "CorruptEventChain",
-                    );
-                }
-                if (session.record.backend == .tmux and
-                    (session.record.lifecycle == .starting or
-                        session.record.lifecycle == .running))
-                {
-                    var execution_scope: ?RecoveredExecutionScope = if (authority_recoverable)
-                        session.load_recovery_execution_scope(self.alloc) catch |err| blk: {
-                            if (!is_definitive_recovery_authority_error(err)) return err;
-                            try recovered.append_diagnostic(
-                                self.alloc,
-                                owner_id,
-                                terminal_id,
-                                @errorName(err),
-                            );
-                            authority_recoverable = false;
-                            break :blk null;
-                        }
-                    else
-                        null;
-                    if (execution_scope) |*scope| scope.deinit(self.alloc);
-                    if (!authority_recoverable) {
-                        try session.persist_lost(now_ms);
-                    }
-                    try recovered.sessions.append(self.alloc, session);
-                    keep = true;
-                    continue;
-                }
-                const process_evidence = process_evidence_for(
-                    self.alloc,
-                    self.process_provider,
-                    session.record,
-                );
-                const decision = recovery.reconcile(.{
-                    .record = .valid,
-                    .lifecycle = session.record.lifecycle,
-                    .termination_present = session.record.termination != null,
-                    .host = if (std.mem.eql(
-                        u8,
-                        session.record.host_identity,
-                        host_identity,
-                    )) .present_same else .present_foreign,
-                    .process = process_evidence,
-                    .checkpoint = checkpoint_evidence_for(session.record),
-                });
-                switch (decision.disposition) {
-                    .retain_live, .unavailable => {
-                        // A newly constructed registry has no PTY descriptor to
-                        // attach even when stale identity text happens to match.
-                        try session.persist_lost(now_ms);
-                    },
-                    .mark_lost => try session.persist_lost(now_ms),
-                    .finalize_exited => {
-                        if (session.record.lifecycle == .starting or
-                            session.record.lifecycle == .running)
-                        {
-                            session.record.lifecycle = .exited;
-                            session.record.updated_at_ms = now_ms;
-                            try save_record(
-                                self.alloc,
-                                try session.state_capability(),
-                                session.record,
-                            );
-                        }
-                    },
-                    .retain_final => {},
-                    .isolate_corrupt => unreachable,
-                }
-                session.release_completed_handles();
-                try recovered.sessions.append(self.alloc, session);
-                keep = true;
-            }
-        }
+        try self.recover_owner(
+            &recovered,
+            claim.principal.durable_session_id,
+            now_ms,
+            owner_liveness,
+        );
         return recovered;
+    }
+
+    fn is_resident(self: *ProfileStore, terminal_session_id: []const u8) bool {
+        const zio = io_mod.getIo();
+        self.mutex.lockUncancelable(zio);
+        defer self.mutex.unlock(zio);
+        return self.resident_by_id(terminal_session_id) != null;
+    }
+
+    fn recover_owner(
+        self: *ProfileStore,
+        recovered: *RecoveredList,
+        owner_id: []const u8,
+        now_ms: i64,
+        liveness: *const fn (Allocator, process_provider_mod.Provider, Record) OwnerLiveness,
+    ) !void {
+        var capability = self.open_capability(owner_id, false, false) catch |err| switch (err) {
+            error.FileNotFound => return,
+            else => return err,
+        };
+        defer capability.deinit();
+        var names = capability.iterate(self.alloc, .terminal_state) catch |err| switch (err) {
+            error.FileNotFound => return,
+            else => return err,
+        };
+        defer names.deinit();
+        for (names.names) |name| {
+            // Artifacts without a record may be a start that another running
+            // process has not finished writing, so they are left alone.
+            const terminal_id = terminal_id_from_record_name(name) orelse continue;
+            if (self.is_resident(terminal_id)) continue;
+            var session = self.open_existing(owner_id, terminal_id) catch |err| {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
+                try recovered.append_diagnostic(
+                    self.alloc,
+                    owner_id,
+                    terminal_id,
+                    @errorName(err),
+                );
+                continue;
+            };
+            var keep = false;
+            defer if (!keep) session.deinit();
+            switch (liveness(self.alloc, self.process_provider, session.record)) {
+                .running, .unknown => continue,
+                .gone => {},
+            }
+            try self.recover_terminal(recovered, owner_id, terminal_id, &session, now_ms);
+            try recovered.sessions.append(self.alloc, session);
+            keep = true;
+        }
+    }
+
+    /// Repairs one record whose owner process instance is gone.
+    fn recover_terminal(
+        self: *ProfileStore,
+        recovered: *RecoveredList,
+        owner_id: []const u8,
+        terminal_id: []const u8,
+        session: *DurableSession,
+        now_ms: i64,
+    ) !void {
+        const repaired_close = session.reconcile_close_transaction(now_ms) catch |err| switch (classify_close_recovery_error(err)) {
+            .isolate => blk: {
+                try session.isolate_invalid_close_transaction(now_ms);
+                try recovered.append_diagnostic(
+                    self.alloc,
+                    owner_id,
+                    terminal_id,
+                    "InvalidCloseTransaction",
+                );
+                break :blk false;
+            },
+            .propagate => return err,
+        };
+        if (repaired_close) {
+            try recovered.append_diagnostic(
+                self.alloc,
+                owner_id,
+                terminal_id,
+                "CloseTransactionReconciled",
+            );
+        }
+        const removed_orphans = session.reconcile_unreferenced_artifacts() catch |err| blk: {
+            try recovered.append_diagnostic(
+                self.alloc,
+                owner_id,
+                terminal_id,
+                @errorName(err),
+            );
+            break :blk false;
+        };
+        if (removed_orphans) {
+            try recovered.append_diagnostic(
+                self.alloc,
+                owner_id,
+                terminal_id,
+                "UnreferencedArtifacts",
+            );
+        }
+        const repaired_authority = session.reconcile_authority() catch |err| blk: {
+            if (!is_definitive_recovery_authority_error(err)) return err;
+            try recovered.append_diagnostic(
+                self.alloc,
+                owner_id,
+                terminal_id,
+                @errorName(err),
+            );
+            break :blk false;
+        };
+        if (repaired_authority) {
+            try recovered.append_diagnostic(
+                self.alloc,
+                owner_id,
+                terminal_id,
+                "AuthorityRecordReconciled",
+            );
+        }
+        const repaired_journal = session.reconcile_journals() catch |err| blk: {
+            try recovered.append_diagnostic(
+                self.alloc,
+                owner_id,
+                terminal_id,
+                @errorName(err),
+            );
+            break :blk false;
+        };
+        if (repaired_journal) {
+            try recovered.append_diagnostic(
+                self.alloc,
+                owner_id,
+                terminal_id,
+                "CorruptJournalChain",
+            );
+        }
+        session.reconcile_checkpoint() catch |err| {
+            try recovered.append_diagnostic(
+                self.alloc,
+                owner_id,
+                terminal_id,
+                @errorName(err),
+            );
+        };
+        const repaired_events = session.reconcile_events() catch |err| blk: {
+            try recovered.append_diagnostic(
+                self.alloc,
+                owner_id,
+                terminal_id,
+                @errorName(err),
+            );
+            break :blk false;
+        };
+        if (repaired_events) {
+            try recovered.append_diagnostic(
+                self.alloc,
+                owner_id,
+                terminal_id,
+                "CorruptEventChain",
+            );
+        }
+        const decision = recovery.reconcile(.{
+            .record = .valid,
+            .lifecycle = session.record.lifecycle,
+            .termination_present = session.record.termination != null,
+            .host = .absent,
+            .process = process_evidence_for(
+                self.alloc,
+                self.process_provider,
+                session.record,
+            ),
+            .checkpoint = checkpoint_evidence_for(session.record),
+        });
+        switch (decision.disposition) {
+            .mark_lost => {
+                debug_trace.logf(
+                    "terminal_store",
+                    "terminal ended with its owner id={s} owner={s}",
+                    .{ terminal_id, owner_id },
+                );
+                try session.persist_lost(now_ms);
+            },
+            .finalize_exited => {
+                if (session.record.lifecycle == .starting or
+                    session.record.lifecycle == .running)
+                {
+                    session.record.lifecycle = .exited;
+                    session.record.updated_at_ms = now_ms;
+                    try save_record(
+                        self.alloc,
+                        try session.state_capability(),
+                        session.record,
+                    );
+                }
+            },
+            .retain_final => {},
+            // An absent owner can never retain a live terminal.
+            .retain_live, .unavailable, .isolate_corrupt => unreachable,
+        }
+        session.release_completed_handles();
     }
 };
 
@@ -1321,6 +1318,77 @@ pub const RecoveredList = struct {
         });
     }
 };
+
+/// `Record.host_identity` names the fx process instance that owns a terminal:
+/// `fx-process-v1/<instance>/<pid>/<start token>`. The instance is random per
+/// process, and the pid and start token prove whether that process still runs.
+/// Records written by the retired terminal host daemon hold a bare instance id
+/// instead and are judged by their terminal process.
+const owner_identity_prefix = "fx-process-v1/";
+const owner_instance_hex_len = 32;
+
+pub const max_owner_identity_bytes = owner_identity_prefix.len +
+    owner_instance_hex_len + 1 + 20 + 1 + 128;
+
+/// Writes the owner identity of one process instance into `buffer`. The
+/// result borrows `buffer`.
+pub fn formatOwnerIdentity(
+    buffer: []u8,
+    instance_hex: []const u8,
+    pid: std.posix.pid_t,
+    token: process_identity.ProcessInstanceToken,
+) error{ NoSpaceLeft, InvalidOwnerIdentity }![]const u8 {
+    if (instance_hex.len != owner_instance_hex_len) return error.InvalidOwnerIdentity;
+    return std.fmt.bufPrint(buffer, "{s}{s}/{d}/{s}", .{
+        owner_identity_prefix,
+        instance_hex,
+        pid,
+        token.view(),
+    });
+}
+
+const OwnerProcess = struct {
+    pid: []const u8,
+    token: process_identity.ProcessInstanceToken,
+};
+
+fn parse_owner_identity(text: []const u8) ?OwnerProcess {
+    if (!std.mem.startsWith(u8, text, owner_identity_prefix)) return null;
+    var parts = std.mem.splitScalar(u8, text[owner_identity_prefix.len..], '/');
+    const instance = parts.next() orelse return null;
+    if (instance.len != owner_instance_hex_len) return null;
+    const pid = parts.next() orelse return null;
+    _ = std.fmt.parseInt(std.posix.pid_t, pid, 10) catch return null;
+    const token = process_identity.ProcessInstanceToken.parse(parts.rest()) catch
+        return null;
+    return .{ .pid = pid, .token = token };
+}
+
+const OwnerLiveness = enum { running, gone, unknown };
+
+/// Whether the process instance that owns `record` still runs. Only `gone`
+/// permits another process to change the record.
+fn owner_liveness(
+    alloc: Allocator,
+    process_provider: process_provider_mod.Provider,
+    record: Record,
+) OwnerLiveness {
+    if (parse_owner_identity(record.host_identity)) |owner| {
+        return switch (process_provider.matchToken(alloc, owner.pid, owner.token)) {
+            .matched => .running,
+            .missing, .mismatched => .gone,
+            .unavailable => .unknown,
+        };
+    }
+    // A retired daemon's launcher watchdog ends the terminal when the daemon
+    // goes away, so a running terminal process means its daemon still runs.
+    if (record.pid == null or record.process_token == null) return .unknown;
+    return switch (process_evidence_for(alloc, process_provider, record)) {
+        .matched => .running,
+        .missing, .mismatched => .gone,
+        .unavailable => .unknown,
+    };
+}
 
 fn process_evidence_for(
     alloc: Allocator,
@@ -1567,28 +1635,6 @@ fn is_payload_artifact_name(name: []const u8) bool {
     if (!std.mem.endsWith(u8, name, ".bin")) return false;
     return std.mem.startsWith(u8, name, "journal-") or
         std.mem.startsWith(u8, name, "checkpoint-");
-}
-
-fn collect_artifact_ids(
-    alloc: Allocator,
-    ids: *std.ArrayList([]u8),
-    names: []const []u8,
-) !void {
-    for (names) |name| {
-        const id = terminal_id_from_artifact_name(name) orelse continue;
-        var duplicate = false;
-        for (ids.items) |existing| {
-            if (std.mem.eql(u8, existing, id)) {
-                duplicate = true;
-                break;
-            }
-        }
-        if (!duplicate) {
-            const owned = try alloc.dupe(u8, id);
-            errdefer alloc.free(owned);
-            try ids.append(alloc, owned);
-        }
-    }
 }
 
 fn cleanup_session_artifacts(
@@ -2476,15 +2522,6 @@ test "reloaded authority failures preserve exact error types and identities" {
     );
 }
 
-pub const RecoveredExecutionScope = struct {
-    workspace_root: []u8,
-
-    pub fn deinit(self: *RecoveredExecutionScope, alloc: Allocator) void {
-        alloc.free(self.workspace_root);
-        self.* = undefined;
-    }
-};
-
 pub const DurableSession = struct {
     profile: *ProfileStore,
     state: ?session_child_store.SessionChildCapability,
@@ -2648,50 +2685,6 @@ pub const DurableSession = struct {
         self.record.deinit(self.profile.alloc);
         if (self.state) |*state| state.deinit();
         self.* = undefined;
-    }
-
-    /// Returns an owned execution scope. The caller frees it with `deinit`
-    /// using the allocator passed here.
-    pub fn load_recovery_execution_scope(
-        self: *DurableSession,
-        alloc: Allocator,
-    ) !RecoveredExecutionScope {
-        const zio = io_mod.getIo();
-        self.profile.mutex.lockUncancelable(zio);
-        defer self.profile.mutex.unlock(zio);
-        const authority = try load_authority(
-            self.profile.alloc,
-            try self.state_capability(),
-            self.record.session_id,
-        );
-        defer authority.deinit();
-        try validate_recovery_authority(&self.record, &authority.value);
-        if (authority.value.revoked) return error.AuthorityRevoked;
-        var proofs = try self.profile.open_capability(
-            self.record.owner_session_id,
-            true,
-            false,
-        );
-        defer proofs.deinit();
-        var proof = try read_proof(
-            self.profile.alloc,
-            &proofs,
-            self.record.session_id,
-        );
-        defer std.crypto.secureZero(u8, @volatileCast(proof.bytes[0..]));
-        const verifier = proof_verifier(
-            proof,
-            authority.value.grant,
-        );
-        if (!std.mem.eql(u8, &verifier, &authority.value.verifier)) {
-            return error.InvalidHolderProof;
-        }
-        return .{
-            .workspace_root = try alloc.dupe(
-                u8,
-                authority.value.grant.principal.workspace_root,
-            ),
-        };
     }
 
     pub fn rollback_unreleased_start(self: *DurableSession) !void {
@@ -5854,7 +5847,6 @@ test "close recovery classification isolates only malformed durable evidence" {
         error.PrivateStatePermissionsUnsupported,
         error.SessionChildStoreFailed,
         error.InjectedCrash,
-        error.TmuxCommandFailed,
         error.UnclassifiedRecoveryFailure,
     }) |err| {
         try std.testing.expectEqual(
@@ -5947,6 +5939,27 @@ test "a v2 session's terminal folder owns its terminal state, an unmoved side fo
     try std.testing.expectEqualStrings("terminal-store-owner", names.items[0]);
     try std.testing.expectEqualStrings("v2-new-owner", names.items[1]);
     try std.testing.expectEqualStrings("v2-side-owner", names.items[2]);
+}
+
+fn assume_owner_gone(
+    _: Allocator,
+    _: process_provider_mod.Provider,
+    _: Record,
+) OwnerLiveness {
+    return .gone;
+}
+
+/// Recovers every owner in the profile as though each owner process had gone,
+/// so the repair tests below can observe the per-terminal recovery body.
+fn recover_profile_for_test(profile: *ProfileStore, now_ms: i64) !RecoveredList {
+    var recovered = RecoveredList{ .profile = profile };
+    errdefer recovered.deinit();
+    var owners = try profile.owner_iterator();
+    defer owners.deinit();
+    while (try owners.next()) |owner_id| {
+        try profile.recover_owner(&recovered, owner_id, now_ms, assume_owner_gone);
+    }
+    return recovered;
 }
 
 const TestStoreFixture = struct {
@@ -6070,22 +6083,6 @@ const TestStoreFixture = struct {
             .command = "printf ready",
             .backend = .native,
             .dimensions = dimensions,
-            .persistence = persistence,
-            .now_ms = 1,
-        });
-    }
-
-    fn create_tmux(self: *TestStoreFixture, session_id: []const u8) !DurableSession {
-        var persistence = test_persistence();
-        persistence.grant.principal.backend = .tmux;
-        return DurableSession.create(&self.profile, .{
-            .session_id = session_id,
-            .host_identity = "host-one",
-            .shell = "/bin/zsh",
-            .cwd = "/workspace",
-            .command = "printf ready",
-            .backend = .tmux,
-            .dimensions = .{ .rows = 24, .columns = 80 },
             .persistence = persistence,
             .now_ms = 1,
         });
@@ -6219,21 +6216,6 @@ fn checkAuthorityReloadAllocationFailures(alloc: Allocator) !void {
         .generation = persistence.grant.generation,
     });
     defer loaded.deinit();
-}
-
-fn checkRecoveryExecutionScopeAllocationFailures(alloc: Allocator) !void {
-    var fixture = try TestStoreFixture.init(alloc, test_options());
-    defer fixture.deinit();
-    var persistence = test_persistence();
-    persistence.grant.principal.workspace_root = "/saved-workspace";
-    var session = try fixture.create_with_persistence(
-        "terminal-recovery-scope-allocation",
-        .{ .rows = 24, .columns = 80 },
-        persistence,
-    );
-    defer session.deinit();
-    var scope = try session.load_recovery_execution_scope(alloc);
-    defer scope.deinit(alloc);
 }
 
 fn test_persistence() contracts.StartPersistence {
@@ -6378,6 +6360,143 @@ test "owner catalog enumerates the exact durable owner without a terminal anchor
         error.InvalidHolderProof,
         fixture.profile.ownerCatalog(forged),
     );
+}
+
+/// Treats only pid 4242 as a running process.
+fn match_only_running_pid(
+    _: ?*anyopaque,
+    _: Allocator,
+    pid: []const u8,
+    _: process_identity.ProcessInstanceToken,
+) process_identity.TokenMatch {
+    return if (std.mem.eql(u8, pid, "4242")) .matched else .missing;
+}
+
+fn create_owned_live_terminal(
+    fixture: *TestStoreFixture,
+    session_id: []const u8,
+    owner_identity: []const u8,
+    persistence: contracts.StartPersistence,
+    terminal_pid: []const u8,
+) !void {
+    var session = try DurableSession.create(&fixture.profile, .{
+        .session_id = session_id,
+        .host_identity = owner_identity,
+        .shell = "/bin/zsh",
+        .cwd = "/workspace",
+        .command = "sleep 30",
+        .backend = .native,
+        .dimensions = .{ .rows = 24, .columns = 80 },
+        .persistence = persistence,
+        .now_ms = 1,
+    });
+    defer session.deinit();
+    try session.mark_started(
+        terminal_pid,
+        try process_identity.ProcessInstanceToken.parse(
+            "macos:00000000000000000000000000000000:1:2",
+        ),
+        2,
+    );
+}
+
+fn recorded_lifecycle(
+    fixture: *TestStoreFixture,
+    owner_session_id: []const u8,
+    session_id: []const u8,
+) !contracts.Lifecycle {
+    var session = try fixture.profile.open_existing(owner_session_id, session_id);
+    defer session.deinit();
+    return session.record.lifecycle;
+}
+
+test "owner reconcile ends only terminals whose owner process is gone" {
+    const alloc = std.testing.allocator;
+    var fixture = try TestStoreFixture.init(alloc, test_options());
+    defer fixture.deinit();
+    fixture.profile.process_provider = .{
+        .capture_token_fn = testCaptureToken,
+        .match_token_fn = match_only_running_pid,
+        .signal_process_fn = testSignalProcess,
+    };
+    const token = try process_identity.ProcessInstanceToken.parse(
+        "macos:00000000000000000000000000000000:1:2",
+    );
+    var running_buffer: [max_owner_identity_bytes]u8 = undefined;
+    const running_owner = try formatOwnerIdentity(&running_buffer, "a" ** 32, 4242, token);
+    var gone_buffer: [max_owner_identity_bytes]u8 = undefined;
+    const gone_owner = try formatOwnerIdentity(&gone_buffer, "b" ** 32, 4243, token);
+    // The retired daemon wrote a bare instance id, so its records are judged
+    // by their terminal process.
+    const legacy_owner = "0123456789abcdef0123456789abcdef";
+
+    try create_owned_live_terminal(&fixture, "terminal-owner-running", running_owner, test_persistence(), "5000");
+    try create_owned_live_terminal(&fixture, "terminal-owner-gone", gone_owner, test_persistence(), "5001");
+    try create_owned_live_terminal(&fixture, "terminal-legacy-live", legacy_owner, test_persistence(), "4242");
+    try create_owned_live_terminal(&fixture, "terminal-legacy-gone", legacy_owner, test_persistence(), "5002");
+    try fixture.create_owner("terminal-other-owner");
+    var other_persistence = test_persistence();
+    other_persistence.grant.principal.durable_session_id = "terminal-other-owner";
+    try create_owned_live_terminal(&fixture, "terminal-other-gone", gone_owner, other_persistence, "5003");
+    try fixture.reopen();
+
+    var owner = try fixture.owner_capability("terminal-store-owner", .writable);
+    defer owner.deinit();
+    var claim = try loadOrCreateOwnerCatalogClaim(alloc, &owner, .{
+        .profile_user = "profile-user",
+        .durable_session_id = "terminal-store-owner",
+        .workspace_root = "/workspace",
+        .transport_role = .interactive,
+        .actor = .agent,
+    });
+    defer claim.deinit();
+
+    var recovered = try fixture.profile.reconcileOwner(claim.view(), 3);
+    defer recovered.deinit();
+    try std.testing.expectEqual(@as(usize, 2), recovered.sessions.items.len);
+    try std.testing.expect(recovered_session_index(recovered.sessions.items, "terminal-owner-gone") != null);
+    try std.testing.expect(recovered_session_index(recovered.sessions.items, "terminal-legacy-gone") != null);
+
+    const owner_id = "terminal-store-owner";
+    try std.testing.expectEqual(contracts.Lifecycle.lost, try recorded_lifecycle(&fixture, owner_id, "terminal-owner-gone"));
+    try std.testing.expectEqual(contracts.Lifecycle.lost, try recorded_lifecycle(&fixture, owner_id, "terminal-legacy-gone"));
+    // A running owner's terminals are never ended, whatever process runs them.
+    try std.testing.expectEqual(contracts.Lifecycle.running, try recorded_lifecycle(&fixture, owner_id, "terminal-owner-running"));
+    try std.testing.expectEqual(contracts.Lifecycle.running, try recorded_lifecycle(&fixture, owner_id, "terminal-legacy-live"));
+    // Another owner session is never scanned, even with a gone owner.
+    try std.testing.expectEqual(
+        contracts.Lifecycle.running,
+        try recorded_lifecycle(&fixture, "terminal-other-owner", "terminal-other-gone"),
+    );
+
+    var forged = claim.view();
+    forged.proof.bytes[0] ^= 1;
+    try std.testing.expectError(
+        error.InvalidHolderProof,
+        fixture.profile.reconcileOwner(forged, 4),
+    );
+}
+
+test "owner identities round trip and reject malformed text" {
+    const token = try process_identity.ProcessInstanceToken.parse(
+        "linux:00112233445566778899aabbccddeeff:12345",
+    );
+    var buffer: [max_owner_identity_bytes]u8 = undefined;
+    const text = try formatOwnerIdentity(&buffer, "c" ** 32, 77, token);
+    try std.testing.expectEqualStrings(
+        "fx-process-v1/" ++ "c" ** 32 ++ "/77/linux:00112233445566778899aabbccddeeff:12345",
+        text,
+    );
+    const parsed = parse_owner_identity(text).?;
+    try std.testing.expectEqualStrings("77", parsed.pid);
+    try std.testing.expect(parsed.token.eql(token));
+    try std.testing.expectError(
+        error.InvalidOwnerIdentity,
+        formatOwnerIdentity(&buffer, "short", 77, token),
+    );
+    try std.testing.expect(parse_owner_identity("0123456789abcdef0123456789abcdef") == null);
+    try std.testing.expect(parse_owner_identity("fx-process-v1/" ++ "c" ** 32 ++ "/x/linux:00112233445566778899aabbccddeeff:1") == null);
+    try std.testing.expect(parse_owner_identity("fx-process-v1/" ++ "c" ** 32 ++ "/77/not-a-token") == null);
 }
 
 fn recovered_session_index(
@@ -6741,7 +6860,7 @@ test "fresh reopen isolates checkpoint payload byte mismatch before accounting" 
     try std.testing.expectEqual(@as(u64, payload.len), candidates.total_bytes);
     try std.testing.expectEqual(@as(usize, 0), candidates.items.items.len);
 
-    var recovered = try fixture.profile.recover("host-two", 3);
+    var recovered = try recover_profile_for_test(&fixture.profile, 3);
     defer recovered.deinit();
     try std.testing.expectEqual(@as(usize, 0), recovered.sessions.items.len);
     try std.testing.expectEqual(@as(usize, 1), recovered.diagnostics.items.len);
@@ -6858,305 +6977,25 @@ test "authority reload covers allocation failures" {
     );
 }
 
-test "recovery execution scope reloads the exact durable authority" {
+test "close recovery isolates a malformed transaction from a live sibling" {
     const alloc = std.testing.allocator;
     var fixture = try TestStoreFixture.init(alloc, test_options());
     defer fixture.deinit();
-    var persistence = test_persistence();
-    persistence.grant.principal.workspace_root = "/saved-workspace";
-    var session = try fixture.create_with_persistence(
-        "terminal-recovery-scope",
-        .{ .rows = 24, .columns = 80 },
-        persistence,
-    );
-    defer session.deinit();
-
-    var scope = try session.load_recovery_execution_scope(alloc);
-    defer scope.deinit(alloc);
-    try std.testing.expectEqualStrings("/saved-workspace", scope.workspace_root);
-    try std.testing.expect(!std.mem.eql(u8, scope.workspace_root, session.record.cwd));
-    try std.testing.expect(!@hasField(RecoveredExecutionScope, "proof"));
-}
-
-test "recovery execution scope authenticates workspace" {
-    const alloc = std.testing.allocator;
-    var fixture = try TestStoreFixture.init(alloc, test_options());
-    defer fixture.deinit();
-    const cases = [_][]const u8{"terminal-recovery-workspace-tamper"};
-
-    for (cases) |session_id| {
-        var session = try fixture.create(session_id);
-        defer session.deinit();
-        const parsed = try load_authority(
-            alloc,
-            try session.state_capability(),
-            session_id,
-        );
-        defer parsed.deinit();
-        var authority = parsed.value;
-        authority.grant.principal.workspace_root = "/tampered-workspace";
-        try replace_test_authority(alloc, &session, authority);
-        try std.testing.expectError(
-            error.InvalidHolderProof,
-            session.load_recovery_execution_scope(alloc),
-        );
-    }
-}
-
-test "recovery execution scope rejects revocation before reading invalidated proof" {
-    const alloc = std.testing.allocator;
-    var fixture = try TestStoreFixture.init(alloc, test_options());
-    defer fixture.deinit();
-    var session = try fixture.create("terminal-recovery-scope-revoked");
-    defer session.deinit();
-
-    try session.revoke(2);
-    try std.testing.expectError(
-        error.AuthorityRevoked,
-        session.load_recovery_execution_scope(alloc),
-    );
-}
-
-test "recovery execution scope rejects record authority inconsistency" {
-    const alloc = std.testing.allocator;
-    var fixture = try TestStoreFixture.init(alloc, test_options());
-    defer fixture.deinit();
-    var session = try fixture.create("terminal-recovery-scope-inconsistent");
-    defer session.deinit();
-
-    const inconsistent_cwd = try alloc.dupe(u8, "/other-cwd");
-    alloc.free(session.record.cwd);
-    session.record.cwd = inconsistent_cwd;
-    try save_record(
-        alloc,
-        try session.state_capability(),
-        session.record,
-    );
-    try std.testing.expectError(
-        error.InvalidAuthorityRecord,
-        session.load_recovery_execution_scope(alloc),
-    );
-}
-
-test "recovery execution scope covers allocation failures" {
-    try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
-        checkRecoveryExecutionScopeAllocationFailures,
-        .{},
-    );
-}
-
-test "tmux recovery propagates execution scope allocation failure without durable loss" {
-    const alloc = std.testing.allocator;
-    var failing = OneShotFailingAllocator.init(alloc);
-    var fixture = try TestStoreFixture.init(failing.allocator(), test_options());
-    defer fixture.deinit();
-    var session = try fixture.create_tmux("terminal-recovery-scope-oom");
-    const authority_generation = session.record.authority_generation;
-    session.deinit();
-    try fixture.reopen();
-
-    const baseline_start = failing.failing.alloc_index;
-    var baseline = try fixture.profile.recover("host-two", 2);
-    baseline.deinit();
-    const recovery_allocations = failing.failing.alloc_index - baseline_start;
-    try std.testing.expect(recovery_allocations >= 2);
-    // The saved workspace copy is immediately followed by the recovered-list append.
-    failing.failing.fail_index = failing.failing.alloc_index +
-        recovery_allocations - 2;
-
-    if (fixture.profile.recover("host-two", 2)) |unexpected_value| {
-        var unexpected = unexpected_value;
-        defer unexpected.deinit();
-        return error.TestExpectedError;
-    } else |err| {
-        try std.testing.expectEqual(error.OutOfMemory, err);
-    }
-    try std.testing.expect(failing.failing.has_induced_failure);
-
-    {
-        var durable = try fixture.profile.open_existing(
-            "terminal-store-owner",
-            "terminal-recovery-scope-oom",
-        );
-        defer durable.deinit();
-        try std.testing.expectEqual(
-            contracts.Lifecycle.starting,
-            durable.record.lifecycle,
-        );
-        try std.testing.expectEqual(
-            authority_generation,
-            durable.record.authority_generation,
-        );
-    }
-
-    var recovered = try fixture.profile.recover("host-two", 2);
-    defer recovered.deinit();
-    try std.testing.expectEqual(@as(usize, 0), recovered.diagnostics.items.len);
-    try std.testing.expectEqual(@as(usize, 1), recovered.sessions.items.len);
-    try std.testing.expectEqual(
-        contracts.Lifecycle.starting,
-        recovered.sessions.items[0].record.lifecycle,
-    );
-    try std.testing.expectEqual(
-        authority_generation,
-        recovered.sessions.items[0].record.authority_generation,
-    );
-}
-
-test "tmux recovery propagates proof capability failure without durable loss" {
-    const alloc = std.testing.allocator;
-    var fixture = try TestStoreFixture.init(alloc, test_options());
-    defer fixture.deinit();
-    var session = try fixture.create_tmux("terminal-recovery-proof-capability");
-    const authority_generation = session.record.authority_generation;
-    session.deinit();
-    try fixture.reopen();
-
-    const name = try proof_name(alloc, "terminal-recovery-proof-capability");
-    defer alloc.free(name);
-    const path = try std.fs.path.join(alloc, &.{
-        fixture.home,
-        ".fx",
-        "sessions",
-        "terminal-store-owner",
-        "terminal",
-        "proofs",
-        name,
-    });
-    defer alloc.free(path);
-    var proof_file = try std.Io.Dir.openFileAbsolute(
-        std.testing.io,
-        path,
-        .{ .mode = .read_write },
-    );
-    try proof_file.setPermissions(
-        std.testing.io,
-        std.Io.File.Permissions.fromMode(0o640),
-    );
-    proof_file.close(std.testing.io);
-
-    if (fixture.profile.recover("host-two", 2)) |unexpected_value| {
-        var unexpected = unexpected_value;
-        defer unexpected.deinit();
-        return error.TestExpectedError;
-    } else |err| {
-        try std.testing.expectEqual(
-            error.PrivateStatePermissionsUnsupported,
-            err,
-        );
-    }
-
-    proof_file = try std.Io.Dir.openFileAbsolute(
-        std.testing.io,
-        path,
-        .{ .mode = .read_write },
-    );
-    defer proof_file.close(std.testing.io);
-    try proof_file.setPermissions(
-        std.testing.io,
-        std.Io.File.Permissions.fromMode(0o600),
-    );
-
-    {
-        var durable = try fixture.profile.open_existing(
-            "terminal-store-owner",
-            "terminal-recovery-proof-capability",
-        );
-        defer durable.deinit();
-        try std.testing.expectEqual(
-            contracts.Lifecycle.starting,
-            durable.record.lifecycle,
-        );
-        try std.testing.expectEqual(
-            authority_generation,
-            durable.record.authority_generation,
-        );
-    }
-
-    var recovered = try fixture.profile.recover("host-two", 2);
-    defer recovered.deinit();
-    try std.testing.expectEqual(@as(usize, 0), recovered.diagnostics.items.len);
-    try std.testing.expectEqual(@as(usize, 1), recovered.sessions.items.len);
-    try std.testing.expectEqual(
-        contracts.Lifecycle.starting,
-        recovered.sessions.items[0].record.lifecycle,
-    );
-    try std.testing.expectEqual(
-        authority_generation,
-        recovered.sessions.items[0].record.authority_generation,
-    );
-}
-
-test "tmux recovery isolates invalid authority from a valid sibling" {
-    const alloc = std.testing.allocator;
-    var fixture = try TestStoreFixture.init(alloc, test_options());
-    defer fixture.deinit();
-    var valid = try fixture.create_tmux("terminal-recovery-valid-sibling");
-    var invalid = try fixture.create_tmux("terminal-recovery-invalid-sibling");
-    const parsed = try load_authority(
-        alloc,
-        try invalid.state_capability(),
-        invalid.record.session_id,
-    );
-    defer parsed.deinit();
-    var authority = parsed.value;
-    authority.grant.principal.workspace_root = "/tampered-workspace";
-    try replace_test_authority(alloc, &invalid, authority);
-    valid.deinit();
-    invalid.deinit();
-    try fixture.reopen();
-
-    var recovered = try fixture.profile.recover("host-two", 2);
-    defer recovered.deinit();
-    try std.testing.expectEqual(@as(usize, 2), recovered.sessions.items.len);
-    const valid_index = recovered_session_index(
-        recovered.sessions.items,
-        "terminal-recovery-valid-sibling",
-    ).?;
-    const invalid_index = recovered_session_index(
-        recovered.sessions.items,
-        "terminal-recovery-invalid-sibling",
-    ).?;
-    try std.testing.expectEqual(
-        contracts.Lifecycle.starting,
-        recovered.sessions.items[valid_index].record.lifecycle,
-    );
-    try std.testing.expectEqual(
-        contracts.Lifecycle.lost,
-        recovered.sessions.items[invalid_index].record.lifecycle,
-    );
-    try std.testing.expectEqual(@as(usize, 1), recovered.diagnostics.items.len);
-    try std.testing.expectEqualStrings(
-        "terminal-recovery-invalid-sibling",
-        recovered.diagnostics.items[0].terminal_session_id,
-    );
-    try std.testing.expectEqualStrings(
-        "InvalidHolderProof",
-        recovered.diagnostics.items[0].reason,
-    );
-}
-
-test "close recovery isolates a malformed transaction from a live tmux sibling" {
-    const alloc = std.testing.allocator;
-    var fixture = try TestStoreFixture.init(alloc, test_options());
-    defer fixture.deinit();
-    var persistence = test_persistence();
-    persistence.grant.principal.backend = .tmux;
-    var valid = try fixture.create_tmux("terminal-close-valid-tmux-sibling");
-    var invalid = try fixture.create_tmux("terminal-close-invalid-transaction");
+    const persistence = test_persistence();
+    var valid = try fixture.create("terminal-close-valid-sibling");
+    var invalid = try fixture.create("terminal-close-invalid-transaction");
     try expect_close_candidate(invalid.begin_close(test_claim(persistence), 2));
     try replace_test_close_transaction(alloc, &invalid, "{");
     valid.deinit();
     invalid.deinit();
     try fixture.reopen();
 
-    var recovered = try fixture.profile.recover("host-two", 3);
+    var recovered = try recover_profile_for_test(&fixture.profile, 3);
     defer recovered.deinit();
     try std.testing.expectEqual(@as(usize, 2), recovered.sessions.items.len);
     const valid_index = recovered_session_index(
         recovered.sessions.items,
-        "terminal-close-valid-tmux-sibling",
+        "terminal-close-valid-sibling",
     ).?;
     const invalid_index = recovered_session_index(
         recovered.sessions.items,
@@ -7165,7 +7004,7 @@ test "close recovery isolates a malformed transaction from a live tmux sibling" 
     const valid_sibling = &recovered.sessions.items[valid_index];
     const isolated = &recovered.sessions.items[invalid_index];
     try std.testing.expectEqual(
-        contracts.Lifecycle.starting,
+        contracts.Lifecycle.lost,
         valid_sibling.record.lifecycle,
     );
     try std.testing.expect(!valid_sibling.record.authority_revoked);
@@ -7183,14 +7022,13 @@ test "close recovery isolates a malformed transaction from a live tmux sibling" 
     );
 }
 
-test "close recovery isolates an oversized transaction from a live tmux sibling" {
+test "close recovery isolates an oversized transaction from a live sibling" {
     const alloc = std.testing.allocator;
     var fixture = try TestStoreFixture.init(alloc, test_options());
     defer fixture.deinit();
-    var persistence = test_persistence();
-    persistence.grant.principal.backend = .tmux;
-    var valid = try fixture.create_tmux("terminal-close-valid-oversized-sibling");
-    var invalid = try fixture.create_tmux("terminal-close-oversized-transaction");
+    const persistence = test_persistence();
+    var valid = try fixture.create("terminal-close-valid-oversized-sibling");
+    var invalid = try fixture.create("terminal-close-oversized-transaction");
     try expect_close_candidate(invalid.begin_close(test_claim(persistence), 2));
     const oversized = try alloc.alloc(u8, max_event_bytes + 1);
     defer alloc.free(oversized);
@@ -7200,7 +7038,7 @@ test "close recovery isolates an oversized transaction from a live tmux sibling"
     invalid.deinit();
     try fixture.reopen();
 
-    var recovered = try fixture.profile.recover("host-two", 3);
+    var recovered = try recover_profile_for_test(&fixture.profile, 3);
     defer recovered.deinit();
     try std.testing.expectEqual(@as(usize, 2), recovered.sessions.items.len);
     const valid_index = recovered_session_index(
@@ -7214,7 +7052,7 @@ test "close recovery isolates an oversized transaction from a live tmux sibling"
     const valid_sibling = &recovered.sessions.items[valid_index];
     const isolated = &recovered.sessions.items[invalid_index];
     try std.testing.expectEqual(
-        contracts.Lifecycle.starting,
+        contracts.Lifecycle.lost,
         valid_sibling.record.lifecycle,
     );
     try std.testing.expect(!valid_sibling.record.authority_revoked);
@@ -7236,10 +7074,9 @@ test "close recovery propagates allocation failure without durable mutation" {
     const alloc = std.testing.allocator;
     var fixture = try TestStoreFixture.init(alloc, test_options());
     defer fixture.deinit();
-    var persistence = test_persistence();
-    persistence.grant.principal.backend = .tmux;
-    var session = try fixture.create_tmux("terminal-close-recovery-oom");
-    var sibling = try fixture.create_tmux("terminal-close-recovery-oom-sibling");
+    const persistence = test_persistence();
+    var session = try fixture.create("terminal-close-recovery-oom");
+    var sibling = try fixture.create("terminal-close-recovery-oom-sibling");
     try expect_close_candidate(session.begin_close(test_claim(persistence), 2));
     try expect_close_candidate(sibling.begin_close(test_claim(persistence), 2));
     const generation = session.record.authority_generation;
@@ -7256,7 +7093,7 @@ test "close recovery propagates allocation failure without durable mutation" {
     try fixture.reopen();
 
     fixture.profile.options.fail_at = .before_close_recovery_oom;
-    if (fixture.profile.recover("host-two", 3)) |unexpected_value| {
+    if (recover_profile_for_test(&fixture.profile, 3)) |unexpected_value| {
         var unexpected = unexpected_value;
         defer unexpected.deinit();
         return error.TestExpectedError;
@@ -7285,10 +7122,9 @@ test "close recovery propagates capability failure without durable mutation" {
     const alloc = std.testing.allocator;
     var fixture = try TestStoreFixture.init(alloc, test_options());
     defer fixture.deinit();
-    var persistence = test_persistence();
-    persistence.grant.principal.backend = .tmux;
-    var session = try fixture.create_tmux("terminal-close-recovery-capability");
-    var sibling = try fixture.create_tmux(
+    const persistence = test_persistence();
+    var session = try fixture.create("terminal-close-recovery-capability");
+    var sibling = try fixture.create(
         "terminal-close-recovery-capability-sibling",
     );
     try expect_close_candidate(session.begin_close(test_claim(persistence), 2));
@@ -7307,7 +7143,7 @@ test "close recovery propagates capability failure without durable mutation" {
     try fixture.reopen();
 
     fixture.profile.options.fail_at = .before_close_recovery_capability;
-    if (fixture.profile.recover("host-two", 3)) |unexpected_value| {
+    if (recover_profile_for_test(&fixture.profile, 3)) |unexpected_value| {
         var unexpected = unexpected_value;
         defer unexpected.deinit();
         return error.TestExpectedError;
@@ -8218,7 +8054,7 @@ test "close intent converges every durable boundary without reviving authority" 
         session.deinit();
         try fixture.reopen();
 
-        var recovered = try fixture.profile.recover("host-reopen", 4);
+        var recovered = try recover_profile_for_test(&fixture.profile, 4);
         defer recovered.deinit();
         const recovered_index = recovered_session_index(
             recovered.sessions.items,
@@ -8396,7 +8232,7 @@ test "durable failure boundaries do not report success" {
     try std.testing.expectError(error.InjectedFailure, session.persist_lost(8));
 }
 
-test "recovery discovers and removes partial start artifacts after durable effects" {
+test "recovery leaves partial start artifacts to the process writing them" {
     const alloc = std.testing.allocator;
     var fixture = try TestStoreFixture.init(alloc, test_options());
     defer fixture.deinit();
@@ -8412,14 +8248,12 @@ test "recovery discovers and removes partial start artifacts after durable effec
         try std.testing.expectError(error.InjectedCrash, fixture.create(id));
         fixture.profile.options.fail_at = null;
         try fixture.reopen();
-        var recovered = try fixture.profile.recover("host-reopen", 10);
+        // Without a record there is no owner to prove gone: another running
+        // process may still be finishing this start.
+        var recovered = try recover_profile_for_test(&fixture.profile, 10);
         defer recovered.deinit();
         try std.testing.expectEqual(@as(usize, 0), recovered.sessions.items.len);
-        try std.testing.expectEqual(@as(usize, 1), recovered.diagnostics.items.len);
-        try std.testing.expectEqualStrings(
-            "PartialStartArtifacts",
-            recovered.diagnostics.items[0].reason,
-        );
+        try std.testing.expectEqual(@as(usize, 0), recovered.diagnostics.items.len);
     }
 }
 
@@ -8435,7 +8269,7 @@ test "fresh reopen reconciles journal checkpoint event authority and cleanup com
     fixture.profile.options.fail_at = null;
     journal.deinit();
     try fixture.reopen();
-    var journal_recovery = try fixture.profile.recover("host-reopen", 4);
+    var journal_recovery = try recover_profile_for_test(&fixture.profile, 4);
     try std.testing.expectEqual(@as(usize, 1), journal_recovery.sessions.items.len);
     var page = try journal_recovery.sessions.items[0].read(
         alloc,
@@ -8465,7 +8299,7 @@ test "fresh reopen reconciles journal checkpoint event authority and cleanup com
     fixture.profile.options.fail_at = null;
     checkpoint.deinit();
     try fixture.reopen();
-    var checkpoint_recovery = try fixture.profile.recover("host-reopen", 4);
+    var checkpoint_recovery = try recover_profile_for_test(&fixture.profile, 4);
     const checkpoint_index = recovered_session_index(
         checkpoint_recovery.sessions.items,
         "terminal-crash-checkpoint",
@@ -8488,18 +8322,13 @@ test "fresh reopen reconciles journal checkpoint event authority and cleanup com
     fixture.profile.options.fail_at = null;
     authority.deinit();
     try fixture.reopen();
-    var authority_recovery = try fixture.profile.recover("host-reopen", 3);
+    var authority_recovery = try recover_profile_for_test(&fixture.profile, 3);
     const authority_index = recovered_session_index(
         authority_recovery.sessions.items,
         "terminal-crash-authority",
     ).?;
     try std.testing.expect(
         authority_recovery.sessions.items[authority_index].record.authority_revoked,
-    );
-    try std.testing.expectError(
-        error.AuthorityRevoked,
-        authority_recovery.sessions.items[authority_index]
-            .load_recovery_execution_scope(alloc),
     );
     const recovered_authority = try load_authority(
         alloc,
@@ -8528,7 +8357,7 @@ test "fresh reopen reconciles journal checkpoint event authority and cleanup com
     fixture.profile.options.fail_at = null;
     committed_checkpoint.deinit();
     try fixture.reopen();
-    var committed_recovery = try fixture.profile.recover("host-reopen", 4);
+    var committed_recovery = try recover_profile_for_test(&fixture.profile, 4);
     const committed_index = recovered_session_index(
         committed_recovery.sessions.items,
         "terminal-crash-checkpoint-record",
@@ -8554,7 +8383,7 @@ test "fresh reopen reconciles journal checkpoint event authority and cleanup com
     fixture.profile.options.fail_at = null;
     acknowledged.deinit();
     try fixture.reopen();
-    var acknowledged_recovery = try fixture.profile.recover("host-reopen", 4);
+    var acknowledged_recovery = try recover_profile_for_test(&fixture.profile, 4);
     const acknowledged_index = recovered_session_index(
         acknowledged_recovery.sessions.items,
         "terminal-crash-acknowledgement",
@@ -8574,7 +8403,7 @@ test "fresh reopen reconciles journal checkpoint event authority and cleanup com
     fixture.profile.options.fail_at = null;
     evicted.deinit();
     try fixture.reopen();
-    var eviction_recovery = try fixture.profile.recover("host-reopen", 4);
+    var eviction_recovery = try recover_profile_for_test(&fixture.profile, 4);
     const eviction_index = recovered_session_index(
         eviction_recovery.sessions.items,
         "terminal-crash-eviction",
@@ -8599,7 +8428,7 @@ test "fresh reopen reconciles journal checkpoint event authority and cleanup com
     fixture.profile.options.fail_at = null;
     events.deinit();
     try fixture.reopen();
-    var event_recovery = try fixture.profile.recover("host-reopen", 3);
+    var event_recovery = try recover_profile_for_test(&fixture.profile, 3);
     const event_index = recovered_session_index(
         event_recovery.sessions.items,
         "terminal-crash-events",
@@ -8658,7 +8487,7 @@ test "journal recovery validates the complete chain and retains only a verified 
     session.deinit();
     try fixture.reopen();
 
-    var recovered = try fixture.profile.recover("host-reopen", 3);
+    var recovered = try recover_profile_for_test(&fixture.profile, 3);
     defer recovered.deinit();
     const index = recovered_session_index(
         recovered.sessions.items,
@@ -8714,7 +8543,7 @@ test "host restart marks native work lost without restart and reconnect is idemp
     try session.append("durable-output", 2);
     session.deinit();
 
-    var first = try fixture.profile.recover("host-two", 3);
+    var first = try recover_profile_for_test(&fixture.profile, 3);
     try std.testing.expectEqual(@as(usize, 1), first.sessions.items.len);
     try std.testing.expectEqual(
         contracts.Lifecycle.lost,
@@ -8733,7 +8562,7 @@ test "host restart marks native work lost without restart and reconnect is idemp
     ));
     first.deinit();
 
-    var second = try fixture.profile.recover("host-three", 4);
+    var second = try recover_profile_for_test(&fixture.profile, 4);
     defer second.deinit();
     try std.testing.expectEqual(@as(usize, 1), second.sessions.items.len);
     try std.testing.expectEqual(
@@ -8775,7 +8604,7 @@ test "recovery isolates partial corrupt and unsupported records" {
         session.deinit();
     }
 
-    var recovered = try fixture.profile.recover("host-two", 5);
+    var recovered = try recover_profile_for_test(&fixture.profile, 5);
     defer recovered.deinit();
     try std.testing.expectEqual(@as(usize, 0), recovered.sessions.items.len);
     try std.testing.expectEqual(@as(usize, 3), recovered.diagnostics.items.len);

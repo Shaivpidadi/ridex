@@ -346,6 +346,9 @@ pub const ServerState = struct {
     pending_legacy_urls: std.ArrayListUnmanaged(PendingLegacyUrl) = .empty,
 
     pub fn deinit(self: *ServerState) void {
+        // Terminals end with this process. Ending them first also releases
+        // an active prompt waiting on one.
+        self.terminal_client.closeOwnedTerminals();
         reapActivePrompt(self, true);
         self.managed_executions.deinit();
         self.terminal_client.deinit();

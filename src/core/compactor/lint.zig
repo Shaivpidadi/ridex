@@ -6,9 +6,10 @@
 //!   or entry names exists;
 //! - the exact values it states, like paths, file names, `code`, versions and
 //!   long numbers, appear in the turns and tool calls it is about, when this
-//!   compaction has them;
+//!   compaction has them, or in the conversation that stays after them;
 //! - what an entry replaces is an earlier entry;
-//! - a rule quotes the user word for word;
+//! - a rule quotes the user word for word, from a message or an answer to a
+//!   question;
 //! - a note, or an entry about one tool call, does not call a failed tool
 //!   call a success.
 //! What fails a check stays, marked `[check: ...]`, so the agent confirms it
@@ -39,8 +40,12 @@ pub const Sources = struct {
     /// zero, and its tool calls in order. Values are looked for in them.
     turns: []const Record,
     tools: []const Record,
-    /// Every user message a rule may quote.
+    /// Every user message, and every answer the user gave a question, that a
+    /// rule may quote.
     users: []const []const u8,
+    /// The texts that stay in the conversation after this compaction's turns.
+    /// Values are looked for in them too, but nothing can cite them.
+    kept: []const []const u8 = &.{},
     /// The highest number of each kind of entry before this compaction's,
     /// counting entries only a saved ledger holds, so replacing one of them
     /// is allowed.
@@ -66,12 +71,14 @@ const max_values = 16;
 pub fn check(arena: Allocator, written: ledger.Written, earlier: []const checkpoint.Entry, sources: Sources, counts: *Counts) Allocator.Error!ledger.Written {
     var users: std.ArrayList([]const u8) = .empty;
     for (sources.users) |user| try users.append(arena, try normalized(arena, user));
-    // A value found anywhere in this compaction is taken as true, even when
-    // the note names another turn or tool call for it.
+    // A value found anywhere in this compaction, or in what stays after it,
+    // is taken as true, even when the note names another turn or tool call
+    // for it.
     var everything: std.ArrayList([]const u8) = .empty;
     for (sources.turns) |record| try everything.append(arena, record.text);
     for (sources.tools) |record| try everything.append(arena, record.text);
     try everything.appendSlice(arena, sources.users);
+    try everything.appendSlice(arena, sources.kept);
     const all = everything.items;
     var result = written;
 

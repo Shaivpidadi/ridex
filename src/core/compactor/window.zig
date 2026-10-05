@@ -275,6 +275,9 @@ pub const Window = struct {
     older: []HistoryTurn,
     /// The raw part that stays after the checkpoint.
     retained_history: []HistoryTurn,
+    /// What stays in the conversation after the cut: `retained_history` and
+    /// the rest of the turn in progress, which lives outside the history.
+    kept: []HistoryTurn,
     cut: types.ContextHistoryCut,
     /// Token budget of the part kept unchanged.
     kept_tokens: usize,
@@ -350,6 +353,7 @@ fn split(
         .earlier = earlier,
         .older = try history_range.contextHistoryRange(arena, combined.items, .{}, cut),
         .retained_history = try history_range.contextHistoryRange(arena, history, cut, null),
+        .kept = try history_range.contextHistoryRange(arena, combined.items, cut, null),
         .cut = cut,
         .kept_tokens = kept_tokens,
         .kept_used = recent.tokens,
@@ -526,6 +530,37 @@ test "the window ends an unfinished turn at its completed exchange" {
     const saved = try split(arena_state.allocator(), &.{.{ .assistant = turn }}, null, 800, 4_000, selection);
     try testing.expectEqual(types.ContextHistoryCut{ .turns = 1 }, saved.cut);
     try testing.expectEqual(@as(usize, 0), saved.retained_history.len);
+}
+
+test "what stays after the cut includes the rest of an unfinished turn" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const calls = [_]types.ToolCall{
+        .{ .id = "large-write", .name = "write_file", .arguments_json = "x" ** 32_000 },
+        .{ .id = "small-read", .name = "read_file", .arguments_json = "{\"path\":\"src/a.zig\"}" },
+    };
+    const results = [_]types.PersistedToolResult{
+        .{ .tool_call_id = @constCast("large-write"), .tool_name = @constCast("write_file"), .status = .success, .output = @constCast("written"), .output_bytes = 7, .stored_output_bytes = 7 },
+        .{ .tool_call_id = @constCast("small-read"), .tool_name = @constCast("read_file"), .status = .success, .output = @constCast("const a = 1;"), .output_bytes = 12, .stored_output_bytes = 12 },
+    };
+    const steps = [_]types.ToolExecutionStep{
+        .{ .tool_calls = @constCast(calls[0..1]), .tool_results = @constCast(results[0..1]) },
+        .{ .tool_calls = @constCast(calls[1..2]), .tool_results = @constCast(results[1..2]) },
+    };
+    const turn = types.AssistantHistoryTurn{
+        .user = .{ .text = @constCast("write, then read") },
+        .assistant = @constCast(""),
+        .execution = .{ .tool_steps = @constCast(&steps) },
+    };
+    const window = try split(arena_state.allocator(), &.{}, turn, 800, 4_000, selection);
+    try testing.expectEqual(types.ContextHistoryCut{ .tool_steps = 1 }, window.cut);
+    // The unfinished turn is not in the history, so nothing of it is retained
+    // there, but its newest call stays in the conversation.
+    try testing.expectEqual(@as(usize, 0), window.retained_history.len);
+    try testing.expectEqual(@as(usize, 1), window.kept.len);
+    const kept_steps = window.kept[0].assistant.execution.tool_steps;
+    try testing.expectEqual(@as(usize, 1), kept_steps.len);
+    try testing.expectEqualStrings("small-read", kept_steps[0].tool_calls[0].id);
 }
 
 test "nothing is compacted unless it is due or required" {
