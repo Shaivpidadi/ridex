@@ -933,7 +933,8 @@ pub fn Bindings(comptime App: type) type {
         fn agentResolveModelCapabilities(ctx: *anyopaque, _: Allocator, model: []const u8) model_capabilities.ResolveError!model_capabilities.Capabilities {
             const app: *App = @ptrCast(@alignCast(ctx));
             if (comptime runtime_profile.allows(App, .cooperative_agent)) {
-                if (app.worker.effectiveAgentTurnSettings().ultrafast_mode) {
+                const settings = app.worker.effectiveAgentTurnSettings();
+                if (settings.fast_mode or settings.ultrafast_mode) {
                     if (app.worker.isCancelRequested()) return error.Cancelled;
                     app.ensureModelCache();
                     // A host abort can settle the fetch before queued input reaches the worker.
@@ -2501,7 +2502,7 @@ test "agent deps use request-time model capability resolution when available" {
     try std.testing.expect(model_capabilities.reasoningEffortSupported(capabilities, types.ReasoningEffort.literal("future-tier")));
 }
 
-test "cooperative Ultrafast capability resolution uses active request settings and honors cancellation" {
+test "cooperative speed capability resolution uses active request settings and honors cancellation" {
     const App = struct {
         pub const host_profile = runtime_profile.wasm;
         worker: worker_runtime.WorkerRuntime = .{},
@@ -2524,10 +2525,14 @@ test "cooperative Ultrafast capability resolution uses active request settings a
 
         pub fn resolveModelCapabilitiesForRequest(self: *@This(), _: []const u8) model_capabilities.ResolveError!model_capabilities.Capabilities {
             self.resolutions += 1;
-            return .{ .supports_ultrafast_mode = self.eligible and self.warmups > 0 };
+            return .{
+                .supports_fast_mode = self.eligible and self.warmups > 0,
+                .supports_ultrafast_mode = self.eligible and self.warmups > 0,
+            };
         }
     };
     const Case = struct {
+        fast: bool = false,
         configured: bool = false,
         active: ?bool = null,
         eligible: bool = true,
@@ -2545,11 +2550,22 @@ test "cooperative Ultrafast capability resolution uses active request settings a
         .{ .active = true, .cancel_before = true, .cancelled = true },
         .{ .active = true, .cancel_on_pulse = true, .warmups = 1, .cancelled = true },
         .{ .active = true, .fail_pulse = true, .warmups = 1, .cancelled = true },
+        .{ .fast = true },
+        .{ .fast = true, .configured = true, .active = false },
+        .{ .fast = true, .active = true, .warmups = 1 },
+        .{ .fast = true, .configured = true, .warmups = 1, .eligible = false },
+        .{ .fast = true, .active = true, .cancel_before = true, .cancelled = true },
+        .{ .fast = true, .active = true, .cancel_on_pulse = true, .warmups = 1, .cancelled = true },
+        .{ .fast = true, .active = true, .fail_pulse = true, .warmups = 1, .cancelled = true },
     }) |case| {
         var app: App = .{ .eligible = case.eligible, .cancel_on_pulse = case.cancel_on_pulse, .fail_pulse = case.fail_pulse };
         defer app.worker.deinit(std.testing.allocator);
-        app.worker.agent_turn_settings.ultrafast_mode = case.configured;
-        if (case.active) |active| app.worker.setActiveAgentTurnSettings(.{ .ultrafast_mode = active });
+        app.worker.agent_turn_settings.fast_mode = case.fast and case.configured;
+        app.worker.agent_turn_settings.ultrafast_mode = !case.fast and case.configured;
+        if (case.active) |active| app.worker.setActiveAgentTurnSettings(.{
+            .fast_mode = case.fast and active,
+            .ultrafast_mode = !case.fast and active,
+        });
         if (case.cancel_before) app.worker.requestCancel();
         const resolver = Bindings(App).modelCapabilityResolver(&app);
         if (case.cancelled) {
@@ -2558,7 +2574,8 @@ test "cooperative Ultrafast capability resolution uses active request settings a
         } else {
             const capabilities = try resolver.resolve(std.testing.allocator, "openai/test");
             try std.testing.expectEqual(@as(usize, 1), app.resolutions);
-            if (case.configured and !case.eligible) {
+            try std.testing.expectEqual(case.eligible and case.warmups > 0, capabilities.supports_fast_mode);
+            if (!case.fast and case.configured and !case.eligible) {
                 try std.testing.expectError(error.UltrafastUnavailable, model_capabilities.resolveUltrafastProviderOptions(capabilities, .gateway, "openai/test", .auto, false, true));
             }
         }
