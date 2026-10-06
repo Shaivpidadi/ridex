@@ -1,6 +1,6 @@
 //! Binds an ACP session to the workspace its client names in `cwd`.
 //!
-//! The server's workspace starts as the directory `fx acp` was launched in.
+//! The server's workspace starts as the directory `ridex acp` was launched in.
 //! `session/new`, `session/load`, and `session/resume` may name a different
 //! absolute directory; that session then uses it for file access, shell
 //! commands, project instructions, project skills, project MCP servers, and

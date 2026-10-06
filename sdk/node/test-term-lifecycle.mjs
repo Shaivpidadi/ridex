@@ -76,7 +76,7 @@ const runtime = await createFxTerminal({
   backend: "wasm",
   wasm: await readFile(wasmPath),
   terminal: instrumentedTerminalHost,
-  env: { AI_GATEWAY_API_KEY: "term-lifecycle-key" },
+  env: { FX_DEFAULT_PROVIDER: "gateway", AI_GATEWAY_API_KEY: "term-lifecycle-key" },
   fetch,
   onEvent(event) { events.push(event); },
 });
@@ -91,7 +91,7 @@ async function waitFor(predicate, label) {
   }
 }
 
-await waitFor(() => grid().includes("𝒇x"), "startup");
+await waitFor(() => grid().includes("ridex"), "startup");
 terminal.resize(112, 36);
 await waitFor(
   () => events.some((event) => event.type === "terminal.resize" && event.cols === 112 && event.rows === 36) &&
@@ -157,13 +157,13 @@ const abortRuntime = await createFxTerminal({
   backend: "wasm",
   wasm: await readFile(wasmPath),
   terminal: instrumentTerminal(abortTerminal, abortDisposals),
-  env: { AI_GATEWAY_API_KEY: "term-lifecycle-key" },
+  env: { FX_DEFAULT_PROVIDER: "gateway", AI_GATEWAY_API_KEY: "term-lifecycle-key" },
   fetch,
 });
 const abortFlush = () => new Promise((resolve) => abortTerminal.write("", resolve));
 const abortGrid = () => terminalGrid(abortTerminal);
 const abortStartupDeadline = performance.now() + 5000;
-while (!abortGrid().includes("𝒇x")) {
+while (!abortGrid().includes("ridex")) {
   await abortFlush();
   if (performance.now() >= abortStartupDeadline) throw new Error(`timed out waiting for abort runtime startup:\n${abortGrid()}`);
   await new Promise((resolve) => setTimeout(resolve, 10));
@@ -421,7 +421,7 @@ async function runActiveTransitionChild(scenario, command) {
     backend: "wasm",
     wasm: await readFile(wasmPath),
     terminal: childHost,
-    env: { AI_GATEWAY_API_KEY: "term-active-transition-key" },
+    env: { FX_DEFAULT_PROVIDER: "gateway", AI_GATEWAY_API_KEY: "term-active-transition-key" },
     fetch: childFetch,
   });
   const childFlush = () => new Promise((resolveFlush) => childTerminal.write("", resolveFlush));

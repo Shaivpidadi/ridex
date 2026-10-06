@@ -179,7 +179,7 @@ async function start(env = {}) {
     backend: "wasm",
     wasm,
     terminal: capture.terminal,
-    env: { FX_THEME: "dark", FX_TRACE_STDERR: "1", FX_TRACE_SCOPES: "auth", ...env },
+    env: { FX_DEFAULT_PROVIDER: "gateway", FX_THEME: "dark", FX_TRACE_STDERR: "1", FX_TRACE_SCOPES: "auth", ...env },
     fetch: stubFetch,
     openUrl(url) { openedUrls.push(url); return true; },
     oauthSessionStore,

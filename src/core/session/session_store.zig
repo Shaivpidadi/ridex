@@ -1199,7 +1199,7 @@ pub const Store = struct {
 
     /// Resumes the newest resumable session in `workspace_root`, taking
     /// candidates in the order and with the workspace filter of the index
-    /// page `fx session last` reads. A listed session whose stale schema-v3
+    /// page `ridex session last` reads. A listed session whose stale schema-v3
     /// log failed to replay in this listing is skipped without a second replay
     /// and counted as unreadable. A candidate that disappears or
     /// moves to another workspace between selection and open yields to the
@@ -8116,7 +8116,7 @@ test "writable last reports unreadable sessions when nothing is resumable" {
     try std.testing.expectError(error.NoSavedSessions, ctx.store.resumeTargetForWrite(alloc, .last, ctx.workspace, .{}));
     const path = try writeSessionFixture(alloc, ctx.store, "broken", "{\"schema_version\":1,");
     alloc.free(path);
-    // `fx session last` reports the same error for the same store.
+    // `ridex session last` reports the same error for the same store.
     try std.testing.expectError(error.NoReadableSessions, ctx.store.resumeTargetForWrite(alloc, .last, ctx.workspace, .{}));
 }
 

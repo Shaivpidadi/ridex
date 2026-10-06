@@ -50,6 +50,7 @@ const runtime = await createFxTerminal({
   wasm: await readFile(wasmPath),
   terminal: xtermAdapter(terminal),
   env: {
+    FX_DEFAULT_PROVIDER: "gateway",
     AI_GATEWAY_API_KEY: "feature-key",
     FX_TRACE_STDERR: "1",
     FX_TRACE_SCOPES: "full_transcript,full_transcript_cache,frame_schedule",
@@ -81,7 +82,7 @@ async function command(text, expected) {
   await waitFor(() => grid().includes(expected), expected);
 }
 
-await waitFor(() => grid().includes("𝒇x"), "startup");
+await waitFor(() => grid().includes("ridex"), "startup");
 assert.equal(catalogRequests, 0, "ordinary terminal startup must not fetch the catalog");
 runtime.write("clipboard draft");
 runtime.write("\x1b[97;9u\x1b[99;9u");

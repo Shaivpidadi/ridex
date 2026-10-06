@@ -570,7 +570,7 @@ function toolResultText(body: string, toolCallId: string): string {
 
 describe("Vision route fake Gateway", () => {
   test(
-    "fx ask rejects missing images before Gateway startup in text and JSON modes",
+    "ridex ask rejects missing images before Gateway startup in text and JSON modes",
     async () => {
       const root = createIsolatedRoot();
       const gateway = startImageGateway([]);
@@ -672,7 +672,7 @@ describe("Vision route fake Gateway", () => {
   );
 
   test(
-    "fx ask gates GLM images through Vision without leaking paths",
+    "ridex ask gates GLM images through Vision without leaking paths",
     async () => {
       const root = createIsolatedRoot();
       const fixture = createScopedImageFixture(root);
@@ -731,7 +731,7 @@ describe("Vision route fake Gateway", () => {
   );
 
   test(
-    "fx ask recovers when the model rejects the post-Vision prompt as assistant prefill",
+    "ridex ask recovers when the model rejects the post-Vision prompt as assistant prefill",
     async () => {
       const root = createIsolatedRoot();
       const fixture = createScopedImageFixture(root);
@@ -795,7 +795,7 @@ describe("Vision route fake Gateway", () => {
   );
 
   test(
-    "fx ask executes path-source Vision and cleans transient snapshots without failure telemetry",
+    "ridex ask executes path-source Vision and cleans transient snapshots without failure telemetry",
     async () => {
       const root = createIsolatedRoot();
       const imagePath = join(root.workspace, "path-source.png");
@@ -1041,7 +1041,7 @@ describe("Vision route fake Gateway", () => {
   );
 
   test(
-    "fx ask preserves native image parts for Gemini",
+    "ridex ask preserves native image parts for Gemini",
     async () => {
       const root = createIsolatedRoot();
       const fixture = createScopedImageFixture(root);
@@ -1083,7 +1083,7 @@ describe("Vision route fake Gateway", () => {
   );
 
   test(
-    "fx ask uses Kimi native vision without Vision tool",
+    "ridex ask uses Kimi native vision without Vision tool",
     async () => {
       const root = createIsolatedRoot();
       const fixture = createScopedImageFixture(root);
@@ -1125,7 +1125,7 @@ describe("Vision route fake Gateway", () => {
   );
 
   test(
-    "fx ask withholds byte-oversized native images instead of normalizing or rejecting",
+    "ridex ask withholds byte-oversized native images instead of normalizing or rejecting",
     async () => {
       const root = createIsolatedRoot();
       const oversizedPath = join(root.workspace, "encoded-oversized.png");
@@ -1170,7 +1170,7 @@ describe("Vision route fake Gateway", () => {
   );
 
   test(
-    "fx ask sends single-request native PNG images byte-for-byte below the 8000-pixel limit",
+    "ridex ask sends single-request native PNG images byte-for-byte below the 8000-pixel limit",
     async () => {
       const root = createIsolatedRoot();
       const widePath = join(root.workspace, "wide-screenshot.png");
@@ -1212,7 +1212,7 @@ describe("Vision route fake Gateway", () => {
   );
 
   test(
-    "fx ask withholds native JPEG images over the 8000-pixel limit with saved-path guidance",
+    "ridex ask withholds native JPEG images over the 8000-pixel limit with saved-path guidance",
     async () => {
       const root = createIsolatedRoot();
       const photoPath = join(root.workspace, "photo.jpg");
@@ -1573,7 +1573,7 @@ describe("Vision route fake Gateway", () => {
   );
 
   test(
-    "fx ask applies image_adapter_output_bytes to Vision provider capture",
+    "ridex ask applies image_adapter_output_bytes to Vision provider capture",
     async () => {
       const root = createIsolatedRoot();
       const fixture = createScopedImageFixture(root);
@@ -1789,7 +1789,7 @@ describe("Vision route fake Gateway", () => {
         expect(result.code).toBe(1);
         expect(result.stdout).toBe("");
         expect(result.stderr).toBe(
-          "fx ask: Unable to verify image support for this model, so the image was not sent. Try again later, choose another model, or remove the image.\n",
+          "ridex ask: Unable to verify image support for this model, so the image was not sent. Try again later, choose another model, or remove the image.\n",
         );
         expect(result.stderr).not.toContain("ModelImageCapabilityUnavailable");
         expect(gateway.catalogRequests).toBe(1);

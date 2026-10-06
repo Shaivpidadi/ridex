@@ -330,7 +330,7 @@ fn traceDiagnostic(_: ?*anyopaque, event: sm.Diagnostic) void {
 }
 
 // ---------------------------------------------------------------------------
-// Commands: `fx session {id}`, `fx session recover`, doctor
+// Commands: `ridex session {id}`, `ridex session recover`, doctor
 
 /// What the session commands report, in the names fx's CLI knows.
 pub const CommandError = error{
@@ -373,7 +373,7 @@ pub fn commandError(err: anyerror) CommandError {
 }
 
 /// A saved root session as v1's state, read without its lock while another
-/// process may hold it (D37), for `fx session {id}`: every turn, with each
+/// process may hold it (D37), for `ridex session {id}`: every turn, with each
 /// compaction's summary where it happened (D32). A missing session, a
 /// child, or an id that cannot name one is `error.SessionNotFound`. Caller
 /// owns the result.
@@ -426,7 +426,7 @@ pub const Recovered = struct {
     }
 };
 
-/// `fx session recover` (D15): a new root session copied from `id` up to
+/// `ridex session recover` (D15): a new root session copied from `id` up to
 /// its last turn that ended before any damage, with a copy of its side
 /// files. The source is never changed, and may be held by another process.
 /// Caller owns the result.
@@ -485,7 +485,7 @@ pub const Doctor = struct {
 /// turn has not created its log yet (D36).
 const orphan_min_age_ms: i64 = 24 * std.time.ms_per_hour;
 
-/// `fx doctor` on v2 (D36): verifies up to `limit` sessions and removes side
+/// `ridex doctor` on v2 (D36): verifies up to `limit` sessions and removes side
 /// folders whose session is gone. Rebuilds nothing. Caller owns the report.
 pub fn doctor(store: *Store, alloc: Allocator, limit: usize, now_ms: i64) !Doctor {
     var report: Doctor = .{};
@@ -2268,7 +2268,7 @@ fn settingsFrom(alloc: Allocator, sa: Allocator, state: sm.State) !Restored {
 }
 
 /// Every turn in the log, oldest first, with each compaction's summary where
-/// its line sits, as v1's archive lists them for `fx session {id}` (D32).
+/// its line sits, as v1's archive lists them for `ridex session {id}` (D32).
 /// Pages are freed as they are read. Caller owns the result.
 fn detailHistory(src: Source, alloc: Allocator) ![]types.HistoryTurn {
     var history: std.ArrayList(types.HistoryTurn) = .empty;
@@ -3970,7 +3970,7 @@ test "resume refuses a session whose compaction line is damaged" {
     try testing.expectError(error.InvalidSessionFormat, r.restore(testing.allocator));
 }
 
-test "fx session lists every turn with each summary where it happened, as v1 counts it (D32)" {
+test "ridex session lists every turn with each summary where it happened, as v1 counts it (D32)" {
     var t: TestHome = undefined;
     try t.init();
     defer t.deinit();

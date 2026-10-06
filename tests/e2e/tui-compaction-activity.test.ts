@@ -283,7 +283,7 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
         if (trigger === "manual") {
           await terminal.waitForPane((pane) => !ACTIVITY.test(pane) && hasEmptyComposer(pane), 10_000);
           expect(f.counts().ordinary).toBe(f.seedTurns);
-          // The reply holds only facts, so fx asks once more for the notes
+          // The reply holds only facts, so ridex asks once more for the notes
           // of the turn that did work.
           expect(f.counts().summaries).toBe(2);
         } else {

@@ -724,11 +724,18 @@ const App = struct {
                 SessionAppRuntime.syncTerminalTitle(&app);
             }
         }
-        const env_disabled = if (io_mod.getenv("FX_AUTO_UPGRADE")) |val|
-            std.mem.eql(u8, val, "0") or std.ascii.eqlIgnoreCase(val, "false")
-        else
-            false;
-        if (env_disabled or !auto_upgrade.shouldEnableForCurrentExecutable()) {
+        // Tri-state: "0"/"false" disables, "1"/"true" force-enables
+        // (upstream tests rely on this now that the fork's default is
+        // off — its channel would pull stock fx binaries), unset keeps
+        // the settings default.
+        if (io_mod.getenv("FX_AUTO_UPGRADE")) |val| {
+            if (std.mem.eql(u8, val, "0") or std.ascii.eqlIgnoreCase(val, "false")) {
+                app.auto_upgrade_enabled = false;
+            } else if (std.mem.eql(u8, val, "1") or std.ascii.eqlIgnoreCase(val, "true")) {
+                app.auto_upgrade_enabled = true;
+            }
+        }
+        if (!auto_upgrade.shouldEnableForCurrentExecutable()) {
             app.auto_upgrade_enabled = false;
         }
         if (comptime !host_profile.auto_upgrade) app.auto_upgrade_enabled = false;
@@ -2092,7 +2099,7 @@ const App = struct {
     }
 
     pub fn providerSet(self: *const App) provider_set.Set {
-        if (self.provider_selection.model_requests_blocked) return .{ .gateway = .{}, .codex = .{}, .grok = .{} };
+        if (self.provider_selection.model_requests_blocked) return .{ .freeride = .{}, .gateway = .{}, .codex = .{}, .grok = .{} };
         if (comptime host_target.is_wasm) {
             return provider_set.gateway_only(.{
                 .capabilities = .{
@@ -2122,6 +2129,7 @@ const App = struct {
             }
         }
         if (comptime !host_profile.tools) {
+            providers.freeride.permission_reviewer = null;
             providers.gateway.permission_reviewer = null;
             providers.codex.permission_reviewer = null;
             providers.grok.permission_reviewer = null;
@@ -3500,7 +3508,7 @@ fn runNonBenchmark(raw_args: []const [*:0]const u8, raw_env: RawEnviron, cli_arg
 
     const alloc = processAllocator();
     const auth_mode = credentials.parseAuthMode(rawEnvValue(raw_env, "FX_AUTH_MODE")) catch {
-        try writeStderrFast("fx: FX_AUTH_MODE must be local or host-managed\n");
+        try writeStderrFast("ridex: FX_AUTH_MODE must be local or host-managed\n");
         exitFast(1);
     };
     const cfg = if (cli_args.len == 0)

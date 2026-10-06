@@ -9,6 +9,7 @@ const agent_steps = @import("core/config/agent_steps.zig");
 const host = @import("core/hosts/host.zig");
 const js_host_attachments = @import("core/hosts/js_host_attachments.zig");
 const io_mod = @import("core/shared/io.zig");
+const model_provider = @import("core/config/model_provider.zig");
 const model_catalog = @import("core/gateway/model_catalog.zig");
 const js_host_model_catalog = @import("gateway/js_host_model_catalog.zig");
 const oauth_transport = @import("core/auth/oauth_transport.zig");
@@ -31,6 +32,10 @@ pub const panic = @import("core/hosts/wasm_panic.zig").panic;
 pub fn main(init: std.process.Init) !void {
     io_mod.setIo(init.io);
     io_mod.setEnvironMap(init.environ_map);
+    model_provider.surface_default = .gateway;
+    // Keep transport-URL resolution in step with the surface default —
+    // the wasm host agent doesn't run the CLI's provider republish.
+    model_provider.active_transport_provider = model_provider.defaultProvider();
     try acp_server.run(std.heap.c_allocator, .{
         .default_model = builtin_gateway.default_model,
         .default_agent_step_limit = agent_steps.default_max_agent_steps,

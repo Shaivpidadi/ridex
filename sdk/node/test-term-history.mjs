@@ -59,7 +59,7 @@ async function start() {
   backend: "wasm",
     wasm,
     terminal: xtermAdapter(terminal),
-    env: { AI_GATEWAY_API_KEY: "term-history-key" },
+    env: { FX_DEFAULT_PROVIDER: "gateway", AI_GATEWAY_API_KEY: "term-history-key" },
     fetch,
     promptHistoryStore,
     onEvent(event) { events.push(event); },

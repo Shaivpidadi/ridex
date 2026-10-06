@@ -15,6 +15,15 @@ pub const Entry = struct {
 
 pub const entries = [_]Entry{
     .{
+        .id = .freeride,
+        .slug = "freeride",
+        .login_source = .ai_gateway_api_key,
+        .name = "FreeRide",
+        .route_name = "FreeRide local gateway",
+        .description = "Local FreeRide gateway routing free-tier providers (no login)",
+        .subscription = false,
+    },
+    .{
         .id = .gateway,
         .slug = "vercel",
         .aliases = &.{ "gateway", "ai-gateway" },

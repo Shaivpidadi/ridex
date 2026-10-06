@@ -428,7 +428,7 @@ describe("web_fetch Gateway fixture", () => {
   );
 
   test(
-    "default fx ask validates malformed web_fetch before transport",
+    "default ridex ask validates malformed web_fetch before transport",
     async () => {
       const root = createIsolatedRoot();
       const gateway = startFakeGateway([
@@ -582,7 +582,7 @@ describe("web_fetch Gateway fixture", () => {
             url: "https://example.com/docs",
             prompt: "legacy",
           },
-          _meta: { fx: { toolCall: { internal: false } } },
+          _meta: { ridex: { toolCall: { internal: false } } },
         });
       } finally {
         await client.close();

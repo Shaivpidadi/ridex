@@ -75,7 +75,7 @@ function titleRequests(gateway: ReturnType<typeof startTitleAwareGateway>) {
   return gateway.titleRequests;
 }
 
-test("fx ask generates a model title for a fresh session", async () => {
+test("ridex ask generates a model title for a fresh session", async () => {
   const root = createFixtureRoot("ask");
   const gateway = startTitleAwareGateway();
   try {
@@ -106,7 +106,7 @@ test("fx ask generates a model title for a fresh session", async () => {
   }
 });
 
-test("fx ask keeps the derived title when session_titles is off", async () => {
+test("ridex ask keeps the derived title when session_titles is off", async () => {
   const root = createFixtureRoot("disabled", JSON.stringify({ session_titles: false }));
   const gateway = startTitleAwareGateway();
   try {
@@ -124,7 +124,7 @@ test("fx ask keeps the derived title when session_titles is off", async () => {
   }
 });
 
-test("fx ask keeps the derived title when the title model output is unusable", async () => {
+test("ridex ask keeps the derived title when the title model output is unusable", async () => {
   const root = createFixtureRoot("unusable");
   const gateway = startDynamicFakeGateway(_raw => fakeGatewayFinalText("MAIN_ANSWER_OK"), {
     models: [{ id: MAIN_MODEL, type: "language", tags: ["tool-use"] }],

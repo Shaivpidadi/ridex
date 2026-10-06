@@ -364,7 +364,9 @@ pub fn requestedSource(
     provider: model_provider.ProviderId,
     preferred: ?credentials.Source,
 ) ?credentials.Source {
-    if (provider != .gateway) return provider_catalog.find(provider).login_source;
+    // FreeRide's credential is synthetic; like the gateway, any
+    // preferred source the user holds is acceptable.
+    if (provider != .gateway and provider != .freeride) return provider_catalog.find(provider).login_source;
     return if (model_provider.authorizesCredential(provider, preferred)) preferred else null;
 }
 
@@ -381,6 +383,8 @@ test "requested credential source follows provider authority" {
         .{ .provider = .gateway, .preferred = .vercel_oidc_token, .required = .vercel_oidc_token },
         .{ .provider = .gateway, .preferred = .chatgpt_subscription, .required = null },
         .{ .provider = .gateway, .preferred = .grok_subscription, .required = null },
+        .{ .provider = .freeride, .preferred = .ai_gateway_api_key, .required = .ai_gateway_api_key },
+        .{ .provider = .freeride, .preferred = .chatgpt_subscription, .required = null },
         .{ .provider = .codex, .preferred = .fx_login, .required = .chatgpt_subscription },
         .{ .provider = .grok, .preferred = .fx_login, .required = .grok_subscription },
     };
@@ -1525,7 +1529,7 @@ pub const StatusSnapshot = struct {
         if (self.active_source != null) return null;
         if (self.stored_key_status == .unavailable) {
             if (self.required_source == .stored_key) return switch (surface) {
-                .cli => "The selected stored API key could not be read from " ++ credentials.stored_key_backend_label ++ ". Start fx and open /provider to choose an available credential; no other credential was selected.",
+                .cli => "The selected stored API key could not be read from " ++ credentials.stored_key_backend_label ++ ". Start ridex and open /provider to choose an available credential; no other credential was selected.",
                 .interactive => "The selected stored API key could not be read from " ++ credentials.stored_key_backend_label ++ ". Run /provider to choose an available credential; no other credential was selected.",
             };
             return credentials.unreadable_store_message;
@@ -1542,18 +1546,18 @@ pub const StatusSnapshot = struct {
             .vercel_oidc_token => "VERCEL_OIDC_TOKEN is selected but unavailable. Set VERCEL_OIDC_TOKEN before starting fx; no other credential was selected.",
             .ai_gateway_api_key => "AI_GATEWAY_API_KEY is selected but unavailable. Set AI_GATEWAY_API_KEY before starting fx; no other credential was selected.",
             .stored_key => switch (surface) {
-                .cli => "A stored API key is selected but unavailable. Start fx and open /provider to choose an available credential; no other credential was selected.",
+                .cli => "A stored API key is selected but unavailable. Start ridex and open /provider to choose an available credential; no other credential was selected.",
                 .interactive => "A stored API key is selected but unavailable. Run /provider to choose an available credential; no other credential was selected.",
             },
             .fx_login => switch (surface) {
                 .cli => if (self.fx_login_status == .unavailable)
-                    "The saved fx login could not be loaded. Run fx login to repair this source; no other credential was selected."
+                    "The saved ridex login could not be loaded. Run ridex login to repair this source; no other credential was selected."
                 else
-                    "fx login is selected but unavailable. Run fx login to reconnect; no other credential was selected.",
+                    "ridex login is selected but unavailable. Run ridex login to reconnect; no other credential was selected.",
                 .interactive => if (self.fx_login_status == .unavailable)
-                    "The saved fx login could not be loaded. Run /login to repair this source; no other credential was selected."
+                    "The saved ridex login could not be loaded. Run /login to repair this source; no other credential was selected."
                 else
-                    "fx login is selected but unavailable. Run /login to reconnect; no other credential was selected.",
+                    "ridex login is selected but unavailable. Run /login to reconnect; no other credential was selected.",
             },
             .chatgpt_subscription => switch (surface) {
                 .cli => credentials.missing_chatgpt_credential_message,
@@ -3405,13 +3409,13 @@ test "auth failure snapshot keeps refresh failures distinct from HTTP rejection"
 
     const message = try snapshot.renderText(std.testing.allocator);
     defer std.testing.allocator.free(message);
-    try std.testing.expectEqualStrings("fx login credential refresh failed", message);
+    try std.testing.expectEqualStrings("ridex login credential refresh failed", message);
 
     const json = try snapshot.renderJson(std.testing.allocator);
     defer std.testing.allocator.free(json);
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
     defer parsed.deinit();
-    try std.testing.expectEqualStrings("fx login", parsed.value.object.get("source").?.string);
+    try std.testing.expectEqualStrings("ridex login", parsed.value.object.get("source").?.string);
     try std.testing.expectEqualStrings("credential_refresh_failed", parsed.value.object.get("reason").?.string);
     try std.testing.expect(parsed.value.object.get("http_status") == null);
 
@@ -3588,7 +3592,7 @@ test "auth runtime exposes one current Gateway credential for prompt admission" 
     try std.testing.expectEqual(credentials.Source.fx_login, gateway_credential.source);
 }
 
-test "auth runtime never admits a teamless fx login credential" {
+test "auth runtime never admits a teamless ridex login credential" {
     const alloc = std.testing.allocator;
     var runtime: Runtime = .{};
     defer runtime.deinit(alloc);
@@ -3914,7 +3918,7 @@ test "auth status names each explicit key source and its recovery" {
     }{
         .{ .source = .vercel_oidc_token, .label = "VERCEL_OIDC_TOKEN", .cli_recovery = "Set VERCEL_OIDC_TOKEN before starting fx", .interactive_recovery = "Set VERCEL_OIDC_TOKEN before starting fx" },
         .{ .source = .ai_gateway_api_key, .label = "AI_GATEWAY_API_KEY", .cli_recovery = "Set AI_GATEWAY_API_KEY before starting fx", .interactive_recovery = "Set AI_GATEWAY_API_KEY before starting fx" },
-        .{ .source = .stored_key, .label = "stored API key", .cli_recovery = "Start fx and open /provider", .interactive_recovery = "Run /provider" },
+        .{ .source = .stored_key, .label = "stored API key", .cli_recovery = "Start ridex and open /provider", .interactive_recovery = "Run /provider" },
     };
     for (cases) |case| {
         const status = StatusSnapshot{ .required_source = case.source };
@@ -3947,14 +3951,14 @@ test "auth status preserves selected stored-key read failure without suggesting 
     try std.testing.expect(status.missingHelp(.cli) == null);
 }
 
-test "auth status keeps an unavailable explicit fx login distinct from automatic absence" {
+test "auth status keeps an unavailable explicit ridex login distinct from automatic absence" {
     for ([_]credentials.FxLoginReadStatus{ .absent, .unavailable }) |read_status| {
         const status = StatusSnapshot{
             .required_source = .fx_login,
             .fx_login_status = read_status,
         };
         const help = status.missingHelp(.cli).?;
-        try std.testing.expect(std.mem.find(u8, help, "Run fx login") != null);
+        try std.testing.expect(std.mem.find(u8, help, "Run ridex login") != null);
         try std.testing.expect(std.mem.find(u8, help, "no other credential was selected") != null);
         const interactive = status.missingHelp(.interactive).?;
         try std.testing.expect(std.mem.find(u8, interactive, "Run /login") != null);
@@ -3969,7 +3973,7 @@ test "auth status snapshot reports an expired session without claiming it is unr
     const fresh_detail = try fresh.formatDoctorDetail(alloc);
     defer alloc.free(fresh_detail);
     try std.testing.expectEqualStrings(
-        "fx login is configured; refreshable=true; team=vercel-labs",
+        "ridex login is configured; refreshable=true; team=vercel-labs",
         fresh_detail,
     );
 
@@ -3977,7 +3981,7 @@ test "auth status snapshot reports an expired session without claiming it is unr
     const stale_detail = try stale.formatDoctorDetail(alloc);
     defer alloc.free(stale_detail);
     try std.testing.expectEqualStrings(
-        "fx login is configured; session expired; refreshable=true; team=vercel-labs",
+        "ridex login is configured; session expired; refreshable=true; team=vercel-labs",
         stale_detail,
     );
 
@@ -4307,7 +4311,7 @@ const LogoutFixture = struct {
     }
 };
 
-test "logout replaces an active fx login with the next available source" {
+test "logout replaces an active ridex login with the next available source" {
     const alloc = std.testing.allocator;
     var runtime: Runtime = .{};
     defer runtime.deinit(alloc);
@@ -4381,7 +4385,7 @@ test "logout clears the active login and re-enables auth selection when no sourc
     try std.testing.expect(!runtime.view().onboarding_skipped);
 }
 
-test "logout reconciliation adopts a newer concurrent fx login" {
+test "logout reconciliation adopts a newer concurrent ridex login" {
     const alloc = std.testing.allocator;
     var runtime: Runtime = .{};
     defer runtime.deinit(alloc);
@@ -4494,7 +4498,7 @@ test "provider picker projects the active Vercel team" {
     try std.testing.expectEqualStrings("team_1", current_team.?);
 }
 
-test "adopting fx login publishes Vercel session availability to setup" {
+test "adopting ridex login publishes Vercel session availability to setup" {
     const alloc = std.testing.allocator;
     var runtime: Runtime = .{};
     defer runtime.deinit(alloc);

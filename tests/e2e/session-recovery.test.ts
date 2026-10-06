@@ -1256,7 +1256,7 @@ describe("session recovery", () => {
         expect(result.code).toBe(1);
         expect(result.elapsedMs).toBeLessThan(5_000);
         // The unreadable session is skipped exactly as every listing skips it,
-        // and the error says unreadable sessions exist, as `fx session last` does.
+        // and the error says unreadable sessions exist, as `ridex session last` does.
         expect(result.stdout + result.stderr).toContain("NoReadableSessions");
         expect(gateway.requests).toHaveLength(fenced ? 0 : 1);
         expect(gateway.classifierRequests).toHaveLength(0);

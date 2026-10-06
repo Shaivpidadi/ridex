@@ -440,7 +440,7 @@ pub fn renderAuthenticationRequired(
         switch (mode) {
             .oauth => {
                 try out.writer.writeAll(",\"interactive\":true,\"message\":");
-                const guidance = try std.fmt.allocPrint(alloc, "Run /mcp auth {s} --open in an interactive fx session.", .{server.config.name});
+                const guidance = try std.fmt.allocPrint(alloc, "Run /mcp auth {s} --open in an interactive ridex session.", .{server.config.name});
                 defer alloc.free(guidance);
                 try writeEncodedJsonScalar(alloc, &out.writer, guidance);
             },

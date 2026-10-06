@@ -245,16 +245,18 @@ pub fn catalogAccessForCredentialAndAccount(
 pub const stored_key_backend_label = if (builtin.os.tag == .macos) "macOS Keychain" else "profile file";
 
 /// Both modes resolve the same source set; the mode selects only whether an expired
-/// fx login session is refreshed first.
+/// ridex login session is refreshed first.
 pub const LoadMode = enum { stored, refresh_if_needed };
 
 const FxLoginRefreshMode = enum { if_needed, force };
 
-pub const missing_credential_message = "fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.";
+pub const freeride_local_token = "freeride-local";
+
+pub const missing_credential_message = "fx needs access to Vercel AI Gateway. Run ridex login to sign in, ridex setup to use an API key, or set AI_GATEWAY_API_KEY.";
 pub const missing_interactive_credential_message = "fx needs access to Vercel AI Gateway. Run /login to sign in, /provider to use an API key, or set AI_GATEWAY_API_KEY.";
-pub const missing_chatgpt_credential_message = "fx needs a Codex subscription login for this model. Run fx login codex.";
+pub const missing_chatgpt_credential_message = "fx needs a Codex subscription login for this model. Run ridex login codex.";
 pub const missing_chatgpt_interactive_credential_message = "Codex needs a subscription login. Run /login, open Connections, then choose Codex subscription.";
-pub const missing_grok_credential_message = "fx needs a Grok subscription login for this model. Run fx login grok.";
+pub const missing_grok_credential_message = "fx needs a Grok subscription login for this model. Run ridex login grok.";
 pub const missing_grok_interactive_credential_message = "Grok needs a subscription login. Run /login, open Connections, then choose Grok subscription.";
 pub const unreadable_store_message = "fx could not read the stored API key from " ++ stored_key_backend_label ++ ". A key may be saved but unreadable. Set FX_TRACE_LOG for the failing step, or set AI_GATEWAY_API_KEY.";
 pub const host_managed_auth_message = "Authentication is managed by the host.";
@@ -339,7 +341,7 @@ pub const StoredKeyReadStatus = enum {
     unavailable,
 };
 
-/// Why the fx login produced no credential. Only meaningful once resolution has
+/// Why the ridex login produced no credential. Only meaningful once resolution has
 /// reached the fx-login step and it stayed silent. `unavailable` means the
 /// session could not be loaded or its refresh failed, which is different from
 /// having no session at all: the login exists and may still be repairable.
@@ -380,6 +382,14 @@ pub fn resolveForProvider(
     provider: model_provider.ProviderId,
     preferred: ?Source,
 ) !Resolution {
+    // FreeRide is a local gateway that ignores the bearer token; a
+    // synthetic credential means no login flow ever gates the agent.
+    if (provider == .freeride) {
+        return .{ .credential = .{
+            .token = try alloc.dupe(u8, freeride_local_token),
+            .source = .ai_gateway_api_key,
+        } };
+    }
     if (provider == .configured) {
         var registry = try @import("../config/config_runtime.zig").loadConfiguredProviders(alloc);
         defer registry.deinit(alloc);
@@ -448,7 +458,7 @@ pub fn resolvePreferring(
         if (err == error.OutOfMemory) return err;
         fx_login_status = .unavailable;
         failure = .{ .source = .fx_login, .err = err };
-        debug_trace.logf("auth", "fx login load failed mode={t} err={s}; using precedence", .{ mode, @errorName(err) });
+        debug_trace.logf("auth", "ridex login load failed mode={t} err={s}; using precedence", .{ mode, @errorName(err) });
         break :blk null;
     };
     if (fx_login) |credential| return .{ .credential = credential };
@@ -496,7 +506,7 @@ fn loadFxLoginForPrecedence(
     };
 }
 
-/// `loadSource` always refreshes an expired fx login, which `.stored` mode
+/// `loadSource` always refreshes an expired ridex login, which `.stored` mode
 /// forbids: a diagnostic must not rewrite the session file or make an OAuth
 /// request. Honour the mode for the preferred source too.
 fn loadPreferredSource(
@@ -798,12 +808,12 @@ pub fn refreshFxSession(
         session.refresh_token,
     ) catch |err| {
         if (err == error.InvalidOAuthResponse) {
-            debug_trace.logf("auth", "retiring fx login session reason={s}", .{@errorName(err)});
+            debug_trace.logf("auth", "retiring ridex login session reason={s}", .{@errorName(err)});
             try retire_fx_session(alloc, mutation);
             return error.NoRefreshToken;
         }
         if (refresh_rejection_requires_sign_in(err)) {
-            debug_trace.logf("auth", "retiring terminal fx login session reason={s}", .{@errorName(err)});
+            debug_trace.logf("auth", "retiring terminal ridex login session reason={s}", .{@errorName(err)});
             try retire_fx_session(alloc, mutation);
         }
         return err;
@@ -811,7 +821,7 @@ pub fn refreshFxSession(
     defer refreshed.deinit(alloc);
 
     const rotated_refresh_token = refreshed.refresh_token orelse {
-        debug_trace.logf("auth", "retiring fx login session reason=NoRefreshToken", .{});
+        debug_trace.logf("auth", "retiring ridex login session reason=NoRefreshToken", .{});
         try retire_fx_session(alloc, mutation);
         return error.NoRefreshToken;
     };
@@ -819,7 +829,7 @@ pub fn refreshFxSession(
         io_mod.milliTimestamp(),
         refreshed.expires_in,
     ) catch |err| {
-        debug_trace.logf("auth", "retiring fx login session reason={s}", .{@errorName(err)});
+        debug_trace.logf("auth", "retiring ridex login session reason={s}", .{@errorName(err)});
         try retire_fx_session(alloc, mutation);
         return error.NoRefreshToken;
     };
@@ -836,9 +846,9 @@ pub fn refreshFxSession(
         .team_id = session.team_id,
     };
     mutation.save(alloc, replacement) catch |err| {
-        debug_trace.logf("auth", "retiring fx login session after refresh save failed err={s}", .{@errorName(err)});
+        debug_trace.logf("auth", "retiring ridex login session after refresh save failed err={s}", .{@errorName(err)});
         retire_fx_session(alloc, mutation) catch |cleanup_err| {
-            debug_trace.logf("auth", "fx login session retirement failed err={s}", .{@errorName(cleanup_err)});
+            debug_trace.logf("auth", "ridex login session retirement failed err={s}", .{@errorName(cleanup_err)});
         };
         return error.OAuthSessionCleanupUncertain;
     };
@@ -908,7 +918,7 @@ pub fn sourceLabel(source: Source) []const u8 {
     return switch (source) {
         .vercel_oidc_token => "VERCEL_OIDC_TOKEN",
         .ai_gateway_api_key => "AI_GATEWAY_API_KEY",
-        .fx_login => "fx login",
+        .fx_login => "ridex login",
         .stored_key => "stored API key (" ++ stored_key_backend_label ++ ")",
         .chatgpt_subscription => "Codex subscription",
         .grok_subscription => "Grok subscription",
@@ -930,8 +940,8 @@ test "stored key label discloses the backend that answered" {
 }
 
 test "missing credential messages use surface commands in preferred order" {
-    const cli_login = std.mem.find(u8, missing_credential_message, "fx login").?;
-    const cli_setup = std.mem.find(u8, missing_credential_message, "fx setup").?;
+    const cli_login = std.mem.find(u8, missing_credential_message, "ridex login").?;
+    const cli_setup = std.mem.find(u8, missing_credential_message, "ridex setup").?;
     const cli_env = std.mem.find(u8, missing_credential_message, "AI_GATEWAY_API_KEY").?;
 
     try std.testing.expect(cli_login < cli_setup);
@@ -995,7 +1005,7 @@ test "catalog access isolates public and authenticated provider credentials" {
     try std.testing.expect(rejected.teamContext() == null);
 }
 
-test "selected fx login authorizes its team model catalog" {
+test "selected ridex login authorizes its team model catalog" {
     var login = Credential{
         .token = try std.testing.allocator.dupe(u8, "login-token"),
         .source = .fx_login,
@@ -1010,7 +1020,7 @@ test "selected fx login authorizes its team model catalog" {
     try std.testing.expectEqualStrings("team_123", access.teamContext().?);
 }
 
-test "fx login catalog access requires a fresh credential and selected team" {
+test "ridex login catalog access requires a fresh credential and selected team" {
     var login = Credential{
         .token = try std.testing.allocator.dupe(u8, "login-token"),
         .source = .fx_login,
@@ -1128,7 +1138,7 @@ const CredentialTestEnv = struct {
     /// The Keychain is force-disabled: it is keyed by service and account, not
     /// by `HOME`, so without this a fixture session written under a tmp HOME
     /// migrates into the developer's real `FX_OAUTH_SESSION_V1` item and
-    /// destroys their fx login.
+    /// destroys their ridex login.
     fn install(alloc: std.mem.Allocator, entries: []const [2][]const u8) !*CredentialTestEnv {
         _ = try stableCredentialTestEnviron();
 
@@ -1255,7 +1265,7 @@ test "a remembered choice outranks the environment" {
     try std.testing.expectEqualStrings("api-key", credential.token);
 }
 
-test "a remembered fx login never refreshes in stored mode" {
+test "a remembered ridex login never refreshes in stored mode" {
     const alloc = std.testing.allocator;
     const env = try CredentialTestEnv.install(alloc, &.{});
     defer env.deinit();
@@ -1461,7 +1471,7 @@ test "a failed fx-login refresh is still reported when nothing else resolves" {
     try std.testing.expectEqual(StoredKeyReadStatus.not_found, resolution.stored_key_status);
 }
 
-/// A HOME holding an fx login whose session is expired and whose refresh token
+/// A HOME holding an ridex login whose session is expired and whose refresh token
 /// the issuer rejects, which is what an expired or revoked login looks like on
 /// disk. Paired with `oauth_transport.unavailable_provider`, the refresh fails.
 const ExpiredFxLoginFixture = struct {
@@ -1550,7 +1560,7 @@ const FxLoginRefreshProbe = struct {
     }
 };
 
-test "an invalid fx login refresh retires the rejected session" {
+test "an invalid ridex login refresh retires the rejected session" {
     const alloc = std.testing.allocator;
     var fixture = try ExpiredFxLoginFixture.install(alloc);
     defer fixture.deinit();
@@ -1570,7 +1580,7 @@ test "an invalid fx login refresh retires the rejected session" {
     try std.testing.expect(persisted == null);
 }
 
-test "an fx login refresh without a rotated refresh token retires the session" {
+test "an ridex login refresh without a rotated refresh token retires the session" {
     const alloc = std.testing.allocator;
     var fixture = try ExpiredFxLoginFixture.install(alloc);
     defer fixture.deinit();
@@ -1595,7 +1605,7 @@ test "an fx login refresh without a rotated refresh token retires the session" {
     try std.testing.expect(persisted == null);
 }
 
-test "a malformed successful fx login refresh retires the session" {
+test "a malformed successful ridex login refresh retires the session" {
     const alloc = std.testing.allocator;
     var fixture = try ExpiredFxLoginFixture.install(alloc);
     defer fixture.deinit();
@@ -1615,7 +1625,7 @@ test "a malformed successful fx login refresh retires the session" {
     try std.testing.expect(persisted == null);
 }
 
-test "an fx login refresh retires the consumed token when durable replacement fails" {
+test "an ridex login refresh retires the consumed token when durable replacement fails" {
     const alloc = std.testing.allocator;
     var fixture = try ExpiredFxLoginFixture.install(alloc);
     defer fixture.deinit();
@@ -1638,7 +1648,7 @@ test "an fx login refresh retires the consumed token when durable replacement fa
     try std.testing.expect(persisted == null);
 }
 
-test "a disabled store still reports why the fx login was silent" {
+test "a disabled store still reports why the ridex login was silent" {
     const alloc = std.testing.allocator;
     var fixture = try ExpiredFxLoginFixture.install(alloc);
     defer fixture.deinit();

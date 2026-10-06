@@ -577,7 +577,7 @@ test "child runtime capability callbacks preserve fallback and child cancellatio
                 .on_output_chunk = Fixture.output,
                 .cancel_flag = &parent_cancel,
             },
-            .provider_set = .{ .gateway = .{ .model_catalog = .{ .context = &fixture, .fetch_fn = Fixture.fetch } }, .codex = .{}, .grok = .{} },
+            .provider_set = .{ .freeride = .{}, .gateway = .{ .model_catalog = .{ .context = &fixture, .fetch_fn = Fixture.fetch } }, .codex = .{}, .grok = .{} },
             .system_prompt = "",
             .context_registry = registry,
             .context_enabled = false,

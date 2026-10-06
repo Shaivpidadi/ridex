@@ -74,7 +74,7 @@ function fakeShellStop(callId: string, sessionId: string): Response {
 const SESSIONS_V2 = process.env.FX_SESSIONS_V2 === "1";
 
 /// The command fx prints to continue a session; v2 keeps its flag.
-const RESUME_COMMAND = SESSIONS_V2 ? "fx --sessions-v2 --resume" : "fx --resume";
+const RESUME_COMMAND = SESSIONS_V2 ? "ridex --sessions-v2 --resume" : "ridex --resume";
 
 function sessionsRoot(home: string): string {
   return SESSIONS_V2 ? join(home, ".fx", "sessions", "v2") : join(home, ".fx", "sessions");
@@ -993,7 +993,7 @@ test("volatile status rows normalize before stable-grid comparison", () => {
 });
 
 test.skipIf(!tmuxAvailable())(
-  "saved fx ask metadata appears after interactive Ctrl-O resume",
+  "saved ridex ask metadata appears after interactive Ctrl-O resume",
   async () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-ask-metadata-resume-")));
     const home = join(root, "home");
@@ -1007,7 +1007,7 @@ test.skipIf(!tmuxAvailable())(
     );
     writeFileSync(stderrPath, "");
 
-    const prompt = "Persist this fx ask metadata.";
+    const prompt = "Persist this ridex ask metadata.";
     const answer = "FX_ASK_METADATA_COMPLETE";
     const askGateway = startFakeGateway([fakeGatewayFinalText(answer)]);
     let active: TmuxSession | null = null;
@@ -4556,7 +4556,7 @@ test.skipIf(!tmuxAvailable())(
 
       expect(paneExitMatches(contender.paneStatus(), 1)).toBe(true);
       expect(readFileSync(contenderStderrPath, "utf8")).toBe(
-        "fx: another fx process may be using this session (running or suspended); check other terminals or run jobs, then use fg or quit that process\n",
+        "ridex: another ridex process may be using this session (running or suspended); check other terminals or run jobs, then use fg or quit that process\n",
       );
       expect(owner.isPaneAlive()).toBe(true);
       const contenderScrollback = await contender.captureFullScrollback();
@@ -5028,6 +5028,7 @@ test.skipIf(!tmuxAvailable())(
     mkdirSync(workspace);
     mkdirSync(binDir);
     symlinkSync(FX_BIN, join(binDir, "fx"));
+    symlinkSync(FX_BIN, join(binDir, "ridex"));
     writeFileSync(stderrPath, "");
     writeFileSync(resumedStderrPath, "");
     const initialGateway = startFakeGateway([fakeGatewayFinalText(marker)]);
@@ -6742,7 +6743,7 @@ test.skipIf(!tmuxAvailable())(
       const currentPicker = stripAnsi(await active.capturePane());
       expect(currentPicker).toContain("Sessions 1");
       expect(currentPicker).toContain("[Current workspace]");
-      expect(currentPicker).toContain("𝒇x");
+      expect(currentPicker).toContain("ridex");
       expect(currentPicker).toContain("Save the workspace A transcript.");
       expect(currentPicker).not.toContain("Save the workspace B transcript.");
 

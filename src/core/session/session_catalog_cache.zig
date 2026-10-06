@@ -1,6 +1,6 @@
 //! The session index: the single derived owner of "which saved sessions exist
 //! and how they summarize". Every listing surface (the resume picker,
-//! `fx sessions`, `fx session last`, ACP listing, and latest-session resume)
+//! `ridex sessions`, `ridex session last`, ACP listing, and latest-session resume)
 //! reads it through `listActionableCatalog`, so no listing surface scans
 //! session directories on its own.
 //!
@@ -607,7 +607,7 @@ const CatalogWorker = struct {
             const managed = child_state.isDiscoveredManagedChildSession(self.read.store, self.alloc, candidate.summary.id, candidate.subagent_child) catch |err| switch (err) {
                 error.OutOfMemory => return err,
                 // An unverifiable marker or first event stays listed, as
-                // `fx sessions` always did; exact resume still refuses a real
+                // `ridex sessions` always did; exact resume still refuses a real
                 // child. The row is not cached, so the check runs again.
                 else => blk: {
                     cacheable = false;

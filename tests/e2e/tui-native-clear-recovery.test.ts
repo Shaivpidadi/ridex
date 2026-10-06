@@ -74,7 +74,7 @@ tmuxTest("direct native-clear recovery resets the view and replays the held draf
   await session.waitForPane((pane) => composerContains(pane, "abc"), 10_000);
   const history = await session.captureFullScrollback();
   expect(history).not.toContain(old_marker);
-  expect(history).toContain("𝒇x v");
+  expect(history).toContain("ridex v");
   expect(readFileSync(stderr_path, "utf8")).toBe("");
 }, 30_000);
 
@@ -123,7 +123,7 @@ tmuxTest("native-clear recovery after a tool call keeps fx running and the tool 
 
     const history = await session.captureFullScrollback();
     expect(history).not.toContain("TOOL_TURN_DONE");
-    expect(history).toContain("𝒇x v");
+    expect(history).toContain("ridex v");
 
     await session.sendKeys("C-o");
     await session.waitForText("echo TOOL_BEFORE_CLEAR", 10_000);

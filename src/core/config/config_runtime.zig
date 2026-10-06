@@ -326,8 +326,10 @@ pub fn selectProviderModel(
     provider_override: ?model_provider.ProviderId,
     run_model: ?[]const u8,
 ) ModelSelectionError!model_provider.ProviderSelection {
-    const provider = provider_override orelse settings.provider orelse .gateway;
+    const provider = provider_override orelse settings.provider orelse model_provider.defaultProvider();
     const model = settings.models.get(provider) orelse switch (provider) {
+        // FreeRide's smart-router preset: no saved model needed.
+        .freeride => model_provider.freeride_default_model,
         .gateway => default_model,
         .codex => run_model orelse return error.CodexModelNotSelected,
         .grok => run_model orelse return error.GrokModelNotSelected,
@@ -340,8 +342,8 @@ pub fn selectProviderModel(
 pub fn modelNotSelectedMessage(err: anyerror) ?[]const u8 {
     const for_this_run = "or set a model for this run with --model or FX_MODEL";
     return switch (err) {
-        error.CodexModelNotSelected => "no Codex model is selected; run `fx provider codex` to choose one, " ++ for_this_run,
-        error.GrokModelNotSelected => "no Grok model is selected; run `fx provider grok` to choose one, " ++ for_this_run,
+        error.CodexModelNotSelected => "no Codex model is selected; run `ridex provider codex` to choose one, " ++ for_this_run,
+        error.GrokModelNotSelected => "no Grok model is selected; run `ridex provider grok` to choose one, " ++ for_this_run,
         error.ConfiguredModelNotSelected => "no model is selected for this connection; save one under \"models\" in ~/.fx/settings.json, " ++ for_this_run,
         else => null,
     };
@@ -4707,9 +4709,9 @@ test "selectProviderModel accepts the run model when the provider has none saved
 
 test "modelNotSelectedMessage names the provider and both ways to recover" {
     const codex = modelNotSelectedMessage(error.CodexModelNotSelected).?;
-    try std.testing.expect(std.mem.find(u8, codex, "`fx provider codex`") != null);
+    try std.testing.expect(std.mem.find(u8, codex, "`ridex provider codex`") != null);
     try std.testing.expect(std.mem.find(u8, codex, "--model or FX_MODEL") != null);
-    try std.testing.expect(std.mem.find(u8, modelNotSelectedMessage(error.GrokModelNotSelected).?, "`fx provider grok`") != null);
+    try std.testing.expect(std.mem.find(u8, modelNotSelectedMessage(error.GrokModelNotSelected).?, "`ridex provider grok`") != null);
     try std.testing.expect(std.mem.find(u8, modelNotSelectedMessage(error.ConfiguredModelNotSelected).?, "\"models\" in ~/.fx/settings.json") != null);
     try std.testing.expect(modelNotSelectedMessage(error.OutOfMemory) == null);
 }

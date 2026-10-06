@@ -5697,7 +5697,7 @@ pub fn Runtime(comptime App: type) type {
 
         /// A fresh interactive session that never received durable work has
         /// nothing to resume. Discarding it on close keeps each launch from
-        /// leaving an empty session directory behind, matching `fx ask` and
+        /// leaving an empty session directory behind, matching `ridex ask` and
         /// ACP. A user-chosen title is durable intent, so a renamed session stays.
         fn discardableOnClose(
             app: *App,
@@ -6154,7 +6154,7 @@ pub fn Runtime(comptime App: type) type {
                 std.heap.c_allocator,
                 provider_runtime.model(app),
             );
-            // Launch flags (fx --effort/--fast) win over the resumed session's
+            // Launch flags (ridex --effort/--fast) win over the resumed session's
             // stored preferences for this launch, without rewriting them.
             const effective_effort = app.session_persistence.process_effort_override orelse preferences.effort;
             const effective_fast_mode = app.session_persistence.process_fast_override orelse preferences.fast_mode;
@@ -6231,7 +6231,7 @@ pub fn Runtime(comptime App: type) type {
 
         fn reportRememberFailure(app: *App, failure: RememberFailure, comptime from_worker: bool) void {
             const alloc = std.heap.c_allocator;
-            const body = std.fmt.allocPrint(alloc, "Session saved, but could not remember it for -c ({s}). Resume with fx --resume {s}.", .{ @errorName(failure.err), failure.id[0..failure.len] }) catch return;
+            const body = std.fmt.allocPrint(alloc, "Session saved, but could not remember it for -c ({s}). Resume with ridex --resume {s}.", .{ @errorName(failure.err), failure.id[0..failure.len] }) catch return;
             defer alloc.free(body);
             const notice = types.SemanticNotice{ .topic = "session", .tone = .warning, .body = body };
             if (comptime @hasDecl(@TypeOf(app.worker), "pushEvent") and (from_worker or !@hasDecl(App, "writeDomainNotice"))) {

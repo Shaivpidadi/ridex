@@ -32,7 +32,7 @@ import {
   tmuxAvailable,
 } from "./tmux-helpers";
 
-// Sessions v2 behind FX_SESSIONS_V2 and --sessions-v2: every `fx ask` entry
+// Sessions v2 behind FX_SESSIONS_V2 and --sessions-v2: every `ridex ask` entry
 // and exit, the files it writes, and the faults a real disk and a real
 // crash produce: kills mid-stream and mid-tool, a torn tail, a flipped
 // byte, a second process, a read-only folder and a full disk.
@@ -203,7 +203,7 @@ function blocksJustPast(path: string) {
   return Math.ceil(statSync(path).size / SH_LIMIT_BLOCK) + 1;
 }
 
-/// `fx ask` under a file-size limit of `blocks` shell blocks with SIGXFSZ
+/// `ridex ask` under a file-size limit of `blocks` shell blocks with SIGXFSZ
 /// ignored, so a write past it fails with EFBIG the way a full disk fails
 /// with ENOSPC. The ignored signal survives the `exec`.
 function askWithSizeLimit(fixture: Fixture, gateway: any, blocks: number, args: string[]) {
@@ -257,7 +257,7 @@ function blobNames(fixture: Fixture, id: string): string[] {
   return names;
 }
 
-/// A local command such as `fx sessions`, run in the fixture's workspace.
+/// A local command such as `ridex sessions`, run in the fixture's workspace.
 function command(fixture: Fixture, gateway: any, args: string[], v2 = true, cwd = fixture.workspace) {
   return runFx(args, { cwd, env: env(fixture, gateway, v2), timeoutMs: TIMEOUT });
 }
@@ -271,7 +271,7 @@ async function ask(fixture: Fixture, gateway: any, args: string[], v2 = true) {
   return result;
 }
 
-test("fx ask saves to v2, resumes by id and by last, and never writes v1", async () => {
+test("ridex ask saves to v2, resumes by id and by last, and never writes v1", async () => {
   const fixture = createFixture("fx-v2-ask-");
   const gateway = startFakeGateway([
     fakeGatewayFinalText("V2_FIRST_ANSWER"),
@@ -357,7 +357,7 @@ test("the flag works before and after ask, and --no-save writes nothing", async 
   }
 }, TIMEOUT * 3);
 
-test("fx ask keeps the conversation language when a resumed turn has no language of its own", async () => {
+test("ridex ask keeps the conversation language when a resumed turn has no language of its own", async () => {
   const fixture = createFixture("fx-v2-language-");
   const gateway = startFakeGateway([
     fakeGatewayFinalText("こんにちは。"),
@@ -400,7 +400,7 @@ function compactionRecordPath(fixture: Fixture, id: string, name: string): strin
 const sha256 = (bytes: Buffer) => createHash("sha256").update(bytes).digest("hex");
 
 for (const userHeavy of [false, true]) {
-  test(`fx ask compacts on its own, keeps what it summarized as blobs, and resumes from the summary, userHeavy=${userHeavy}`, async () => {
+  test(`ridex ask compacts on its own, keeps what it summarized as blobs, and resumes from the summary, userHeavy=${userHeavy}`, async () => {
     const fixture = createFixture("fx-v2-compaction-");
     const model = "fixture/compaction";
     const originalUser = "Keep café and the original constraint unchanged." +
@@ -617,7 +617,7 @@ test("a long command output is kept as one read-only blob, and the model pages i
   }
 }, TIMEOUT * 3);
 
-test("fx ask killed in the middle of a turn resumes with that turn interrupted", async () => {
+test("ridex ask killed in the middle of a turn resumes with that turn interrupted", async () => {
   const fixture = createFixture("fx-v2-kill-");
   let stalled: () => void = () => {};
   const reachedStall = new Promise<void>((resolve) => (stalled = resolve));
@@ -1630,7 +1630,7 @@ function inlineImages(fixture: Fixture, id: string): Buffer[] {
 
 const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 
-test("fx ask keeps an image inside its turn, and resume in a new process sends it again", async () => {
+test("ridex ask keeps an image inside its turn, and resume in a new process sends it again", async () => {
   const fixture = createFixture("fx-v2-image-");
   const gateway = replyToLatest([
     ["Describe the image.", "IMAGE_SEEN"],
@@ -1884,7 +1884,7 @@ function childLines(fixture: Fixture, id: string): any[] {
 /// A child's requests never offer the subagent tool, so they tell apart.
 const isChildRequest = (body: string) => !body.includes('"name":"subagent"');
 
-test("fx ask runs a one-off subagent as a v2 child with its own log, recorded in the parent's log", async () => {
+test("ridex ask runs a one-off subagent as a v2 child with its own log, recorded in the parent's log", async () => {
   const fixture = createFixture("fx-v2-subagent-run-");
   const gateway = startDynamicFakeGateway((body) => {
     if (isChildRequest(body)) return fakeGatewayFinalText("CHILD_ANSWER_5521");
@@ -1932,7 +1932,7 @@ test("fx ask runs a one-off subagent as a v2 child with its own log, recorded in
   }
 }, TIMEOUT * 2);
 
-test("a named subagent keeps its id, history and instructions across fx ask runs", async () => {
+test("a named subagent keeps its id, history and instructions across ridex ask runs", async () => {
   const fixture = createFixture("fx-v2-subagent-named-");
   const childBodies: string[] = [];
   let parentRequests = 0;
@@ -2125,7 +2125,7 @@ test("ACP runs a subagent on v2, and load replays the delegation", async () => {
   }
 }, TIMEOUT * 3);
 
-// -- fx sessions, fx session and doctor ----------------------------------------
+// -- ridex sessions, ridex session and doctor ----------------------------------------
 
 /// Every file under `dir`, as paths relative to it with their modes.
 function treeOf(dir: string, prefix = ""): string[] {
@@ -2137,7 +2137,7 @@ function treeOf(dir: string, prefix = ""): string[] {
   }).sort();
 }
 
-test("fx sessions and fx session show v2 sessions by workspace, page them, and v1 sees none", async () => {
+test("ridex sessions and ridex session show v2 sessions by workspace, page them, and v1 sees none", async () => {
   const fixture = createFixture("fx-v2-commands-");
   mkdirSync(join(fixture.root, "other"));
   const other = realpathSync(join(fixture.root, "other"));
@@ -2231,8 +2231,8 @@ async function waitForSavedText(dir: string, needle: string, timeoutMs = TIMEOUT
   throw new Error(`no saved file ever contained ${needle}`);
 }
 
-test.skipIf(!tmuxAvailable())("fx session lists a compacted session's every turn and summary as v1 does", async () => {
-  // The same turns and `/compact` on each store, then `fx session {id}`.
+test.skipIf(!tmuxAvailable())("ridex session lists a compacted session's every turn and summary as v1 does", async () => {
+  // The same turns and `/compact` on each store, then `ridex session {id}`.
   const shapes: Record<string, unknown[]> = {};
   for (const v2 of [false, true]) {
     const fixture = createFixture(v2 ? "fx-v2-detail-compacted-" : "fx-v1-detail-compacted-");
@@ -2310,7 +2310,7 @@ test.skipIf(!tmuxAvailable())("fx session lists a compacted session's every turn
   expect(shapes.v2).toEqual(shapes.v1);
 }, TIMEOUT * 8);
 
-test("fx session reads a session another process holds, and reads past a torn tail without cutting it", async () => {
+test("ridex session reads a session another process holds, and reads past a torn tail without cutting it", async () => {
   const fixture = createFixture("fx-v2-peek-");
   let stalled: () => void = () => {};
   const reachedStall = new Promise<void>((resolve) => (stalled = resolve));
@@ -2350,7 +2350,7 @@ test("fx session reads a session another process holds, and reads past a torn ta
   }
 }, TIMEOUT * 3);
 
-test("fx session recover copies the good turns and side files of a damaged session, which stays as it was", async () => {
+test("ridex session recover copies the good turns and side files of a damaged session, which stays as it was", async () => {
   const fixture = createFixture("fx-v2-recover-");
   const gateway = startFakeGateway([
     fakeShellRun("recover-shell", "echo RECOVER_TOOL_OUTPUT_4410"),
@@ -2457,7 +2457,7 @@ test("an older session moves off its side folder on its next open, and the model
   }
 }, TIMEOUT * 3);
 
-test("fx session migrate refuses on v2 and changes nothing", async () => {
+test("ridex session migrate refuses on v2 and changes nothing", async () => {
   const fixture = createFixture("fx-v2-migrate-");
   const gateway = startFakeGateway([fakeGatewayFinalText("MIGRATE_ANSWER")]);
   try {
@@ -2468,7 +2468,7 @@ test("fx session migrate refuses on v2 and changes nothing", async () => {
     expect(JSON.parse(refused.stdout).code).toBe("SessionMigrationUnavailable");
     const text = await command(fixture, gateway, ["session", "migrate", id]);
     expect(text.code).toBe(1);
-    expect(text.stderr).toBe("fx session: session migrate converts v1 sessions and is not available with sessions v2 yet\n");
+    expect(text.stderr).toBe("ridex session: session migrate converts v1 sessions and is not available with sessions v2 yet\n");
     expect(readFileSync(join(v2Root(fixture), id, "log.jsonl"))).toEqual(before);
     expectNoV1Sessions(fixture);
   } finally {
@@ -2511,7 +2511,7 @@ test("doctor on v2 reports a damaged session and removes only old terminal and s
     const named = (name: string) => checks.filter((check) => check.name === name).map((check) => `${check.status}: ${check.detail}`);
     expect(named("state")).toEqual(["ok: sessions v2"]);
     expect(named("session")).toEqual([
-      `warn: session ${damaged} has a damaged log; \`fx session recover ${damaged}\` copies its good turns`,
+      `warn: session ${damaged} has a damaged log; \`ridex session recover ${damaged}\` copies its good turns`,
       "ok: removed 2 terminal or side folder(s) whose session is gone",
     ]);
     expect(named("sessions")).toEqual([`ok: 2 saved session(s); latest=${damaged}`]);
@@ -2558,7 +2558,7 @@ test("doctor reports a session whose blob went missing, and recover copies the t
     // The log is intact, but a turn it holds is not: doctor says so.
     const checks = JSON.parse((await command(fixture, gateway, ["doctor", "--json"])).stdout).checks;
     expect(checks.filter((check: any) => check.name === "session").map((check: any) => `${check.status}: ${check.detail}`)).toEqual([
-      `warn: session ${id} has a damaged log; \`fx session recover ${id}\` copies its good turns`,
+      `warn: session ${id} has a damaged log; \`ridex session recover ${id}\` copies its good turns`,
     ]);
 
     // Recover keeps the turn before the one whose blob is gone.
@@ -2587,7 +2587,7 @@ test("doctor reports a session whose blob went missing, and recover copies the t
 // Flows v1's suites check only through v1 files: a blob-sized piece, a
 // compacted app session, steering and cancelling an app turn.
 
-test("fx ask keeps a piece over 256 KB as a blob, and resume sends it whole", async () => {
+test("ridex ask keeps a piece over 256 KB as a blob, and resume sends it whole", async () => {
   const fixture = createFixture("fx-v2-blob-");
   const big = "BLOB_PIECE_START " + "blob-body ".repeat(30_000) + "BLOB_PIECE_END";
   const gateway = startFakeGateway([fakeGatewayFinalText(big), fakeGatewayFinalText("AFTER_BLOB_RESUME")]);
@@ -3005,7 +3005,7 @@ for (const action of ["run", "message"] as const) {
 }
 
 // ---------------------------------------------------------------------------
-// The fault matrix beyond fx ask: kills between turns, a damaged or missing
+// The fault matrix beyond ridex ask: kills between turns, a damaged or missing
 // piece, a read-only folder, a full disk and contention, for the app and
 // ACP, and a damaged child log for subagents.
 
@@ -3021,7 +3021,7 @@ function flipMiddleByte(path: string) {
   writeFileSync(path, bytes);
 }
 
-/// Two saved `fx ask` turns, for a fault to damage.
+/// Two saved `ridex ask` turns, for a fault to damage.
 async function savedTwoTurns(fixture: Fixture, gateway: any) {
   const first = await ask(fixture, gateway, ["Fault question one."]);
   expect(first.code).toBe(0);
@@ -3123,7 +3123,7 @@ test.skipIf(!tmuxAvailable())("the app refuses a damaged session, a busy one and
     const flipped = await appExit(fixture, gateway, ["--resume", id]);
     expect(flipped.status).toBe(1);
     expect(flipped.stderr).toContain("saved session is unreadable");
-    expect(flipped.stderr).toContain(`fx session recover`);
+    expect(flipped.stderr).toContain(`ridex session recover`);
     expect(readFileSync(log)).toEqual(damaged);
     writeFileSync(log, good);
 
@@ -3133,7 +3133,7 @@ test.skipIf(!tmuxAvailable())("the app refuses a damaged session, a busy one and
     try {
       const readOnly = await appExit(fixture, gateway, ["--resume", id]);
       expect(readOnly.status).toBe(1);
-      expect(readOnly.stderr).toBe("fx: this session cannot be opened for writing: permission denied. Check the permissions under ~/.fx/sessions/v2, then resume again.\n");
+      expect(readOnly.stderr).toBe("ridex: this session cannot be opened for writing: permission denied. Check the permissions under ~/.fx/sessions/v2, then resume again.\n");
     } finally {
       chmodSync(folder, 0o700);
       chmodSync(log, 0o600);
@@ -3698,7 +3698,7 @@ const GRID_SAYS: Record<"damaged" | "denied" | "busy" | "full", Record<GridHost,
 const GRID_BIG = `GRID_BIG_START ${"grid-body ".repeat(30_000)}GRID_BIG_END`;
 
 /// One saved home per exit and host, made once and copied into every case.
-/// The first turn is always `fx ask`'s; the app's `-c` continues only a
+/// The first turn is always `ridex ask`'s; the app's `-c` continues only a
 /// session the app has opened, so its bases end their second turn in the app.
 const gridBases = new Map<string, Promise<{ fixture: Fixture; id: string }>>();
 

@@ -1021,7 +1021,7 @@ test.skipIf(!tmuxAvailable())(
   60_000,
 );
 
-test("fx ask exit ends its TTY terminal within one second", async () => {
+test("ridex ask exit ends its TTY terminal within one second", async () => {
   const fixture = createFixture("fx-shell-tty-ask-exit-");
   let sessionId = "";
   const gateway = startFakeGateway([

@@ -1,0 +1,86 @@
+name: ridex release
+
+# Tag-driven binary releases for the ridex fork:
+#
+#   git tag ridex-v0.1.0 && git push origin ridex-v0.1.0
+#
+# Cross-compiles from ubuntu (same pattern as dev-release.yml), but
+# packages the ridex product: the agent binary shipped as
+# `ridex-agent`, the `ridex` launcher (daemon lifecycle + key setup),
+# the freeride operations skill, and the installer. Upstream's own
+# release workflows are untouched.
+
+on:
+  push:
+    tags:
+      - "ridex-v*"
+
+permissions:
+  contents: write # create the GitHub Release
+
+concurrency:
+  group: ridex-release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            target: x86_64-linux
+          - name: linux-aarch64
+            target: aarch64-linux
+          - name: macos-x86_64
+            target: x86_64-macos
+          - name: macos-aarch64
+            target: aarch64-macos
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: "0.16.0"
+
+      - name: Build (ReleaseSafe)
+        run: zig build -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }}
+
+      - name: Package
+        run: |
+          package_dir="$RUNNER_TEMP/ridex-${{ matrix.name }}"
+          mkdir -p "$package_dir/skills/freeride"
+          cp zig-out/bin/ridex "$package_dir/ridex-agent"
+          cp scripts/ridex "$package_dir/ridex"
+          cp assets/skills/freeride/SKILL.md "$package_dir/skills/freeride/SKILL.md"
+          cp LICENSE THIRD_PARTY_NOTICES.md "$package_dir/"
+          chmod +x "$package_dir/ridex-agent" "$package_dir/ridex"
+          tar -czf "ridex-${{ matrix.name }}.tar.gz" -C "$package_dir" \
+            ridex-agent ridex skills LICENSE THIRD_PARTY_NOTICES.md
+          sha256sum "ridex-${{ matrix.name }}.tar.gz" > "ridex-${{ matrix.name }}.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ridex-${{ matrix.name }}
+          path: |
+            ridex-${{ matrix.name }}.tar.gz
+            ridex-${{ matrix.name }}.tar.gz.sha256
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

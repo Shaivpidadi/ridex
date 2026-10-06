@@ -781,9 +781,9 @@ test "text blocks stay byte-identical and markdown colors inline code" {
     defer alloc.free(text);
     try std.testing.expectEqualStrings("plain prose with 42 numbers and # no comment", text);
 
-    const md = try highlight(alloc, "run `fx upgrade` to update", languages.resolve("md").?, .dark, null);
+    const md = try highlight(alloc, "run `ridex upgrade` to update", languages.resolve("md").?, .dark, null);
     defer alloc.free(md);
-    try std.testing.expect(std.mem.indexOf(u8, md, "\x1b[38;5;250m`fx upgrade`\x1b[39m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, md, "\x1b[38;5;250m`ridex upgrade`\x1b[39m") != null);
 }
 
 test "split slots let themes color commands variables and operators apart" {

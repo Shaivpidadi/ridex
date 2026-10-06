@@ -1225,7 +1225,7 @@ function sendSteeringPrompt(client: AcpClient, id: number, text: string): void {
     jsonrpc: "2.0",
     id,
     method: "session/prompt",
-    params: { prompt: [{ type: "text", text }], _meta: { fx: { steer: true } } },
+    params: { prompt: [{ type: "text", text }], _meta: { ridex: { steer: true } } },
   });
 }
 
@@ -1297,7 +1297,7 @@ async function continueRecovery(
     params: {
       ...(sessionId ? { sessionId } : {}),
       prompt: [],
-      _meta: { fx: { continueRecovery: true } },
+      _meta: { ridex: { continueRecovery: true } },
     },
   });
 
@@ -2971,7 +2971,7 @@ describe("acp: model-independent", () => {
               name: "fixture",
               url: httpFixture.url,
               headers: [{ name: "X-Workspace", value: "acp" }],
-              _meta: { fx: { alwaysLoaded: false } },
+              _meta: { ridex: { alwaysLoaded: false } },
             }],
           },
           2,
@@ -3111,7 +3111,7 @@ describe("acp: model-independent", () => {
             cwd: root.workspace,
             mcpServers: [{
               ...acpHttpServer(httpFixture, "acp"),
-              _meta: { fx: { alwaysLoaded: false } },
+              _meta: { ridex: { alwaysLoaded: false } },
             }],
           },
           2,
@@ -3292,7 +3292,7 @@ describe("acp: model-independent", () => {
           });
           const init = await client.request("initialize", {
             protocolVersion: 1,
-            _meta: { fx: { terminal: false } },
+            _meta: { ridex: { terminal: false } },
           }, 1) as any;
           expect(init.result.agentCapabilities.sessionCapabilities.systemPrompt).toEqual({});
 
@@ -3511,7 +3511,7 @@ describe("acp: model-independent", () => {
         const opted = await client.request("session/new", {
           cwd: root.workspace,
           mcpServers: [],
-          _meta: { fx: { profileMcpServers: true } },
+          _meta: { ridex: { profileMcpServers: true } },
         }, 3) as any;
         expect(opted.error).toBeUndefined();
         await client.readLine();
@@ -7067,7 +7067,7 @@ describe("acp: model-independent", () => {
         client = await AcpClient.create({ cwd: root.workspace, env });
         const refused = await client.request("initialize", { protocolVersion: 1 }, 1) as any;
         expect(refused.error?.message).toBe(
-          "no Codex model is selected; run `fx provider codex` to choose one, or set a model for this run with --model or FX_MODEL",
+          "no Codex model is selected; run `ridex provider codex` to choose one, or set a model for this run with --model or FX_MODEL",
         );
         await client.close();
 
@@ -7917,8 +7917,8 @@ describe("acp: model-independent", () => {
         });
         const resp = await client.request("initialize", { protocolVersion: 1 }, 1) as any;
         expect(resp.error).toBeDefined();
-        expect(resp.error.message).toContain("fx login");
-        expect(resp.error.message).toContain("fx setup");
+        expect(resp.error.message).toContain("ridex login");
+        expect(resp.error.message).toContain("ridex setup");
         expect(resp.error.message).toContain("AI_GATEWAY_API_KEY");
         expect(client.stderr).toBe("");
       } finally {
@@ -9828,7 +9828,7 @@ describe("acp: model catalog authentication", () => {
           const initialized = await client.request("initialize", { protocolVersion: 1 }, 1) as any;
           if (scenario.expectInitializeFailure) {
             expect(initialized.error).toBeDefined();
-            expect(initialized.error.message).toContain("fx login");
+            expect(initialized.error.message).toContain("ridex login");
             expect(gateway.modelRequests).toHaveLength(0);
             return;
           }

@@ -1039,7 +1039,7 @@ const api_tests = struct {
         (try m.openResume(.{ .target = .{ .id = b_id }, .workspace = "/w", .host = .acp })).release();
 
         // b was updated last (closed by acp); the app last opened a. Resuming
-        // is itself an open, so this check runs as `fx ask --resume last`.
+        // is itself an open, so this check runs as `ridex ask --resume last`.
         const last = try m.openResume(.{ .target = .last, .workspace = "/w", .host = .ask });
         try testing.expectEqualStrings(b_id, last.id());
         last.release();

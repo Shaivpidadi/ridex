@@ -50,7 +50,7 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(WasmSurface, "wasm_surface", .none);
 
     const exe = b.addExecutable(.{
-        .name = "fx",
+        .name = "ridex",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,
@@ -68,6 +68,10 @@ pub fn build(b: *std.Build) void {
     const session_manager = addSessionManager(b, exe.root_module, target, optimize, null);
 
     b.installArtifact(exe);
+    // Upstream's e2e/benchmark tooling resolves zig-out/bin/fx; install
+    // the same binary under the legacy name so the fork can keep running
+    // upstream CI unmodified while the product ships as `ridex`.
+    b.getInstallStep().dependOn(&b.addInstallBinFile(exe.getEmittedBin(), "fx").step);
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
@@ -85,7 +89,7 @@ pub fn build(b: *std.Build) void {
     run_exe_tests.step.dependOn(b.getInstallStep());
     run_exe_tests.setEnvironmentVariable(
         "FX_TEST_PRODUCT_EXE",
-        b.getInstallPath(.bin, "fx"),
+        b.getInstallPath(.bin, "ridex"),
     );
     // The session boundary test walks the source tree from here.
     run_exe_tests.setEnvironmentVariable("FX_TEST_SOURCE_ROOT", b.pathFromRoot("src"));

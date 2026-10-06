@@ -4,7 +4,7 @@
 //! executable links it instead of the C library's. Safe builds call memset to
 //! fill every `undefined` buffer: a `PATH_MAX` buffer for each file system
 //! call and the new memory of each allocation. That loop executed about two
-//! thirds of the instructions in `fx status --json` and `fx sessions --json`.
+//! thirds of the instructions in `ridex status --json` and `ridex sessions --json`.
 //! Upstream tracks this as https://codeberg.org/ziglang/zig/issues/32091.
 //! Delete this file once the pinned Zig's memset stores more than one byte per
 //! iteration.

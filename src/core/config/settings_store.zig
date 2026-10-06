@@ -1643,6 +1643,7 @@ fn putModelPreference(
     const provider_key = if (preference.provider == .configured) try arena.dupe(u8, preference.provider.label()) else preference.provider.label();
     changed = try putString(arena, models, provider_key, preference.model) or changed;
     const legacy_key = switch (preference.provider) {
+        .freeride => "freeride_model", // no legacy installs; never present
         .gateway => "model",
         .codex => "codex_model",
         .grok => "grok_model",

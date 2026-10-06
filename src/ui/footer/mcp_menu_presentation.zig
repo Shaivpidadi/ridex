@@ -620,13 +620,13 @@ fn composeConfigurationIssueRow(
     const content_width = @as(usize, width) -| indent;
     var summary_buf: [96]u8 = undefined;
     const summary = if (issues.len == 1)
-        "1 project MCP configuration error. Run fx mcp list for details. "
+        "1 project MCP configuration error. Run ridex mcp list for details. "
     else
         std.fmt.bufPrint(
             &summary_buf,
-            "{d} project MCP configuration errors. Run fx mcp list for details. ",
+            "{d} project MCP configuration errors. Run ridex mcp list for details. ",
             .{issues.len},
-        ) catch "Project MCP configuration errors. Run fx mcp list for details. ";
+        ) catch "Project MCP configuration errors. Run ridex mcp list for details. ";
     const summary_width = display_width.visibleWidth(summary);
     if (summary_width >= content_width) {
         try appendTerminalSafeSingleLine(alloc, &row, summary, content_width);
@@ -932,7 +932,7 @@ test "MCP menu every screen and section renders through the VT" {
         projection,
         width,
         max_inline_rows,
-        &.{ "MCP 1", "fixture", "2 project MCP configuration errors", "fx mcp list", ".mcp.json server 'broken'" },
+        &.{ "MCP 1", "fixture", "2 project MCP configuration errors", "ridex mcp list", ".mcp.json server 'broken'" },
     );
     projection.configuration_issues = &.{};
 

@@ -55,7 +55,7 @@ pub const Config = struct {
     allow_native_tools: bool = true,
     minimal_kernel: bool = false,
     /// Raw prompt image and checkpoint bytes from a libfx host. Null for
-    /// hosts that only speak standard ACP, such as `fx acp`.
+    /// hosts that only speak standard ACP, such as `ridex acp`.
     host_attachments: ?host_attachments.Store = null,
 };
 

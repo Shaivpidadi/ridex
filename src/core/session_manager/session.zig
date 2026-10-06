@@ -1569,7 +1569,7 @@ fn blobIsWhole(env: *const Env, id_: []const u8, hash: []const u8) (error{OutOfM
 pub const ForkPoint = union(enum) {
     /// The end of this turn; 0 means before the first turn.
     turn: u64,
-    /// The last turn that ended before any damage (`fx session recover`, D15).
+    /// The last turn that ended before any damage (`ridex session recover`, D15).
     last_good,
 };
 

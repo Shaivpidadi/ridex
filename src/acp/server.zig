@@ -1617,7 +1617,7 @@ fn handleKernelCheckpoint(
     const active = activeLibfxSession(state, parsed.value) orelse
         return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_params,
-            .message = "Unknown libfx session",
+            .message = "Unknown libridex session",
         });
     const unavailable: jsonrpc.RpcError = .{
         .code = ErrorCode.invalid_request,
@@ -1650,7 +1650,7 @@ fn handleKernelRestore(
     const active = activeLibfxSession(state, parsed.value) orelse
         return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_params,
-            .message = "Unknown libfx session",
+            .message = "Unknown libridex session",
         });
     const reference = parsed.value.object.get("checkpointAttachment") orelse
         return state.writer.writeError(alloc, msg.id, .{

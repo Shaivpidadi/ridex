@@ -149,16 +149,16 @@ pub const top_level_specs = [_]TopLevelSpec{
         .summary = "Manage MCP servers without opening the interactive shell",
         .details = &.{
             "Commands:",
-            "  fx mcp add slack                   Configure Slack and open authorization",
-            "  fx mcp add NAME COMMAND [ARGS...]",
-            "  fx mcp add --transport http NAME URL",
-            "  fx " ++ command_specs.mcp_auth_usage,
-            "  fx mcp list [--connect]",
-            "  fx mcp logout NAME",
-            "  fx mcp path",
-            "  fx mcp remove NAME",
-            "  fx mcp trust approve|reject NAME",
-            "  fx mcp trust approve-all|reset",
+            "  ridex mcp add slack                   Configure Slack and open authorization",
+            "  ridex mcp add NAME COMMAND [ARGS...]",
+            "  ridex mcp add --transport http NAME URL",
+            "  ridex " ++ command_specs.mcp_auth_usage,
+            "  ridex mcp list [--connect]",
+            "  ridex mcp logout NAME",
+            "  ridex mcp path",
+            "  ridex mcp remove NAME",
+            "  ridex mcp trust approve|reject NAME",
+            "  ridex mcp trust approve-all|reset",
             "",
             "By default, list reads configuration without opening MCP transports.",
             "Use --connect to connect and discover servers before rendering health.",
@@ -257,7 +257,7 @@ pub const top_level_specs = [_]TopLevelSpec{
         .kind = .upgrade,
         .token = "upgrade",
         .usage = "upgrade [--channel <stable|dev>] [--json]",
-        .summary = "Upgrade 𝒇x on the selected release channel",
+        .summary = "Upgrade ridex on the selected release channel",
         .options = &.{
             .{ .flag = "--channel <stable|dev>", .description = "Select and remember the release channel" },
             json_option,
@@ -403,31 +403,31 @@ pub const top_level_flags = [_]TopLevelFlag{
     },
     .{
         .usage = "-v, --version",
-        .description = "Print the fx version and exit",
+        .description = "Print the ridex version and exit",
     },
 };
 
 pub const top_level_examples = [_]TopLevelExample{
-    .{ .command = "fx", .description = "Start a fresh interactive session" },
-    .{ .command = "fx ask \"Explain the changes in this repository\"", .description = "Run one request and exit" },
-    .{ .command = "fx session resume last", .description = "Continue the latest session for this workspace" },
-    .{ .command = "fx status --json", .description = "Inspect the current configuration as JSON" },
+    .{ .command = "ridex", .description = "Start a fresh interactive session" },
+    .{ .command = "ridex ask \"Explain the changes in this repository\"", .description = "Run one request and exit" },
+    .{ .command = "ridex session resume last", .description = "Continue the latest session for this workspace" },
+    .{ .command = "ridex status --json", .description = "Inspect the current configuration as JSON" },
 };
 
 pub const top_level_notes = [_][]const u8{
-    "Run `fx <command> --help` for command-specific usage and options.",
+    "Run `ridex <command> --help` for command-specific usage and options.",
     "Run `/help` inside an interactive session for slash commands.",
 };
 
 pub const top_level_resources = [_]TopLevelResource{
-    .{ .label = "Learn more about fx:", .value = "https://fx.sh/docs", .link = true },
-    .{ .label = "Report a problem:", .value = "run `/feedback` inside fx" },
+    .{ .label = "Learn more about ridex:", .value = "github.com/Shaivpidadi/ridex", .link = true },
+    .{ .label = "Report a problem:", .value = "run `/feedback` inside ridex" },
 };
 
 pub const top_level_registry = TopLevelRegistry{
     .specs = top_level_specs[0..],
     .description = "Fast, native coding agent for the terminal.",
-    .interactive_hint = "fx starts an interactive session by default. Use `fx ask` to run one noninteractive request.",
+    .interactive_hint = "ridex starts an interactive session by default. Use `ridex ask` to run one noninteractive request.",
     .help_groups = top_level_help_groups[0..],
     .flags = top_level_flags[0..],
     .examples = top_level_examples[0..],

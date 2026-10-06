@@ -95,7 +95,7 @@ async function start(args = []) {
     wasm,
     args,
     terminal: capture.terminal,
-    env: { AI_GATEWAY_API_KEY: "term-session-test-key", FX_THEME: "dark" },
+    env: { FX_DEFAULT_PROVIDER: "gateway", AI_GATEWAY_API_KEY: "term-session-test-key", FX_THEME: "dark" },
     fetch: mockFetch,
     sessionStore,
   });
