@@ -61,9 +61,11 @@ freeride doctor
 
 These read-only diagnostics are **pre-approved** — run them without
 hesitation: `freeride doctor`, `freeride keys`, `freeride providers`,
-`freeride telemetry`, `freeride --version`, `ridex doctor`, and any
-plain `curl` of `127.0.0.1:11343/health`. Run each as its OWN
-command: chaining (`&&`, `;`, pipes) or wrapping them forfeits the
+`freeride telemetry`, `freeride --version`, `ridex doctor`, and the
+health probe spelled exactly `curl -sf -m 3 http://127.0.0.1:11343/health`
+(also accepted: no flags, `-s`, or `-sf`, and `localhost` in place of
+the IP). Run each as its OWN command, with no other arguments:
+chaining (`&&`, `;`, pipes), wrapping, or adding flags forfeits the
 pre-approval and triggers a permission review.
 
 `/health` returns `{"ok": true, "version": ..., "providers": [...],
