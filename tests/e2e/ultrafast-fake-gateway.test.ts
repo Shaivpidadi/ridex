@@ -1305,21 +1305,21 @@ describe("ultrafast fake Gateway", () => {
   });
 });
 
-const FAST_ONLY_MODEL = "openai/gpt-5.6-priority";
-const PLAIN_MODEL = "anthropic/claude-plain";
+const FAST_ONLY_MODEL = "provider/fast-lane-model";
+const PLAIN_MODEL = "provider/plain-model";
 
 function fastOnlyCatalogModel() {
   return {
     id: FAST_ONLY_MODEL,
     type: "language" as const,
-    owned_by: "openai",
+    owned_by: "provider",
     tags: ["tool-use"],
-    pricing: { service_tiers: { priority: { input: "0.00003", output: "0.00015" } } },
+    pricing: { fast: { input: "0.00003", output: "0.00015" } },
   };
 }
 
 function plainCatalogModel() {
-  return { id: PLAIN_MODEL, type: "language" as const, owned_by: "anthropic", tags: ["tool-use"] };
+  return { id: PLAIN_MODEL, type: "language" as const, owned_by: "provider", tags: ["tool-use"] };
 }
 
 function speedCatalog() {
@@ -1327,11 +1327,9 @@ function speedCatalog() {
 }
 
 function expectFastRequest(body: string) {
-  const request = JSON.parse(body) as {
-    providerOptions?: { gateway?: { speed?: string }; openai?: { serviceTier?: string } };
-  };
+  expectStandardRequest(body);
+  const request = JSON.parse(body) as { providerOptions?: { gateway?: { speed?: string } } };
   expect(request.providerOptions?.gateway?.speed).toBe("fast");
-  expect(request.providerOptions?.openai?.serviceTier).toBeUndefined();
 }
 
 function expectNoLaneRequest(body: string) {
