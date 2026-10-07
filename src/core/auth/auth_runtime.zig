@@ -489,7 +489,10 @@ test "credential preparation rejects refresh-due and provider-mismatched credent
 
 test "credential preparation preserves failure categories across providers" {
     const alloc = std.testing.allocator;
-    for (provider_catalog.entries) |provider| {
+    var ordered_entries: [provider_catalog.entries.len]*const provider_catalog.Entry = undefined;
+    const ordered_count = provider_catalog.orderedEntries(&ordered_entries);
+    for (ordered_entries[0..ordered_count]) |provider_ptr| {
+        const provider = provider_ptr.*;
         const cases = [_]struct { original: anyerror, expected: CredentialPreparationError }{
             .{ .original = error.CredentialStorageUnavailable, .expected = error.CredentialStorageUnavailable },
             .{ .original = error.ConnectionResetByPeer, .expected = error.CredentialTemporarilyUnavailable },

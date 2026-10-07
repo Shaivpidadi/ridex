@@ -116,13 +116,29 @@ fn providerVisible(id: model_provider.ProviderId) bool {
 
 /// Writes the visible provider slugs into `out` and returns how many landed.
 pub fn providerOptions(out: *[max_provider_options][]const u8) usize {
+    var ordered: [provider_catalog.entries.len]*const provider_catalog.Entry = undefined;
+    const ordered_count = provider_catalog.orderedEntries(&ordered);
     var count: usize = 0;
-    for (&provider_catalog.entries) |*entry| {
+    for (ordered[0..ordered_count]) |entry| {
         if (!providerVisible(entry.id)) continue;
         out[count] = entry.slug;
         count += 1;
     }
     return count;
+}
+
+test "picker order follows the default provider" {
+    var buf: [max_provider_options][]const u8 = undefined;
+    const saved = model_provider.surface_default;
+    defer model_provider.surface_default = saved;
+    model_provider.surface_default = .freeride;
+    var count = providerOptions(&buf);
+    try std.testing.expectEqualStrings("freeride", buf[0]);
+    try std.testing.expectEqualStrings("vercel", buf[1]);
+    model_provider.surface_default = .gateway;
+    count = providerOptions(&buf);
+    try std.testing.expectEqualStrings("vercel", buf[0]);
+    try std.testing.expectEqualStrings("freeride", buf[count - 1]);
 }
 
 pub fn providerMethods(id: model_provider.ProviderId) []const Method {

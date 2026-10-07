@@ -107,12 +107,6 @@ pub const State = struct {
     provider_picker_pending_method: std.ArrayList(u8) = .empty,
     provider_column_index: usize = 0,
     provider_column_window_start: usize = 0,
-    /// Set whenever the provider flow resets; consumed by the next provider
-    /// column build so the highlight starts on the row marked `current`
-    /// rather than on row 0. ridex lists FreeRide first, ahead of the
-    /// upstream providers, so Enter/Right on a freshly opened picker must
-    /// still act on the provider in use.
-    provider_column_anchor_current: bool = true,
     method_column_index: usize = 0,
     method_column_window_start: usize = 0,
     team_column_index: usize = 0,
@@ -373,7 +367,6 @@ pub const State = struct {
         self.provider_picker_pending_method.clearRetainingCapacity();
         self.provider_column_index = 0;
         self.provider_column_window_start = 0;
-        self.provider_column_anchor_current = true;
         self.method_column_index = 0;
         self.method_column_window_start = 0;
         self.team_column_index = 0;

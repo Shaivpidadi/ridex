@@ -71,6 +71,34 @@ const configured_entry = Entry{
     .login_source = .configured,
 };
 
+/// Catalog entries in picker order. FreeRide leads only while it is the
+/// default provider; under `FX_DEFAULT_PROVIDER=gateway` (how the upstream
+/// e2e and SDK suites run) the upstream order is kept and FreeRide is
+/// appended, so row 0 of every provider picker is still Vercel and the
+/// suites' Down-count navigation holds.
+pub fn orderedEntries(out: *[entries.len]*const Entry) usize {
+    const freeride_first = model_provider.defaultProvider() == .freeride;
+    var count: usize = 0;
+    if (freeride_first) {
+        for (&entries) |*entry| {
+            out[count] = entry;
+            count += 1;
+        }
+        return count;
+    }
+    for (&entries) |*entry| {
+        if (entry.id == .freeride) continue;
+        out[count] = entry;
+        count += 1;
+    }
+    for (&entries) |*entry| {
+        if (entry.id != .freeride) continue;
+        out[count] = entry;
+        count += 1;
+    }
+    return count;
+}
+
 pub fn find(id: model_provider.ProviderId) *const Entry {
     if (id == .configured) return &configured_entry;
     for (&entries) |*entry| if (entry.id.eql(id)) return entry;
