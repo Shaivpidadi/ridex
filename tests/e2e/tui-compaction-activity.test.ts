@@ -103,6 +103,8 @@ async function fixture(trigger: Trigger, outcome: Outcome = "success", longResum
     return fakeGatewayFinalText(phase === "reopen" ? REOPEN : FOLLOWUP);
   }, { models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"], context_window: 128000, max_tokens: 8192 }] });
   const env = {
+    // Upstream suite: pin the fork's default provider to the gateway.
+    FX_DEFAULT_PROVIDER: "gateway",
     PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: home, TMPDIR: root,
     TERM: "xterm-256color", AI_GATEWAY_API_KEY: "synthetic-compaction-key",
     FX_DISABLE_KEYCHAIN: "1", FX_E2E_DISABLE_DOTENV: "1", FX_SKIP_ONBOARDING: "1",
@@ -635,6 +637,8 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
       return fakeGatewayFinalText("STEER_NOT_COMPACTED_8d4");
     }, { models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"], context_window: 60000, max_tokens: 4096 }] });
     const env: Record<string, string> = {
+      // Upstream suite: pin the fork's default provider to the gateway.
+      FX_DEFAULT_PROVIDER: "gateway",
       PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: home, TMPDIR: root,
       TERM: "xterm-256color", AI_GATEWAY_API_KEY: "fake-compaction-key",
       FX_DISABLE_KEYCHAIN: "1", FX_SKIP_ONBOARDING: "1", FX_E2E_DISABLE_DOTENV: "1",
@@ -774,6 +778,8 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
         return fakeGatewayFinalText("RECOVERY_FOLLOWUP_67e");
       }, { models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["vision", "file-input", "tool-use"], context_window: 400000, max_tokens: 8192 }] });
       const env: Record<string, string> = {
+        // Upstream suite: pin the fork's default provider to the gateway.
+        FX_DEFAULT_PROVIDER: "gateway",
         PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: home, TMPDIR: root,
         TERM: "xterm-256color", AI_GATEWAY_API_KEY: "fake-compaction-key",
         FX_DISABLE_KEYCHAIN: "1", FX_SKIP_ONBOARDING: "1", FX_E2E_DISABLE_DOTENV: "1",
