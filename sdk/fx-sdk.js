@@ -1525,7 +1525,7 @@ function promptFrameSize(prompt, countImages = true) {
     type: "image",
     mimeType: block.mimeType,
     ...(block.sourceRef === undefined ? {} : { sourceRef: block.sourceRef }),
-    ...(block.data === undefined && block.bytes === undefined ? {} : { _meta: { ridex: { attachment: 0xffffffff } } }),
+    ...(block.data === undefined && block.bytes === undefined ? {} : { _meta: { fx: { attachment: 0xffffffff } } }),
   });
   return encoder.encode(JSON.stringify({ sessionId: "", prompt: projected })).length +
     encodedImageBytes + promptFrameEnvelopeBytes;
@@ -1908,7 +1908,7 @@ export async function createFxAgent(options = {}) {
       type: "image",
       mimeType: block.mimeType,
       ...(block.sourceRef === undefined ? {} : { sourceRef: block.sourceRef }),
-      ...(block.bytes === undefined ? {} : { _meta: { ridex: { attachment: ids[next++] } } }),
+      ...(block.bytes === undefined ? {} : { _meta: { fx: { attachment: ids[next++] } } }),
     });
     return request("session/prompt", { sessionId, prompt });
   };

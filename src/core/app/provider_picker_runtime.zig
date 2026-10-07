@@ -80,6 +80,25 @@ pub fn Runtime(comptime App: type) type {
                         column.annotations[i] = if (id.eql(active_provider) and
                             model_provider.authorizesCredential(id, app.auth.credentialSource())) "current" else "";
                     }
+                    // A freshly opened column highlights the provider in
+                    // use, not row 0: FreeRide leads the list, so a
+                    // Gateway user pressing Right/Enter must land on
+                    // Gateway's methods, not switch providers.
+                    const picker = &app.input_runtime.picker;
+                    if (picker.provider_column_anchor_current and query.query.len == 0) {
+                        picker.provider_column_anchor_current = false;
+                        for (column.annotations[0..count], 0..) |annotation, i| {
+                            if (!std.mem.eql(u8, annotation, "current")) continue;
+                            picker.provider_column_index = i;
+                            picker.provider_column_window_start = list_window.updateEdgeStart(
+                                0,
+                                count,
+                                i,
+                                list_window.default_max_picker_rows,
+                            );
+                            break;
+                        }
+                    }
                 },
                 .method => {
                     const pending = app.input_runtime.picker.provider_picker_pending_provider.items;
@@ -740,6 +759,22 @@ test "provider picker loading preserves query and selection instead of exposing 
     try std.testing.expectEqualStrings("codex", ready.labels[0]);
     try Runtime(ColumnTestApp).autocomplete(&app);
     try std.testing.expectEqualStrings("/provider codex", app.input_runtime.edit_state.input.items);
+}
+
+test "provider column anchors the highlight on the current provider" {
+    var app = ColumnTestApp.init(std.testing.allocator);
+    defer app.deinit();
+    try app.provider_selection.replaceSelection(.gateway, "");
+    app.auth.source = .ai_gateway_api_key;
+    app.input_runtime.picker.clearProviderPickerFlow();
+    const column = columnFor(&app, .provider, "");
+    try std.testing.expectEqualStrings("freeride", column.labels[0]);
+    try std.testing.expectEqualStrings("vercel", column.labels[1]);
+    try std.testing.expectEqualStrings("current", column.annotations[1]);
+    try std.testing.expectEqual(@as(usize, 1), app.input_runtime.picker.provider_column_index);
+    // Anchoring happens once per open; navigation afterwards is free.
+    _ = columnFor(&app, .provider, "");
+    try std.testing.expectEqual(@as(usize, 1), app.input_runtime.picker.provider_column_index);
 }
 
 test "method column marks the credential the active provider is using" {

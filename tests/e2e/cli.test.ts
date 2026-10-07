@@ -3918,7 +3918,7 @@ describe("cli: interactive startup", () => {
 
 describe("cli: pr", () => {
   test(
-    "fx pr without gateway auth exits non-zero",
+    "ridex pr without gateway auth exits non-zero",
     async () => {
       const home = mkdtempSync(join(tmpdir(), "fx-e2e-noauth-"));
       try {
@@ -3937,7 +3937,7 @@ describe("cli: pr", () => {
 
 describe("cli: issue", () => {
   test(
-    "fx issue without gateway auth exits non-zero",
+    "ridex issue without gateway auth exits non-zero",
     async () => {
       const home = mkdtempSync(join(tmpdir(), "fx-e2e-noauth-"));
       try {

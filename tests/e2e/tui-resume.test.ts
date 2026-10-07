@@ -518,7 +518,7 @@ function hasSemanticSymbol(
   return text.includes("\ud83d\udc69");
 }
 
-// `fx replay --frames` draws each captured row between `|` edges.
+// `ridex replay --frames` draws each captured row between `|` edges.
 function semanticTextLines(text: string): string[] {
   return text.split("\n").map((line) => {
     const plain = stripAnsi(line);
@@ -8010,7 +8010,7 @@ test.skipIf(!tmuxAvailable())("remembered continuation restores the selected con
     other = await open(["--continue"], "busy");
     await other.waitForPane(() => other!.paneStatus().dead, TIMEOUT);
     expect(other.paneStatus().status).toBe(1);
-    expect(readFileSync(join(root, "busy.stderr"), "utf8")).toContain("another fx process");
+    expect(readFileSync(join(root, "busy.stderr"), "utf8")).toContain("another ridex process");
     await other.kill(); other = null;
     await active.sendText("/resume");
     await active.waitForText("enter resume", TIMEOUT);

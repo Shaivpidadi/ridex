@@ -3143,7 +3143,7 @@ test.skipIf(!tmuxAvailable())("the app refuses a damaged session, a busy one and
     const owner = await startApp(fixture, gateway, ["--resume", id]);
     const busy = await appExit(fixture, gateway, ["--resume", id]);
     expect(busy.status).toBe(1);
-    expect(busy.stderr).toContain("another fx process may be using this session");
+    expect(busy.stderr).toContain("another ridex process may be using this session");
     await quitApp(owner);
     expect(gateway.requests.length).toBe(requests);
     expectWholeLog(fixture, id);
@@ -3688,7 +3688,7 @@ const REAL_FULL_DISK = process.platform === "darwin";
 const GRID_SAYS: Record<"damaged" | "denied" | "busy" | "full", Record<GridHost, RegExp>> = {
   damaged: { ask: /InvalidSessionFormat/, app: /saved session is unreadable/, acp: /^Session could not be loaded$/ },
   denied: { ask: /AccessDenied/, app: /cannot be opened for writing: permission denied|AccessDenied/, acp: /permission denied/ },
-  busy: { ask: /SessionBusy/, app: /another fx process may be using this session/, acp: /^Session is busy$/ },
+  busy: { ask: /SessionBusy/, app: /another ridex process may be using this session/, acp: /^Session is busy$/ },
   full: REAL_FULL_DISK
     ? { ask: /NoSpaceLeft/, app: /NoSpaceLeft|the disk is full/, acp: /the disk is full/ }
     : { ask: /FileTooBig/, app: /FileTooBig|a file-size limit was reached/, acp: /a file-size limit was reached/ },

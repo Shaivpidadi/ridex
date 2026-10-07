@@ -140,7 +140,7 @@ async function waitForProfileUsage(
   throw new Error("Timed out waiting for profile usage publication");
 }
 
-// Holds the profile-wide usage ledger lock the way another fx process would.
+// Holds the profile-wide usage ledger lock the way another ridex process would.
 async function holdProfileUsageLock(home: string) {
   const holder = Bun.spawn(
     [

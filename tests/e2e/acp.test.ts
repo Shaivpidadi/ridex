@@ -1225,7 +1225,7 @@ function sendSteeringPrompt(client: AcpClient, id: number, text: string): void {
     jsonrpc: "2.0",
     id,
     method: "session/prompt",
-    params: { prompt: [{ type: "text", text }], _meta: { ridex: { steer: true } } },
+    params: { prompt: [{ type: "text", text }], _meta: { fx: { steer: true } } },
   });
 }
 
@@ -1297,7 +1297,7 @@ async function continueRecovery(
     params: {
       ...(sessionId ? { sessionId } : {}),
       prompt: [],
-      _meta: { ridex: { continueRecovery: true } },
+      _meta: { fx: { continueRecovery: true } },
     },
   });
 
@@ -2971,7 +2971,7 @@ describe("acp: model-independent", () => {
               name: "fixture",
               url: httpFixture.url,
               headers: [{ name: "X-Workspace", value: "acp" }],
-              _meta: { ridex: { alwaysLoaded: false } },
+              _meta: { fx: { alwaysLoaded: false } },
             }],
           },
           2,
@@ -3111,7 +3111,7 @@ describe("acp: model-independent", () => {
             cwd: root.workspace,
             mcpServers: [{
               ...acpHttpServer(httpFixture, "acp"),
-              _meta: { ridex: { alwaysLoaded: false } },
+              _meta: { fx: { alwaysLoaded: false } },
             }],
           },
           2,
@@ -3292,7 +3292,7 @@ describe("acp: model-independent", () => {
           });
           const init = await client.request("initialize", {
             protocolVersion: 1,
-            _meta: { ridex: { terminal: false } },
+            _meta: { fx: { terminal: false } },
           }, 1) as any;
           expect(init.result.agentCapabilities.sessionCapabilities.systemPrompt).toEqual({});
 
@@ -3511,7 +3511,7 @@ describe("acp: model-independent", () => {
         const opted = await client.request("session/new", {
           cwd: root.workspace,
           mcpServers: [],
-          _meta: { ridex: { profileMcpServers: true } },
+          _meta: { fx: { profileMcpServers: true } },
         }, 3) as any;
         expect(opted.error).toBeUndefined();
         await client.readLine();
