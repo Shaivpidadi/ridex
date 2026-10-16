@@ -3,10 +3,13 @@
 **A coding agent that runs entirely on free-tier inference.** ridex is a
 fork of [vercel-labs/fx](https://github.com/vercel-labs/fx) whose default
 model provider is [FreeRide](https://github.com/Shaivpidadi/FreeRideV3) —
-a local gateway that fans requests out across OpenRouter, Groq, NVIDIA
-NIM, HuggingFace, Cerebras, Cloudflare Workers AI, and your own Ollama,
-with automatic provider/model failover. No vendor subscription, no
-Vercel account, no login.
+a local gateway that fans requests out across OpenRouter, Google Gemini,
+Ollama Cloud, Z.ai (GLM), Groq, NVIDIA NIM, Cloudflare Workers AI, xKiro,
+a dozen smaller no-card gateways, keyless fallbacks (OVHcloud, BlockRun),
+and your own Ollama — with automatic provider *and* model failover inside
+a single request. No vendor subscription, no Vercel account, no login;
+one free key is enough, and `FREERIDE_KEYLESS=ovh,blockrun` works with
+none at all.
 
 ```bash
 curl -sSL https://api.free-ride.xyz/ridex.sh | sh
