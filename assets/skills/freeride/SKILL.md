@@ -14,9 +14,11 @@ description: >-
 
 This agent (ridex) does not talk to model vendors directly. Every request
 goes to **FreeRide**, a local gateway daemon on `http://127.0.0.1:11343`,
-which fans out across free-tier providers — OpenRouter, Groq, NVIDIA NIM,
-HuggingFace, Cerebras, Cloudflare Workers AI, and local Ollama — with
-automatic failover when one rate-limits or errors. If model requests break,
+which fans out across free-tier providers — OpenRouter, Google Gemini,
+Mistral, SambaNova, Z.ai, Groq, NVIDIA NIM, Cloudflare Workers AI, Ollama
+Cloud, HuggingFace (PRO), a long tail of smaller gateways, keyless
+fallbacks (OVHcloud, BlockRun) and local Ollama — with automatic failover
+when one rate-limits or errors. If model requests break,
 the fault is almost always in this chain, and you can diagnose and fix it
 yourself with the commands below.
 
@@ -140,11 +142,14 @@ provider is reachable; same fix as empty `keyed_providers`.
 
 ## Keys
 
-- Stored ONLY in `~/.freeride/.env` (`OPENROUTER_API_KEY`, `GROQ_API_KEY`,
-  `NIM_API_KEY`/`NVIDIA_API_KEY`, `HUGGINGFACE_API_KEY`,
-  `CEREBRAS_API_KEY`, `CLOUDFLARE_API_TOKEN`+`CLOUDFLARE_ACCOUNT_ID`,
-  `OLLAMA_BASE_URL`). Numbered variants (`OPENROUTER_API_KEY_2`, …) add
-  failover headroom on the same provider.
+- Stored ONLY in `~/.freeride/.env` (`OPENROUTER_API_KEY`, `GEMINI_API_KEY`,
+  `MISTRAL_API_KEY`, `SAMBANOVA_API_KEY`, `ZAI_API_KEY`, `GROQ_API_KEY`,
+  `NIM_API_KEY`/`NVIDIA_API_KEY`, `CLOUDFLARE_API_TOKEN`+`CLOUDFLARE_ACCOUNT_ID`,
+  `OLLAMA_CLOUD_API_KEY`, `HUGGINGFACE_API_KEY`, `CEREBRAS_API_KEY`,
+  `OLLAMA_BASE_URL`, plus `<NAME>_API_KEY` for the smaller gateways).
+  Numbered variants (`OPENROUTER_API_KEY_2`, …) add failover headroom on
+  the same provider. `FREERIDE_KEYLESS=ovh,blockrun` enables the
+  anonymous gateways when no key is configured at all.
 - `freeride keys` — per-provider: how many keys, how many available vs
   cooling, and when the soonest returns.
 - `freeride init` — the interactive wizard; after any `.env` edit run
