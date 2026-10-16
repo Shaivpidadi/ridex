@@ -114,7 +114,7 @@ describe("configured providers", () => {
     try {
       const result = await runFx(["ask", "--json", "--no-save", "say hello"], { cwd: f.workspace, env: f.env, timeoutMs: 20000 });
       expect(result.stderr).toBe("");
-      if (result.code !== 0) throw new Error(`fx ask failed: ${result.stdout} ${result.stderr}; paths=${f.requests.map(r => r.path).join(",")}`);
+      if (result.code !== 0) throw new Error(`ridex ask failed: ${result.stdout} ${result.stderr}; paths=${f.requests.map(r => r.path).join(",")}`);
       expect(result.code).toBe(0);
       expect(JSON.parse(result.stdout).output).toBe("local reply");
       expect(f.requests).toHaveLength(1);
@@ -150,7 +150,7 @@ describe("configured providers", () => {
       expect(selection.code).toBe(0);
       expect(JSON.parse(readFileSync(f.settingsPath, "utf8")).provider).toBe("remote");
       const result = await runFx(["ask", "--json", "--no-save", "say hello"], { cwd: f.workspace, env: f.env, timeoutMs: 20000 });
-      if (result.code !== 0) throw new Error(`fx ask failed: ${result.stdout} ${result.stderr}; paths=${f.requests.map(r => r.path).join(",")}`);
+      if (result.code !== 0) throw new Error(`ridex ask failed: ${result.stdout} ${result.stderr}; paths=${f.requests.map(r => r.path).join(",")}`);
       expect(result.code).toBe(0);
       expect(f.requests).toHaveLength(1);
       expect(f.requests[0].authorization).toBe("Bearer own-provider-token");
@@ -480,7 +480,7 @@ describe("configured providers", () => {
 
       const blank = await runFx(["status"], { cwd: f.workspace, env: { ...f.env, FX_MODEL: "   " } });
       expect(blank.code).toBe(1);
-      expect(blank.stderr).toBe("fx: no model is selected for this connection; save one under \"models\" in ~/.fx/settings.json, or set a model for this run with --model or FX_MODEL\n");
+      expect(blank.stderr).toBe("ridex: no model is selected for this connection; save one under \"models\" in ~/.fx/settings.json, or set a model for this run with --model or FX_MODEL\n");
       expect(chatModels()).toHaveLength(2);
       expect(JSON.parse(readFileSync(f.settingsPath, "utf8")).models.local).toBeUndefined();
     } finally { f.close(); }

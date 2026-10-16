@@ -1135,7 +1135,7 @@ test.skipIf(!tmuxAvailable())(
   60_000,
 );
 
-test("fx ask exit ends its TTY terminal within one second", async () => {
+test("ridex ask exit ends its TTY terminal within one second", async () => {
   const fixture = createFixture("fx-shell-tty-ask-exit-");
   let sessionId = "";
   const gateway = startFakeGateway([
@@ -1205,7 +1205,7 @@ test("TTY runs in the requested cwd on a real PTY and reports the exact exit", a
 }, TIMEOUT);
 
 test.skipIf(!tmuxAvailable())(
-  "another fx process can neither drive nor end a running owner's terminal",
+  "another ridex process can neither drive nor end a running owner's terminal",
   async () => {
     const fixture = createFixture("fx-shell-tty-owner-");
     let ownerTerminal = "";

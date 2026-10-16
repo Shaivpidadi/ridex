@@ -17,11 +17,11 @@ const gateway_client = @import("../gateway/client.zig");
 const vercel_failure_diagnostics = @import("../gateway/vercel_failure_diagnostics.zig");
 const vercel_protocol = @import("../gateway/vercel_protocol.zig");
 const io_mod = @import("../core/shared/io.zig");
+const model_provider = @import("../core/config/model_provider.zig");
 const gateway_provider = @import("../core/gateway/gateway_provider.zig");
 const provider_set = @import("../core/gateway/provider_set.zig");
 const provider_catalog = @import("../core/auth/provider_catalog.zig");
 const model_capabilities = @import("../core/config/model_capabilities.zig");
-const model_provider = @import("../core/config/model_provider.zig");
 const vercel_model_policy = @import("../gateway/vercel_model_policy.zig");
 const model_catalog = @import("../core/gateway/model_catalog.zig");
 const output_contracts = @import("../core/output/output_contracts.zig");
@@ -48,6 +48,11 @@ const credits_path = "/coding-agent/v1/credits";
 pub const retry_count: usize = 3;
 pub const chat_url_env = "FX_GATEWAY_CHAT_URL";
 pub const default_model_catalog_base_url = "https://ai-gateway.vercel.sh";
+// FreeRide's local gateway (ridex's default provider). Loopback by
+// definition, so the same trust rules as the FX_GATEWAY_* overrides
+// apply automatically.
+pub const freeride_default_chat_url = "http://127.0.0.1:11343/v3/ai/language-model";
+pub const freeride_model_catalog_base_url = "http://127.0.0.1:11343";
 const base_url_env = "FX_GATEWAY_BASE_URL";
 const e2e_gateway_models_url_env = "FX_E2E_GATEWAY_MODELS_URL";
 const oauth_request_timeout_ms: i64 = 15_000;
@@ -125,8 +130,15 @@ pub const chat_url_provider = gateway_provider.ChatUrlProvider{
     .resolve_fn = resolveChatUrlForProvider,
 };
 
+fn activeDefaultChatUrl() []const u8 {
+    return switch (model_provider.active_transport_provider) {
+        .freeride => freeride_default_chat_url,
+        else => default_chat_url,
+    };
+}
+
 pub fn agentChatUrl() []const u8 {
-    return resolveChatUrl(default_chat_url, io_mod.getenv(chat_url_env));
+    return resolveChatUrl(activeDefaultChatUrl(), io_mod.getenv(chat_url_env));
 }
 
 pub const cli_model_catalog_provider = gateway_provider.CliModelCatalogProvider{
@@ -149,6 +161,23 @@ pub const agent_stream_provider = agent_stream_provider_contract.Provider{
     .stream_fn = streamAgentCompletion,
     .build_request_fn = buildAgentRequestForProvider,
     .project_replay_fn = vercel_protocol.selectReplayParts,
+};
+
+fn freerideModelCapabilities(_: []const u8) model_capabilities.Capabilities {
+    // FreeRide's catalog serves capability tags; this fallback covers
+    // ids the catalog has not loaded yet. The coding preset guarantees
+    // tool-call support, which is the one capability the agent loop
+    // cannot run without.
+    return .{ .supports_tool_use = true };
+}
+
+pub const freeride_provider_bundle = provider_set.Bundle{
+    .presentation = provider_catalog.find(.freeride),
+    .fallback_model_capabilities_fn = freerideModelCapabilities,
+    .agent_stream = agent_stream_provider,
+    .cli_model_catalog = cli_model_catalog_provider,
+    .model_catalog = model_catalog_provider,
+    .permission_reviewer = permission_reviewer.provider,
 };
 
 pub const provider_bundle = provider_set.Bundle{
@@ -722,7 +751,7 @@ fn fetchCredits(
     );
 }
 
-/// An fx login can reach several teams, so `/v1/credits` rejects it outright
+/// An ridex login can reach several teams, so `/v1/credits` rejects it outright
 /// unless the request names one. The endpoint reads the team from a `teamId`
 /// query value and ignores `x-vercel-ai-gateway-team`, which is the reverse of
 /// the inference endpoint. An API key carries its own team and resolves to no
@@ -955,7 +984,7 @@ pub fn chatUrl(fallback: []const u8) []const u8 {
 }
 
 pub fn defaultChatUrl() []const u8 {
-    return chatUrl(default_chat_url);
+    return chatUrl(activeDefaultChatUrl());
 }
 
 fn resolveChatUrlForProvider(_: ?*anyopaque, fallback: []const u8) []const u8 {
@@ -2158,10 +2187,22 @@ test "built-in credits provider ignores non-string fields" {
 }
 
 test "built-in model catalog owns default and loopback target resolution" {
+    // Base resolution follows the active transport provider; pin it
+    // per assertion so other tests' startup-state loads can't leak in.
+    const prior = model_provider.active_transport_provider;
+    defer model_provider.active_transport_provider = prior;
+
+    model_provider.active_transport_provider = .gateway;
     const default_url = try modelCatalogUrl(std.testing.allocator, models_path, null);
     defer std.testing.allocator.free(default_url);
     try std.testing.expectEqualStrings("https://ai-gateway.vercel.sh/coding-agent/v1/models", default_url);
 
+    model_provider.active_transport_provider = .freeride;
+    const freeride_url = try modelCatalogUrl(std.testing.allocator, models_path, null);
+    defer std.testing.allocator.free(freeride_url);
+    try std.testing.expectEqualStrings("http://127.0.0.1:11343/coding-agent/v1/models", freeride_url);
+
+    model_provider.active_transport_provider = .gateway;
     const loopback_url = try modelCatalogUrl(std.testing.allocator, models_path, "http://127.0.0.1:43123");
     defer std.testing.allocator.free(loopback_url);
     try std.testing.expectEqualStrings("http://127.0.0.1:43123/coding-agent/v1/models", loopback_url);
@@ -2476,11 +2517,15 @@ test "catalog request failures preserve transport and cancellation facts" {
 }
 
 fn modelCatalogUrl(alloc: Allocator, path: []const u8, base_url_override: ?[]const u8) ![]u8 {
+    const active_base_url = switch (model_provider.active_transport_provider) {
+        .freeride => freeride_model_catalog_base_url,
+        else => default_model_catalog_base_url,
+    };
     const base_url = if (base_url_override) |candidate| blk: {
         if (gateway_client.isLoopbackHttpUrl(candidate)) break :blk candidate;
         debug_trace.logf("gateway", "ignoring {s}: not loopback http", .{base_url_env});
-        break :blk default_model_catalog_base_url;
-    } else default_model_catalog_base_url;
+        break :blk active_base_url;
+    } else active_base_url;
 
     return alloc.print("{s}{s}", .{ base_url, path });
 }

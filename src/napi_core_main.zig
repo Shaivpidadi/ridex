@@ -10,6 +10,7 @@ const host = @import("core/hosts/host.zig");
 const host_attachments = @import("core/hosts/host_attachments.zig");
 const agent_checkpoint = @import("core/agent/runtime/checkpoint.zig");
 const io_mod = @import("core/shared/io.zig");
+const model_provider = @import("core/config/model_provider.zig");
 const fetch_state = @import("napi_fetch_state.zig");
 const streamable_http = @import("core/mcp/streamable_http.zig");
 const host_stream_provider = @import("gateway/host_stream_provider.zig");
@@ -842,6 +843,12 @@ fn ensureThreadedIo() void {
         // Node.js owns the environment and may grow it at any time, which
         // can move and free libc's array, so it is read at each use.
         io_mod.setLibcEnviron();
+        model_provider.surface_default = .gateway;
+        // The lean SDK agent never reaches the provider runtime's
+        // adoptOwned republish, so transport-URL resolution would stay
+        // on the compiled default (.freeride). Seed it from the same
+        // resolution the surface advertises (env override included).
+        model_provider.active_transport_provider = model_provider.defaultProvider();
         threaded_io_state.store(2, .release);
         return;
     }

@@ -7431,7 +7431,7 @@ describe("acp: model-independent", () => {
         client = await AcpClient.create({ cwd: root.workspace, env });
         const refused = await client.request("initialize", { protocolVersion: 1 }, 1) as any;
         expect(refused.error?.message).toBe(
-          "no Codex model is selected; run `fx provider codex` to choose one, or set a model for this run with --model or FX_MODEL",
+          "no Codex model is selected; run `ridex provider codex` to choose one, or set a model for this run with --model or FX_MODEL",
         );
         await client.close();
 
@@ -8281,8 +8281,8 @@ describe("acp: model-independent", () => {
         });
         const resp = await client.request("initialize", { protocolVersion: 1 }, 1) as any;
         expect(resp.error).toBeDefined();
-        expect(resp.error.message).toContain("fx login");
-        expect(resp.error.message).toContain("fx setup");
+        expect(resp.error.message).toContain("ridex login");
+        expect(resp.error.message).toContain("ridex setup");
         expect(resp.error.message).toContain("AI_GATEWAY_API_KEY");
         expect(client.stderr).toBe("");
       } finally {
@@ -10205,7 +10205,7 @@ describe("acp: model catalog authentication", () => {
           const initialized = await client.request("initialize", { protocolVersion: 1 }, 1) as any;
           if (scenario.expectInitializeFailure) {
             expect(initialized.error).toBeDefined();
-            expect(initialized.error.message).toContain("fx login");
+            expect(initialized.error.message).toContain("ridex login");
             expect(gateway.modelRequests).toHaveLength(0);
             return;
           }

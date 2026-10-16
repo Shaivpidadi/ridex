@@ -50,6 +50,7 @@ fn emptyModelCapabilities(_: []const u8) model_capabilities.Capabilities {
 }
 
 pub const Set = struct {
+    freeride: Bundle,
     gateway: Bundle,
     codex: Bundle,
     grok: Bundle,
@@ -60,6 +61,7 @@ pub const Set = struct {
 
     pub fn select(self: Set, provider: model_provider.ProviderId) Bundle {
         return switch (provider) {
+            .freeride => self.freeride,
             .gateway => self.gateway,
             .codex => self.codex,
             .grok => self.grok,
@@ -75,6 +77,11 @@ pub const Set = struct {
 
 pub fn gateway_only(gateway: Bundle) Set {
     return .{
+        // WASM/JS-host surfaces route every provider through the host's
+        // stream provider; freeride (the compiled default) must carry
+        // the same bundle or the SDK boots into
+        // AgentStreamProviderUnavailable.
+        .freeride = gateway,
         .gateway = gateway,
         .codex = .{},
         .grok = .{},
@@ -147,7 +154,7 @@ test "provider set selects each provider's complete route" {
         .model_catalog = .{ .context = &grok_tag, .fetch_fn = Fake.model_catalog_fetch },
         .permission_reviewer = .{ .context = &grok_tag, .review_fn = Fake.review },
     };
-    var providers = Set{ .gateway = gateway, .codex = codex, .grok = grok };
+    var providers = Set{ .freeride = .{}, .gateway = gateway, .codex = codex, .grok = grok };
 
     try std.testing.expect(providers.select(.gateway).agent_stream.?.context.? == @as(*anyopaque, @ptrCast(&gateway_tag)));
     try std.testing.expect(providers.select(.gateway).capabilities.fx_search);

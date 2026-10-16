@@ -317,7 +317,7 @@ fn appendV2StateChecks(checks: *std.ArrayList(Check), alloc: Allocator) !void {
     defer report.deinit(alloc);
     try appendCheck(checks, alloc, "state", .ok, "sessions v2");
     for (report.damaged.items) |id| {
-        const detail = try alloc.print("session {s} has a damaged log; `fx session recover {s}` copies its good turns", .{ id, id });
+        const detail = try alloc.print("session {s} has a damaged log; `ridex session recover {s}` copies its good turns", .{ id, id });
         try appendCheckOwned(checks, alloc, "session", .warn, detail);
     }
     if (report.checked < report.sessions) try appendSessionDiagnosticsTruncatedCheck(checks, alloc, report.checked);
@@ -485,7 +485,7 @@ fn recoveryActionForSessionDiagnostic(
         .authority_transition_pending,
         .commit_intent_pending,
         .cleanup_candidate,
-        => "rerun fx doctor after active writers exit; cleanup is guarded",
+        => "rerun ridex doctor after active writers exit; cleanup is guarded",
 
         .canonical_log_large,
         .canonical_log_compaction_overdue,
@@ -506,7 +506,7 @@ fn recoveryActionForSessionDiagnostic(
         .commit_watermark_mismatched,
         => std.mem.print(
             buffer,
-            "run fx session recover {s}; it creates a separate resumable copy and leaves the source unchanged",
+            "run ridex session recover {s}; it creates a separate resumable copy and leaves the source unchanged",
             .{session_id},
         ),
 
@@ -515,7 +515,7 @@ fn recoveryActionForSessionDiagnostic(
         .invalid_commit_intent,
         => std.mem.print(
             buffer,
-            "back up ~/.fx/sessions, then inspect this session with fx session {s} --json",
+            "back up ~/.fx/sessions, then inspect this session with ridex session {s} --json",
             .{session_id},
         ),
 
@@ -928,7 +928,7 @@ test "session doctor renders precise watermark and compaction diagnostics" {
     try std.testing.expect(std.mem.find(
         u8,
         checks.items[0].detail,
-        "fx session recover missing-watermark",
+        "ridex session recover missing-watermark",
     ) != null);
     try std.testing.expectEqual(CheckStatus.warn, checks.items[1].status);
     try std.testing.expect(std.mem.find(

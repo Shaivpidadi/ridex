@@ -11,7 +11,7 @@ on:
         type: boolean
         default: false
   push:
-    branches: [main]
+    branches: [main, feat/freeride-provider]
   pull_request:
 
 concurrency:
@@ -218,6 +218,11 @@ jobs:
           cache-hit: ${{ steps.zig.outputs.cache-hit }}
 
   sdk-node-wasm:
+    env:
+      # Upstream's e2e/SDK suites model gateway-first flows; the fork's
+      # compiled default is freeride. Pin these suites to the upstream
+      # default instead of rewriting hundreds of fixtures.
+      FX_DEFAULT_PROVIDER: gateway
     name: SDK (Node + WASM)
     needs: sdk-wasm
     runs-on: ubuntu-latest
@@ -264,6 +269,11 @@ jobs:
         run: node sdk/tests/test-types.mjs
 
   sdk-node-napi:
+    env:
+      # Upstream's e2e/SDK suites model gateway-first flows; the fork's
+      # compiled default is freeride. Pin these suites to the upstream
+      # default instead of rewriting hundreds of fixtures.
+      FX_DEFAULT_PROVIDER: gateway
     name: SDK (Node + N-API)
     needs: sdk-napi
     runs-on: ubuntu-latest
@@ -316,6 +326,11 @@ jobs:
           node sdk/tests/test-durable-core.mjs queue
 
   sdk-bun:
+    env:
+      # Upstream's e2e/SDK suites model gateway-first flows; the fork's
+      # compiled default is freeride. Pin these suites to the upstream
+      # default instead of rewriting hundreds of fixtures.
+      FX_DEFAULT_PROVIDER: gateway
     name: SDK (Bun + N-API/WASM)
     needs: [sdk-wasm, sdk-napi]
     runs-on: ubuntu-latest
@@ -482,6 +497,11 @@ jobs:
           if-no-files-found: ignore
 
   sdk-browser-wasm:
+    env:
+      # Upstream's e2e/SDK suites model gateway-first flows; the fork's
+      # compiled default is freeride. Pin these suites to the upstream
+      # default instead of rewriting hundreds of fixtures.
+      FX_DEFAULT_PROVIDER: gateway
     name: SDK (Browser + WASM)
     needs: sdk-wasm
     runs-on: ubuntu-latest
@@ -526,6 +546,10 @@ jobs:
           - index: 3
             label: "4/4"
     env:
+      # Upstream's e2e/SDK suites model gateway-first flows; the fork's
+      # compiled default is freeride. Pin these suites to the upstream
+      # default instead of rewriting hundreds of fixtures.
+      FX_DEFAULT_PROVIDER: gateway
       AI_GATEWAY_API_KEY: ""
       VERCEL_OIDC_TOKEN: ""
       FX_REQUIRE_TMUX: "1"
@@ -633,6 +657,10 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
+      # Upstream's e2e/SDK suites model gateway-first flows; the fork's
+      # compiled default is freeride. Pin these suites to the upstream
+      # default instead of rewriting hundreds of fixtures.
+      FX_DEFAULT_PROVIDER: gateway
       AI_GATEWAY_API_KEY: ""
       VERCEL_OIDC_TOKEN: ""
       FX_SOUND: "0"
@@ -722,6 +750,11 @@ jobs:
           shellcheck "${scripts[@]}"
 
   e2e_acp_live:
+    env:
+      # Upstream's e2e/SDK suites model gateway-first flows; the fork's
+      # compiled default is freeride. Pin these suites to the upstream
+      # default instead of rewriting hundreds of fixtures.
+      FX_DEFAULT_PROVIDER: gateway
     name: E2E ACP (live models)
     if: github.event_name == 'workflow_dispatch' && inputs.acp_live
     runs-on: ubuntu-latest

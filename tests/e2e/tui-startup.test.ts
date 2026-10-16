@@ -255,7 +255,7 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
       writeFileSync(stderrPath, "");
 
       const version = execFileSync(FX_BIN, ["--version"], { encoding: "utf8" }).trim();
-      const banner = `𝒇x v${version} · Run /help for commands`;
+      const banner = `ridex v${version} · Run /help for commands`;
 
       try {
         session = await TmuxSession.create({
@@ -315,7 +315,7 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
       mkdirSync(home, { recursive: true });
       writeFileSync(stderrPath, "");
       const version = execFileSync(FX_BIN, ["--version"], { encoding: "utf8" }).trim();
-      const banner = `𝒇x v${version} · Run /help for commands`;
+      const banner = `ridex v${version} · Run /help for commands`;
 
       try {
         session = await TmuxSession.create({
@@ -375,7 +375,7 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
       writeFileSync(stderrPath, "");
       const gateway = startDynamicFakeGateway(() => fakeGatewayFinalText("FIXTURE_REPLY_OK"));
       const version = execFileSync(FX_BIN, ["--version"], { encoding: "utf8" }).trim();
-      const banner = `𝒇x v${version} · Run /help for commands`;
+      const banner = `ridex v${version} · Run /help for commands`;
 
       try {
         session = await TmuxSession.create({
@@ -431,7 +431,7 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
       mkdirSync(home, { recursive: true });
       writeFileSync(stderrPath, "");
       const version = execFileSync(FX_BIN, ["--version"], { encoding: "utf8" }).trim();
-      const banner = `𝒇x v${version} · Run /help for commands`;
+      const banner = `ridex v${version} · Run /help for commands`;
 
       try {
         session = await TmuxSession.create({

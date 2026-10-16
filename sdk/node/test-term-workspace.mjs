@@ -230,7 +230,7 @@ const runtime = await createFxTerminal({
   backend: "wasm",
   wasm: await readFile(wasmPath),
   terminal: xtermAdapter(terminal),
-  env: { AI_GATEWAY_API_KEY: "workspace-key" },
+  env: { FX_DEFAULT_PROVIDER: "gateway", AI_GATEWAY_API_KEY: "workspace-key" },
   fetch,
   configStore: { get(id) { return config.get(id) ?? null; }, set(id, value) { config.set(id, value); } },
   stderr(chunk) { stderr += stderrDecoder.decode(chunk, { stream: true }); },
@@ -257,7 +257,7 @@ async function prompt(value, expected) {
   await waitFor(() => grid().includes(expected), expected);
 }
 
-await waitFor(() => grid().includes("𝒇x"), "startup");
+await waitFor(() => grid().includes("ridex"), "startup");
 await prompt("workspace success", "success record checked");
 await prompt("workspace truncation", "truncation record checked");
 await prompt("workspace timeout", "timeout mapping checked");

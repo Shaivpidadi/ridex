@@ -528,7 +528,7 @@ describe("web_search Gateway fixture", () => {
   );
 
   test(
-    "default fx ask unadvertised native web_search cannot start a worker",
+    "default ridex ask unadvertised native web_search cannot start a worker",
     async () => {
       const root = createIsolatedRoot();
       const gateway = startFakeGateway([
@@ -897,7 +897,7 @@ describe("web_search Gateway fixture", () => {
   );
 
   test(
-    "fx ask preserves the exact GLM model while sending declared Fast",
+    "ridex ask preserves the exact GLM model while sending declared Fast",
     async () => {
       const root = createIsolatedRoot("allow", {
         model: "zai/glm-5.2",
@@ -1092,7 +1092,7 @@ describe("web_search Gateway fixture", () => {
   );
 
   test(
-    "default fx ask applies environment model, permission, and step-limit overrides",
+    "default ridex ask applies environment model, permission, and step-limit overrides",
     async () => {
       const root = createIsolatedRoot(null, {
         model: OUTER_MODEL,

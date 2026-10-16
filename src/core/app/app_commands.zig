@@ -2105,7 +2105,7 @@ fn buildTraceReport(app: anytype) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(app.alloc);
     defer out.deinit();
 
-    try out.writer.writeAll("# fx trace\n\n");
+    try out.writer.writeAll("# ridex trace\n\n");
     try out.writer.writeAll("Private diagnostic report. It may include prompts, file paths, command output, and file snippets.\n\n");
 
     try out.writer.writeAll("## Summary\n");
@@ -4733,7 +4733,7 @@ test "trace auth summary preserves missing and loaded status text" {
     defer loaded.deinit();
     try writeAuthStateSummary(&loaded.writer, &app);
     try std.testing.expectEqualStrings(
-        "auth: source=fx login refreshable=true gateway_team=unset\n",
+        "auth: source=ridex login refreshable=true gateway_team=unset\n",
         loaded.written(),
     );
 }

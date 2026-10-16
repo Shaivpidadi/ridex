@@ -114,10 +114,12 @@ pub const Summarizer = struct {
             if (err == error.Cancelled or err == error.OutOfMemory) return err;
             primary_error = err;
         }
-        // Only the gateway can route to another model family with this
-        // credential. Elsewhere an empty reply becomes the summary step's
-        // EmptySummary error.
-        if (self.caller.provider != .gateway) {
+        // Only a gateway can route to another model family with this
+        // credential: Vercel's, or FreeRide, which fans the id out across
+        // its free providers (an unknown id falls through its ladder).
+        // Elsewhere an empty reply becomes the summary step's EmptySummary
+        // error.
+        if (self.caller.provider != .gateway and self.caller.provider != .freeride) {
             if (primary_error) |err| return err;
             return alloc.dupe(u8, "");
         }

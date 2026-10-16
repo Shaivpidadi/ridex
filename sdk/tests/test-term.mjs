@@ -112,7 +112,7 @@ const runtime = await createFxTerminal({
   backend: "wasm",
   wasm: await readFile(wasmPath),
   terminal,
-  env: { AI_GATEWAY_API_KEY: "term-test-key" },
+  env: { FX_DEFAULT_PROVIDER: "gateway", AI_GATEWAY_API_KEY: "term-test-key" },
   fetch: mockFetch,
   configStore: {
     get(configId) { return persistedConfig.get(configId) ?? null; },
@@ -174,7 +174,7 @@ globalThis.setTimeout = originalSetTimeout;
 const text = new TextDecoder().decode(Buffer.concat(output.map((chunk) => Buffer.from(chunk))));
 
 if (exitCode !== 0) throw new Error(`fx-term exited with code ${exitCode}`);
-if (!text.includes("𝒇x")) throw new Error("shared fx welcome frame was not observed");
+if (!text.includes("ridex")) throw new Error("shared fx welcome frame was not observed");
 if (!text.includes("Run /help for commands")) throw new Error("shared fx welcome guidance was not observed");
 if (requestedModel !== "sdk/term-model") throw new Error(`terminal prompt did not use the host-restored model: ${requestedModel}`);
 if (!(streamStartedAt < secondRequestAt)) throw new Error("terminal started steering before the active response");

@@ -125,6 +125,10 @@ jobs:
           - index: 1
             label: "2/2"
     env:
+      # Upstream's e2e/SDK suites model gateway-first flows; the fork's
+      # compiled default is freeride. Pin these suites to the upstream
+      # default instead of rewriting hundreds of fixtures.
+      FX_DEFAULT_PROVIDER: gateway
       AI_GATEWAY_API_KEY: ""
       VERCEL_OIDC_TOKEN: ""
       FX_REQUIRE_TMUX: "1"

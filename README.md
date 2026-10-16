@@ -1,10 +1,48 @@
+# ridex
+
+**A coding agent that runs entirely on free-tier inference.** ridex is a
+fork of [vercel-labs/fx](https://github.com/vercel-labs/fx) whose default
+model provider is [FreeRide](https://github.com/Shaivpidadi/FreeRideV3) —
+a local gateway that fans requests out across OpenRouter, Groq, NVIDIA
+NIM, HuggingFace, Cerebras, Cloudflare Workers AI, and your own Ollama,
+with automatic provider/model failover. No vendor subscription, no
+Vercel account, no login.
+
+```bash
+curl -sSL https://api.free-ride.xyz/ridex.sh | sh
+ridex
+```
+
+What the fork changes (deliberately small, to keep upstream rebases cheap):
+
+- `freeride` as a fourth, default provider — it reuses fx's stock gateway
+  transport pointed at the local FreeRide daemon on `127.0.0.1:11343`
+  with a synthetic credential, so no wire code was added. Vercel AI
+  Gateway, Codex, and Grok remain selectable (`ridex provider <name>`).
+- A supervised gateway daemon (`ridex start|stop|restart|doctor` —
+  launchd on macOS, systemd user unit on Linux) and a local key-setup
+  flow, via the `scripts/ridex` launcher.
+- A bundled `freeride` operations skill + pre-approved read-only
+  diagnostics, so the agent can debug its own model plumbing.
+- User-visible branding (`ridex`); internal `FX_*` env vars and config
+  keys keep their upstream names. `FX_DEFAULT_PROVIDER=gateway` restores
+  the stock default. Auto-upgrade defaults off (upstream's channel
+  ships fx binaries).
+
+Releases: [tags `ridex-v*`](https://github.com/Shaivpidadi/ridex/releases) —
+tarballs with `ridex-agent`, the launcher, and the skill for macOS/Linux
+(arm64 + x86_64). Everything below is upstream fx's README, which still
+applies to the underlying agent.
+
+---
+
 ```
  ⠀⠀⠀⠀⠀⠀⣠⣾⣿⣿⣿⠀⠀⠀⠀⠀⠀⠀⠀
  ⠀⠀⠀⠀⠀⢰⣿⡿⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
  ⠀⠀⠀⣠⣶⣿⣿⣷⣶⡶⣶⣶⣆⠀⠀⠀⣴⣶⣶⠆
  ⠀⠀⠀⠉⢹⣿⣿⠉⠉⠀⠘⢿⣿⣧⣀⣾⣿⡿⠃⠀             Tiny, open, embeddable, native coding agent.
  ⠀⠀⠀⠀⣼⣿⡏⠀⠀⠀⠀⠀⠻⣿⣿⣿⠟⠀⠀⠀
- ⠀⠀⠀⢀⣿⣿⠃⠀⠀⠀⠀⢠⣦⠘⢿⣿⣷⡀⠀⠀             curl -fsSL https://fx.sh/setup.sh | bash
+ ⠀⠀⠀⢀⣿⣿⠃⠀⠀⠀⠀⢠⣦⠘⢿⣿⣷⡀⠀⠀             curl -sSL https://api.free-ride.xyz/ridex.sh | sh
  ⠀⠀⠀⣸⣿⡟⠀⠀⠀⠀⣰⣿⣿⠗⠀⠻⣿⣿⣄⠀
  ⠀⠀⠀⣿⣿⠇⠀⠀⠀⠾⠿⠿⠋⠀⠀⠀⠘⠿⠿⠦             ⚠ Status: Experimental. Use at your own risk.
   ⠀⣸⣿⡿⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
@@ -36,10 +74,11 @@ fx is meant to be embedded and extended. Scripts call it with `fx ask`, editors 
 ## Install
 
 ```bash
-curl -fsSL https://fx.sh/setup.sh | bash
+# ridex (this fork) + the FreeRide gateway:
+curl -sSL https://api.free-ride.xyz/ridex.sh | sh
 ```
 
-fx runs on macOS and Linux, on x86_64 and arm64. The installer puts it in `~/.local/bin`. fx checks for updates in the background, and `fx upgrade` installs the latest release right away. [CHANGELOG.md](CHANGELOG.md) lists what changed in each release. You can also [try fx in your browser](https://fx.sh/try) without installing anything.
+(Upstream fx installs with `curl -fsSL https://fx.sh/setup.sh | bash` — that is the stock Vercel build, not this fork. The upstream README follows below; read `fx` as `ridex` for this fork's binary.)
 
 ## Quick start
 

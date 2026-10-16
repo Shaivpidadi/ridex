@@ -449,7 +449,7 @@ pub fn renderAuthenticationRequired(
         const failed = server.state.load(.acquire) == .failed;
         server.status_lock.unlock(io_mod.getIo());
         if (authentication == .required) {
-            const guidance = try alloc.print("Run /mcp auth {s} --open in an interactive fx session.", .{server.config.name});
+            const guidance = try alloc.print("Run /mcp auth {s} --open in an interactive ridex session.", .{server.config.name});
             defer alloc.free(guidance);
             return try writeAuthenticationRequired(alloc, server.config.name, .{ .oauth = guidance });
         }

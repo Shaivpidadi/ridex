@@ -31,6 +31,7 @@ async function verifyStartup(label, configStore, expectedEvent, trigger, expecte
     wasm,
     terminal: xtermAdapter(terminal),
     env: {
+      FX_DEFAULT_PROVIDER: "gateway",
       AI_GATEWAY_API_KEY: "config-restore-test-key",
       FX_TRACE_STDERR: "1",
       FX_TRACE_SCOPES: "host_config",

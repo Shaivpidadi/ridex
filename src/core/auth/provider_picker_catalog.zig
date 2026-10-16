@@ -14,7 +14,7 @@ const types = @import("../shared/types.zig");
 /// How a provider is authenticated. Subscription providers expose no methods;
 /// choosing one acts directly instead of opening the method column.
 pub const Method = enum {
-    /// Browser sign-in that yields an fx login session.
+    /// Browser sign-in that yields an ridex login session.
     oauth,
     /// A pasted AI Gateway key held in the keychain or profile.
     api_key,
@@ -116,8 +116,10 @@ fn providerVisible(id: model_provider.ProviderId) bool {
 
 /// Writes the visible provider slugs into `out` and returns how many landed.
 pub fn providerOptions(out: *[max_provider_options][]const u8) usize {
+    var ordered: [provider_catalog.entries.len]*const provider_catalog.Entry = undefined;
+    const ordered_count = provider_catalog.orderedEntries(&ordered);
     var count: usize = 0;
-    for (&provider_catalog.entries) |*entry| {
+    for (ordered[0..ordered_count]) |entry| {
         if (!providerVisible(entry.id)) continue;
         out[count] = entry.slug;
         count += 1;
@@ -125,8 +127,26 @@ pub fn providerOptions(out: *[max_provider_options][]const u8) usize {
     return count;
 }
 
+test "picker order follows the default provider" {
+    var buf: [max_provider_options][]const u8 = undefined;
+    const saved = model_provider.surface_default;
+    defer model_provider.surface_default = saved;
+    model_provider.surface_default = .freeride;
+    var count = providerOptions(&buf);
+    try std.testing.expectEqualStrings("freeride", buf[0]);
+    try std.testing.expectEqualStrings("vercel", buf[1]);
+    model_provider.surface_default = .gateway;
+    count = providerOptions(&buf);
+    try std.testing.expectEqualStrings("vercel", buf[0]);
+    try std.testing.expectEqualStrings("freeride", buf[count - 1]);
+}
+
 pub fn providerMethods(id: model_provider.ProviderId) []const Method {
     return switch (id) {
+        // FreeRide needs no sign-in method: the local gateway holds the
+        // provider keys (freeride init); the agent-side credential is
+        // synthetic.
+        .freeride => &.{},
         .gateway => &.{ .oauth, .api_key },
         .codex, .grok, .configured => &.{},
     };
@@ -146,7 +166,9 @@ test "provider options expose the catalog slugs the composer accepts" {
     const count = providerOptions(&buf);
 
     try std.testing.expect(count >= 2);
-    try std.testing.expectEqualStrings("vercel", buf[0]);
+    // The fork's default provider leads the catalog; Vercel follows.
+    try std.testing.expectEqualStrings("freeride", buf[0]);
+    try std.testing.expectEqualStrings("vercel", buf[1]);
     for (buf[0..count]) |slug| {
         try std.testing.expect(provider_catalog.parse(slug) != null);
         try std.testing.expect(std.mem.findScalar(u8, slug, ' ') == null);

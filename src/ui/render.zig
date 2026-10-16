@@ -1,6 +1,7 @@
 const std = @import("std");
 const build_options = @import("build_options");
 const io_mod = @import("../core/shared/io.zig");
+const branding = @import("../core/shared/branding.zig");
 const host = @import("../core/hosts/host.zig");
 const display_width = @import("../core/shared/display_width.zig");
 const text_utils = @import("../core/shared/text_utils.zig");
@@ -186,7 +187,7 @@ pub fn welcomeMessage(alloc: std.mem.Allocator) ![]u8 {
         build_options.git_commit,
     );
     return alloc.print(
-        "{s}𝒇x{s}{s} {s} · Run /help for commands" ++ reset_style ++ "\n\n",
+        "{s}" ++ branding.display_name ++ "{s}{s} {s} · Run /help for commands" ++ reset_style ++ "\n\n",
         .{ subtitle_style, reset_style, dim_style, build_label },
     );
 }
@@ -798,7 +799,7 @@ pub fn formatResumeHandoff(
 ) ![]const u8 {
     const label = "Continue session with:";
     // A v2 session resumes only with the flag that saved it.
-    const command = if (sessions_v2) "fx --sessions-v2 --resume " else "fx --resume ";
+    const command = if (sessions_v2) "ridex --sessions-v2 --resume " else "ridex --resume ";
     const single_row_width = label.len + 1 + command.len + session_id.len;
     const separator = if (single_row_width <= terminal_cols) " " else "\n  ";
     return std.mem.print(
@@ -865,25 +866,25 @@ test "resume handoff uses one row only when the full instruction fits" {
     initTheme(false, null);
     defer initTheme(false, null);
 
-    const single_row = "Continue session with: fx --resume session-123";
+    const single_row = "Continue session with: ridex --resume session-123";
     var exact_buffer: [128]u8 = undefined;
     const exact = try formatResumeHandoff(&exact_buffer, "session-123", single_row.len, false);
     try std.testing.expectEqualStrings(
-        "\x1b[38;5;245mContinue session with: fx --resume session-123\x1b[0m\n",
+        "\x1b[38;5;245mContinue session with: ridex --resume session-123\x1b[0m\n",
         exact,
     );
 
     var narrow_buffer: [128]u8 = undefined;
     const narrow = try formatResumeHandoff(&narrow_buffer, "session-123", single_row.len - 1, false);
     try std.testing.expectEqualStrings(
-        "\x1b[38;5;245mContinue session with:\n  fx --resume session-123\x1b[0m\n",
+        "\x1b[38;5;245mContinue session with:\n  ridex --resume session-123\x1b[0m\n",
         narrow,
     );
 
     var v2_buffer: [128]u8 = undefined;
     const v2 = try formatResumeHandoff(&v2_buffer, "session-123", 80, true);
     try std.testing.expectEqualStrings(
-        "\x1b[38;5;245mContinue session with: fx --sessions-v2 --resume session-123\x1b[0m\n",
+        "\x1b[38;5;245mContinue session with: ridex --sessions-v2 --resume session-123\x1b[0m\n",
         v2,
     );
 }
@@ -895,7 +896,7 @@ test "resume handoff follows the active muted theme shade" {
     var buffer: [128]u8 = undefined;
     const message = try formatResumeHandoff(&buffer, "session-123", 80, false);
     try std.testing.expectEqualStrings(
-        "\x1b[38;5;247mContinue session with: fx --resume session-123\x1b[0m\n",
+        "\x1b[38;5;247mContinue session with: ridex --resume session-123\x1b[0m\n",
         message,
     );
 }
@@ -930,7 +931,7 @@ test "welcomeMessage shows version and help hint" {
     const message = try welcomeMessage(std.testing.allocator);
     defer std.testing.allocator.free(message);
 
-    try std.testing.expect(std.mem.find(u8, message, "𝒇x") != null);
+    try std.testing.expect(std.mem.find(u8, message, "ridex") != null);
     try std.testing.expect(std.mem.find(u8, message, build_options.app_version) != null);
     try std.testing.expect(std.mem.find(u8, message, "/help") != null);
 }
@@ -948,7 +949,7 @@ test "welcomeMessage keeps only the app name bright" {
         build_options.git_commit,
     );
     const expected = try std.testing.allocator.print(
-        "{s}𝒇x{s}{s} {s} · Run /help for commands" ++ reset_style ++ "\n\n",
+        "{s}" ++ branding.display_name ++ "{s}{s} {s} · Run /help for commands" ++ reset_style ++ "\n\n",
         .{ subtitle_style, reset_style, dim_style, build_label },
     );
     defer std.testing.allocator.free(expected);

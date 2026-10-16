@@ -16,6 +16,7 @@ fn configuredBundle(_: ?*anyopaque, definition: *const configured_provider.Defin
 
 pub const native = provider_set.Set{
     .configured_fn = configuredBundle,
+    .freeride = gateway.freeride_provider_bundle,
     .gateway = gateway.provider_bundle,
     .codex = .{
         .presentation = provider_catalog.find(.codex),

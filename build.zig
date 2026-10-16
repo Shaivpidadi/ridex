@@ -53,7 +53,7 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(bool, "libfx", false);
 
     const exe = b.addExecutable(.{
-        .name = "fx",
+        .name = "ridex",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,
@@ -71,6 +71,10 @@ pub fn build(b: *std.Build) void {
     const session_manager = addSessionManager(b, exe.root_module, target, optimize, null);
 
     b.installArtifact(exe);
+    // Upstream's e2e/benchmark tooling resolves zig-out/bin/fx; install
+    // the same binary under the legacy name so the fork can keep running
+    // upstream CI unmodified while the product ships as `ridex`.
+    b.getInstallStep().dependOn(&b.addInstallBinFile(exe.getEmittedBin(), "fx").step);
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
@@ -87,7 +91,7 @@ pub fn build(b: *std.Build) void {
     // Tests launch the installed fx binary, and the session boundary test
     // walks the source tree.
     const test_paths = b.addOptions();
-    test_paths.addOptionPathUntracked("product_exe", b.graph.path(.install_bin, "fx"));
+    test_paths.addOptionPathUntracked("product_exe", b.graph.path(.install_bin, "ridex"));
     test_paths.addOptionPathUntracked("source_root", b.path("src"));
     exe.root_module.addImport("test_paths", test_paths.createModule());
 

@@ -139,7 +139,7 @@ function isCanonicalBuiltin(name: string): boolean {
 
 function isFxOwnedSystemText(text: string): boolean {
   return text.startsWith("# Identity and context\n") ||
-    /^You are a (?:read-only )?(?:Explore|Plan|Verify|Web) subagent inside fx\./.test(text) ||
+    /^You are a (?:read-only )?(?:Explore|Plan|Verify|Web) subagent inside ridex\./.test(text) ||
     text === WEB_SEARCH_GUIDANCE ||
     text.startsWith("<fx-turn-context>") ||
     text.startsWith("Runtime context:");

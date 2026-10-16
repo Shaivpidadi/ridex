@@ -73,7 +73,9 @@ pub fn logoutFallbackProviders(facts: LogoutFacts) [2]?model_provider.ProviderId
                 facts.available_sources.contains(.stored_key),
             .codex => facts.available_sources.contains(.chatgpt_subscription),
             .grok => facts.available_sources.contains(.grok_subscription),
-            .configured => false,
+            // Never a logout fallback: FreeRide is the compiled default and
+            // needs no credential, so it is reachable via /provider anyway.
+            .freeride, .configured => false,
         };
         if (!available) continue;
         candidates[count] = provider;
@@ -101,7 +103,7 @@ test "logout fallback prefers Gateway then the remaining subscription" {
     }
 }
 
-test "default logout honors an active fx login before other subscriptions" {
+test "default logout honors an active ridex login before other subscriptions" {
     for ([_]model_provider.ProviderId{ .codex, .grok }) |other| {
         var facts: LogoutFacts = .{
             .requested = null,
@@ -147,6 +149,9 @@ pub fn signInCompletion(
     provider_routing_supported: bool,
 ) SignInCompletionAction {
     return switch (provider) {
+        // FreeRide never runs a sign-in flow (synthetic credential), so
+        // completion just lands on the provider itself.
+        .freeride => .{ .switch_provider = .freeride },
         .gateway => .vercel,
         .configured => .{ .switch_provider = provider },
         .codex => if (provider_routing_supported)

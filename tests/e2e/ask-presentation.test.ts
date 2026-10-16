@@ -135,7 +135,7 @@ function fakeGatewayStreamingText(lines: string[], delayMs: number) {
   );
 }
 
-describe("fx ask presentation", () => {
+describe("ridex ask presentation", () => {
   test("redirected command output separates the next tool header", async () => {
     const root = createRoot();
     const gateway = startFakeGateway([
@@ -981,7 +981,7 @@ function occurrences(text: string, needle: string): number {
   return text.split(needle).length - 1;
 }
 
-describe("fx ask shell startup files", () => {
+describe("ridex ask shell startup files", () => {
   test("user-profile commands load startup files once and reload after an edit", async () => {
     const root = createRoot();
     writeStartupFiles(
@@ -1041,7 +1041,7 @@ describe("fx ask shell startup files", () => {
 
     expect(result.code).toBe(0);
     const notice = "shell snapshot unavailable (the captured state exceeded 8 MiB)";
-    expect(occurrences(result.stderr, `fx ask: warning: ${notice}`)).toBe(1);
+    expect(occurrences(result.stderr, `ridex ask: warning: ${notice}`)).toBe(1);
     expect(occurrences(gateway.requests[1]!.body, notice)).toBe(1);
     // The later request repeats the history, so one notice in total.
     expect(occurrences(gateway.requests[2]!.body, notice)).toBe(1);
@@ -1073,7 +1073,7 @@ describe("fx ask shell startup files", () => {
 
     expect(result.code).toBe(0);
     expect(existsSync(join(root.home, "fault-fired"))).toBe(true);
-    const notice = "fx ask: warning: shell snapshot unavailable (the login shell exited before reporting its state)";
+    const notice = "ridex ask: warning: shell snapshot unavailable (the login shell exited before reporting its state)";
     expect(occurrences(result.stderr, notice)).toBe(1);
     expect(gateway.requests[3]!.body).toContain("FX_RECOVERY_ALIAS");
   }, TIMEOUT);

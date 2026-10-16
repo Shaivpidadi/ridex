@@ -9,7 +9,7 @@ pub const Runtime = struct {
     const Self = @This();
 
     alloc: Allocator,
-    active_provider: model_provider.ProviderId = .gateway,
+    active_provider: model_provider.ProviderId = model_provider.default_provider,
     model: std.ArrayList(u8) = .empty,
     definitions: @import("../config/configured_provider.zig").Registry = .{},
     model_requests_blocked: bool = false,
@@ -19,6 +19,10 @@ pub const Runtime = struct {
     gateway_http_pool: ?*http_pool.HttpPool = null,
 
     pub fn init(alloc: Allocator) Self {
+        // Comptime-safe (main.zig uses this as a struct-field default):
+        // the compiled default only seeds the field; every real startup
+        // path adopts the env-aware defaultProvider() via
+        // loadStartupState → replaceSelection before first use.
         return .{ .alloc = alloc };
     }
 
@@ -74,6 +78,7 @@ pub const Runtime = struct {
         self.model = .fromOwnedSlice(owned_model.*);
         owned_model.* = &.{};
         self.active_provider = target_provider;
+        model_provider.active_transport_provider = target_provider;
     }
 };
 
