@@ -145,6 +145,7 @@ Restart=on-failure
 RestartSec=2
 StandardOutput=append:$DAEMON_LOG
 StandardError=append:$DAEMON_LOG
+UMask=0077
 
 [Install]
 WantedBy=default.target
@@ -179,6 +180,13 @@ supervisor_stop() {
 
 spawn_daemon() {
     mkdir -p "$RIDEX_HOME"
+    # The gateway log can carry provider error text. Create it private
+    # before any supervisor appends to it (launchd/systemd keep the
+    # mode of an existing file; a fresh one would be 0644).
+    if [ ! -e "$DAEMON_LOG" ]; then
+        (umask 077 && : >"$DAEMON_LOG")
+    fi
+    chmod 600 "$DAEMON_LOG" 2>/dev/null || true
     require_freeride
     case "$(supervisor_kind)" in
         launchd)
